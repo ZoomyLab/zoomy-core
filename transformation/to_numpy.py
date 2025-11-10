@@ -50,39 +50,42 @@ class NumpyRuntimeModel:
     def __attrs_post_init__(self):
         model = self.model
 
+        modules = [self.module]
+        if self.printer:
+            modules.append(self.printer)
         
-        flux=model._flux.lambdify(modules=[self.module, self.printer])
-        dflux=model._dflux.lambdify(modules=[self.module, self.printer])
+        flux=model._flux.lambdify(modules=modules)
+        dflux=model._dflux.lambdify(modules=modules)
         nonconservative_matrix=model._nonconservative_matrix.lambdify(
-            modules=[self.module, self.printer]
+            modules=modules
         )
         quasilinear_matrix=model._quasilinear_matrix.lambdify(
-            modules=[self.module, self.printer]
+            modules=modules
         )
         eigenvalues=model._eigenvalues.lambdify(
-            modules=[self.module, self.printer]
+            modules=modules
         )
         left_eigenvectors=model._left_eigenvectors.lambdify(
-            modules=[self.module, self.printer]
+            modules=modules
         )
         right_eigenvectors=model._right_eigenvectors.lambdify(
-            modules=[self.module, self.printer]
+            modules=modules
         )
-        source=model._source.lambdify(modules=[self.module, self.printer])
+        source=model._source.lambdify(modules=modules)
         source_jacobian_wrt_variables=model._source_jacobian_wrt_variables.lambdify(
-            modules=[self.module, self.printer]
+            modules=modules
         )
         source_jacobian_wrt_aux_variables=model._source_jacobian_wrt_aux_variables.lambdify(
-            modules=[self.module, self.printer]
+            modules=modules
         )
-        residual=model._residual.lambdify(modules=[self.module, self.printer])
+        residual=model._residual.lambdify(modules=modules)
         project_2d_to_3d=model._project_2d_to_3d.lambdify(
-            modules=[self.module, self.printer]
+            modules=modules
         )
         project_3d_to_2d=model._project_3d_to_2d.lambdify(
-            modules=[self.module, self.printer]
+            modules=modules
         )
-        bcs = model._boundary_conditions.lambdify(modules=[self.module, self.printer])
+        bcs = model._boundary_conditions.lambdify(modules=modules)
 
 
         # --- Assign frozen fields -------------------------------------

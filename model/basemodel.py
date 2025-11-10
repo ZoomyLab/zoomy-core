@@ -355,6 +355,7 @@ class Model:
         #     self.n_variables, self.n_variables, self.dimension
         # )
         JacF = ZArray(sympy.derive_by_array(self.flux(), self.variables.get_list()))
+        JacF_d = ZArray.zeros(*JacF.shape)
         for d in range(self.dimension):
             JacF_d = JacF[:, :, d]
             JacF_d = ZArray(JacF_d.tomatrix().T)
