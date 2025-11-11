@@ -136,8 +136,8 @@ class Settings(Zstruct):
     def __init__(self, **kwargs):
         # assert that kwargs constains name
         if 'output' not in kwargs or not isinstance(kwargs['output'], Zstruct):
-            logger.warning("No 'output' Zstruct found in Settings. Default: Zstruct(directory='output', filename='simulation', clean_directory=False)")
-            kwargs['output'] = Zstruct(directory='output', filename='simulation', clean_directory=True)
+            logger.warning("No 'output' Zstruct found in Settings. Default: Zstruct(directory='output', filename='simulation', snapshots=2, clean_directory=False)")
+            kwargs['output'] = Zstruct(directory='output', filename='simulation', snapshots=2, clean_directory=True)
         output = kwargs['output']
         if not output.contains('directory'):
             logger.warning("No 'directory' attribute found in output Zstruct. Default: 'output'")
@@ -148,6 +148,9 @@ class Settings(Zstruct):
         if not output.contains('clean_directory'):
             logger.warning("No 'clean_directory' attribute found in output Zstruct. Default: False")
             kwargs['output'] = Zstruct(clean_directory=False, **output.as_dict())
+        if not output.contains('snapshots'):
+            logger.warning("No 'snapshots' attribute found in output Zstruct. Default: 2")
+            kwargs['output'] = Zstruct(snapshots=2, **output.as_dict())
         super().__init__(**kwargs)
         
     @classmethod
@@ -156,7 +159,7 @@ class Settings(Zstruct):
         Returns a default Settings instance.
         """
         return cls(
-            output=Zstruct(directory='output', filename='simulation', clean_directory=False)
+            output=Zstruct(directory='output', filename='simulation', snapshots=2, clean_directory=False)
         )
     
 

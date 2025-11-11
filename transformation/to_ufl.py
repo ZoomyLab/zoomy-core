@@ -10,7 +10,7 @@ class UFLRuntimeModel(NumpyRuntimeModel):
     
     module = {
         'ones_like': lambda x: 0*x + 1,
-        'zeros_like': lambda x: 0*x,
+        'zeros_like': lambda x:  0*x,
         'array': ufl.as_vector,
         'squeeze': lambda x: x,
         

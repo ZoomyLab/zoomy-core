@@ -31,12 +31,14 @@ def listify(expr):
         return expr
 
 
-def vectorize_constant_sympy_expressions(expr, Q, Qaux):
+def vectorize_constant_sympy_expressions(expr, Q, Qaux, vectorize=True):
     """
     Replace entries in `expr` that are constant w.r.t. Q and Qaux
     by entry * ones_like(Q[0]) so NumPy/JAX vectorization works.
     Handles scalars, lists, sympy.Matrix, sympy.Array, and sympy.Piecewise.
     """
+    if not vectorize:
+        return expr
     symbol_list = set(Q.get_list() + Qaux.get_list())
     q0 = Q[0]
     ones_like = sp.Function("ones_like")  # symbolic placeholder
@@ -74,7 +76,7 @@ def vectorize_constant_sympy_expressions(expr, Q, Qaux):
             return sp.Matrix([[recurse(sub) for sub in row] for row in e.tolist()])
 
         # Handle Arrays (any rank)
-        if isinstance(e, sp.Array):
+        if isinstance(e, sp.Array) or isinstance(e, ZArray):
             return sp.Array([recurse(sub) for sub in e])
 
         # Handle Piecewise
@@ -128,7 +130,7 @@ class Function:
         func = lambdify(
             self.args.get_list(),
             make_array(listify(vectorize_constant_sympy_expressions(
-                self.definition, self.args.variables, self.args.aux_variables
+                self.definition, self.args.variables, self.args.aux_variables, vectorize=True
             ))),
             modules=modules,
         )
