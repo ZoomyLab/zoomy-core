@@ -3,14 +3,33 @@ import sympy
 import sympy as sp
 from attrs import define, field
 from sympy import lambdify
+from sympy import Tuple
 
-from zoomy_core.misc.misc import Zstruct
+from zoomy_core.misc.misc import Zstruct, ZArray
 
+# def listify(expr):
+#     if type(expr) is sp.Piecewise:
+#         return expr
+#     else:
+#         return expr.tolist()
+    
+# def listify(expr):
+#     if isinstance(expr, sp.NDimArray):
+#         return expr.tolist()
+#     elif expr.args:
+#         return expr.func(*[listify(arg) for arg in expr.args])
+#     else:
+#         return expr
+    
+    
 def listify(expr):
-    if type(expr) is sp.Piecewise:
-        return expr
+    if isinstance(expr, ZArray) or isinstance(expr, sp.NDimArray):
+        return Tuple(*expr.tolist())  # convert list to sympy Tuple
+    elif hasattr(expr, 'args') and expr.args:
+        return expr.func(*[listify(a) for a in expr.args])
     else:
-        return list(expr)
+        return expr
+
 
 def vectorize_constant_sympy_expressions(expr, Q, Qaux):
     """
@@ -102,12 +121,15 @@ class Function:
 
     def lambdify(self, modules=None):
         """Return a lambdified version of the function."""
+        
+        # Create a symbolic placeholder to translate the output in the correct format
+        make_array = sp.Function('array')
 
         func = lambdify(
             self.args.get_list(),
-            vectorize_constant_sympy_expressions(
-                listify(self.definition), self.args.variables, self.args.aux_variables
-            ),
+            make_array(listify(vectorize_constant_sympy_expressions(
+                self.definition, self.args.variables, self.args.aux_variables
+            ))),
             modules=modules,
         )
         return func

@@ -3,6 +3,7 @@ import numpy as np
 from attrs import define, field
 
 from zoomy_core.misc.custom_types import FArray
+from zoomy_core.model.basemodel import Model
 
 
 @define(kw_only=False, slots=True, frozen=True)
@@ -10,7 +11,7 @@ class NumpyRuntimeModel:
     """Runtime model generated from a symbolic Model."""
 
     # --- User-provided ---
-    model: object = field()
+    model: Model = field()
 
     # --- Automatically derived ---
     name: str = field(init=False)
