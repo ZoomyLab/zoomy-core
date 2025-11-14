@@ -25,10 +25,11 @@ class Model:
     Generic (virtual) model implementation.
     """
 
-    boundary_conditions: BoundaryConditions
+    boundary_conditions: BoundaryConditions = field(default= BoundaryConditions(boundary_conditions=[]))
 
     name: str = "Model"
     dimension: int = 1
+    disable_differentiation: bool = False
 
     initial_conditions: InitialConditions = field(factory=Constant)
     aux_initial_conditions: InitialConditions = field(factory=Constant)
@@ -366,12 +367,20 @@ class Model:
 
     def source_jacobian_wrt_variables(self):
         """generated automatically unless explicitly provided"""
+        if self.disable_differentiation:
+            return ZArray.zeros(
+                self.n_variables, self.n_variables
+            )
         return self._simplify(
             sympy.derive_by_array(self.source(), self.variables.get_list())
         )
 
     def source_jacobian_wrt_aux_variables(self):
         """generated automatically unless explicitly provided"""
+        if self.disable_differentiation:
+            return ZArray.zeros(
+                self.n_variables, self.n_aux_variables
+            )
         return self._simplify(
             sympy.derive_by_array(self.source(), self.aux_variables.get_list())
         )
@@ -390,12 +399,15 @@ class Model:
         for d in range(1, self.dimension):
             A += self.normal[d] * self.quasilinear_matrix()[:, :, d]
         return self._simplify(eigenvalue_dict_to_matrix(sympy.Matrix(A).eigenvals()))
+    
 
     def left_eigenvectors(self):
         return ZArray.zeros(self.n_variables, self.n_variables)
 
+
     def right_eigenvectors(self):
         return ZArray.zeros(self.n_variables, self.n_variables)
+
 
 
 def substitute_precomputed_denominator(self, expr, sym, sym_inv):

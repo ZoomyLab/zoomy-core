@@ -2,7 +2,11 @@ from attrs import define
 import ufl
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
 
-
+def _ufl_conditional(condition, true_val, false_val):
+    if isinstance(true_val, tuple):
+        return ufl.conditional(condition, ufl.as_vector(true_val), ufl.as_vector(false_val))
+    else:
+        return ufl.conditional(condition, true_val, false_val)
 
 @define(kw_only=False, slots=True, frozen=True)
 class UFLRuntimeModel(NumpyRuntimeModel):
@@ -13,6 +17,7 @@ class UFLRuntimeModel(NumpyRuntimeModel):
         'zeros_like': lambda x:  0*x,
         'array': ufl.as_vector,
         'squeeze': lambda x: x,
+        'conditional': _ufl_conditional,
         
         # --- Elementary arithmetic ---
         "Abs": abs,

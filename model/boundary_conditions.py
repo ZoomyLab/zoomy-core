@@ -90,12 +90,14 @@ class FromData(BoundaryCondition):
 class Wall(BoundaryCondition):
     """
     momentum_field_indices: list(int): indicate which fields need to be mirrored at the wall
-    permeability: float : 1.0 corresponds to a perfect reflection (impermeable wall)
+    permeability: float : 0.0 corresponds to a perfect reflection (impermeable wall)
+    blending: float: 0.5 blend the reflected wall solution with the solution of the inner cell, (1-blending)*wall_solution + blending*inner_cell_solution
     """
 
     momentum_field_indices: List[List[int]] = [[1, 2]]
     permeability: float = 0.0
     wall_slip: float = 1.0
+    blending: float = 0.5
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
         q = ZArray(Q)
@@ -116,7 +118,7 @@ class Wall(BoundaryCondition):
             momentum_list_wall.append(momentum_wall)
         for l, momentum_wall in zip(self.momentum_field_indices, momentum_list_wall):
             for i_k, k in enumerate(l):
-                out[k] = momentum_wall[i_k]
+                out[k] = (1-self.blending) * momentum_wall[i_k] + self.blending * q[k]
         return out
 
 
@@ -170,12 +172,15 @@ class BoundaryConditions:
 
     def get_boundary_condition_function(self, time, X, dX, Q, Qaux, parameters, normal):
         bc_idx = sympy.Symbol("bc_idx", integer=True)
-        bc_func = sympy.Piecewise(
-            *(
-                (func(time, X.get_list(), dX, Q.get_list(), Qaux.get_list(), parameters.get_list(), normal.get_list()), sympy.Eq(bc_idx, i))
-                for i, func in enumerate(self._boundary_functions)
+        if self._boundary_functions == []:
+            bc_func = ZArray(Q.get_list())
+        else:
+            bc_func = sympy.Piecewise(
+                *(
+                    (func(time, X.get_list(), dX, Q.get_list(), Qaux.get_list(), parameters.get_list(), normal.get_list()), sympy.Eq(bc_idx, i))
+                    for i, func in enumerate(self._boundary_functions)
+                )
             )
-        )
         func = Function(
             name="boundary_conditions",
             args=Zstruct(
