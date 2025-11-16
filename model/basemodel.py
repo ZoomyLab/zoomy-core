@@ -355,6 +355,10 @@ class Model:
         # NC = ZArray.zeros(
         #     self.n_variables, self.n_variables, self.dimension
         # )
+        if self.disable_differentiation:
+            return ZArray.zeros(
+                self.n_variables, self.n_variables, self.dimension
+            )
         JacF = ZArray(sympy.derive_by_array(self.flux(), self.variables.get_list()))
         JacF_d = ZArray.zeros(*JacF.shape)
         for d in range(self.dimension):

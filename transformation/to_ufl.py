@@ -3,7 +3,11 @@ import ufl
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
 
 def _ufl_conditional(condition, true_val, false_val):
-    if isinstance(true_val, tuple):
+    if condition is True:
+        return true_val
+    elif condition is False:
+        return false_val
+    elif isinstance(true_val, tuple):
         return ufl.conditional(condition, ufl.as_vector(true_val), ufl.as_vector(false_val))
     else:
         return ufl.conditional(condition, true_val, false_val)
