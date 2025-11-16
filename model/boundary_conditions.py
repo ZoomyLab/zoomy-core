@@ -84,6 +84,63 @@ class FromData(BoundaryCondition):
             interp_func = _sympy_interpolate_data(time, self.timeline, v)
             Qout[k] = 2 * interp_func - Q[k]
         return Qout
+    
+@define(slots=True, frozen=False, kw_only=True)
+class CharacteristicReflective(BoundaryCondition):
+    """
+    Generic characteristic reflective wall boundary condition.
+
+    Inputs:
+        M: diagonal scaling matrix in characteristic space (Matrix)
+           User sets:
+             - acoustic waves:   -1 for reflection
+             - shear waves:      wall_slip
+             - entropy waves:    1
+        model must supply:
+             S, R, L, D
+    """
+    R: Matrix
+    L: Matrix
+    D: Matrix
+    S: Matrix
+    M: Matrix  # diagonal scaling matrix provided by user or model
+
+    def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
+
+        q = Matrix(Q)
+        # 1. Retrieve model matrices
+
+        # 2. Rotate Q into normal frame
+        q_n = self.S @ q
+
+        # 3. Project to characteristic space
+        W_int = self.L @ q_n
+
+        # 4. Build boundary characteristic state
+        W_bc = W_int.copy()
+        MW = self.M @ W_int
+        for i in range(W_int.rows):
+            lam = self.D[i, i]
+            cond = sympy.GreaterThan(-lam, 0, evaluate=False)
+            W_bc[i, 0] = sympy.Function('conditional')(cond, MW[i, 0],  W_int[i, 0])
+            # W_bc[i, 0] = sympy.Piecewise(( MW[i, 0], sympy.GreaterThan(lam, 0)),  (W_int[i, 0], True))
+            # W_bc[i, 0] = sympy.Piecewise(( MW[i, 0], cond),  (W_int[i, 0], True))
+
+
+            # W_bc[i] = W_int[i]
+
+        # 5. Transform back
+        q_n_bc = self.R @ W_bc
+        q_bc   = sympy.simplify(self.S.inv() @ q_n_bc)
+
+        out = ZArray.zeros(len(q_bc))
+        for i in range(len(q_bc)):
+            out[i] = sympy.Function('conditional')(sympy.GreaterThan(q[1, 0], 1e-4), q_bc[i, 0], q[i, 0])
+            # out[i] = q_bc[i, 0]
+
+        return out
+
+
 
 
 @define(slots=True, frozen=False, kw_only=True)
