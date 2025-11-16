@@ -154,7 +154,7 @@ class Wall(BoundaryCondition):
     momentum_field_indices: List[List[int]] = [[1, 2]]
     permeability: float = 0.0
     wall_slip: float = 1.0
-    blending: float = 0.5
+    blending: float = 0.0
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
         q = ZArray(Q)
