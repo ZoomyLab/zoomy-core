@@ -61,8 +61,7 @@ def write_dict_to_hdf5(group, d):
             subgroup = group.create_group(key)
             write_dict_to_hdf5(subgroup, value.as_dict())
         else:
-            logger.warning(f"Skipping unsupported type for key: {
-                           key} -> {type(value)}")
+            logger.warning(f"Skipping unsupported type for key: {key} -> {type(value)}")
 
 
 def load_hdf5_to_dict(group):
@@ -76,8 +75,7 @@ def load_hdf5_to_dict(group):
             else:
                 d[key] = value[()]
         else:
-            logger.warning(f"Skipping unsupported type for key: {
-                           key} -> {type(value)}")
+            logger.warning(f"Skipping unsupported type for key: {key} -> {type(value)}")
 
     return d
 
@@ -176,7 +174,7 @@ def _save_fields_to_hdf5(filepath, i_snapshot, time, Q, Qaux=None, overwrite=Tru
 
     filepath = os.path.join(main_dir, filepath)
     with h5py.File(filepath, "a") as f:
-        if i_snap == 0 and not "fields" in f.keys():
+        if i_snap == 0 and "fields" not in f.keys():
             fields = f.create_group("fields")
         else:
             fields = f["fields"]
@@ -185,8 +183,7 @@ def _save_fields_to_hdf5(filepath, i_snapshot, time, Q, Qaux=None, overwrite=Tru
             if overwrite:
                 del fields[group_name]
             else:
-                raise ValueError(
-                    f"Group {group_name} already exists in {filepath}")
+                raise ValueError(f"Group {group_name} already exists in {filepath}")
         attrs = fields.create_group(group_name)
         attrs.create_dataset("time", data=time, dtype=float)
         attrs.create_dataset("Q", data=Q)
@@ -203,7 +200,7 @@ def get_save_fields_simple(_filepath, write_all, overwrite=True):
         filepath = os.path.join(main_dir, _filepath)
 
         with h5py.File(filepath, "a") as f:
-            if i_snap == 0 and not "fields" in f.keys():
+            if i_snap == 0 and "fields" not in f.keys():
                 fields = f.create_group("fields")
             else:
                 fields = f["fields"]
@@ -212,8 +209,7 @@ def get_save_fields_simple(_filepath, write_all, overwrite=True):
                 if overwrite:
                     del fields[group_name]
                 else:
-                    raise ValueError(
-                        f"Group {group_name} already exists in {filepath}")
+                    raise ValueError(f"Group {group_name} already exists in {filepath}")
             attrs = fields.create_group(group_name)
             attrs.create_dataset("time", data=time, dtype=float)
             attrs.create_dataset("Q", data=Q)
@@ -231,7 +227,7 @@ def _save_hdf5(_filepath, i_snapshot, time, Q, Qaux, overwrite=True):
     filepath = os.path.join(main_dir, _filepath)
 
     with h5py.File(filepath, "a") as f:
-        if i_snap == 0 and not "fields" in f.keys():
+        if i_snap == 0 and "fields" not in f.keys():
             fields = f.create_group("fields")
         else:
             fields = f["fields"]
@@ -240,8 +236,7 @@ def _save_hdf5(_filepath, i_snapshot, time, Q, Qaux, overwrite=True):
             if overwrite:
                 del fields[group_name]
             else:
-                raise ValueError(
-                    f"Group {group_name} already exists in {filepath}")
+                raise ValueError(f"Group {group_name} already exists in {filepath}")
         attrs = fields.create_group(group_name)
         attrs.create_dataset("time", data=time, dtype=float)
         attrs.create_dataset("Q", data=Q)
@@ -352,15 +347,13 @@ def _write_to_vtk_from_vertices_edges(
         if field_names is None:
             field_names = [str(i) for i in range(fields.shape[0])]
         for i_fields, _ in enumerate(fields):
-            d_fields[field_names[i_fields]] = [
-                fields[i_fields, :n_inner_elements]]
+            d_fields[field_names[i_fields]] = [fields[i_fields, :n_inner_elements]]
     point_d_fields = {}
     if point_fields is not None:
         if point_field_names is None:
             point_field_names = [str(i) for i in range(point_fields.shape[0])]
         for i_fields, _ in enumerate(point_fields):
-            point_d_fields[point_field_names[i_fields]
-                           ] = point_fields[i_fields]
+            point_d_fields[point_field_names[i_fields]] = point_fields[i_fields]
     meshout = meshio.Mesh(
         vertex_coordinates,
         [(mesh_util.convert_mesh_type_to_meshio_mesh_type(mesh_type), cell_vertices)],
@@ -381,7 +374,7 @@ def generate_vtk(
     filename="out",
     warp=False,
 ):
-    main_dir =  misc.get_main_directory()
+    main_dir = misc.get_main_directory()
     abs_filepath = os.path.join(main_dir, filepath)
     path = os.path.dirname(abs_filepath)
     full_filepath_out = os.path.join(path, filename)
@@ -415,8 +408,7 @@ def generate_vtk(
         if field_names is None:
             field_names = [str(i) for i in range(Q.shape[0])]
         if aux_field_names is None:
-            aux_field_names = ["aux_{}".format(
-                str(i)) for i in range(Qaux.shape[0])]
+            aux_field_names = ["aux_{}".format(str(i)) for i in range(Qaux.shape[0])]
 
         fields = np.concatenate((Q, Qaux), axis=0)
         field_names = field_names + aux_field_names

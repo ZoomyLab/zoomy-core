@@ -60,7 +60,7 @@ def vtk_project_2d_to_3d(
 
             #rhoUVWP[i_elem + (iz * mesh.n_cells), :] = pde.project_2d_to_3d(np.array([0, 0, z]), q, qaux, parameters)
             # rhoUVWP[(iz * mesh.n_inner_cells):((iz+1) * mesh.n_inner_cells), 0] = Q[0, :mesh.n_inner_cells]
-            rhoUVWP[(iz * mesh.n_inner_cells):((iz+1) * mesh.n_inner_cells), :] = Qnew[iz, :]
+            rhoUVWP[(iz * mesh.n_inner_cells):((iz+1) * mesh.n_inner_cells), :] = Qnew[:, :]
 
         # rhoUVWP[mesh.n_inner_cells:mesh.n_inner_cells+mesh.n_inner_cells, 0] = Q[0, :mesh.n_inner_cells]
 

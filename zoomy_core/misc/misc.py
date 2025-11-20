@@ -1,6 +1,10 @@
 import os
 import numpy as np
 
+
+import subprocess
+import sys 
+
 # import scipy.interpolate as interp
 # from functools import wraps
 
@@ -11,16 +15,57 @@ from types import SimpleNamespace
 from sympy import MatrixSymbol
 from sympy import MutableDenseNDimArray as ZArray
 
+
 from zoomy_core.misc.custom_types import FArray
 from zoomy_core.misc.logger_config import logger
 
 
 
+
 def get_main_directory():
-    main_dir = os.getenv("ZOOMY_DIR")
-    if main_dir is None:
-        main_dir = ""
-    return main_dir
+    """
+    Determine the main project directory.
+
+    Priority:
+    1. Environment variable ZOOMY_DIR
+    2. Git repository root (if inside a Git repo)
+    3. Directory of the current script or Jupyter notebook
+    4. Fallback: current working directory
+    """
+
+    # 1. Environment variable overrides everything
+    env_dir = os.getenv("ZOOMY_DIR")
+    if env_dir:
+        return os.path.abspath(env_dir)
+
+    # 2. Detect Git root if available
+    try:
+        git_root = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            stderr=subprocess.DEVNULL
+        ).decode().strip()
+        return git_root
+    except Exception:
+        pass
+
+    # 3. Handle Jupyter notebooks vs scripts
+    #    If running in Jupyter: use notebook dir
+    try:
+        from IPython import get_ipython
+        ip = get_ipython()
+        if ip and hasattr(ip, "run_line_magic"):
+            notebook_dir = ip.run_line_magic("pwd", "")
+            if notebook_dir:
+                return notebook_dir
+    except Exception:
+        pass
+
+    # 4. Fallback: use the directory of the current script
+    if hasattr(sys.modules["__main__"], "__file__"):
+        return os.path.dirname(os.path.abspath(sys.modules["__main__"].__file__))
+
+    # 5. Ultimate fallback: CWD
+    return os.getcwd()
 
 
 
