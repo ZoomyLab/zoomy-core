@@ -797,7 +797,6 @@ class Mesh:
                     _face_subvolume[0] = _face_subvolume[1]
                 else:
                     _face_subvolume[1] = _face_subvolume[0]
-                
 
             face_centers.append(face_center)
             _face_cells = gdm.getSupport(e) - cStart
@@ -1210,6 +1209,13 @@ class Mesh:
         if not os.path.exists(path) and path != "":
             os.mkdir(path)
         meshout.write(filepath + ".vtk", binary=False)
+
+
+def msh_to_h5(path_to_msh_file: str):
+    mesh = Mesh.from_gmsh(path_to_msh_file)
+    base = os.path.splitext(os.path.basename(path_to_msh_file))[0]
+    path = os.path.join(os.path.dirname(path_to_msh_file), base + ".h5")
+    mesh.write_to_hdf5(path)
 
 
 if __name__ == "__main__":
