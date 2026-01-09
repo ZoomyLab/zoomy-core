@@ -1,59 +1,15 @@
 import numpy as np
 from time import time as get_time
-
-
 import sympy
 from sympy import Matrix
-
-from attr import define, field
+import param
 from typing import Callable, List
 
 from zoomy_core.misc.misc import Zstruct, ZArray
-
 from zoomy_core.model.basefunction import Function
 
 
-@define(slots=True, frozen=False, kw_only=True)
-class BoundaryCondition:
-    tag: str
-
-    """ 
-    Default implementation. The required data for the 'ghost cell' is the data from the interior cell. Can be overwritten e.g. to implement periodic boundary conditions.
-    """
-
-    def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
-        print("BoundaryCondition is a virtual class. Use one if its derived classes!")
-        assert False
-
-
-@define(slots=True, frozen=False, kw_only=True)
-class Extrapolation(BoundaryCondition):
-    def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
-        return ZArray(Q)
-
-
-@define(slots=True, frozen=False, kw_only=True)
-class InflowOutflow(BoundaryCondition):
-    prescribe_fields: dict[int, float]
-
-    def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
-        Qout = ZArray(Q)
-        for k, v in self.prescribe_fields.items():
-            Qout[k] = eval(v)
-        return Qout
-
-
-@define(slots=True, frozen=False, kw_only=True)
-class Lambda(BoundaryCondition):
-    prescribe_fields: dict[int, float]
-
-    def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
-        Qout = ZArray(Q)
-        for k, v in self.prescribe_fields.items():
-            Qout[k] = v(time, X, dX, Q, Qaux, parameters, normal)
-        return Qout
-
-
+# --- Helper Function (Unchanged) ---
 def _sympy_interpolate_data(time, timeline, data):
     assert timeline.shape[0] == data.shape[0]
     conditions = (((data[0], time <= timeline[0])),)
@@ -69,92 +25,118 @@ def _sympy_interpolate_data(time, timeline, data):
     return sympy.Piecewise(*conditions)
 
 
-@define(slots=True, frozen=False, kw_only=True)
+# --- Base Class ---
+class BoundaryCondition(param.Parameterized):
+    """
+    Default implementation. The required data for the 'ghost cell' is the data
+    from the interior cell. Can be overwritten e.g. to implement periodic boundary conditions.
+    """
+
+    tag = param.String(default="bc")
+
+    def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
+        print("BoundaryCondition is a virtual class. Use one if its derived classes!")
+        assert False
+
+
+# --- Derived Boundary Conditions ---
+
+
+class Extrapolation(BoundaryCondition):
+    def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
+        return ZArray(Q)
+
+
+class InflowOutflow(BoundaryCondition):
+    prescribe_fields = param.Dict(default={})
+
+    def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
+        Qout = ZArray(Q)
+        for k, v in self.prescribe_fields.items():
+            # Note: eval() is kept to match original behavior
+            Qout[k] = eval(v)
+        return Qout
+
+
+class Lambda(BoundaryCondition):
+    prescribe_fields = param.Dict(default={})
+
+    def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
+        Qout = ZArray(Q)
+        for k, v in self.prescribe_fields.items():
+            Qout[k] = v(time, X, dX, Q, Qaux, parameters, normal)
+        return Qout
+
+
 class FromData(BoundaryCondition):
-    prescribe_fields: dict[int, np.ndarray]
-    timeline: np.ndarray
+    prescribe_fields = param.Dict(default={})
+    timeline = param.Array(default=None)
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
         # Extrapolate all fields
         Qout = ZArray(Q)
 
         # Set the fields which are prescribed in boundary condition dict
-        time_start = get_time()
+        # time_start = get_time() # (Unused variable from original)
         for k, v in self.prescribe_fields.items():
             interp_func = _sympy_interpolate_data(time, self.timeline, v)
             Qout[k] = 2 * interp_func - Q[k]
         return Qout
-    
-@define(slots=True, frozen=False, kw_only=True)
+
+
 class CharacteristicReflective(BoundaryCondition):
     """
     Generic characteristic reflective wall boundary condition.
-
-    Inputs:
-        M: diagonal scaling matrix in characteristic space (Matrix)
-           User sets:
-             - acoustic waves:   -1 for reflection
-             - shear waves:      wall_slip
-             - entropy waves:    1
-        model must supply:
-             S, R, L, D
     """
-    R: Matrix
-    L: Matrix
-    D: Matrix
-    S: Matrix
-    M: Matrix  # diagonal scaling matrix provided by user or model
+
+    # Using Generic Parameter for Matrices to allow flexibility (SymPy/NumPy)
+    R = param.Parameter(default=None)
+    L = param.Parameter(default=None)
+    D = param.Parameter(default=None)
+    S = param.Parameter(default=None)
+    M = param.Parameter(default=None)  # diagonal scaling matrix
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
-
         q = Matrix(Q)
-        # 1. Retrieve model matrices
 
-        # 2. Rotate Q into normal frame
+        # 1. Rotate Q into normal frame
         q_n = self.S @ q
 
-        # 3. Project to characteristic space
+        # 2. Project to characteristic space
         W_int = self.L @ q_n
 
-        # 4. Build boundary characteristic state
+        # 3. Build boundary characteristic state
         W_bc = W_int.copy()
         MW = self.M @ W_int
         for i in range(W_int.rows):
             lam = self.D[i, i]
             cond = sympy.GreaterThan(-lam, 0, evaluate=False)
-            W_bc[i, 0] = sympy.Function('conditional')(cond, MW[i, 0],  W_int[i, 0])
-            # W_bc[i, 0] = sympy.Piecewise(( MW[i, 0], sympy.GreaterThan(lam, 0)),  (W_int[i, 0], True))
-            # W_bc[i, 0] = sympy.Piecewise(( MW[i, 0], cond),  (W_int[i, 0], True))
+            W_bc[i, 0] = sympy.Function("conditional")(cond, MW[i, 0], W_int[i, 0])
 
-
-            # W_bc[i] = W_int[i]
-
-        # 5. Transform back
+        # 4. Transform back
         q_n_bc = self.R @ W_bc
-        q_bc   = sympy.simplify(self.S.inv() @ q_n_bc)
+        q_bc = sympy.simplify(self.S.inv() @ q_n_bc)
 
         out = ZArray.zeros(len(q_bc))
         for i in range(len(q_bc)):
-            out[i] = sympy.Function('conditional')(sympy.GreaterThan(q[1, 0], 1e-4), q_bc[i, 0], q[i, 0])
-            # out[i] = q_bc[i, 0]
+            out[i] = sympy.Function("conditional")(
+                sympy.GreaterThan(q[1, 0], 1e-4), q_bc[i, 0], q[i, 0]
+            )
 
         return out
 
 
-
-
-@define(slots=True, frozen=False, kw_only=True)
 class Wall(BoundaryCondition):
     """
-    momentum_field_indices: list(int): indicate which fields need to be mirrored at the wall
     permeability: float : 0.0 corresponds to a perfect reflection (impermeable wall)
-    blending: float: 0.5 blend the reflected wall solution with the solution of the inner cell, (1-blending)*wall_solution + blending*inner_cell_solution
+    blending: float: 0.5 blend the reflected wall solution with the solution of the inner cell
     """
 
-    momentum_field_indices: List[List[int]] = [[1, 2]]
-    permeability: float = 0.0
-    wall_slip: float = 1.0
-    blending: float = 0.0
+    # Defaults are handled safely by param (no factory needed)
+    momentum_field_indices = param.List(default=[[1, 2]])
+    permeability = param.Number(default=0.0)
+    wall_slip = param.Number(default=1.0)
+    blending = param.Number(default=0.0)
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
         q = ZArray(Q)
@@ -162,9 +144,10 @@ class Wall(BoundaryCondition):
         momentum_list = [Matrix([q[k] for k in l]) for l in self.momentum_field_indices]
         dim = momentum_list[0].shape[0]
         n = Matrix(normal[:dim])
-        out = ZArray.zeros(n_variables)
-        out = q
+
+        out = ZArray(Q)  # Initialize with Q copy
         momentum_list_wall = []
+
         for momentum in momentum_list:
             normal_momentum_coef = momentum.dot(n)
             transverse_momentum = momentum - normal_momentum_coef * n
@@ -173,71 +156,102 @@ class Wall(BoundaryCondition):
                 - (1 - self.permeability) * normal_momentum_coef * n
             )
             momentum_list_wall.append(momentum_wall)
+
         for l, momentum_wall in zip(self.momentum_field_indices, momentum_list_wall):
             for i_k, k in enumerate(l):
-                out[k] = (1-self.blending) * momentum_wall[i_k] + self.blending * q[k]
+                out[k] = (1 - self.blending) * momentum_wall[i_k] + self.blending * q[k]
         return out
 
 
-@define(slots=True, frozen=False, kw_only=True)
 class RoughWall(Wall):
-    CsW: float = 0.5  # roughness constant
-    Ks: float = 0.001  # roughness height
+    CsW = param.Number(default=0.5)  # roughness constant
+    Ks = param.Number(default=0.001)  # roughness height
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
         slip_length = dX * sympy.ln((dX * self.CsW) / self.Ks)
-        # wall_slip = (1-2*dX/slip_length)
-        # wall_slip = sympy.Min(sympy.Max(wall_slip, 0.0), 1.0)
         f = dX / slip_length
         wall_slip = (1 - f) / (1 + f)
+
+        # We can modify self temporarily or pass it locally.
+        # Modifying self.wall_slip is fine in param (it's mutable).
         self.wall_slip = wall_slip
+
         return super().compute_boundary_condition(
             time, X, dX, Q, Qaux, parameters, normal
         )
 
 
-@define(slots=True, frozen=False, kw_only=True)
 class Periodic(BoundaryCondition):
-    periodic_to_physical_tag: str
+    periodic_to_physical_tag = param.String(default="")
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
         return ZArray(Q)
 
 
-@define(slots=True, frozen=True)
-class BoundaryConditions:
-    _boundary_conditions: List[BoundaryCondition]
-    _boundary_functions: List[Callable] = field(init=False)
-    _boundary_tags: List[str] = field(init=False)
+# --- Container Class ---
 
-    def __attrs_post_init__(self):
-        tags_unsorted = [bc.tag for bc in self._boundary_conditions]
+
+# In zoomy_core/model/boundary_conditions.py
+
+
+class BoundaryConditions(param.Parameterized):
+    # FIXED: item_type instead of class_
+    boundary_conditions_list = param.List(default=[], item_type=BoundaryCondition)
+
+    # Internal state
+    _boundary_functions = param.List(default=[])
+    _boundary_tags = param.List(default=[])
+
+    # FIXED: Added 'boundary_conditions' as a positional argument
+    def __init__(self, boundary_conditions=None, **params):
+        # 1. Handle Positional Arg: BoundaryConditions([...])
+        if boundary_conditions is not None:
+            params["boundary_conditions_list"] = boundary_conditions
+
+        # 2. Handle Keyword Alias: BoundaryConditions(boundary_conditions=[...])
+        elif "boundary_conditions" in params:
+            params["boundary_conditions_list"] = params.pop("boundary_conditions")
+
+        super().__init__(**params)
+
+        # 3. Sort and Setup (Same as before)
+        tags_unsorted = [bc.tag for bc in self.boundary_conditions_list]
         order = np.argsort(tags_unsorted)
-        object.__setattr__(
-            self,
-            "_boundary_functions",
-            [self._boundary_conditions[i].compute_boundary_condition for i in order],
-        )
-        object.__setattr__(
-            self,
-            "_boundary_tags",
-            [self._boundary_conditions[i].tag for i in order],
-        )
-        object.__setattr__(
-            self, "_boundary_conditions", [self._boundary_conditions[i] for i in order]
-        )
 
+        self.boundary_conditions_list = [
+            self.boundary_conditions_list[i] for i in order
+        ]
+
+        self._boundary_functions = [
+            bc.compute_boundary_condition for bc in self.boundary_conditions_list
+        ]
+        self._boundary_tags = [bc.tag for bc in self.boundary_conditions_list]
+
+    # ... (get_boundary_condition_function remains the same) ...
     def get_boundary_condition_function(self, time, X, dX, Q, Qaux, parameters, normal):
         bc_idx = sympy.Symbol("bc_idx", integer=True)
-        if self._boundary_functions == []:
+
+        if not self._boundary_functions:
             bc_func = ZArray(Q.get_list())
         else:
             bc_func = sympy.Piecewise(
                 *(
-                    (func(time, X.get_list(), dX, Q.get_list(), Qaux.get_list(), parameters.get_list(), normal.get_list()), sympy.Eq(bc_idx, i))
+                    (
+                        func(
+                            time,
+                            X.get_list(),
+                            dX,
+                            Q.get_list(),
+                            Qaux.get_list(),
+                            parameters.get_list(),
+                            normal.get_list(),
+                        ),
+                        sympy.Eq(bc_idx, i),
+                    )
                     for i, func in enumerate(self._boundary_functions)
                 )
             )
+
         func = Function(
             name="boundary_conditions",
             args=Zstruct(

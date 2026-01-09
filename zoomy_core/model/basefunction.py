@@ -1,31 +1,16 @@
-
 import sympy
 import sympy as sp
-from attrs import define, field
-from sympy import lambdify
-from sympy import Tuple
-
+import param
+from sympy import lambdify, Tuple
 from zoomy_core.misc.misc import Zstruct, ZArray
 
-# def listify(expr):
-#     if type(expr) is sp.Piecewise:
-#         return expr
-#     else:
-#         return expr.tolist()
-    
-# def listify(expr):
-#     if isinstance(expr, sp.NDimArray):
-#         return expr.tolist()
-#     elif expr.args:
-#         return expr.func(*[listify(arg) for arg in expr.args])
-#     else:
-#         return expr
-    
-    
+# --- Helper Functions (Kept exactly as provided) ---
+
+
 def listify(expr):
     if isinstance(expr, ZArray) or isinstance(expr, sp.NDimArray):
         return Tuple(*expr.tolist())  # convert list to sympy Tuple
-    elif hasattr(expr, 'args') and expr.args:
+    elif hasattr(expr, "args") and expr.args:
         return expr.func(*[listify(a) for a in expr.args])
     else:
         return expr
@@ -45,7 +30,9 @@ def vectorize_constant_sympy_expressions(expr, Q, Qaux, vectorize=True):
     zeros_like = sp.Function("zeros_like")  # symbolic placeholder
 
     # convert matrices to nested lists (Array handles lists better)
-    if isinstance(expr, (sp.MatrixBase, sp.ImmutableDenseMatrix, sp.MutableDenseMatrix)):
+    if isinstance(
+        expr, (sp.MatrixBase, sp.ImmutableDenseMatrix, sp.MutableDenseMatrix)
+    ):
         expr = expr.tolist()
 
     def vectorize_entry(entry):
@@ -59,7 +46,9 @@ def vectorize_constant_sympy_expressions(expr, Q, Qaux, vectorize=True):
             return entry * ones_like(q0)
 
         # symbolic constant independent of Q and Qaux
-        if hasattr(entry, "free_symbols") and entry.free_symbols.isdisjoint(symbol_list):
+        if hasattr(entry, "free_symbols") and entry.free_symbols.isdisjoint(
+            symbol_list
+        ):
             return entry * ones_like(q0)
 
         # otherwise, depends on variables
@@ -104,18 +93,30 @@ def vectorize_constant_sympy_expressions(expr, Q, Qaux, vectorize=True):
     return result
 
 
+# --- Refactored Class ---
 
 
-
-@define(frozen=True, slots=True, kw_only=True)
-class Function:
+class Function(param.Parameterized):
     """
     Generic (virtual) function implementation.
     """
 
-    name: str = field(default="Function")
-    args: Zstruct = field(default=Zstruct())
-    definition = field(default=sympy.zeros(1, 1))
+    name = param.String(default="Function")
+
+    # We use default=None for mutable objects to avoid shared state bugs.
+    # We will initialize them in __init__.
+    args = param.ClassSelector(class_=Zstruct, default=None)
+    definition = param.Parameter(default=None)
+
+    def __init__(self, **params):
+        super().__init__(**params)
+
+        # Safe initialization of mutables
+        if self.args is None:
+            self.args = Zstruct()
+
+        if self.definition is None:
+            self.definition = sympy.zeros(1, 1)
 
     def __call__(self):
         """Allow calling the instance to get its symbolic definition."""
@@ -123,15 +124,22 @@ class Function:
 
     def lambdify(self, modules=None):
         """Return a lambdified version of the function."""
-        
+
         # Create a symbolic placeholder to translate the output in the correct format
-        make_array = sp.Function('array')
+        make_array = sp.Function("array")
 
         func = lambdify(
             self.args.get_list(),
-            make_array(listify(vectorize_constant_sympy_expressions(
-                self.definition, self.args.variables, self.args.aux_variables, vectorize=True
-            ))),
+            make_array(
+                listify(
+                    vectorize_constant_sympy_expressions(
+                        self.definition,
+                        self.args.variables,
+                        self.args.aux_variables,
+                        vectorize=True,
+                    )
+                )
+            ),
             modules=modules,
         )
         return func
