@@ -42,6 +42,14 @@ class ShallowMoments2d(Model):
 
     def __attrs_post_init__(self):
         object.__setattr__(self, "variables", ((self.level+1)*self.dimension)+1)
+        # Recompute basis matrices
+        object.__setattr__(
+            self, "basisfunctions", self.basisfunctions(level=self.level)
+        )
+        basismatrices = Basismatrices(self.basisfunctions)
+        basismatrices.compute_matrices(self.level)
+        object.__setattr__(self, "basismatrices", basismatrices)
+
         super().__attrs_post_init__()
         aux_variables = self.aux_variables
         aux_var_list = aux_variables.keys()
@@ -51,12 +59,7 @@ class ShallowMoments2d(Model):
             aux_var_list += ["dvdy"]
         object.__setattr__(self, "aux_variables", register_sympy_attribute(aux_var_list, "qaux_"))
 
-        # Recompute basis matrices
-        object.__setattr__(self, "basisfunctions", self.basisfunctions(level=self.level))
-        basismatrices = Basismatrices(self.basisfunctions)
-        basismatrices.compute_matrices(self.level)
-        object.__setattr__(self, "basismatrices", basismatrices)
-        
+
 
 
 
