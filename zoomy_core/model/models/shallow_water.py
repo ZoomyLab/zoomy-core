@@ -1,266 +1,205 @@
-import numpy as np
-import os
-import logging
-
 import sympy
-from sympy import Symbol, Matrix, lambdify, transpose, Abs, sqrt
+from sympy import Matrix, sqrt, Abs
+import param
 
-from sympy import zeros, ones
-
-from attr import define, field
-from typing import Optional
-from types import SimpleNamespace
-
-from zoomy_core.model.boundary_conditions import BoundaryConditions, Extrapolation
-from zoomy_core.model.initial_conditions import InitialConditions, Constant
-from zoomy_core.misc.custom_types import FArray
 from zoomy_core.model.basemodel import Model
+from zoomy_core.misc.misc import Zstruct, ZArray
 
-from zoomy_core.misc.misc import Zstruct
 
-@define(frozen=True, slots=True, kw_only=True)
 class ShallowWaterEquations(Model):
-    dimension: int = 1
+    """
+    Shallow Water Equations model (1D and 2D).
 
-@define(frozen=True, slots=True, kw_only=True)
-class ShallowWaterEquations(Model):
-    dimension: int=1
-    variables: Zstruct = field(default=3)
-    aux_variables: Zstruct = field(default=2)
-    _default_parameters: dict = field(
-        init=False,
-        factory=lambda: {"g": 9.81, "ex": 0.0, "ey": 0.0, "ez": 1.0}
+    Usage:
+        To add physics, subclass and override source():
+
+        class MyRiver(ShallowWaterEquations):
+            def source(self):
+                return self.topography_term() + self.manning_term()
+    """
+
+    # --- Physical Parameters ---
+    g = param.Number(default=9.81, doc="Gravitational acceleration")
+
+    # Gravity direction vectors (usually ez=1 for standard shallow water)
+    ex = param.Number(default=0.0)
+    ey = param.Number(default=0.0)
+    ez = param.Number(default=1.0)
+
+    # --- Coefficients (Used only if their respective term is called) ---
+    manning_n = param.Number(default=0.03, doc="Manning roughness coefficient")
+    chezy_C = param.Number(default=50.0, doc="Chezy friction coefficient")
+    nu = param.Number(
+        default=0.0, doc="Kinematic viscosity for Newtonian friction")
+
+    def __init__(self, **params):
+        # 1. Defaults
+        dim = params.get("dimension", 1)
+
+        if "variables" not in params:
+            params["variables"] = dim + 1
+
+        # Default aux_variables to 0 unless user specifies (e.g. for topography)
+        if "aux_variables" not in params:
+            params["aux_variables"] = 0
+
+        # 2. Init Base
+        super().__init__(**params)
+
+        # 3. Register Symbols
+        self._update_symbolic_parameters()
+
+    def _update_symbolic_parameters(self):
+        """Inject class parameters into SymPy symbols."""
+        extra_params = {
+            "g": self.g,
+            "ex": self.ex,
+            "ey": self.ey,
+            "ez": self.ez,
+            "nm": self.manning_n,
+            "C": self.chezy_C,
+            "nu": self.nu,
+        }
+        self._default_parameters.update(extra_params)
+
+        from zoomy_core.model.basemodel import (
+            register_sympy_attribute,
+            register_parameter_values,
         )
-    
-    def __attrs_post_init__(self):
-        if type(self.variables)==int:
-            object.__setattr__(self, "variables",self.dimension+1)
-        super().__attrs_post_init__()
 
+        self.parameters = register_sympy_attribute(
+            self._default_parameters, "p")
+        self.parameter_values = register_parameter_values(
+            self._default_parameters)
+
+        # Refresh derived functions
+        self._initialize_derived_properties()
+
+    # --- Core Conservation Laws ---
+
+    def flux(self):
+        h = self.variables[0]
+        hu_vec = self.variables[1:]  # vector of momentums
+        p = self.parameters
+        fluxes = []
+
+        # -- X-Direction Flux --
+        fx = Matrix.zeros(self.n_variables, 1)
+        fx[0] = hu_vec[0]
+        fx[1] = (hu_vec[0] ** 2 / h) + (0.5 * p.g * p.ez * h**2)
+
+        if self.dimension > 1:
+            fx[2] = hu_vec[0] * hu_vec[1] / h
+
+        fluxes.append(fx)
+
+        # -- Y-Direction Flux --
+        if self.dimension > 1:
+            fy = Matrix.zeros(self.n_variables, 1)
+            fy[0] = hu_vec[1]
+            fy[1] = hu_vec[0] * hu_vec[1] / h
+            fy[2] = (hu_vec[1] ** 2 / h) + (0.5 * p.g * p.ez * h**2)
+            fluxes.append(fy)
+
+        return fluxes
+
+    def source(self):
+        """
+        Default source term is zero.
+        Overwrite this method to add physics terms (e.g. return self.topography_term())
+        """
+        return Matrix.zeros(self.n_variables, 1)
+
+    # --- Building Blocks (Physics Terms) ---
+
+    def topography_term(self):
+        """
+        Bathymetry source term: S = [0, -gh * dz/dx, -gh * dz/dy]
+        Requires: aux_variables >= dimension (for gradients dhdx, dhdy)
+        """
+        out = Matrix.zeros(self.n_variables, 1)
+        h = self.variables[0]
+        p = self.parameters
+
+        # We assume aux_variables[0] is dhdx, aux_variables[1] is dhdy
+        # (User must ensure aux_variables are set up correctly when using this)
+        dhdx = self.aux_variables[0]
+        out[1] = h * p.g * (p.ex - p.ez * dhdx)
+
+        if self.dimension > 1:
+            dhdy = self.aux_variables[1]
+            out[2] = h * p.g * (p.ey - p.ez * dhdy)
+
+        return out
+
+    def newtonian_friction_term(self):
+        """Viscous friction: S = -nu * u / h"""
+        out = Matrix.zeros(self.n_variables, 1)
+        h = self.variables[0]
+        p = self.parameters
+
+        for i in range(1, self.n_variables):
+            qi = self.variables[i]  # momentum
+            out[i] = -p.nu * qi / h
+        return out
+
+    def manning_friction_term(self):
+        """Manning friction: S = -g * n^2 * u * |u| / h^(7/3)"""
+        out = Matrix.zeros(self.n_variables, 1)
+        h = self.variables[0]
+        p = self.parameters
+
+        # Calculate velocity magnitude
+        hu_vec = self.variables[1:]
+        u_vec = Matrix([q / h for q in hu_vec])
+        u_mag = sqrt(u_vec.dot(u_vec))
+
+        # Using the formulation provided in original code
+        factor = -p.g * (p.nm**2) * u_mag / (h ** (7 / 3))
+
+        for i in range(1, self.n_variables):
+            qi = self.variables[i]
+            out[i] = factor * qi
+        return out
+
+    def chezy_friction_term(self):
+        """Chezy friction: S = -1/C^2 * u * |u|"""
+        out = Matrix.zeros(self.n_variables, 1)
+        h = self.variables[0]
+        p = self.parameters
+
+        hu_vec = self.variables[1:]
+        u_vec = Matrix([q / h for q in hu_vec])
+        u_mag = sqrt(u_vec.dot(u_vec))
+
+        factor = -1.0 / (p.C**2) * u_mag
+
+        for i in range(1, self.n_variables):
+            u = self.variables[i] / h
+            out[i] = factor * u
+        return out
+
+    # --- Visualization ---
 
     def project_2d_to_3d(self):
         out = Matrix([0 for i in range(5)])
         dim = self.dimension
-        x = self.position[0]
-        y = self.position[1]
         z = self.position[2]
+
         h = self.variables[0]
-        U = [hu / h for hu in self.variables[1:1+dim]]
-        rho_w = 1000.
-        g = 9.81
+        hu_vec = self.variables[1:]
+
+        u = hu_vec[0] / h
+        v = 0
+        if dim > 1:
+            v = hu_vec[1] / h
+
+        rho_w = 1000.0
+        p = self.parameters
+
         out[0] = h
-        out[1] = U[0]
-        out[2] = 0 if dim == 1 else U[1]
+        out[1] = u
+        out[2] = v
         out[3] = 0
-        out[4] = rho_w * g * h * (1-z)
-        return out
-
-        
-
-    def flux(self):
-        dim = self.dimension
-        h = self.variables[0]
-        U = Matrix([hu / h for hu in self.variables[1:1+dim]])
-        g = self.parameters.g
-        I = Matrix.eye(dim)
-        F = Matrix.zeros(self.variables.length(), dim)
-        F[0, :] = (h * U).T
-        F[1:, :] = h * U * U.T + g/2 * h**2 * I
-        return [F[:, d] for d in range(dim)]
-    
-    def source(self):
-        out = Matrix([0 for i in range(self.n_variables)])
-        return out
-    
-    def chezy(self):
-        assert "C" in vars(self.parameters)
-        dim = self.dimension
-        out = Matrix([0 for i in range(self.n_variables)])
-        h = self.variables[0]
-        hU = self.variables[1:1+dim]
-        U = Matrix([hu / h for hu in hU])
-        p = self.parameters
-        u_sq = sqrt(U.dot(U))
-        out[1:1+dim, 0] = -1.0 / p.C**2 * U * u_sq
-        return out
-
-
-@define(slots=True, frozen=False, kw_only=True)
-class ShallowWater(Model):
-    """
-    :gui:
-    { 'parameters': { 'g': {'type': 'float', 'value': 9.81, 'step': 0.01}, 'ex': {'type': 'float', 'value': 0., 'step':0.1}, 'ez': {'type': 'float', 'value': 1., 'step': 0.1}, },}
-    """
-
-    def __init__(
-        self,
-        boundary_conditions,
-        initial_conditions,
-        dimension=1,
-        fields=2,
-        aux_variables=0,
-        parameters={},
-        _default_parameters={"g": 1.0, "ex": 0.0, "ez": 1.0},
-        settings={},
-        settings_default={"topography": False, "friction": []},
-    ):
-        super().__init__(
-            dimension=dimension,
-            fields=fields,
-            aux_variables=aux_variables,
-            parameters=parameters,
-            _default_parameters=_default_parameters,
-            boundary_conditions=boundary_conditions,
-            initial_conditions=initial_conditions,
-            settings={**settings_default, **settings},
-        )
-
-    def flux(self):
-        flux = Matrix([0 for i in range(self.n_variables)])
-        h = self.variables[0]
-        hu = self.variables[1]
-        p = self.parameters
-        flux[0] = hu
-        flux[1] = hu**2 / h + p.g * p.ez * h * h / 2
-        return [flux]
-
-    def source(self):
-        out = Matrix([0 for i in range(self.n_variables)])
-        return out
-
-    def topography(self):
-        assert "dhdx" in vars(self.aux_variables)
-        out = Matrix([0 for i in range(self.n_variables)])
-        h = self.variables[0]
-        hu = self.variables[1]
-        p = self.parameters
-        dhdx = self.aux_variables.dhdx
-        out[1] = h * p.g * (p.ex - p.ez * dhdx)
-        return out
-
-    def newtonian(self):
-        assert "nu" in vars(self.parameters)
-        out = Matrix([0 for i in range(self.n_variables)])
-        h = self.variables[0]
-        hu = self.variables[1]
-        p = self.parameters
-        out[1] = -p.nu * hu / h
-        return out
-
-    def manning(self):
-        assert "nm" in vars(self.parameters)
-        out = Matrix([0 for i in range(self.n_variables)])
-        h = self.variables[0]
-        hu = self.variables[1]
-        u = hu / h
-        p = self.parameters
-        out[1] = -p.g * (p.nm**2) * u * Abs(u) / h ** (7 / 3)
-        return out
-
-    def chezy(self):
-        assert "C" in vars(self.parameters)
-        out = Matrix([0 for i in range(self.n_variables)])
-        h = self.variables[0]
-        hu = self.variables[1]
-        u = hu / h
-        p = self.parameters
-        out[1] = -1.0 / p.C**2 * u * Abs(u)
-        return out
-
-
-class ShallowWater2d(ShallowWater):
-    """
-    :gui:
-    { 'parameters': { 'g': {'type': 'float', 'value': 9.81, 'step': 0.01}, 'ex': {'type': 'float', 'value': 0., 'step':0.1}, 'ey': {'type': 'float', 'value': 0., 'step':0.1}, 'ez': {'type': 'float', 'value': 1., 'step': 0.1}, },}
-    """
-
-    def __init__(
-        self,
-        boundary_conditions,
-        initial_conditions,
-        dimension=2,
-        fields=3,
-        aux_variables=0,
-        parameters={},
-        _default_parameters={"g": 1.0, "ex": 0.0, "ey": 0.0, "ez": 1.0},
-        settings={},
-        settings_default={"topography": False, "friction": []},
-    ):
-        # combine settings_default of current class with settings such that the default settings of super() does not get overwritten.
-        super().__init__(
-            dimension=dimension,
-            fields=fields,
-            aux_variables=aux_variables,
-            parameters=parameters,
-            _default_parameters=_default_parameters,
-            boundary_conditions=boundary_conditions,
-            initial_conditions=initial_conditions,
-            settings={**settings_default, **settings},
-        )
-
-    def flux(self):
-        fx = Matrix([0 for i in range(self.n_variables)])
-        fy = Matrix([0 for i in range(self.n_variables)])
-        h = self.variables[0]
-        hu = self.variables[1]
-        hv = self.variables[2]
-        p = self.parameters
-        fx[0] = hu
-        fx[1] = hu**2 / h + p.g * p.ez * h * h / 2
-        fx[2] = hu * hv / h
-        fy[0] = hv
-        fy[1] = hu * hv / h
-        fy[2] = hv**2 / h + p.g * p.ez * h * h / 2
-        return [fx, fy]
-
-    def topography(self):
-        assert "dhdx" in vars(self.aux_variables)
-        assert "dhdy" in vars(self.aux_variables)
-        out = Matrix([0 for i in range(self.n_variables)])
-        h = self.variables[0]
-        hu = self.variables[1]
-        hv = self.variables[2]
-        p = self.parameters
-        dhdx = self.aux_variables.dhdx
-        dhdy = self.aux_variables.dhdy
-        out[1] = h * p.g * (p.ex - p.ez * dhdx)
-        out[2] = h * p.g * (p.ey - p.ez * dhdy)
-        return out
-
-    def newtonian(self):
-        assert "nu" in vars(self.parameters)
-        out = Matrix([0 for i in range(self.n_variables)])
-        h = self.variables[0]
-        hu = self.variables[1]
-        hv = self.variables[2]
-        p = self.parameters
-        out[1] = -p.nu * hu / h
-        out[2] = -p.nu * hv / h
-        return out
-
-    def manning(self):
-        assert "nu" in vars(self.parameters)
-        out = Matrix([0 for i in range(self.n_variables)])
-        h = self.variables[0]
-        hu = self.variables[1]
-        hv = self.variables[2]
-        u = hu / h
-        v = hv / h
-        p = self.parameters
-        out[1] = -p.g * (p.nu**2) * hu * Abs(u) ** (7 / 3)
-        out[2] = -p.g * (p.nu**2) * hv * Abs(v) ** (7 / 3)
-        return out
-
-    def chezy(self):
-        assert "C" in vars(self.parameters)
-        out = Matrix([0 for i in range(self.n_variables)])
-        h = self.variables[0]
-        hu = self.variables[1]
-        hv = self.variables[2]
-        u = hu / h
-        v = hv / h
-        p = self.parameters
-        u_sq = sqrt(u**2 + v**2)
-        out[1] = -1.0 / p.C**2 * u * u_sq
-        out[2] = -1.0 / p.C**2 * v * u_sq
+        out[4] = rho_w * p.g * h * (1 - z)
         return out

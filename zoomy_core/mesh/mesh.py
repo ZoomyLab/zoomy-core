@@ -421,7 +421,7 @@ class Mesh:
 
         boundary_face_cells_copy = deepcopy(self.boundary_face_cells)
 
-        for i_bc, bc in enumerate(bcs._boundary_conditions):
+        for i_bc, bc in enumerate(bcs.boundary_conditions_list):
             if type(bc) == Periodic:
                 from_physical_tag = dict_function_index_to_physical_tag[
                     dict_physical_name_to_index[bc.periodic_to_physical_tag]
