@@ -96,7 +96,8 @@ class Basisfunction:
         alpha = np.zeros(n_basis)
         z = Symbol("z")
         for i in range(n_basis):
-            b = lambdify(z, self.eval(i, Z))
+            # b = lambdify(z, self.eval(i, Z))
+            b = self.get_lambda(i)
             alpha[i] = np.trapz(Y * b(Z) * self.weight_eval(Z), Z)
         return alpha
 
