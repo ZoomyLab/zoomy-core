@@ -264,6 +264,18 @@ class Model(param.Parameterized):
                 self.normal,
             )
         )
+    
+    def print_boundary_conditions(self):
+        bc_expr = self.boundary_conditions.get_boundary_condition_function(
+            self.time,
+            self.position,
+            self.distance,
+            self.variables,
+            self.aux_variables,
+            self.parameters,
+            self.normal,
+        )
+        return bc_expr.definition
 
     # --- Default Implementations ---
 

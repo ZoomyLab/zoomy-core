@@ -4,7 +4,7 @@ import param
 from sympy import lambdify, Tuple
 from zoomy_core.misc.misc import Zstruct, ZArray
 
-# --- Helper Functions (Kept exactly as provided) ---
+# --- Helper Functions ---
 
 
 def listify(expr):
@@ -14,6 +14,37 @@ def listify(expr):
         return expr.func(*[listify(a) for a in expr.args])
     else:
         return expr
+
+
+def substitute_expression(expr, subs_map):
+    """
+    Generic substitution for scalars, lists, matrices, and ZArrays.
+    Ensures that ZArray inputs return ZArray outputs where possible.
+    """
+    # 1. Handle Lists (recursive)
+    if isinstance(expr, list):
+        return [substitute_expression(e, subs_map) for e in expr]
+
+    # 2. Handle Tuples (recursive)
+    if isinstance(expr, tuple):
+        return tuple(substitute_expression(e, subs_map) for e in expr)
+
+    # 3. Handle SymPy Objects (ZArray, Matrix, Expr)
+    if hasattr(expr, "subs"):
+        result = expr.subs(subs_map)
+
+        # If input was ZArray (mutable) but output is ImmutableDenseNDimArray, convert back
+        if isinstance(expr, ZArray) and not isinstance(result, ZArray):
+            try:
+                # ZArray is MutableDenseNDimArray. Construct from list and shape.
+                if hasattr(result, "tolist") and hasattr(result, "shape"):
+                    return ZArray(result.tolist(), result.shape)
+                return ZArray(result)
+            except Exception:
+                pass
+        return result
+
+    return expr
 
 
 def vectorize_constant_sympy_expressions(expr, Q, Qaux, vectorize=True):
@@ -99,6 +130,7 @@ def vectorize_constant_sympy_expressions(expr, Q, Qaux, vectorize=True):
 class Function(param.Parameterized):
     """
     Generic (virtual) function implementation.
+    Wraps symbolic definitions and handles substitution/lambdification.
     """
 
     name = param.String(default="Function")
@@ -121,6 +153,13 @@ class Function(param.Parameterized):
     def __call__(self):
         """Allow calling the instance to get its symbolic definition."""
         return self.definition
+
+    def subs(self, subs_map):
+        """
+        Perform substitution on the function definition using the new helper.
+        Returns the substituted expression (does NOT modify self).
+        """
+        return substitute_expression(self.definition, subs_map)
 
     def lambdify(self, modules=None):
         """Return a lambdified version of the function."""
