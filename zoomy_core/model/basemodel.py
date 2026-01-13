@@ -331,7 +331,7 @@ class Model(param.Parameterized):
         A = self.normal[0] * self.quasilinear_matrix()[:, :, 0]
         for d in range(1, self.dimension):
             A += self.normal[d] * self.quasilinear_matrix()[:, :, d]
-        return self._simplify(eigenvalue_dict_to_matrix(sympy.Matrix(A).eigenvals()))
+        return ZArray(self._simplify(eigenvalue_dict_to_matrix(sympy.Matrix(A).eigenvals())))
 
     def left_eigenvectors(self):
         return ZArray.zeros(self.n_variables, self.n_variables)
