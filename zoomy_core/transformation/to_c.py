@@ -4,7 +4,6 @@ from zoomy_core.transformation.generic_c import (
     flatten_index,
 )
 
-
 class CppModel(GenericCppModel):
     _output_subdir = ".c_interface"
     _is_template_class = True
@@ -38,8 +37,6 @@ class CppModel(GenericCppModel):
         return mapping.get(v, "")
 
     def wrap_function_signature(self, name, args_str, body_str, shape):
-        # 1. Function Decl starts at indentation 4
-        # 2. Body is already indented 4 spaces by convert_expression_body
         return f"""
     static inline void {name}(
         {args_str})
@@ -73,22 +70,58 @@ class CppNumerics(GenericCppNumerics):
             # Shared variables
             "n": "const T* n",
             "res": "T* res",
-            "h": "const T h",  # Mesh size
-            "cfl": "const T cfl",  # CFL number
+            "h": "const T h",  
+            "cfl": "const T cfl",  
             # Numerics specific (Left/Right states)
             "Q_minus": "const T* Q_minus",
             "Q_plus": "const T* Q_plus",
             "Qaux_minus": "const T* Qaux_minus",
             "Qaux_plus": "const T* Qaux_plus",
-            # For update/dt kernels
+            # For update/dt/eigenvalue kernels
             "Q": "const T* Q",
             "Qaux": "const T* Qaux",
         }
         return mapping.get(v, "")
 
+    def get_file_header(self):
+        tpl = "template <typename T>" if self._is_template_class else ""
+        
+        lines = [
+            "#pragma once",
+            self.get_includes().strip(),
+            "#include <vector>",
+            ""
+        ]
+
+        # --- GPU Logic ---
+        if self.gpu_enabled:
+            lines.extend([
+                "// --- GPU Compatibility Macros ---",
+                "#ifdef __CUDACC__",
+                "#define PORTABLE_FN __host__ __device__",
+                "#else",
+                "#define PORTABLE_FN",
+                "#endif",
+                ""
+            ])
+        else:
+            lines.append("#define PORTABLE_FN")
+
+        lines.extend([
+            tpl,
+            f"struct {self._wrapper_name} {{",
+            "",
+            f"    // --- Numerics Constants ---",
+            f"    static constexpr int n_dof_q = {self.n_dof_q};",
+            "",
+            f"    // --- Kernels ---",
+        ])
+        return "\n".join(lines)
+
     def wrap_function_signature(self, name, args_str, body_str, shape):
+        # We prepend PORTABLE_FN so it compiles on both Host and Device
         return f"""
-    static inline void {name}(
+    PORTABLE_FN static inline void {name}(
         {args_str})
     {{
 {body_str}

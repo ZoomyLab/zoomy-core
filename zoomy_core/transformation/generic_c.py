@@ -76,7 +76,8 @@ class GenericCppBase(CXX11CodePrinter):
     _output_subdir = "cpp_interface"
     _wrapper_name = "BaseWrapper"
     _is_template_class = False
-
+    
+    gpu_enabled=True
     real_type = "double"
     math_namespace = "std::"
 
@@ -188,6 +189,28 @@ class GenericCppBase(CXX11CodePrinter):
         decls = [self.get_variable_declaration(v) for v in required_vars]
         args_str = ",\n        ".join([d for d in decls if d])
 
+        return [self.wrap_function_signature(name, args_str, body, shape)]
+    
+    def _process_scalar_kernel(self, name, expression, required_vars):
+        """
+        Generates code for a single scalar expression without appending suffixes.
+        """
+        # 1. Wrap the scalar expression in a list/Array so it has shape (1,)
+        #    This matches how _process_kernel prepares 'expr' before calling convert
+        import sympy as sp
+        expr_array = sp.Array([expression])
+        shape = (1,)
+
+        # 2. Convert Body (using the standard signature: expr, shape)
+        #    The base class likely defaults to assigning to 'res' if not specified
+        body = self.convert_expression_body(expr_array, shape)
+        
+        # 3. Generate arguments string
+        #    We filter out empty declarations just like _process_kernel does
+        decls = [self.get_variable_declaration(v) for v in required_vars]
+        args_str = ",\n        ".join([d for d in decls if d])
+        
+        # 4. Wrap signature using the EXACT name provided (No _x suffix)
         return [self.wrap_function_signature(name, args_str, body, shape)]
 
     # --- Printers ---
@@ -382,14 +405,17 @@ class GenericCppNumerics(GenericCppBase):
 
     KERNEL_ARGUMENTS = {
         "numerical_flux": ["Q_minus", "Q_plus", "Qaux_minus", "Qaux_plus", "n", "res"],
+        "local_max_abs_eigenvalue": ["Q", "Qaux", "n", "res"],
         "dt": ["Q", "Qaux", "h", "cfl", "res"],
         "update": ["Q", "Qaux", "res"],
     }
 
-    def __init__(self, numerics, *args, **kwargs):
+    def __init__(self, numerics, gpu_enabled=False, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.numerics = numerics
         self.model = numerics.model  # Reference to physics model
+        self.gpu_enabled = gpu_enabled # Store GPU flag
+        
         self.n_dof_q = self.model.n_variables
         self.n_dof_qaux = self.model.n_aux_variables
 
@@ -413,8 +439,9 @@ class GenericCppNumerics(GenericCppBase):
         )
 
     @classmethod
-    def write_code(cls, numerics, settings, filename="Numerics.H"):
-        printer = cls(numerics)
+    def write_code(cls, numerics, settings, filename="Numerics.H", gpu_enabled=False):
+        # We pass gpu_enabled to the constructor here
+        printer = cls(numerics, gpu_enabled=gpu_enabled)
         code = printer.create_code()
         return cls._write_file(code, settings, filename)
 
@@ -422,16 +449,30 @@ class GenericCppNumerics(GenericCppBase):
         blocks = [self.get_file_header()]
 
         # 1. Numerical Flux
-        expr = self.numerics.numerical_flux()
+        expr_flux = self.numerics.numerical_flux()
         blocks.extend(
             self._process_kernel(
-                "numerical_flux", expr, self.KERNEL_ARGUMENTS["numerical_flux"]
+                "numerical_flux", expr_flux, self.KERNEL_ARGUMENTS["numerical_flux"]
             )
         )
 
-        # 2. Time Step (if implemented)
-        # expr_dt = self.numerics.compute_dt(...)
-        # blocks.extend(self._process_kernel("dt", expr_dt, self.KERNEL_ARGUMENTS["dt"]))
+        # 2. Local Max Abs Eigenvalue
+        # We need the symbolic variables from the model to pass to the numerics method
+        q_sym = list(self.model.variables.values())
+        aux_sym = list(self.model.aux_variables.values())
+        n_sym = list(self.model.normal.values())
+
+        # Evaluate the symbolic expression
+        expr_lambda = self.numerics.local_max_abs_eigenvalue(q_sym, aux_sym, n_sym)
+
+        # Wrap result in a list because _process_kernel expects iterable return values (like a vector)
+        blocks.extend(
+            self._process_scalar_kernel(
+                "local_max_abs_eigenvalue", 
+                expr_lambda, 
+                self.KERNEL_ARGUMENTS["local_max_abs_eigenvalue"]
+            )
+        )
 
         blocks.append(self.get_file_footer())
         return "\n".join(blocks)

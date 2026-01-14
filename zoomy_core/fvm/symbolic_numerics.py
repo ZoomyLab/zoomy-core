@@ -13,21 +13,38 @@ class Numerics(param.Parameterized):
     def __init__(self, model, **params):
         super().__init__(model=model, **params)
         self.variables_minus = self._create_symbolic_vector(
-            "Q_minus", model.n_variables
+            "Q_minus", model.variables
         )
-        self.variables_plus = self._create_symbolic_vector("Q_plus", model.n_variables)
+        self.variables_plus = self._create_symbolic_vector("Q_plus", model.variables)
         self.aux_variables_minus = self._create_symbolic_vector(
-            "Qaux_minus", model.n_aux_variables
+            "Qaux_minus", model.aux_variables
         )
         self.aux_variables_plus = self._create_symbolic_vector(
-            "Qaux_plus", model.n_aux_variables
+            "Qaux_plus", model.aux_variables
         )
 
-    def _create_symbolic_vector(self, name, size):
-        if size == 0:
-            return []
-        return [sp.Symbol(f"{name}_{i}") for i in range(size)]
-
+    def _create_symbolic_vector(self, name, variables):
+        """
+        Creates a list of symbols named {name}_{i}, inheriting assumptions
+        (real, positive, nonnegative) from the input 'variables' list.
+        """
+        symbols = []
+        for i, var in enumerate(variables):
+            # Start with the base assumption that physics variables are real
+            assumptions = {'real': True}
+            
+            # Inherit specific positivity assumptions to prevent "I" (imaginary) in sqrt
+            if var.is_positive:
+                assumptions['positive'] = True
+            elif var.is_nonnegative:
+                assumptions['nonnegative'] = True
+            
+            # Create the new symbol inheriting these properties
+            symbols.append(sp.Symbol(f"{name}_{i}", **assumptions))
+                
+        return symbols
+    
+    
     def numerical_flux(self):
         raise NotImplementedError
 
@@ -35,12 +52,7 @@ class Numerics(param.Parameterized):
         """
         Returns symbolic scalar max eigenvalue using the model's eigenvalues function.
         """
-        # Call eval_symbolic directly on the Function object
-        # Note: model.eigenvalues must be an instance of zoomy_core.model.basefunction.Function
         evs = self.model._eigenvalues.eval_symbolic(q, aux, self.model.parameters, n)
-
-        # Compute Max(|lambda|)
-        # evs is a ZArray, so it is iterable
         return sp.Max(*[sp.Abs(e) for e in evs])
 
 
