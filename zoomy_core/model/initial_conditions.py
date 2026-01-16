@@ -153,7 +153,6 @@ class UserFunction(InitialConditions):
     function = param.Callable(default=None)
 
     def __init__(self, function=None, **params):
-        # Allow positional arg: UserFunction(my_func)
         if function is not None:
             params["function"] = function
         super().__init__(**params)
@@ -166,7 +165,6 @@ class UserFunction(InitialConditions):
             func_to_use = lambda x: np.zeros(Q.shape[0])
 
         for i, x in enumerate(X.T):
-            # COMPLETED LINE HERE:
             Q[:, i] = func_to_use(x)
         return Q
 

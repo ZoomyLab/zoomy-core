@@ -4,6 +4,7 @@ import numpy as np
 
 import subprocess
 import sys 
+import json
 
 # import scipy.interpolate as interp
 # from functools import wraps
@@ -206,6 +207,40 @@ class Settings(Zstruct):
         return cls(
             output=Zstruct(directory='output', filename='simulation', snapshots=2, clean_directory=False)
         )
+        
+    @classmethod
+    def from_json(cls, filepath):
+        """
+        Reads a JSON file and reconstructs the Settings object.
+        """
+        with open(filepath, "r") as f:
+            data = json.load(f)
+
+        # We reconstruct the output Zstruct first to ensure __init__ validation passes
+        if "output" in data:
+            data["output"] = Zstruct(**data["output"])
+
+        return cls(**data)
+        
+    def write_json(self, filepath=None):
+        """
+        Serializes the settings to a JSON file for the C++ solver.
+        """
+        if filepath is None:
+            # Default to the output directory defined in settings
+            filepath = os.path.join(self.output.directory, "settings.json")
+
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+        # Convert the Zstruct hierarchy to a dictionary
+        # Note: If Zstruct doesn't have a recursive to_dict,
+        # you may need a helper that handles nested Zstructs.
+        settings_dict = self.as_dict()
+
+        with open(filepath, "w") as f:
+            json.dump(settings_dict, f, indent=4)
+        print(f"Settings exported to {filepath}")
     
 
 def compute_transverse_direction(normal):
