@@ -21,57 +21,86 @@ class PetscMesh:
     def from_gmsh(cls, filepath):
         """Factory method to create a PetscMesh instance."""
         return cls(filepath)
-
-    import os
-
-
+    
+    
     def to_h5(self, output_path, model=None):
-        # 1. Ensure the directory exists
+        import h5py
+        import numpy as np
+        import os
+
+        if model is None:
+            return
+
+        print(f"--- Exporting IC: {output_path} ---")
         output_dir = os.path.dirname(output_path)
         if output_dir and not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
-        # 2. Create the HDF5 Viewer
-        viewer = PETSc.Viewer().createHDF5(
-            output_path, mode=PETSc.Viewer.Mode.WRITE, comm=PETSc.COMM_WORLD
-        )
+        # 1. Compute Data (Serial Order)
+        (cStart, cEnd) = self.dm.getHeightStratum(0)
+        n_cells = cEnd - cStart
+        dim = self.dm.getDimension()
 
-        try:
-            # Save the topology
-            self.dm.view(viewer)
+        X_coords = np.zeros((dim, n_cells))
+        for i, c in enumerate(range(cStart, cEnd)):
+            _, center, _ = self.dm.computeCellGeometryFVM(c)
+            X_coords[:, i] = center[:dim]
 
-            if model is not None:
-                # Prepare and evaluate ICs
-                (cStart, cEnd) = self.dm.getHeightStratum(0)
-                n_cells = cEnd - cStart
+        q_init = np.zeros((model.n_variables, n_cells))
+        model.initial_conditions.apply(X_coords, q_init)
+        data_flat = q_init.T.flatten()
 
-                # evaluate coordinates
-                X_coords = np.zeros((self.dm.getDimension(), n_cells))
-                for i, c in enumerate(range(cStart, cEnd)):
-                    _, center, _ = self.dm.computeCellGeometryFVM(c)
-                    X_coords[:, i] = center[: self.dm.getDimension()]
+        # 2. Write h5py
+        with h5py.File(output_path, "w") as f:
+            f.attrs["Time"] = 0.0
+            dset = f.create_dataset("Solution", data=data_flat)
+            # Use b"seq" for NumPy 2.0 compatibility
+            dset.attrs["vector_type"] = b"seq"
 
-                # Handle Solution (Q)
-                vec_q = self.dm.createGlobalVector()
-                vec_q.setName("Solution")
-                q_init = np.zeros((model.n_dof_q, n_cells))
-                model.initial_conditions.apply(X_coords, q_init)
-                vec_q.setArray(q_init.T.flatten())
+            if model.n_aux_variables > 0:
+                aux_data = np.ones(n_cells * model.n_aux_variables)
+                dset_aux = f.create_dataset("Auxiliary", data=aux_data)
+                dset_aux.attrs["vector_type"] = b"seq"
 
-                # View the vector
-                viewer.view(vec_q)
+        print("--- Python Export Complete ---")
+        
+    def to_h5_cloud(self, output_path, model=None):
+        """
+        Writes a coordinate-based point cloud HDF5 file.
+        Robust against index reordering.
+        """
+        import h5py
+        import numpy as np
+        import os
 
-                # Handle Auxiliary (Qaux)
-                if hasattr(model, "n_dof_qaux") and model.n_dof_qaux > 0:
-                    vec_aux = self.dm.createGlobalVector()
-                    vec_aux.setName("Auxiliary")
-                    qaux_init = np.ones((model.n_dof_qaux, n_cells))  # Default 1.0 like C++
-                    vec_aux.setArray(qaux_init.T.flatten())
-                    viewer.view(vec_aux)
+        if model is None: return
+        print(f"--- Exporting IC Cloud: {output_path} ---")
+        
+        output_dir = os.path.dirname(output_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir)
 
-            # 3. Explicitly flush and close before the object goes out of scope
-            viewer.flush()
+        # 1. Compute Centers & Data (Serial)
+        (cStart, cEnd) = self.dm.getHeightStratum(0)
+        n_cells = cEnd - cStart
+        dim = self.dm.getDimension()
 
-        finally:
-            # Using finally ensures the file handle is closed even if an error occurs mid-write
-            viewer.destroy()
+        # Arrays for Cloud
+        centers = np.zeros((n_cells, 3)) # Always 3D for consistency
+        for i, c in enumerate(range(cStart, cEnd)):
+            _, center, _ = self.dm.computeCellGeometryFVM(c)
+            centers[i, :dim] = center[:dim]
+
+        q_init = np.zeros((model.n_variables, n_cells))
+        model.initial_conditions.apply(centers[:, :dim].T, q_init)
+        
+        # 2. Write Simple H5 (No PETSc metadata needed)
+        with h5py.File(output_path, 'w') as f:
+            f.create_dataset("centers", data=centers) # (N, 3)
+            f.create_dataset("values", data=q_init.T) # (N, Vars)
+            
+            if model.n_aux_variables > 0:
+                aux = np.ones((n_cells, model.n_aux_variables))
+                f.create_dataset("aux", data=aux)
+
+        print("--- Cloud Export Complete ---")
