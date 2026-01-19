@@ -228,7 +228,7 @@ class Settings(Zstruct):
         """
         if filepath is None:
             # Default to the output directory defined in settings
-            filepath = os.path.join(self.output.directory, "settings.json")
+            filepath = os.path.join(get_main_directory(), self.output.directory, "settings.json")
 
         # Ensure directory exists
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
