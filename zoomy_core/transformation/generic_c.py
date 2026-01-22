@@ -5,18 +5,14 @@ import os
 import itertools
 import textwrap
 from zoomy_core.misc import misc as misc
-
+from zoomy_core.misc.misc import Zstruct, ZArray
 
 # =========================================================================
-#  1. HELPER FUNCTIONS (Pure Logic)
+#  1. HELPER FUNCTIONS
 # =========================================================================
 
 
 def flatten_index(indices, shape):
-    """
-    Converts N-dimensional tuple index to 1D flat index (Row-Major).
-    Example: shape=(3,2), index=(1,1) -> 1*2 + 1 = 3
-    """
     flat_idx = 0
     stride = 1
     for i, size in zip(reversed(indices), reversed(shape)):
@@ -26,26 +22,16 @@ def flatten_index(indices, shape):
 
 
 def get_nested_shape(expr):
-    """
-    Robustly determines the shape of a SymPy expression, handling
-    Piecewise branches and Lists.
-    """
     shape = (1,)
-
-    # 1. Check direct attributes
     if hasattr(expr, "shape"):
         shape = expr.shape
     elif hasattr(expr, "tomatrix"):
         shape = expr.shape
-
-    # 2. Unwrap Zoomy definitions
     if hasattr(expr, "definition"):
         expr = expr.definition
 
-    # 3. Detect shape from Piecewise branches if top-level is scalar
     if shape == (1,) and isinstance(expr, sp.Piecewise):
         try:
-            # Peek at the first branch
             first_arg = expr.args[0]
             val = first_arg.expr if hasattr(first_arg, "expr") else first_arg[0]
             if hasattr(val, "shape"):
@@ -54,7 +40,6 @@ def get_nested_shape(expr):
                 shape = (len(val),)
         except Exception:
             pass
-
     return shape, expr
 
 
@@ -64,25 +49,32 @@ def get_nested_shape(expr):
 
 
 class GenericCppBase(CXX11CodePrinter):
-    """
-    The Core C++ Translation Engine.
-
-    Features:
-    - Module-based Function Dispatch (c_functions dict)
-    - Automatic Vector Conditional Expansion
-    - CSE Optimization
-    """
-
     _output_subdir = "cpp_interface"
     _wrapper_name = "BaseWrapper"
     _is_template_class = False
-
     gpu_enabled = True
     real_type = "double"
     math_namespace = "std::"
 
-    # --- THE MODULE CATALOG (Unified Solution) ---
-    # Define handlers that take (printer, *args) and return a C++ string.
+    ARG_MAPPING = {
+        "variables": "Q",
+        "aux_variables": "Qaux",
+        "p": "p",
+        "normal": "n",
+        "position": "X",
+        "time": "time",
+        "distance": "dX",
+        "q_minus": "Q_minus",
+        "q_plus": "Q_plus",
+        "aux_minus": "Qaux_minus",
+        "aux_plus": "Qaux_plus",
+        "flux_minus": "flux_minus",
+        "flux_plus": "flux_plus",
+        "source": "source_term",
+        "dt": "dt",
+        "dx": "dx",
+    }
+
     c_functions = {
         "conditional": lambda p,
         c,
@@ -95,26 +87,9 @@ class GenericCppBase(CXX11CodePrinter):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.symbol_maps = []  # List of dicts to resolve symbols
+        self.symbol_maps = []
         self._std_regex = re.compile(r"std::([A-Za-z_]\w*)")
 
-    # --- Abstract Interface ---
-    def get_includes(self):
-        raise NotImplementedError
-
-    def format_accessor(self, var_name, index):
-        raise NotImplementedError
-
-    def format_assignment(self, target_name, indices, value, shape):
-        raise NotImplementedError
-
-    def get_variable_declaration(self, variable_name):
-        raise NotImplementedError
-
-    def wrap_function_signature(self, name, args_str, body_str, shape):
-        raise NotImplementedError
-
-    # --- Symbol Resolution ---
     def register_map(self, name, keys):
         new_map = {k: self.format_accessor(name, i) for i, k in enumerate(keys)}
         self.symbol_maps.append(new_map)
@@ -126,176 +101,315 @@ class GenericCppBase(CXX11CodePrinter):
                 return m[s]
         return super()._print_Symbol(s)
 
-    # --- Unified Function Dispatcher ---
     def _print_Function(self, expr):
-        """
-        Looks up the function name in self.c_functions.
-        If found, executes the handler. Otherwise, falls back to default C++ call.
-        """
         name = expr.func.__name__
-
         if name in self.c_functions:
-            handler = self.c_functions[name]
-            # Pass (self, *args) to the handler
-            return handler(self, *expr.args)
-
-        # Default: Print as standard C++ function call: name(arg1, arg2)
+            return self.c_functions[name](self, *expr.args)
         return f"{self._print(expr.func)}({', '.join(map(self._print, expr.args))})"
 
-    # --- Helper for Min/Max (Recursive) ---
+    def _print_IndexedBase(self, expr):
+        return self._print(expr.label) if hasattr(expr, "label") else str(expr)
+
+    def _print_Indexed(self, expr):
+        base = self._print(expr.base)
+        indices = [self._print(i) for i in expr.indices]
+        return f"{base}[{']['.join(indices)}]"
+
     def _print_min_max(self, func_name, args):
         if len(args) == 1:
             return self._print(args[0])
         if len(args) == 2:
             return f"{self.math_namespace}{func_name}({self._print(args[0])}, {self._print(args[1])})"
-        # Recurse for >2 args: min(a, b, c) -> min(a, min(b, c))
-        # We assume the symbolic function allows reconstruction via func(*rest)
-        # For simple recursion we can just chain strings since we know the operator
         arg0 = self._print(args[0])
         rest = self._print_min_max(func_name, args[1:])
         return f"{self.math_namespace}{func_name}({arg0}, {rest})"
 
-    # --- Smart Expansion (Vector Logic Fix) ---
     def _expand_vector_conditionals(self, expr):
-        """
-        Detects 'conditional(c, VecA, VecB)' and transforms it into
-        'Matrix([conditional(c, a1, b1), conditional(c, a2, b2), ...])'.
-        This allows the C++ printer to generate valid ternary operators for scalars.
-        """
-        # 1. Handle Lists/Arrays/Matrices recursively
         if isinstance(expr, (list, tuple)):
             return [self._expand_vector_conditionals(e) for e in expr]
-
         if hasattr(expr, "__getitem__") and not isinstance(expr, sp.Symbol):
-            # It's a SymPy Matrix/Array - iterate and expand elements
             if hasattr(expr, "reshape") and hasattr(expr, "shape"):
                 flat_args = [self._expand_vector_conditionals(e) for e in expr]
                 return sp.Array(flat_args).reshape(*expr.shape)
             return [self._expand_vector_conditionals(e) for e in expr]
-
-        # 2. Handle the 'conditional' Function specifically
         if isinstance(expr, sp.Function) and expr.func.__name__ == "conditional":
             cond, true_val, false_val = expr.args
-
-            # Check if branches are vectors
             is_vec_t = hasattr(true_val, "__getitem__") and not isinstance(
                 true_val, sp.Symbol
             )
             is_vec_f = hasattr(false_val, "__getitem__") and not isinstance(
                 false_val, sp.Symbol
             )
-
             if is_vec_t or is_vec_f:
                 t_list = list(true_val) if is_vec_t else [true_val]
                 f_list = list(false_val) if is_vec_f else [false_val]
-
-                # Expand element-wise
                 expanded_list = []
-                import itertools
-
                 for t, f in itertools.zip_longest(t_list, f_list, fillvalue=0):
-                    t_ex = self._expand_vector_conditionals(t)
-                    f_ex = self._expand_vector_conditionals(f)
-                    expanded_list.append(sp.Function("conditional")(cond, t_ex, f_ex))
-
-                # Return wrapped in Array to preserve shape
+                    expanded_list.append(
+                        sp.Function("conditional")(
+                            cond,
+                            self._expand_vector_conditionals(t),
+                            self._expand_vector_conditionals(f),
+                        )
+                    )
                 shape = (
                     true_val.shape
                     if hasattr(true_val, "shape")
                     else (len(expanded_list),)
                 )
                 return sp.Array(expanded_list).reshape(*shape)
-
         return expr
 
-    # --- Core Generation Logic ---
+    def _flatten_ragged_list(self, expr_list):
+        flat = []
+        for e in expr_list:
+            if isinstance(e, (list, tuple, sp.NDimArray)):
+                flat.extend(self._flatten_ragged_list(e))
+            else:
+                flat.append(e)
+        return flat
+
+    def _optimize_array_calls(self, expr_list):
+        definitions = []
+        call_cache = {}
+
+        def replace_logic(node):
+            if isinstance(node, sp.Indexed):
+                base = node.base
+                label = base.label if hasattr(base, "label") else base
+                if isinstance(label, sp.Function):
+                    if label not in call_cache:
+                        sym = sp.Symbol(f"v_call_{len(call_cache)}")
+                        call_cache[label] = sym
+                        definitions.append((sym, label))
+                    return sp.Indexed(call_cache[label], *node.indices)
+
+            if isinstance(node, sp.Function):
+                name = node.func.__name__
+                if name not in self.c_functions:
+                    has_array_arg = any(
+                        hasattr(a, "__getitem__") and not isinstance(a, sp.Symbol)
+                        for a in node.args
+                    )
+                    if has_array_arg:
+                        if node not in call_cache:
+                            sym = sp.Symbol(f"v_call_{len(call_cache)}")
+                            call_cache[node] = sym
+                            definitions.append((sym, node))
+                        return call_cache[node]
+            return node
+
+        new_exprs = []
+        for e in expr_list:
+            new_e = e.replace(
+                lambda x: isinstance(x, (sp.Indexed, sp.Function)), replace_logic
+            )
+            new_exprs.append(new_e)
+
+        return definitions, new_exprs
+
     def convert_expression_body(self, expr, shape, target="res"):
         if isinstance(expr, sp.Piecewise):
             return self._print_piecewise_structure(expr, shape, target)
+        flat_expr = (
+            list(sp.flatten(expr))
+            if hasattr(expr, "__iter__") and not isinstance(expr, sp.Matrix)
+            else list(expr)
+            if isinstance(expr, sp.Matrix)
+            else [expr]
+        )
 
-        if hasattr(expr, "__iter__") and not isinstance(expr, sp.Matrix):
-            flat_expr = list(sp.flatten(expr))
-        elif isinstance(expr, sp.Matrix):
-            flat_expr = list(expr)
-        else:
-            flat_expr = [expr]
+        # 1. Extract Calls
+        call_defs, optim_exprs = self._optimize_array_calls(flat_expr)
 
-        tmp_sym = sp.numbered_symbols("t")
-        temps, simplified_flat = sp.cse(flat_expr, symbols=tmp_sym)
+        # 2. Extract Arguments
+        arg_defs = []
+        clean_call_defs = []
+        arg_cache = {}
+
+        for call_sym, call_expr in call_defs:
+            new_args = []
+            for arg in call_expr.args:
+                if hasattr(arg, "__getitem__") and not isinstance(arg, sp.Symbol):
+                    if arg not in arg_cache:
+                        sym = sp.Symbol(f"v_arg_{len(arg_cache)}")
+                        arg_cache[arg] = sym
+                        arg_defs.append((sym, arg))
+                    new_args.append(arg_cache[arg])
+                else:
+                    new_args.append(arg)
+            clean_call_defs.append((call_sym, call_expr.func(*new_args)))
+
         lines = []
+        tmp_sym_gen = sp.numbered_symbols("t")
 
-        for lhs, rhs in temps:
-            lines.append(f"{self.real_type} {self.doprint(lhs)} = {self.doprint(rhs)};")
+        # --- STAGE A: COMPUTE INPUTS ---
+        arg_cse_inputs = []
+        arg_sizes = {}
+        for sym, arr in arg_defs:
+            flat_arr = list(sp.flatten(arr))
+            arg_cse_inputs.extend(flat_arr)
+            arg_sizes[sym] = len(flat_arr)
 
-        result_array = sp.Array(simplified_flat).reshape(*shape)
-        ranges = [range(s) for s in shape]
+        if arg_cse_inputs:
+            temps_args, simplified_args = sp.cse(arg_cse_inputs, symbols=tmp_sym_gen)
+            for lhs, rhs in temps_args:
+                lines.append(
+                    f"{self.real_type} {self.doprint(lhs)} = {self.doprint(rhs)};"
+                )
 
-        for indices in itertools.product(*ranges):
-            val = self.doprint(result_array[indices])
-            lines.append(self.format_assignment(target, indices, val, shape))
+            offset = 0
+            for sym, _ in arg_defs:
+                size = arg_sizes[sym]
+                elements = simplified_args[offset : offset + size]
+                offset += size
+                init_str = ", ".join([self.doprint(e) for e in elements])
+                lines.append(
+                    f"{self.real_type} {self.doprint(sym)}[] = {{ {init_str} }};"
+                )
 
+        # --- STAGE B: EXECUTE CALLS ---
+        for sym, call in clean_call_defs:
+            lines.append(f"auto {self.doprint(sym)} = {self.doprint(call)};")
+
+        # --- STAGE C: COMPUTE OUTPUTS ---
+        if optim_exprs:
+            temps_res, simplified_res = sp.cse(optim_exprs, symbols=tmp_sym_gen)
+            for lhs, rhs in temps_res:
+                lines.append(
+                    f"{self.real_type} {self.doprint(lhs)} = {self.doprint(rhs)};"
+                )
+
+            total_size = 1
+            for s in shape:
+                total_size *= s
+            lines.append(f"SimpleArray<T, {total_size}> {target};")
+
+            result_array = sp.Array(simplified_res).reshape(*shape)
+            ranges = [range(s) for s in shape]
+            for indices in itertools.product(*ranges):
+                val = self.doprint(result_array[indices])
+                idx = flatten_index(indices, shape)
+                lines.append(f"{target}[{idx}] = {val};")
+        else:
+            total_size = 1
+            for s in shape:
+                total_size *= s
+            lines.append(f"SimpleArray<T, {total_size}> {target} = {{0}};")
+
+        lines.append(f"return {target};")
         return "\n".join(["    " + line for line in lines])
 
     def _print_piecewise_structure(self, expr, shape, target):
         lines = []
         for i, arg in enumerate(expr.args):
-            val = arg.expr if hasattr(arg, "expr") else arg[0]
-            cond = arg.cond if hasattr(arg, "cond") else arg[1]
+            val, cond = (
+                (arg.expr, arg.cond) if hasattr(arg, "expr") else (arg[0], arg[1])
+            )
             cond_str = self.doprint(cond)
-
             if i == 0:
                 lines.append(f"    if ({cond_str}) {{")
             elif cond == True or cond == sp.true:
                 lines.append("    } else {")
             else:
                 lines.append(f"    }} else if ({cond_str}) {{")
-
-            branch_body = self.convert_expression_body(val, shape, target)
-            lines.append(textwrap.indent(branch_body, "    "))
-
+            lines.append(
+                textwrap.indent(
+                    self.convert_expression_body(val, shape, target), "    "
+                )
+            )
         lines.append("    }")
+        total_size = 1
+        for s in shape:
+            total_size *= s
+        lines.append(f"    SimpleArray<T, {total_size}> default_{target} = {{0}};")
+        lines.append(f"    return default_{target};")
         return "\n".join(lines)
 
-    def _process_kernel(self, name, expr, required_vars):
-        """
-        Handles expressions (Scalar or Vector).
-        Generates a SINGLE function writing to 'res'.
-        """
-        # 1. Expand Vector Conditionals (Flip conditional(vec) -> vec(conditional))
+    def _generate_signature_from_function(self, func_obj):
+        decls = []
+        for key, obj in func_obj.args.items():
+            cpp_name = self.ARG_MAPPING.get(key, key)
+            is_pointer = (
+                hasattr(obj, "_symbolic_name")
+                or hasattr(obj, "values")
+                or isinstance(obj, (ZArray, list, tuple, sp.MatrixBase, sp.NDimArray))
+            )
+            if key in [
+                "variables",
+                "aux_variables",
+                "p",
+                "normal",
+                "position",
+                "q_minus",
+                "q_plus",
+                "aux_minus",
+                "aux_plus",
+                "flux_minus",
+                "flux_plus",
+            ]:
+                is_pointer = True
+            type_prefix = "const T*" if is_pointer else "const T"
+            decls.append(f"{type_prefix} {cpp_name}")
+        return ",\n        ".join(decls)
+
+    def _process_kernel_from_function(self, func_obj):
+        name = func_obj.name
+        expr = func_obj.definition
         expr = self._expand_vector_conditionals(expr)
-
-        # 2. Unify Input: Ensure we have a SymPy Array/Matrix structure
-        # If it's a raw Python list, convert it to a SymPy Array so get_nested_shape works
         if isinstance(expr, (list, tuple)):
-            import sympy as sp
+            # FIX: Ensure we have a flat list before creating Array to avoid ambiguous shapes
+            expr = self._flatten_ragged_list(expr)
             expr = sp.Array(expr)
-        
-        # 3. Determine Shape
-        # get_nested_shape works on SymPy objects (Matrix, Array, Piecewise)
         shape, expr = get_nested_shape(expr)
-
-        # 4. Generate Body
-        # convert_expression_body handles flattening, CSE, and writing assignments based on 'shape'
         body = self.convert_expression_body(expr, shape)
-
-        # 5. Generate Signature
-        decls = [self.get_variable_declaration(v) for v in required_vars]
-        args_str = ",\n        ".join([d for d in decls if d])
-
+        args_str = self._generate_signature_from_function(func_obj)
         return [self.wrap_function_signature(name, args_str, body, shape)]
 
-    def _process_scalar_kernel(self, name, expression, required_vars):
-        expression = self._expand_vector_conditionals(expression)
-        import sympy as sp
+    def get_includes(self):
+        return """#include <cmath>
+#include <array>
+"""
 
-        expr_array = sp.Array([expression])
-        shape = (1,)
-        body = self.convert_expression_body(expr_array, shape)
-        decls = [self.get_variable_declaration(v) for v in required_vars]
-        args_str = ",\n        ".join([d for d in decls if d])
-        return [self.wrap_function_signature(name, args_str, body, shape)]
+    def get_simple_array_def(self):
+        return """
+#ifndef ZOOMY_SIMPLE_ARRAY
+#define ZOOMY_SIMPLE_ARRAY
+template <typename T, int N>
+struct SimpleArray {
+    T data[N];
+    T& operator[](int i) { return data[i]; }
+    const T& operator[](int i) const { return data[i]; }
+    T* begin() { return data; }
+    const T* begin() const { return data; }
+    T* end() { return data + N; }
+    const T* end() const { return data + N; }
+};
+#endif
+"""
 
-    # --- Printers ---
+    def format_accessor(self, var_name, index):
+        return f"{var_name}[{index}]"
+
+    def format_assignment(self, target_name, indices, value, shape):
+        idx = flatten_index(indices, shape)
+        return f"{target_name}[{idx}] = {value};"
+
+    def get_variable_declaration(self, variable_name):
+        return f"const T* {variable_name}"
+
+    def wrap_function_signature(self, name, args_str, body_str, shape):
+        qualifier = "PORTABLE_FN " if self.gpu_enabled else ""
+        total_size = 1
+        for s in shape:
+            total_size *= s
+        return f"""    {qualifier}static inline SimpleArray<T, {total_size}> {name}(
+        {args_str})
+    {{
+{body_str}
+    }}
+"""
+
     def _print_Pow(self, expr):
         base, exp = expr.as_base_exp()
         if exp.is_Integer:
@@ -320,7 +434,6 @@ class GenericCppBase(CXX11CodePrinter):
             return self._std_regex.sub(_repl, code)
         return code
 
-    # --- File IO ---
     @classmethod
     def _write_file(cls, code, settings, filename):
         main_dir = misc.get_main_directory()
@@ -335,38 +448,26 @@ class GenericCppBase(CXX11CodePrinter):
 
 
 # =========================================================================
-#  3. GENERIC MODEL (The Physics)
+#  3. GENERIC MODEL
 # =========================================================================
 
 
 class GenericCppModel(GenericCppBase):
     _wrapper_name = "Model"
 
-    KERNEL_ARGUMENTS = {
-        "physics": ["Q", "Qaux", "res"],
-        "geometric": ["Q", "Qaux", "n", "res"],
-        "interpolate": ["Q", "Qaux", "X", "res"],
-        "boundary": ["bc_idx", "Q", "Qaux", "n", "X", "time", "dX", "res"],
-        "residual": ["Q", "Qaux", "X", "time", "dX", "res"],
-    }
-
     def __init__(self, model, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.model = model
         self.n_dof_q = model.n_variables
         self.n_dof_qaux = model.n_aux_variables
-
         self.register_map("Q", model.variables.values())
         self.register_map("Qaux", model.aux_variables.values())
         self.register_map("n", model.normal.values())
-        self.symbol_maps.append(
-            {
-                k: str(float(model.parameter_values[i]))
-                for i, k in enumerate(model.parameters.values())
-            }
-        )
         if hasattr(model, "position"):
             self.register_map("X", model.position.values())
+        self.symbol_maps.append(
+            {k: f"p[{i}]" for i, k in enumerate(model.parameters.values())}
+        )
 
     @classmethod
     def write_code(cls, model, settings, filename="Model.H"):
@@ -376,52 +477,9 @@ class GenericCppModel(GenericCppBase):
 
     def create_code(self):
         blocks = [self.get_file_header()]
+        for name, func_obj in self.model.functions.items():
+            blocks.extend(self._process_kernel_from_function(func_obj))
 
-        # Physics Kernels
-        for name, expr in [
-            ("flux", self.model.flux()),
-            ("dflux", self.model.dflux()),
-            ("nonconservative_matrix", self.model.nonconservative_matrix()),
-            ("quasilinear_matrix", self.model.quasilinear_matrix()),
-            ("source", self.model.source()),
-            (
-                "source_jacobian_wrt_variables",
-                self.model.source_jacobian_wrt_variables(),
-            ),
-            (
-                "source_jacobian_wrt_aux_variables",
-                self.model.source_jacobian_wrt_aux_variables(),
-            ),
-        ]:
-            blocks.extend(
-                self._process_kernel(name, expr, self.KERNEL_ARGUMENTS["physics"])
-            )
-
-        # Geometric Kernels
-        for name, expr in [
-            ("eigenvalues", self.model.eigenvalues()),
-            ("left_eigenvectors", self.model.left_eigenvectors()),
-            ("right_eigenvectors", self.model.right_eigenvectors()),
-        ]:
-            blocks.extend(
-                self._process_kernel(name, expr, self.KERNEL_ARGUMENTS["geometric"])
-            )
-
-        # Residual & Interpolate
-        blocks.extend(
-            self._process_kernel(
-                "residual", self.model.residual(), self.KERNEL_ARGUMENTS["residual"]
-            )
-        )
-        blocks.extend(
-            self._process_kernel(
-                "interpolate",
-                self.model.project_2d_to_3d(),
-                self.KERNEL_ARGUMENTS["interpolate"],
-            )
-        )
-
-        # Boundary
         bc_wrapper = self.model.boundary_conditions.get_boundary_condition_function(
             self.model.time,
             self.model.position,
@@ -431,12 +489,12 @@ class GenericCppModel(GenericCppBase):
             self.model.parameters,
             self.model.normal,
         )
+        bc_args = "const int bc_idx,\n        const T* Q,\n        const T* Qaux,\n        const T* n,\n        const T* X,\n        const T time,\n        const T dX"
+        shape, expr = get_nested_shape(bc_wrapper.definition)
+        body = self.convert_expression_body(expr, shape)
         blocks.extend(
-            self._process_kernel(
-                "boundary_conditions", bc_wrapper, self.KERNEL_ARGUMENTS["boundary"]
-            )
+            [self.wrap_function_signature("boundary_conditions", bc_args, body, shape)]
         )
-
         blocks.append(self.get_file_footer())
         return "\n".join(blocks)
 
@@ -446,53 +504,61 @@ class GenericCppModel(GenericCppBase):
         )
         bc_str = ", ".join(f'"{item}"' for item in bc_names)
         tpl = "template <typename T>" if self._is_template_class else ""
-        return f"""#pragma once
-{self.get_includes().strip()}
-#include <vector>
-#include <string>
-#include <algorithm>
+        lines = [
+            "#pragma once",
+            self.get_includes().strip(),
+            self.get_simple_array_def(),
+            "#include <vector>",
+            "#include <string>",
+            "#include <algorithm>",
+            "",
+        ]
 
-{tpl}
-struct {self._wrapper_name} {{
-    // --- Constants ---
-    static constexpr int n_dof_q    = {self.n_dof_q};
-    static constexpr int n_dof_qaux = {self.n_dof_qaux};
-    static constexpr int dimension  = {self.model.dimension};
-    static constexpr int n_boundary_tags = {len(bc_names)};
+        if self.gpu_enabled:
+            lines.extend(
+                [
+                    "#ifdef __CUDACC__",
+                    "#define PORTABLE_FN __host__ __device__",
+                    "#else",
+                    "#define PORTABLE_FN",
+                    "#endif",
+                    "",
+                ]
+            )
+        else:
+            lines.append("#define PORTABLE_FN")
 
-    // --- Helpers ---
-    static const std::vector<std::string> get_boundary_tags() {{ return {{ {bc_str} }}; }}
-
-    // --- Kernels ---"""
+        lines.extend(
+            [
+                tpl,
+                f"struct {self._wrapper_name} {{",
+                f"    static constexpr int n_dof_q    = {self.n_dof_q};",
+                f"    static constexpr int n_dof_qaux = {self.n_dof_qaux};",
+                f"    static constexpr int dimension  = {self.model.dimension};",
+                f"    static constexpr int n_boundary_tags = {len(bc_names)};",
+                f"    static const std::vector<std::string> get_boundary_tags() {{ return {{ {bc_str} }}; }}",
+            ]
+        )
+        return "\n".join(lines)
 
     def get_file_footer(self):
         return "};\n"
 
 
 # =========================================================================
-#  4. GENERIC NUMERICS (The Solver)
+#  4. GENERIC NUMERICS
 # =========================================================================
 
 
 class GenericCppNumerics(GenericCppBase):
     _wrapper_name = "Numerics"
 
-    KERNEL_ARGUMENTS = {
-        "numerical_flux": ["Q_minus", "Q_plus", "Qaux_minus", "Qaux_plus", "n", "res"],
-        "local_max_abs_eigenvalue": ["Q", "Qaux", "n", "res"],
-        "update_Q": ["Q", "Qaux", "res"],
-        "update_Qaux": ["Q", "Qaux", "res"],
-    }
-
     def __init__(self, numerics, gpu_enabled=False, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.numerics = numerics
         self.model = numerics.model
         self.gpu_enabled = gpu_enabled
-
         self.n_dof_q = self.model.n_variables
-        self.n_dof_qaux = self.model.n_aux_variables
-
         self.register_map("Q", self.model.variables.values())
         self.register_map("Qaux", self.model.aux_variables.values())
         self.register_map("n", self.model.normal.values())
@@ -500,11 +566,11 @@ class GenericCppNumerics(GenericCppBase):
         self.register_map("Q_plus", numerics.variables_plus)
         self.register_map("Qaux_minus", numerics.aux_variables_minus)
         self.register_map("Qaux_plus", numerics.aux_variables_plus)
+        self.register_map("flux_minus", numerics.flux_minus)
+        self.register_map("flux_plus", numerics.flux_plus)
+        self.register_map("source_term", numerics.source_term)
         self.symbol_maps.append(
-            {
-                k: str(float(self.model.parameter_values[i]))
-                for i, k in enumerate(self.model.parameters.values())
-            }
+            {k: f"p[{i}]" for i, k in enumerate(self.model.parameters.values())}
         )
 
     @classmethod
@@ -515,54 +581,45 @@ class GenericCppNumerics(GenericCppBase):
 
     def create_code(self):
         blocks = [self.get_file_header()]
-        blocks.extend(
-            self._process_kernel(
-                "numerical_flux",
-                self.numerics.numerical_flux(),
-                self.KERNEL_ARGUMENTS["numerical_flux"],
-            )
-        )
-
-        blocks.extend(
-            self._process_scalar_kernel(
-                "local_max_abs_eigenvalue",
-                self.numerics.local_max_abs_eigenvalue(),
-                self.KERNEL_ARGUMENTS["local_max_abs_eigenvalue"],
-            )
-        )
-        
-        blocks.extend(
-            self._process_kernel(
-                "update_Q",
-                self.numerics.update_q(),
-                self.KERNEL_ARGUMENTS["update_Q"],
-            )
-        )
-        
-        blocks.extend(
-            self._process_kernel(
-                "update_Qaux",
-                self.numerics.update_qaux(),
-                self.KERNEL_ARGUMENTS["update_Qaux"],
-            )
-        )
-
+        for name, func_obj in self.numerics.functions.items():
+            blocks.extend(self._process_kernel_from_function(func_obj))
         blocks.append(self.get_file_footer())
         return "\n".join(blocks)
 
     def get_file_header(self):
         tpl = "template <typename T>" if self._is_template_class else ""
-        return f"""#pragma once
-{self.get_includes().strip()}
-#include <vector>
-#include <algorithm>
+        lines = [
+            "#pragma once",
+            self.get_includes().strip(),
+            '#include "Model.H"',  # <--- CORRECTLY ADDED INCLUDE HERE
+            self.get_simple_array_def(),
+            "#include <vector>",
+            "#include <algorithm>",
+            "",
+        ]
 
-{tpl}
-struct {self._wrapper_name} {{
-    // --- Numerics Constants ---
-    static constexpr int n_dof_q = {self.n_dof_q};
+        if self.gpu_enabled:
+            lines.extend(
+                [
+                    "#ifdef __CUDACC__",
+                    "#define PORTABLE_FN __host__ __device__",
+                    "#else",
+                    "#define PORTABLE_FN",
+                    "#endif",
+                    "",
+                ]
+            )
+        else:
+            lines.append("#define PORTABLE_FN")
 
-    // --- Kernels ---"""
+        lines.extend(
+            [
+                tpl,
+                f"struct {self._wrapper_name} {{",
+                f"    static constexpr int n_dof_q = {self.n_dof_q};",
+            ]
+        )
+        return "\n".join(lines)
 
     def get_file_footer(self):
         return "};\n"
