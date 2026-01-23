@@ -153,8 +153,20 @@ class Model(param.Parameterized, SymbolicRegistrar):
             ("residual", self.residual, res_sig),
             ("interpolate", self.interpolate, std_sig),
             ("initial_condition", self.initial_condition, ic_sig),
-            # NEW: Initial Condition for Aux Variables
             ("initial_aux_condition", self.initial_aux_condition, ic_sig),
+            # --- NEW: Variable Update Functions ---
+            ("update_variables", self.update_variables, std_sig),
+            ("update_aux_variables", self.update_aux_variables, std_sig),
+            (
+                "update_variables_jacobian_wrt_variables",
+                self.update_variables_jacobian_wrt_variables,
+                std_sig,
+            ),
+            (
+                "update_aux_variables_jacobian_wrt_variables",
+                self.update_aux_variables_jacobian_wrt_variables,
+                std_sig,
+            ),
         ]
         for name, method, sig in regs:
             self.register_symbolic_function(name, method, sig)
@@ -191,7 +203,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
         return ZArray.zeros(self.n_variables)
 
     def interpolate(self):
-        return self.variables
+        return ZArray(self.variables)
 
     def project_2d_to_3d(self):
         return ZArray.zeros(6)
@@ -202,13 +214,36 @@ class Model(param.Parameterized, SymbolicRegistrar):
     def initial_condition(self):
         return ZArray.zeros(self.n_variables)
 
-    # NEW: Default Aux IC
     def initial_aux_condition(self):
         return ZArray.zeros(self.n_aux_variables)
+
+    # --- NEW: Implicit Update Defaults ---
+    def update_variables(self):
+        # Default: Identity
+        return ZArray(self.variables)
+
+    def update_aux_variables(self):
+        # Default: Identity
+        return ZArray(self.aux_variables)
+
+    def update_variables_jacobian_wrt_variables(self):
+        if self.disable_differentiation:
+            return ZArray.zeros(self.n_variables, self.n_variables)
+        return self._simplify(
+            sp.derive_by_array(self.update_variables(), self.variables.get_list())
+        )
+
+    def update_aux_variables_jacobian_wrt_variables(self):
+        if self.disable_differentiation:
+            return ZArray.zeros(self.n_aux_variables, self.n_variables)
+        return self._simplify(
+            sp.derive_by_array(self.update_aux_variables(), self.variables.get_list())
+        )
 
     def quasilinear_matrix(self):
         if self.disable_differentiation:
             return ZArray.zeros(self.n_variables, self.n_variables, self.dimension)
+        # Fix: ZArray robust handling ensures matrix is preserved
         JacF = ZArray(sp.derive_by_array(self.flux(), self.variables.get_list()))
         for d in range(self.dimension):
             JacF[:, :, d] = ZArray(JacF[:, :, d].tomatrix().T)

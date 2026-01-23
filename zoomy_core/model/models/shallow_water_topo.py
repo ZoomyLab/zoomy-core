@@ -3,7 +3,7 @@ from sympy import Matrix, sqrt, MutableDenseNDimArray, Symbol, S
 
 from zoomy_core.model.basemodel import Model
 from zoomy_core.misc.misc import ZArray
-from zoomy_core.transformation.functions import conditional
+from zoomy_core.model.custom_sympy_functions import conditional
 
 class ShallowWaterEquationsWithTopo(Model):
     """

@@ -53,15 +53,6 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
             "local_max_abs_eigenvalue", self.max_eigenvalue_definition, eig_sig
         )
 
-        overwrite_sig = Zstruct(
-            Q=self.model.variables,
-            Qaux=self.model.aux_variables,
-            p=self.model.parameters,
-        )
-        self.register_symbolic_function(
-            "overwrite_q_qaux", self.overwrite_q_qaux, overwrite_sig
-        )
-
     def max_eigenvalue_definition(self):
         evs = self.model.call.eigenvalues(
             self.model.variables,
@@ -86,34 +77,6 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
             self.model.parameters,
             self.model.normal,
         )
-
-    def overwrite_q_qaux(self):
-        # 1. Update State Q (Finite Volume Step)
-        Q_new = (
-            self.model.variables
-            - (self.dt / self.dx) * (self.flux_plus - self.flux_minus)
-            + self.dt * self.source_term
-        )
-
-        # 2. Update Aux Qaux (Consistent with Q_new)
-        if hasattr(self.model, "update_aux"):
-            aux_expr = self.model.update_aux()
-            # Map old symbols to new expressions
-            subs_map = {
-                old: new for old, new in zip(self.model.variables.values(), Q_new)
-            }
-            aux_list = []
-            for e in aux_expr:
-                if hasattr(e, "subs"):
-                    aux_list.append(e.subs(subs_map))
-                else:
-                    aux_list.append(e)
-            Qaux_new = ZArray(aux_list)
-        else:
-            Qaux_new = self.model.aux_variables
-
-        # 3. Return as tuple (Q, Qaux) as requested
-        return Q_new, Qaux_new
 
     def _compute_flux(self, qL, qR, auxL, auxR, p, n):
         raise NotImplementedError
