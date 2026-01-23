@@ -25,6 +25,16 @@ class Function(param.Parameterized):
         if self.definition is None:
             self.definition = ZArray([0])
 
+        # Safety Check: Allow ZArray, NDimArray, MatrixBase, AND generic Expressions/Lists
+        # This covers Piecewise definitions and simple lists of symbols.
+        allowed_types = (ZArray, sp.NDimArray, sp.MatrixBase, sp.Expr, list, tuple)
+
+        if not isinstance(self.definition, allowed_types):
+            raise TypeError(
+                f"Function '{self.name}' definition has invalid type '{type(self.definition).__name__}'.\n"
+                "Allowed types: ZArray, sp.NDimArray, sp.MatrixBase, sp.Expr (e.g. Piecewise), list, tuple."
+            )
+
 
 class SymbolicRegistrar:
     def register_symbolic_function(self, name, method_ref, sig_struct):

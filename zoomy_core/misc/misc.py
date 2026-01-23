@@ -19,6 +19,52 @@ class ZArray(MutableDenseNDimArray):
     and vector algebra (+, -) with lists and Zstructs.
     """
 
+    def __new__(cls, iterable, *args, **kwargs):
+        # 1. Normalize Input to Nested List
+        if isinstance(iterable, (ZArray, sp.NDimArray, sp.MatrixBase)):
+            data = iterable.tolist()
+        elif hasattr(iterable, "values") and callable(iterable.values):  # Zstruct
+            data = list(iterable.values())
+        elif isinstance(iterable, (list, tuple)):
+            data = iterable
+        else:
+            raise TypeError(
+                f"ZArray constructor does not support type: {type(iterable)}"
+            )
+
+        # 2. Helper to flatten and determine shape
+        # We do this manually because SymPy's inference can be fragile with mixed types
+        flat_list = []
+
+        def flatten_and_get_shape(item, current_depth=0, shape_acc=None):
+            if shape_acc is None:
+                shape_acc = []
+
+            if isinstance(item, (list, tuple)):
+                if current_depth >= len(shape_acc):
+                    shape_acc.append(len(item))
+                elif shape_acc[current_depth] != len(item):
+                    # Ragged array support is limited in SymPy, warn or assume user handles it
+                    pass
+
+                for sub in item:
+                    flatten_and_get_shape(sub, current_depth + 1, shape_acc)
+            else:
+                flat_list.append(item)
+            return shape_acc
+
+        inferred_shape = tuple(flatten_and_get_shape(data))
+
+        # 3. Determine Final Shape (Args > Kwargs > Inferred)
+        final_shape = inferred_shape
+        if args:
+            final_shape = args[0]
+        elif "shape" in kwargs:
+            final_shape = kwargs["shape"]
+
+        # 4. Construct (Flat Data + Explicit Shape is safest)
+        return super().__new__(cls, flat_list, final_shape, **kwargs)
+
     def _to_array(self, other):
         """Helper to cast Zstruct, list, or scalar to a SymPy-compatible Array."""
         if hasattr(other, "values"):  # Specifically catches Zstruct
