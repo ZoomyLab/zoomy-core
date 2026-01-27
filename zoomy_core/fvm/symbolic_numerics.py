@@ -1,4 +1,5 @@
 import sympy as sp
+import numpy as np
 import param
 from zoomy_core.misc.misc import Zstruct, ZArray
 from zoomy_core.model.basemodel import Model
@@ -122,3 +123,109 @@ class PositiveRusanov(Rusanov):
             self.model.parameters,
             self.model.normal,
         )
+
+class QuasilinearRusanov(Numerics):
+    name = param.String(default="QuasilinearRusanov")
+    integration_order = param.Integer(default=3)
+
+    def _initialize_functions(self):
+        # We register a specific symbolic function for the fluctuations
+        flux_sig = Zstruct(
+            q_minus=self.variables_minus,
+            q_plus=self.variables_plus,
+            aux_minus=self.aux_variables_minus,
+            aux_plus=self.aux_variables_plus,
+            p=self.model.parameters,
+            normal=self.model.normal,
+        )
+        # Note: We return a tuple (Dp, Dm), not a single flux
+        self.register_symbolic_function(
+            "numerical_flux", self.compute_fluctuations, flux_sig
+        )
+
+        # Register eigenvalue helper
+        eig_sig = Zstruct(
+            Q=self.model.variables,
+            Qaux=self.model.aux_variables,
+            p=self.model.parameters,
+            n=self.model.normal,
+        )
+        self.register_symbolic_function(
+            "local_max_abs_eigenvalue", self.max_eigenvalue_definition, eig_sig
+        )
+
+    def compute_fluctuations(self):
+        return self._compute_fluctuations(
+            self.variables_minus,
+            self.variables_plus,
+            self.aux_variables_minus,
+            self.aux_variables_plus,
+            self.model.parameters,
+            self.model.normal,
+        )
+
+    def _compute_fluctuations(self, qL, qR, auxL, auxR, p, n):
+        # 1. Setup Integration Rule (Gauss-Legendre) via Numpy
+        xi_np, wi_np = np.polynomial.legendre.leggauss(self.integration_order)
+        # Shift from [-1, 1] to [0, 1]
+        xi_np = 0.5 * (xi_np + 1)
+        wi_np = 0.5 * wi_np
+
+        # 2. Path Integration
+        dQ = qR - qL
+        dAux = auxR - auxL
+        n_vars = self.model.n_variables
+        dim = len(n)
+
+        # Initialize symbolic accumulator for the integrated matrix
+        A_int = sp.Matrix.zeros(n_vars, n_vars)
+
+        for xi, wi in zip(xi_np, wi_np):
+            # Compute state along the path
+            q_path = qL + xi * dQ
+            aux_path = auxL + xi * dAux
+
+            # Get quasilinear tensor A.
+            # Expected Shape: [dof, dof, dim]
+            A_tensor = self.model.call.quasilinear_matrix(q_path, aux_path, p)
+
+            # Contract tensor with normal vector n
+            # A_n[i, j] = sum_d (A_tensor[i, j, d] * n[d])
+            A_n = sp.Matrix.zeros(n_vars, n_vars)
+
+            # Depending on how your model returns the tensor (nested list vs ZArray),
+            # we iterate carefully. Assuming standard indexable support:
+            for i in range(n_vars):
+                for j in range(n_vars):
+                    val = 0
+                    for d in range(dim):
+                        val += A_tensor[i][j][d] * n[d]
+                    A_n[i, j] = val
+
+            # Accumulate weighted sum
+            A_int += wi * A_n
+
+        # 3. Rusanov Dissipation
+        s_max = sp.Max(
+            self.local_max_abs_eigenvalue(qL, auxL, p, n),
+            self.local_max_abs_eigenvalue(qR, auxR, p, n),
+        )
+
+        # 4. Compute D+ and D-
+        # dQ as a column vector for matrix multiplication
+        dQ_vec = sp.Matrix(dQ)
+
+        # Term 1: A_int * dQ
+        term_advection = A_int * dQ_vec
+
+        # Term 2: s_max * I * dQ  => s_max * dQ
+        term_dissipation = s_max * dQ_vec
+
+        # Dp = 0.5 * (A_int + s_max*I) dQ
+        Dp_matrix = 0.5 * (term_advection + term_dissipation)
+
+        # Dm = 0.5 * (A_int - s_max*I) dQ
+        Dm_matrix = 0.5 * (term_advection - term_dissipation)
+
+        # Convert back to ZArray (flattening the column vector)
+        return ZArray(Dp_matrix[:]), ZArray(Dm_matrix[:])
