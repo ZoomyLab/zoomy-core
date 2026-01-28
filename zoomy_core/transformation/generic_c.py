@@ -503,6 +503,36 @@ class GenericCppModel(GenericCppBase):
             self.model.boundary_conditions.boundary_conditions_list_dict.keys()
         )
         bc_str = ", ".join(f'"{item}"' for item in bc_names)
+
+        # --- Extract Parameter Metadata ---
+        # 1. Get ordered list of keys from the symbolic dictionary (used for p[i] indexing)
+        param_keys = list(self.model.parameters.keys())
+
+        # 2. Retrieve default values from the class param definition
+        # Assumes model.param.parameters.default is available and populated
+        defaults = self.model.param.parameters.default
+        if callable(defaults):
+            defaults = defaults()
+
+        param_vals = []
+        for k in param_keys:
+            if k not in defaults:
+                # Fallback or Error: Ideally this shouldn't happen if structure is sound
+                raise ValueError(
+                    f"C++ Gen Error: Parameter '{k}' found in symbols but missing default value in param definition."
+                )
+
+            val = defaults[k]
+            # Handle tuple format e.g. (9.81, "positive") -> extract value
+            if isinstance(val, (list, tuple)):
+                val = val[0]
+
+            param_vals.append(str(val))
+
+        p_names_str = ", ".join(f'"{k}"' for k in param_keys)
+        p_vals_str = ", ".join(param_vals)
+        # ----------------------------------
+
         tpl = "template <typename T>" if self._is_template_class else ""
         lines = [
             "#pragma once",
@@ -537,6 +567,9 @@ class GenericCppModel(GenericCppBase):
                 f"    static constexpr int dimension  = {self.model.dimension};",
                 f"    static constexpr int n_boundary_tags = {len(bc_names)};",
                 f"    static const std::vector<std::string> get_boundary_tags() {{ return {{ {bc_str} }}; }}",
+                # New Parameter Accessors
+                f"    static const std::vector<std::string> parameter_names() {{ return {{ {p_names_str} }}; }}",
+                f"    static const std::vector<T> default_parameters() {{ return {{ {p_vals_str} }}; }}",
             ]
         )
         return "\n".join(lines)

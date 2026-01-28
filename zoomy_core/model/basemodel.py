@@ -24,7 +24,18 @@ def parse_definition_to_zstruct(definition, prefix="q_"):
             attributes[str(name)] = sp.Symbol(str(name), real=True)
     elif isinstance(definition, dict):
         for name, data in definition.items():
-            attributes[str(name)] = sp.Symbol(str(name), real=True)
+            # Default assumptions
+            assumptions = {"real": True}
+
+            # Check if data is provided as (value, constraint)
+            if isinstance(data, (list, tuple)) and len(data) > 1:
+                constraint = data[1]
+                if constraint == "positive":
+                    assumptions["positive"] = True
+                # Add other constraints here if needed (e.g. "integer")
+
+            attributes[str(name)] = sp.Symbol(str(name), **assumptions)
+
     return Zstruct(**attributes)
 
 
@@ -54,10 +65,13 @@ class Model(param.Parameterized, SymbolicRegistrar):
     initial_conditions = param.ClassSelector(class_=InitialConditions, default=None)
     aux_initial_conditions = param.ClassSelector(class_=InitialConditions, default=None)
 
-    def __init__(self, **params):
+    def __init__(self, init_functions = True, **params):
         super().__init__(**params)
         self.functions, self.call = Zstruct(), Zstruct()
         self._initialize_derived_properties()
+        if init_functions:
+            self._initialize_functions()
+
 
     def _resolve_input(self, val):
         if isinstance(val, param.Parameter):
@@ -106,7 +120,6 @@ class Model(param.Parameterized, SymbolicRegistrar):
         self.aux_initial_conditions = self.aux_initial_conditions or Constant()
 
         self._simplify = default_simplify
-        self._initialize_functions()
 
     def _initialize_functions(self):
         std_sig = Zstruct(
@@ -268,10 +281,15 @@ class Model(param.Parameterized, SymbolicRegistrar):
         A = self.normal[0] * q_mat[:, :, 0]
         for i in range(1, self.dimension):
             A += self.normal[i] * q_mat[:, :, i]
-        ev_dict = sp.Matrix(A.tolist()).eigenvals()
-        return ZArray(
-            [self._simplify(ev) for ev, mult in ev_dict.items() for _ in range(mult)]
-        )
+        # ev_dict = sp.Matrix(A.tolist()).eigenvals()
+        # return ZArray(
+        #     [self._simplify(ev) for ev, mult in ev_dict.items() for _ in range(mult)]
+        # )
+        lam = sp.symbols("lam")
+        char_poly = A.charpoly(lam)
+        evs = sp.solve(char_poly, lam)
+        return ZArray([self._simplify(ev) for ev in evs])
+
 
     def left_eigenvectors(self):
         return ZArray.zeros(self.n_variables, self.n_variables)
