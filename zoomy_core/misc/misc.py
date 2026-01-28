@@ -20,10 +20,10 @@ class ZArray(MutableDenseNDimArray):
     """
 
     def __new__(cls, iterable, *args, **kwargs):
-        # 1. Normalize Input to Nested List
-        if isinstance(iterable, (ZArray, sp.NDimArray, sp.MatrixBase)):
+        # 1. Normalize Input (handle single outer ZArray/Matrix/Struct)
+        if hasattr(iterable, "tolist"):
             data = iterable.tolist()
-        elif hasattr(iterable, "values") and callable(iterable.values):  # Zstruct
+        elif hasattr(iterable, "values") and callable(iterable.values):
             data = list(iterable.values())
         elif isinstance(iterable, (list, tuple)):
             data = iterable
@@ -32,19 +32,25 @@ class ZArray(MutableDenseNDimArray):
                 f"ZArray constructor does not support type: {type(iterable)}"
             )
 
-        # 2. Helper to flatten and determine shape
-        # We do this manually because SymPy's inference can be fragile with mixed types
         flat_list = []
 
+        # 2. Recursive Flattening that recognizes Arrays as containers
         def flatten_and_get_shape(item, current_depth=0, shape_acc=None):
             if shape_acc is None:
                 shape_acc = []
 
+            # --- FIX: Convert nested array-likes to lists ---
+            if hasattr(item, "tolist"):
+                item = item.tolist()
+            elif hasattr(item, "values") and callable(item.values):
+                item = list(item.values())
+
             if isinstance(item, (list, tuple)):
+                # Update shape inference
                 if current_depth >= len(shape_acc):
                     shape_acc.append(len(item))
                 elif shape_acc[current_depth] != len(item):
-                    # Ragged array support is limited in SymPy, warn or assume user handles it
+                    # Optional: warning for ragged arrays
                     pass
 
                 for sub in item:
@@ -55,23 +61,23 @@ class ZArray(MutableDenseNDimArray):
 
         inferred_shape = tuple(flatten_and_get_shape(data))
 
-        # 3. Determine Final Shape (Args > Kwargs > Inferred)
+        # 3. Determine Final Shape
         final_shape = inferred_shape
         if args:
             final_shape = args[0]
         elif "shape" in kwargs:
             final_shape = kwargs["shape"]
 
-        # 4. Construct (Flat Data + Explicit Shape is safest)
+        # 4. Construct
         return super().__new__(cls, flat_list, final_shape, **kwargs)
 
     def _to_array(self, other):
         """Helper to cast Zstruct, list, or scalar to a SymPy-compatible Array."""
-        if hasattr(other, "values"):  # Specifically catches Zstruct
+        if hasattr(other, "values"):
             return sp.Array(list(other.values()))
         if isinstance(other, (list, tuple)):
             return sp.Array(other)
-        if hasattr(other, "tolist"):  # Catch numpy arrays or other ZArrays
+        if hasattr(other, "tolist"):
             return sp.Array(other.tolist())
         return other
 
@@ -79,13 +85,13 @@ class ZArray(MutableDenseNDimArray):
         """Matrix Multiplication (@ operator)."""
         other_arr = self._to_array(other)
         if isinstance(other_arr, sp.NDimArray):
-            # Matrix-Vector Projection (Rank 2 @ Rank 1) -> Vector
+            # Rank 2 @ Rank 1 -> Vector
             if self.rank() == 2 and other_arr.rank() == 1:
                 return ZArray(tensorcontraction(tensorproduct(self, other_arr), (1, 2)))
-            # Dot Product (Rank 1 @ Rank 1) -> Scalar
+            # Rank 1 @ Rank 1 -> Scalar
             if self.rank() == 1 and other_arr.rank() == 1:
                 return tensorcontraction(tensorproduct(self, other_arr), (0, 1))
-            # Matrix-Matrix Multiplication (Rank 2 @ Rank 2) -> Matrix
+            # Rank 2 @ Rank 2 -> Matrix
             if self.rank() == 2 and other_arr.rank() == 2:
                 return ZArray(tensorcontraction(tensorproduct(self, other_arr), (1, 2)))
         return NotImplemented
@@ -100,10 +106,10 @@ class ZArray(MutableDenseNDimArray):
         return self.__add__(other)
 
     def __rsub__(self, other):
+        # other - self
         return ZArray(sp.Array(self._to_array(other)) + (-1 * self))
 
     def tomatrix(self):
-        """Converts rank-2 array to SymPy Matrix (needed for .T or .eigenvals)."""
         if self.rank() != 2:
             raise ValueError("Only rank-2 ZArrays can be converted to Matrix.")
         return sp.Matrix(self.tolist())

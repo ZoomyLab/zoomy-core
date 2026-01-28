@@ -14,12 +14,16 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         super().__init__(model=model, **params)
         self.functions, self.call = Zstruct(), Zstruct()
 
+        self.variables = ZArray(self.model.variables.get_list())
+        self.aux_variables = ZArray(self.model.aux_variables.get_list())
+        self.parameters = ZArray(self.model.parameters.get_list())
+        self.normal = ZArray(self.model.normal.get_list())
+
         self.variables_minus = self._create_v("Q_minus")
         self.variables_plus = self._create_v("Q_plus")
         self.aux_variables_minus = self._create_v("Qaux_minus")
         self.aux_variables_plus = self._create_v("Qaux_plus")
 
-        self.dt, self.dx = sp.symbols("dt dx", real=True)
         self.flux_minus = self._create_v("flux_minus")
         self.flux_plus = self._create_v("flux_plus")
         self.source_term = self._create_v("source_term")
@@ -34,21 +38,26 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         return v
 
     def _initialize_functions(self):
-        flux_sig = Zstruct(
+        # Signature is shared for both flux and fluctuations
+        sig = Zstruct(
             q_minus=self.variables_minus,
             q_plus=self.variables_plus,
             aux_minus=self.aux_variables_minus,
             aux_plus=self.aux_variables_plus,
-            p=self.model.parameters,
-            normal=self.model.normal,
+            p=self.parameters,
+            normal=self.normal,
         )
-        self.register_symbolic_function("numerical_flux", self.numerical_flux, flux_sig)
+
+        # 1. Register Conservative Flux (Size: n_dof)
+        self.register_symbolic_function("numerical_flux", self.numerical_flux, sig)
+
+        # 2. Register Non-Conservative Fluctuations (Size: 2 * n_dof)
+        self.register_symbolic_function(
+            "nonconservative_fluctuations", self.nonconservative_fluctuations, sig
+        )
 
         eig_sig = Zstruct(
-            Q=self.model.variables,
-            Qaux=self.model.aux_variables,
-            p=self.model.parameters,
-            n=self.model.normal,
+            Q=self.variables, Qaux=self.aux_variables, p=self.parameters, n=self.normal
         )
         self.register_symbolic_function(
             "local_max_abs_eigenvalue", self.max_eigenvalue_definition, eig_sig
@@ -56,10 +65,7 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
 
     def max_eigenvalue_definition(self):
         evs = self.model.call.eigenvalues(
-            self.model.variables,
-            self.model.aux_variables,
-            self.model.parameters,
-            self.model.normal,
+            self.variables, self.aux_variables, self.parameters, self.normal
         )
         return sp.Max(*[sp.Abs(e) for e in evs])
 
@@ -69,27 +75,35 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         evs = self.model.call.eigenvalues(Q, Qaux, p, n)
         return sp.Max(*[sp.Abs(e) for e in evs])
 
+    # --- Base Implementations (Return Zeros) ---
     def numerical_flux(self):
-        return self._compute_flux(
-            self.variables_minus,
-            self.variables_plus,
-            self.aux_variables_minus,
-            self.aux_variables_plus,
-            self.model.parameters,
-            self.model.normal,
-        )
+        # Returns [0, 0, ..., 0] (Size: n_vars)
+        zeros = [sp.Integer(0)] * self.model.n_variables
+        return ZArray(zeros)
 
-    def _compute_flux(self, qL, qR, auxL, auxR, p, n):
-        raise NotImplementedError
+    def nonconservative_fluctuations(self):
+        # Returns [[0...], [0...]] (Size: 2, n_vars)
+        zeros = [sp.Integer(0)] * self.model.n_variables
+        return ZArray([ZArray(zeros), ZArray(zeros)])
 
 
 class Rusanov(Numerics):
     name = param.String(default="Rusanov")
 
+    def numerical_flux(self):
+        # Override Conservative Flux
+        return self._compute_flux(
+            self.variables_minus,
+            self.variables_plus,
+            self.aux_variables_minus,
+            self.aux_variables_plus,
+            self.parameters,
+            self.normal,
+        )
+
     def _compute_flux(self, qL, qR, auxL, auxR, p, n):
         FL = self.model.call.flux(qL, auxL, p)
         FR = self.model.call.flux(qR, auxR, p)
-
         s_max = sp.Max(
             self.local_max_abs_eigenvalue(qL, auxL, p, n),
             self.local_max_abs_eigenvalue(qR, auxR, p, n),
@@ -112,6 +126,7 @@ class PositiveRusanov(Rusanov):
         )
 
     def numerical_flux(self):
+        # Reconstruction applied to Flux
         qLs, qRs = self.hydrostatic_reconstruction(
             self.variables_minus, self.variables_plus
         )
@@ -120,112 +135,86 @@ class PositiveRusanov(Rusanov):
             qRs,
             self.aux_variables_minus,
             self.aux_variables_plus,
-            self.model.parameters,
-            self.model.normal,
+            self.parameters,
+            self.normal,
         )
 
-class QuasilinearRusanov(Numerics):
+
+class QuasilinearRusanov(Rusanov):
     name = param.String(default="QuasilinearRusanov")
     integration_order = param.Integer(default=3)
 
-    def _initialize_functions(self):
-        # We register a specific symbolic function for the fluctuations
-        flux_sig = Zstruct(
-            q_minus=self.variables_minus,
-            q_plus=self.variables_plus,
-            aux_minus=self.aux_variables_minus,
-            aux_plus=self.aux_variables_plus,
-            p=self.model.parameters,
-            normal=self.model.normal,
-        )
-        # Note: We return a tuple (Dp, Dm), not a single flux
-        self.register_symbolic_function(
-            "numerical_flux", self.compute_fluctuations, flux_sig
-        )
+    # Inherits numerical_flux (Conservative Rusanov) from Parent
+    # Overrides nonconservative_fluctuations
 
-        # Register eigenvalue helper
-        eig_sig = Zstruct(
-            Q=self.model.variables,
-            Qaux=self.model.aux_variables,
-            p=self.model.parameters,
-            n=self.model.normal,
-        )
-        self.register_symbolic_function(
-            "local_max_abs_eigenvalue", self.max_eigenvalue_definition, eig_sig
-        )
-
-    def compute_fluctuations(self):
+    def nonconservative_fluctuations(self):
         return self._compute_fluctuations(
             self.variables_minus,
             self.variables_plus,
             self.aux_variables_minus,
             self.aux_variables_plus,
-            self.model.parameters,
-            self.model.normal,
+            self.parameters,
+            self.normal,
         )
 
     def _compute_fluctuations(self, qL, qR, auxL, auxR, p, n):
-        # 1. Setup Integration Rule (Gauss-Legendre) via Numpy
+        # 1. Setup Integration Rule
         xi_np, wi_np = np.polynomial.legendre.leggauss(self.integration_order)
-        # Shift from [-1, 1] to [0, 1]
         xi_np = 0.5 * (xi_np + 1)
         wi_np = 0.5 * wi_np
 
-        # 2. Path Integration
         dQ = qR - qL
         dAux = auxR - auxL
         n_vars = self.model.n_variables
         dim = len(n)
 
-        # Initialize symbolic accumulator for the integrated matrix
+        # 2. Path Integral
         A_int = sp.Matrix.zeros(n_vars, n_vars)
 
         for xi, wi in zip(xi_np, wi_np):
-            # Compute state along the path
             q_path = qL + xi * dQ
             aux_path = auxL + xi * dAux
+            # Note: Using nonconservative_matrix from model
+            A_tensor = self.model.call.nonconservative_matrix(q_path, aux_path, p)
 
-            # Get quasilinear tensor A.
-            # Expected Shape: [dof, dof, dim]
-            A_tensor = self.model.call.quasilinear_matrix(q_path, aux_path, p)
-
-            # Contract tensor with normal vector n
-            # A_n[i, j] = sum_d (A_tensor[i, j, d] * n[d])
             A_n = sp.Matrix.zeros(n_vars, n_vars)
-
-            # Depending on how your model returns the tensor (nested list vs ZArray),
-            # we iterate carefully. Assuming standard indexable support:
             for i in range(n_vars):
                 for j in range(n_vars):
                     val = 0
                     for d in range(dim):
                         val += A_tensor[i][j][d] * n[d]
                     A_n[i, j] = val
-
-            # Accumulate weighted sum
             A_int += wi * A_n
 
-        # 3. Rusanov Dissipation
+        # 3. Dissipation
         s_max = sp.Max(
             self.local_max_abs_eigenvalue(qL, auxL, p, n),
             self.local_max_abs_eigenvalue(qR, auxR, p, n),
         )
 
-        # 4. Compute D+ and D-
-        # dQ as a column vector for matrix multiplication
         dQ_vec = sp.Matrix(dQ)
-
-        # Term 1: A_int * dQ
         term_advection = A_int * dQ_vec
-
-        # Term 2: s_max * I * dQ  => s_max * dQ
         term_dissipation = s_max * dQ_vec
 
-        # Dp = 0.5 * (A_int + s_max*I) dQ
         Dp_matrix = 0.5 * (term_advection + term_dissipation)
-
-        # Dm = 0.5 * (A_int - s_max*I) dQ
         Dm_matrix = 0.5 * (term_advection - term_dissipation)
 
-        # Convert back to ZArray (flattening the column vector)
-        return ZArray(Dp_matrix[:]), ZArray(Dm_matrix[:])
+        return ZArray([ZArray(Dp_matrix[:]), ZArray(Dm_matrix[:])])
+
+
+class PositiveQuasilinearRusanov(PositiveRusanov, QuasilinearRusanov):
+    name = param.String(default="PositiveQuasilinearRusanov")
+
+    def nonconservative_fluctuations(self):
+        # Reconstruction applied to Flux
+        qLs, qRs = self.hydrostatic_reconstruction(
+            self.variables_minus, self.variables_plus
+        )   
+        return self._compute_fluctuations(
+            qLs,
+            qRs,
+            self.aux_variables_minus,
+            self.aux_variables_plus,
+            self.parameters,
+            self.normal,
+        )
