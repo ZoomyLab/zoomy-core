@@ -281,6 +281,8 @@ class Model(param.Parameterized, SymbolicRegistrar):
         A = self.normal[0] * q_mat[:, :, 0]
         for i in range(1, self.dimension):
             A += self.normal[i] * q_mat[:, :, i]
+        A = A.tomatrix()
+
         # ev_dict = sp.Matrix(A.tolist()).eigenvals()
         # return ZArray(
         #     [self._simplify(ev) for ev, mult in ev_dict.items() for _ in range(mult)]
