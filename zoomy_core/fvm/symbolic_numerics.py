@@ -19,20 +19,20 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         self.parameters = ZArray(self.model.parameters.get_list())
         self.normal = ZArray(self.model.normal.get_list())
 
-        self.variables_minus = self._create_v("Q_minus")
-        self.variables_plus = self._create_v("Q_plus")
-        self.aux_variables_minus = self._create_v("Qaux_minus")
-        self.aux_variables_plus = self._create_v("Qaux_plus")
+        self.variables_minus = self._create_v("Q_minus", self.model.n_variables)
+        self.variables_plus = self._create_v("Q_plus", self.model.n_variables)
+        self.aux_variables_minus = self._create_v("Qaux_minus", self.model.n_aux_variables)
+        self.aux_variables_plus = self._create_v("Qaux_plus", self.model.n_aux_variables)
 
-        self.flux_minus = self._create_v("flux_minus")
-        self.flux_plus = self._create_v("flux_plus")
-        self.source_term = self._create_v("source_term")
+        self.flux_minus = self._create_v("flux_minus", self.model.n_variables)
+        self.flux_plus = self._create_v("flux_plus", self.model.n_variables)
+        self.source_term = self._create_v("source_term", self.model.n_variables)
 
         self._initialize_functions()
 
-    def _create_v(self, name):
+    def _create_v(self, name, size):
         v = ZArray(
-            [sp.Symbol(f"{name}_{i}", real=True) for i in range(self.model.n_variables)]
+            [sp.Symbol(f"{name}_{i}", real=True) for i in range(size)]
         )
         v._symbolic_name = name
         return v
