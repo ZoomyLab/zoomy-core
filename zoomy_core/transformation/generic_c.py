@@ -507,30 +507,16 @@ class GenericCppModel(GenericCppBase):
         # --- Extract Parameter Metadata ---
         # 1. Get ordered list of keys from the symbolic dictionary (used for p[i] indexing)
         param_keys = list(self.model.parameters.keys())
+        param_vals = list(self.model.parameter_values)
+        if len(param_keys) != len(param_vals):
+            raise ValueError(
+                f"Parameter keys {param_keys} and values values {param_vals} do not match"
+            )
 
-        # 2. Retrieve default values from the class param definition
-        # Assumes model.param.parameters.default is available and populated
-        defaults = self.model.param.parameters.default
-        if callable(defaults):
-            defaults = defaults()
-
-        param_vals = []
-        for k in param_keys:
-            if k not in defaults:
-                # Fallback or Error: Ideally this shouldn't happen if structure is sound
-                raise ValueError(
-                    f"C++ Gen Error: Parameter '{k}' found in symbols but missing default value in param definition."
-                )
-
-            val = defaults[k]
-            # Handle tuple format e.g. (9.81, "positive") -> extract value
-            if isinstance(val, (list, tuple)):
-                val = val[0]
-
-            param_vals.append(str(val))
 
         p_names_str = ", ".join(f'"{k}"' for k in param_keys)
-        p_vals_str = ", ".join(param_vals)
+        p_vals_str = ", ".join(f'{k}' for k in param_vals)
+
         # ----------------------------------
 
         tpl = "template <typename T>" if self._is_template_class else ""

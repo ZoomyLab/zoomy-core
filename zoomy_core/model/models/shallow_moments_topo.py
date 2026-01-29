@@ -648,3 +648,5 @@ class NumericalShallowMomentsTopo(ShallowMomentsTopo):
         evs = analytical_model.eigenvalues()
         eps = self.parameters.eps
         return conditional(h > eps, evs, ZArray.zeros(self.n_variables))
+        # evs = sp.Matrix(evs).subs(h, (h+eps))
+        # return ZArray([ev for ev in evs])
