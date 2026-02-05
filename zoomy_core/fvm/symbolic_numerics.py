@@ -53,7 +53,7 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
 
         # 2. Register Non-Conservative Fluctuations (Size: 2 * n_dof)
         self.register_symbolic_function(
-            "nonconservative_fluctuations", self.nonconservative_fluctuations, sig
+            "numerical_fluctuations", self.numerical_fluctuations, sig
         )
 
         eig_sig = Zstruct(
@@ -81,7 +81,7 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         zeros = [sp.Integer(0)] * self.model.n_variables
         return ZArray(zeros)
 
-    def nonconservative_fluctuations(self):
+    def numerical_fluctuations(self):
         # Returns [[0...], [0...]] (Size: 2, n_vars)
         zeros = [sp.Integer(0)] * self.model.n_variables
         return ZArray([ZArray(zeros), ZArray(zeros)])
@@ -140,14 +140,14 @@ class PositiveRusanov(Rusanov):
         )
 
 
-class QuasilinearRusanov(Rusanov):
-    name = param.String(default="QuasilinearRusanov")
+class NonconservativeRusanov(Rusanov):
+    name = param.String(default="NonconservativeRusanov")
     integration_order = param.Integer(default=3)
 
     # Inherits numerical_flux (Conservative Rusanov) from Parent
-    # Overrides nonconservative_fluctuations
+    # Overrides numerical_fluctuations
 
-    def nonconservative_fluctuations(self):
+    def numerical_fluctuations(self):
         return self._compute_fluctuations(
             self.variables_minus,
             self.variables_plus,
@@ -156,6 +156,10 @@ class QuasilinearRusanov(Rusanov):
             self.parameters,
             self.normal,
         )
+        
+    def _call_model_matrix(self):
+        return lambda Q, Qaux, p: self.model.call.nonconservative_matrix(Q, Qaux, p)
+
 
     def _compute_fluctuations(self, qL, qR, auxL, auxR, p, n):
         # 1. Setup Integration Rule
@@ -175,7 +179,7 @@ class QuasilinearRusanov(Rusanov):
             q_path = qL + xi * dQ
             aux_path = auxL + xi * dAux
             # Note: Using nonconservative_matrix from model
-            A_tensor = self.model.call.nonconservative_matrix(q_path, aux_path, p)
+            A_tensor = self._call_model_matrix()(q_path, aux_path, p)
 
             A_n = sp.Matrix.zeros(n_vars, n_vars)
             for i in range(n_vars):
@@ -202,19 +206,18 @@ class QuasilinearRusanov(Rusanov):
         return ZArray([ZArray(Dp_matrix[:]), ZArray(Dm_matrix[:])])
 
 
+class PositiveNonconservativeRusanov(PositiveRusanov, NonconservativeRusanov):
+    name = param.String(default="PositiveNonconservativeRusanov")
+
+
+class QuasilinearRusanov(NonconservativeRusanov):
+    name = param.String(default="QuasilinearRusanov")
+    integration_order = param.Integer(default=3)
+
+    def _call_model_matrix(self):
+        return lambda Q, Qaux, p: self.model.call.quasilinear_matrix(Q, Qaux, p)
+
+
+
 class PositiveQuasilinearRusanov(PositiveRusanov, QuasilinearRusanov):
     name = param.String(default="PositiveQuasilinearRusanov")
-
-    def nonconservative_fluctuations(self):
-        # Reconstruction applied to Flux
-        qLs, qRs = self.hydrostatic_reconstruction(
-            self.variables_minus, self.variables_plus
-        )   
-        return self._compute_fluctuations(
-            qLs,
-            qRs,
-            self.aux_variables_minus,
-            self.aux_variables_plus,
-            self.parameters,
-            self.normal,
-        )
