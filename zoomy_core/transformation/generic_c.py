@@ -44,7 +44,7 @@ def get_nested_shape(expr):
 
 
 # =========================================================================
-#  2. GENERIC BASE (The Engine)
+#  2. GENERIC BASE (Simple, No Layout Magic)
 # =========================================================================
 
 
@@ -358,7 +358,6 @@ class GenericCppBase(CXX11CodePrinter):
         expr = func_obj.definition
         expr = self._expand_vector_conditionals(expr)
         if isinstance(expr, (list, tuple)):
-            # FIX: Ensure we have a flat list before creating Array to avoid ambiguous shapes
             expr = self._flatten_ragged_list(expr)
             expr = sp.Array(expr)
         shape, expr = get_nested_shape(expr)
@@ -448,7 +447,7 @@ struct SimpleArray {
 
 
 # =========================================================================
-#  3. GENERIC MODEL
+#  3. GENERIC MODEL (Clean)
 # =========================================================================
 
 
@@ -504,8 +503,6 @@ class GenericCppModel(GenericCppBase):
         )
         bc_str = ", ".join(f'"{item}"' for item in bc_names)
 
-        # --- Extract Parameter Metadata ---
-        # 1. Get ordered list of keys from the symbolic dictionary (used for p[i] indexing)
         param_keys = list(self.model.parameters.keys())
         param_vals = list(self.model.parameter_values)
         if len(param_keys) != len(param_vals):
@@ -513,11 +510,8 @@ class GenericCppModel(GenericCppBase):
                 f"Parameter keys {param_keys} and values values {param_vals} do not match"
             )
 
-
         p_names_str = ", ".join(f'"{k}"' for k in param_keys)
-        p_vals_str = ", ".join(f'{k}' for k in param_vals)
-
-        # ----------------------------------
+        p_vals_str = ", ".join(f"{k}" for k in param_vals)
 
         tpl = "template <typename T>" if self._is_template_class else ""
         lines = [
@@ -553,7 +547,6 @@ class GenericCppModel(GenericCppBase):
                 f"    static constexpr int dimension  = {self.model.dimension};",
                 f"    static constexpr int n_boundary_tags = {len(bc_names)};",
                 f"    static const std::vector<std::string> get_boundary_tags() {{ return {{ {bc_str} }}; }}",
-                # New Parameter Accessors
                 f"    static const std::vector<std::string> parameter_names() {{ return {{ {p_names_str} }}; }}",
                 f"    static const std::vector<T> default_parameters() {{ return {{ {p_vals_str} }}; }}",
             ]
@@ -565,7 +558,7 @@ class GenericCppModel(GenericCppBase):
 
 
 # =========================================================================
-#  4. GENERIC NUMERICS
+#  4. GENERIC NUMERICS (Clean)
 # =========================================================================
 
 
@@ -610,7 +603,7 @@ class GenericCppNumerics(GenericCppBase):
         lines = [
             "#pragma once",
             self.get_includes().strip(),
-            '#include "Model.H"',  # <--- CORRECTLY ADDED INCLUDE HERE
+            '#include "Model.H"',
             self.get_simple_array_def(),
             "#include <vector>",
             "#include <algorithm>",
@@ -642,3 +635,37 @@ class GenericCppNumerics(GenericCppBase):
 
     def get_file_footer(self):
         return "};\n"
+
+
+# =========================================================================
+#  5. WRAPPERS
+# =========================================================================
+
+
+class CppModel(GenericCppModel):
+    """
+    Configuration wrapper for Model C++ generation.
+    """
+
+    _output_subdir = ".c_interface"
+    _is_template_class = True
+
+    def __init__(self, model, *args, **kwargs):
+        super().__init__(model, *args, **kwargs)
+        self.real_type = "T"
+        self.math_namespace = "std::"
+
+
+class CppNumerics(GenericCppNumerics):
+    """
+    Configuration wrapper for Numerics C++ generation.
+    """
+
+    _output_subdir = ".c_interface"
+    _is_template_class = True
+
+    def __init__(self, numerics, *args, **kwargs):
+        super().__init__(numerics, *args, **kwargs)
+        self.real_type = "T"
+        self.math_namespace = "std::"
+        self.gpu_enabled = True

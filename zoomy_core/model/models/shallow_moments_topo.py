@@ -251,10 +251,10 @@ class ShallowMomentsTopo(Model):
 
         
 
-        nc_x[2, 0] += p.ez * p.g * h 
-        if dim == 2:
-            offset = lvl + 1
-            nc_y[2 + offset, 0] += p.ez * p.g * h 
+        # nc_x[2, 0] += p.ez * p.g * h 
+        # if dim == 2:
+        #     offset = lvl + 1
+        #     nc_y[2 + offset, 0] += p.ez * p.g * h 
 
         # Pack into Tensor
         A_tensor = MutableDenseNDimArray.zeros(n_vars, n_vars, dim)
@@ -558,6 +558,13 @@ class ShallowMomentsTopo(Model):
 
         # Using base implementation (symbolic):
         A = ZArray(self.quasilinear_matrix())
+        p = self.parameters
+        
+        # ## CARE: We re-inject the topography gravity force, as we deleted it due to the HR-reconstruction we want to use!
+        # A[2, 0, 0] += p.ez * p.g * h
+        # if self.dimension == 2:
+        #     offset = self.level + 1
+        #     A[2 + offset, 0, 1] += p.ez * p.g * h
         evs = self._eigenvalues(A)
         return evs
 
@@ -585,7 +592,7 @@ class ShallowMomentsTopo(Model):
         n = self.normal
         An = ZArray.zeros(self.n_variables, self.n_variables)
         for d in range(self.dimension):
-            An[:, :] += A[:, :, d] * n[d]
+            An[:, :] += A[d, :, :] * n[d]
         An = An.tomatrix()
         Apn = M.inv() @ An @ M
         offset = self.level+1
