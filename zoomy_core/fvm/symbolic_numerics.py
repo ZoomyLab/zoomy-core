@@ -89,6 +89,25 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
 
 class Rusanov(Numerics):
     name = param.String(default="Rusanov")
+    
+    def get_viscosity_identity_flux(self):
+        Id = sp.Matrix(sp.Identity(self.model.n_variables))
+        Id = 0 * Id
+        # Id[1, 1] = 1
+        # Id[0, 0] = 0
+        # for i in range(3, self.model.n_variables):
+        #     Id[i, i] = 0
+        return ZArray(Id)
+    
+    def get_viscosity_identity_fluctuations(self):
+        Id = sp.Matrix(sp.Identity(self.model.n_variables))
+        Id[0,0] = 0
+        # Id[1,1] = 0
+        # Id[2,2] = 0
+        # Id[4,4] = 0
+        # Id = 0 * Id
+        return ZArray(Id)
+
 
     def numerical_flux(self):
         # Override Conservative Flux
@@ -108,7 +127,8 @@ class Rusanov(Numerics):
             self.local_max_abs_eigenvalue(qL, auxL, p, n),
             self.local_max_abs_eigenvalue(qR, auxR, p, n),
         )
-        return 0.5 * (FL @ n + FR @ n) - 0.5 * s_max * (qR - qL)
+        Id = self.get_viscosity_identity_flux()
+        return 0.5 * (FL @ n + FR @ n) - 0.5 * s_max * Id @ (qR - qL)
 
 
 class PositiveRusanov(Rusanov):
@@ -120,21 +140,30 @@ class PositiveRusanov(Rusanov):
             sp.Max(0.0, qL[1] + qL[0] - b_star),
             sp.Max(0.0, qR[1] + qR[0] - b_star),
         )
+        eps = self.model.parameters.eps
         hL_eff, hR_eff = sp.Max(qL[1], 1e-6), sp.Max(qR[1], 1e-6)
+        
+        hL_inv = 1/(hL_star + eps)
+        hR_inv = 1/(hR_star + eps)
         return ZArray([b_star, hL_star, *(qL[2:] / hL_eff) * hL_star]), ZArray(
-            [b_star, hR_star, *(qR[2:] / hR_eff) * hR_star]
-        )
+            [b_star, hR_star, *(qR[2:] / hR_eff) * hR_star]), hL_inv, hR_inv
 
     def numerical_flux(self):
         # Reconstruction applied to Flux
-        qLs, qRs = self.hydrostatic_reconstruction(
+        qLs, qRs, hinvL, hinvR = self.hydrostatic_reconstruction(
             self.variables_minus, self.variables_plus
         )
+        
+        qauxL = ZArray(self.aux_variables_minus)
+        qauxR = ZArray(self.aux_variables_plus)
+        qauxL[0] = hinvL
+        qauxR[0] = hinvR
+        
         return self._compute_flux(
             qLs,
             qRs,
-            self.aux_variables_minus,
-            self.aux_variables_plus,
+            qauxL,
+            qauxR,
             self.parameters,
             self.normal,
         )
@@ -146,13 +175,24 @@ class NonconservativeRusanov(Rusanov):
 
     # Inherits numerical_flux (Conservative Rusanov) from Parent
     # Overrides numerical_fluctuations
-
     def numerical_fluctuations(self):
+        
+        # qLs, qRs, hinvL, hinvR = self.hydrostatic_reconstruction(
+        # self.variables_minus, self.variables_plus
+        # )
+        
+        qLs = self.variables_minus
+        qRs = self.variables_plus
+        hinvL = self.aux_variables_minus[0]
+        hinvR = self.aux_variables_plus[0]
+        
+        qauxL = ZArray(self.aux_variables_minus)
+        qauxR = ZArray(self.aux_variables_plus)
+        qauxL[0] = hinvL
+        qauxR[0] = hinvR
+        
         return self._compute_fluctuations(
-            self.variables_minus,
-            self.variables_plus,
-            self.aux_variables_minus,
-            self.aux_variables_plus,
+            qLs, qRs, qauxL, qauxR,
             self.parameters,
             self.normal,
         )
@@ -173,7 +213,7 @@ class NonconservativeRusanov(Rusanov):
         dim = len(n)
 
         # 2. Path Integral
-        A_int = sp.Matrix.zeros(n_vars, n_vars)
+        A_int = ZArray.zeros(n_vars, n_vars)
 
         for xi, wi in zip(xi_np, wi_np):
             q_path = qL + xi * dQ
@@ -181,12 +221,12 @@ class NonconservativeRusanov(Rusanov):
             # Note: Using nonconservative_matrix from model
             A_tensor = self._call_model_matrix()(q_path, aux_path, p)
 
-            A_n = sp.Matrix.zeros(n_vars, n_vars)
+            A_n = ZArray.zeros(n_vars, n_vars)
             for i in range(n_vars):
                 for j in range(n_vars):
                     val = 0
                     for d in range(dim):
-                        val += A_tensor[i][j][d] * n[d]
+                        val += A_tensor[i, j, d] * n[d]
                     A_n[i, j] = val
             A_int += wi * A_n
 
@@ -197,8 +237,10 @@ class NonconservativeRusanov(Rusanov):
         )
 
         dQ_vec = sp.Matrix(dQ)
-        term_advection = A_int * dQ_vec
-        term_dissipation = s_max * dQ_vec
+        term_advection = A_int @ dQ_vec
+        Id = self.get_viscosity_identity_fluctuations()
+        term_dissipation = s_max * (Id @ dQ_vec)
+
 
         Dp_matrix = 0.5 * (term_advection + term_dissipation)
         Dm_matrix = 0.5 * (term_advection - term_dissipation)

@@ -5,13 +5,15 @@ import sys
 import json
 from types import SimpleNamespace
 from typing import Callable, Optional, Any
+from sympy.core.basic import Basic
+from collections.abc import Iterable
+import itertools
 
 import sympy as sp
 from sympy import MutableDenseNDimArray, tensorcontraction, tensorproduct
 
 from zoomy_core.misc.custom_types import FArray
 from zoomy_core.misc.logger_config import logger
-
 
 class ZArray(MutableDenseNDimArray):
     """
@@ -20,7 +22,7 @@ class ZArray(MutableDenseNDimArray):
     """
 
     def __new__(cls, iterable, *args, **kwargs):
-        # 1. Normalize Input (handle single outer ZArray/Matrix/Struct)
+        # 1. Normalize Input
         if hasattr(iterable, "tolist"):
             data = iterable.tolist()
         elif hasattr(iterable, "values") and callable(iterable.values):
@@ -34,23 +36,20 @@ class ZArray(MutableDenseNDimArray):
 
         flat_list = []
 
-        # 2. Recursive Flattening that recognizes Arrays as containers
+        # 2. Recursive Flattening
         def flatten_and_get_shape(item, current_depth=0, shape_acc=None):
             if shape_acc is None:
                 shape_acc = []
 
-            # --- FIX: Convert nested array-likes to lists ---
             if hasattr(item, "tolist"):
                 item = item.tolist()
             elif hasattr(item, "values") and callable(item.values):
                 item = list(item.values())
 
             if isinstance(item, (list, tuple)):
-                # Update shape inference
                 if current_depth >= len(shape_acc):
                     shape_acc.append(len(item))
                 elif shape_acc[current_depth] != len(item):
-                    # Optional: warning for ragged arrays
                     pass
 
                 for sub in item:
@@ -61,18 +60,15 @@ class ZArray(MutableDenseNDimArray):
 
         inferred_shape = tuple(flatten_and_get_shape(data))
 
-        # 3. Determine Final Shape
         final_shape = inferred_shape
         if args:
             final_shape = args[0]
         elif "shape" in kwargs:
             final_shape = kwargs["shape"]
 
-        # 4. Construct
         return super().__new__(cls, flat_list, final_shape, **kwargs)
 
     def _to_array(self, other):
-        """Helper to cast Zstruct, list, or scalar to a SymPy-compatible Array."""
         if hasattr(other, "values"):
             return sp.Array(list(other.values()))
         if isinstance(other, (list, tuple)):
@@ -82,18 +78,30 @@ class ZArray(MutableDenseNDimArray):
         return other
 
     def __matmul__(self, other):
-        """Matrix Multiplication (@ operator)."""
+        """
+        Matrix Multiplication (@).
+        Prioritizes robust Matrix Algebra if inputs are compatible.
+        """
+        # 1. Robust Matrix Path: If 'other' is a Matrix, use Matrix algebra
+        #    This fixes the (N,N) @ (N,1) crash by avoiding tensorcontraction
+        if isinstance(other, sp.MatrixBase) and self.rank() == 2:
+            return ZArray(self.tomatrix() @ other)
+
+        # 2. Tensor Path: Fallback for Arrays/Lists
         other_arr = self._to_array(other)
         if isinstance(other_arr, sp.NDimArray):
-            # Rank 2 @ Rank 1 -> Vector
+            # Rank 2 @ Rank 1 -> Vector (Contraction on last axis of self, first of other)
             if self.rank() == 2 and other_arr.rank() == 1:
                 return ZArray(tensorcontraction(tensorproduct(self, other_arr), (1, 2)))
-            # Rank 1 @ Rank 1 -> Scalar
+
+            # Rank 1 @ Rank 1 -> Scalar (Dot product)
             if self.rank() == 1 and other_arr.rank() == 1:
                 return tensorcontraction(tensorproduct(self, other_arr), (0, 1))
-            # Rank 2 @ Rank 2 -> Matrix
+
+            # Rank 2 @ Rank 2 -> Matrix (Standard Matrix Mult)
             if self.rank() == 2 and other_arr.rank() == 2:
                 return ZArray(tensorcontraction(tensorproduct(self, other_arr), (1, 2)))
+
         return NotImplemented
 
     def __sub__(self, other):
@@ -106,7 +114,6 @@ class ZArray(MutableDenseNDimArray):
         return self.__add__(other)
 
     def __rsub__(self, other):
-        # other - self
         return ZArray(sp.Array(self._to_array(other)) + (-1 * self))
 
     def tomatrix(self):
@@ -114,10 +121,93 @@ class ZArray(MutableDenseNDimArray):
             raise ValueError("Only rank-2 ZArrays can be converted to Matrix.")
         return sp.Matrix(self.tolist())
 
+    def __setitem__(self, index, value):
+        # 1. Determine if we are dealing with slices
+        has_slice = False
+        if isinstance(index, slice):
+            has_slice = True
+            index = (index,)
+        elif isinstance(index, tuple):
+            has_slice = any(isinstance(i, slice) for i in index)
+
+        # 2. Case A: Simple Integer Indexing (Scalar Assignment)
+        # This allows qauxL[0] = ... to work
+        if not has_slice:
+            idx = self._parse_index(index)
+            # Guard against assigning a list/array to a single slot
+            if isinstance(
+                value, (Iterable, sp.MatrixBase, sp.NDimArray)
+            ) and not isinstance(value, Basic):
+                raise ValueError("Cannot assign an iterable to a single ZArray slot.")
+            self._array[idx] = sp.sympify(value)
+            return
+
+        # 3. Case B: Slice Indexing
+        # This restores the functionality of JacF[:, :, d] = ...
+        shape = self.shape
+        ranges = []
+        for i, ind in enumerate(index if isinstance(index, tuple) else [index]):
+            if isinstance(ind, slice):
+                start, stop, step = ind.indices(shape[i])
+                ranges.append(range(start, stop, step))
+            else:
+                ranges.append([ind])
+
+        for i in range(len(ranges), len(shape)):
+            ranges.append(range(shape[i]))
+
+        target_coords = list(itertools.product(*ranges))
+
+        # Prepare the values to be assigned
+        if isinstance(
+            value, (Iterable, sp.MatrixBase, sp.NDimArray)
+        ) and not isinstance(value, Basic):
+            # --- CRITICAL FIX: Ensure value is flattened to scalars ---
+
+            if isinstance(value, sp.NDimArray):
+                # SymPy Arrays (and ZArray) store data flat in _array. Use that.
+                # list(value) returns sub-arrays (rows), which caused the size mismatch.
+                val_list = list(value._array)
+
+            elif isinstance(value, sp.MatrixBase):
+                # SymPy Matrices iterate flat by default
+                val_list = list(value)
+
+            elif hasattr(value, "flat"):
+                # NumPy arrays
+                val_list = list(value.flat)
+
+            else:
+                # Fallback for nested lists: Recursive flatten
+                val_list = []
+
+                def smooth(v):
+                    for elt in v:
+                        if isinstance(elt, (list, tuple, sp.NDimArray)):
+                            smooth(elt)
+                        else:
+                            val_list.append(elt)
+
+                smooth(value)
+
+            # Validate size
+            if len(val_list) != len(target_coords):
+                raise ValueError(
+                    f"Source value length ({len(val_list)}) does not match slice size ({len(target_coords)})"
+                )
+
+            # Assign
+            for coord, val in zip(target_coords, val_list):
+                self._array[self._parse_index(coord)] = sp.sympify(val)
+        else:
+            # Broadcast scalar
+            sym_val = sp.sympify(value)
+            for coord in target_coords:
+                self._array[self._parse_index(coord)] = sym_val
+
     @property
     def flat(self):
         return list(self)
-
 
 def get_main_directory():
     # 1. Environment variable overrides everything
