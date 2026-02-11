@@ -44,7 +44,7 @@ def get_nested_shape(expr):
 
 
 # =========================================================================
-#  2. GENERIC BASE (Simple, No Layout Magic)
+#  2. GENERIC BASE
 # =========================================================================
 
 
@@ -183,7 +183,6 @@ class GenericCppBase(CXX11CodePrinter):
                         call_cache[label] = sym
                         definitions.append((sym, label))
                     return sp.Indexed(call_cache[label], *node.indices)
-
             if isinstance(node, sp.Function):
                 name = node.func.__name__
                 if name not in self.c_functions:
@@ -205,7 +204,6 @@ class GenericCppBase(CXX11CodePrinter):
                 lambda x: isinstance(x, (sp.Indexed, sp.Function)), replace_logic
             )
             new_exprs.append(new_e)
-
         return definitions, new_exprs
 
     def convert_expression_body(self, expr, shape, target="res"):
@@ -218,15 +216,10 @@ class GenericCppBase(CXX11CodePrinter):
             if isinstance(expr, sp.Matrix)
             else [expr]
         )
-
-        # 1. Extract Calls
         call_defs, optim_exprs = self._optimize_array_calls(flat_expr)
-
-        # 2. Extract Arguments
         arg_defs = []
         clean_call_defs = []
         arg_cache = {}
-
         for call_sym, call_expr in call_defs:
             new_args = []
             for arg in call_expr.args:
@@ -239,25 +232,20 @@ class GenericCppBase(CXX11CodePrinter):
                 else:
                     new_args.append(arg)
             clean_call_defs.append((call_sym, call_expr.func(*new_args)))
-
         lines = []
         tmp_sym_gen = sp.numbered_symbols("t")
-
-        # --- STAGE A: COMPUTE INPUTS ---
         arg_cse_inputs = []
         arg_sizes = {}
         for sym, arr in arg_defs:
             flat_arr = list(sp.flatten(arr))
             arg_cse_inputs.extend(flat_arr)
             arg_sizes[sym] = len(flat_arr)
-
         if arg_cse_inputs:
             temps_args, simplified_args = sp.cse(arg_cse_inputs, symbols=tmp_sym_gen)
             for lhs, rhs in temps_args:
                 lines.append(
                     f"{self.real_type} {self.doprint(lhs)} = {self.doprint(rhs)};"
                 )
-
             offset = 0
             for sym, _ in arg_defs:
                 size = arg_sizes[sym]
@@ -267,24 +255,18 @@ class GenericCppBase(CXX11CodePrinter):
                 lines.append(
                     f"{self.real_type} {self.doprint(sym)}[] = {{ {init_str} }};"
                 )
-
-        # --- STAGE B: EXECUTE CALLS ---
         for sym, call in clean_call_defs:
             lines.append(f"auto {self.doprint(sym)} = {self.doprint(call)};")
-
-        # --- STAGE C: COMPUTE OUTPUTS ---
         if optim_exprs:
             temps_res, simplified_res = sp.cse(optim_exprs, symbols=tmp_sym_gen)
             for lhs, rhs in temps_res:
                 lines.append(
                     f"{self.real_type} {self.doprint(lhs)} = {self.doprint(rhs)};"
                 )
-
             total_size = 1
             for s in shape:
                 total_size *= s
             lines.append(f"SimpleArray<T, {total_size}> {target};")
-
             result_array = sp.Array(simplified_res).reshape(*shape)
             ranges = [range(s) for s in shape]
             for indices in itertools.product(*ranges):
@@ -296,7 +278,6 @@ class GenericCppBase(CXX11CodePrinter):
             for s in shape:
                 total_size *= s
             lines.append(f"SimpleArray<T, {total_size}> {target} = {{0}};")
-
         lines.append(f"return {target};")
         return "\n".join(["    " + line for line in lines])
 
@@ -479,21 +460,29 @@ class GenericCppModel(GenericCppBase):
         for name, func_obj in self.model.functions.items():
             blocks.extend(self._process_kernel_from_function(func_obj))
 
-        bc_wrapper = self.model.boundary_conditions.get_boundary_condition_function(
-            self.model.time,
-            self.model.position,
-            self.model.distance,
-            self.model.variables,
-            self.model.aux_variables,
-            self.model.parameters,
-            self.model.normal,
-        )
+        # Shared arguments for BC functions
         bc_args = "const int bc_idx,\n        const T* Q,\n        const T* Qaux,\n        const T* n,\n        const T* X,\n        const T time,\n        const T dX"
+
+        # 1. Main Boundary Conditions
+        bc_wrapper = self.model._boundary_conditions
         shape, expr = get_nested_shape(bc_wrapper.definition)
         body = self.convert_expression_body(expr, shape)
         blocks.extend(
             [self.wrap_function_signature("boundary_conditions", bc_args, body, shape)]
         )
+
+        # 2. Aux Boundary Conditions
+        bc_aux_wrapper = self.model._aux_boundary_conditions
+        shape_aux, expr_aux = get_nested_shape(bc_aux_wrapper.definition)
+        body_aux = self.convert_expression_body(expr_aux, shape_aux)
+        blocks.extend(
+            [
+                self.wrap_function_signature(
+                    "aux_boundary_conditions", bc_args, body_aux, shape_aux
+                )
+            ]
+        )
+
         blocks.append(self.get_file_footer())
         return "\n".join(blocks)
 
@@ -502,17 +491,14 @@ class GenericCppModel(GenericCppBase):
             self.model.boundary_conditions.boundary_conditions_list_dict.keys()
         )
         bc_str = ", ".join(f'"{item}"' for item in bc_names)
-
         param_keys = list(self.model.parameters.keys())
         param_vals = list(self.model.parameter_values)
         if len(param_keys) != len(param_vals):
             raise ValueError(
                 f"Parameter keys {param_keys} and values values {param_vals} do not match"
             )
-
         p_names_str = ", ".join(f'"{k}"' for k in param_keys)
         p_vals_str = ", ".join(f"{k}" for k in param_vals)
-
         tpl = "template <typename T>" if self._is_template_class else ""
         lines = [
             "#pragma once",
@@ -523,7 +509,6 @@ class GenericCppModel(GenericCppBase):
             "#include <algorithm>",
             "",
         ]
-
         if self.gpu_enabled:
             lines.extend(
                 [
@@ -537,7 +522,6 @@ class GenericCppModel(GenericCppBase):
             )
         else:
             lines.append("#define PORTABLE_FN")
-
         lines.extend(
             [
                 tpl,
@@ -609,7 +593,6 @@ class GenericCppNumerics(GenericCppBase):
             "#include <algorithm>",
             "",
         ]
-
         if self.gpu_enabled:
             lines.extend(
                 [
@@ -623,7 +606,6 @@ class GenericCppNumerics(GenericCppBase):
             )
         else:
             lines.append("#define PORTABLE_FN")
-
         lines.extend(
             [
                 tpl,
@@ -643,10 +625,6 @@ class GenericCppNumerics(GenericCppBase):
 
 
 class CppModel(GenericCppModel):
-    """
-    Configuration wrapper for Model C++ generation.
-    """
-
     _output_subdir = ".c_interface"
     _is_template_class = True
 
@@ -657,10 +635,6 @@ class CppModel(GenericCppModel):
 
 
 class CppNumerics(GenericCppNumerics):
-    """
-    Configuration wrapper for Numerics C++ generation.
-    """
-
     _output_subdir = ".c_interface"
     _is_template_class = True
 
