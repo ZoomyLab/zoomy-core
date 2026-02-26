@@ -33,6 +33,9 @@ class ModelAnalyser:
         return self.equations
 
     def print_equations(self):
+        if not self.equations:
+            print("No equations generated.")
+            return
         latex_lines = " \\\\\n".join([f"& {latex(eq)}" for eq in self.equations])
         latex_block = r"$$\begin{align*}" + "\n" + latex_lines + r"\end{align*}$$"
         display(Latex(latex_block))
@@ -65,44 +68,37 @@ class ModelAnalyser:
             self.equations[i] for i in range(len(self.equations)) if i not in indices
         ]
 
-    def solve_for_constraints(self, list_of_selected_equations, list_of_variables):
-        equations = self.equations
-        sol = solve(
-            [equations[i] for i in list_of_selected_equations], list_of_variables
-        )
-        equations = [eq.xreplace(sol).doit() for eq in equations]
-        # delete used equations from equation system
-        equations = [
-            equations[i]
-            for i in range(len(equations))
-            if i not in list_of_selected_equations
-        ]
-        self.equations = equations
-        return sol
-
     def insert_plane_wave_ansatz(self, functions_to_replace):
+        """
+        Apply the ansatz to ALL variables passed in the list.
+        """
         exponential = self._get_exponential()
         f_bar_dict = {}
-        for f in functions_to_replace:
-            # Create the base name (e.g., 'f0')
-            f_name = str(f.func)  # Get the function name (e.g., 'f0')
+        self.plane_wave_symbols = []
 
-            # Create a new symbol representing \bar{f0}
+        for f in functions_to_replace:
+            f_name = str(f.func)
             f_bar = Symbol(r"\bar{" + f_name + "}")
             f_bar_dict[f] = f_bar * exponential
             self.plane_wave_symbols.append(f_bar)
+
         self.equations = [eq.xreplace(f_bar_dict).doit() for eq in self.equations]
 
     def solve_for_dispersion_relation(self):
-        assert self.equations is not None, (
-            "No equations available to solve for dispersion relation."
-        )
-        assert self.plane_wave_symbols, (
-            "No plane wave symbols available to solve for dispersion relation. Use insert_plane_wave_ansatz first."
-        )
+        assert self.equations is not None
+        assert self.plane_wave_symbols, "No plane wave symbols defined."
+
         A, rhs = linear_eq_to_matrix(self.equations, self.plane_wave_symbols)
-        omega, kx, ky, kz = self._get_omega_k()
-        sol = solve(A.det(), omega)
+
+        if A.rows != A.cols:
+            print(
+                f"Warning: System is {A.rows}x{A.cols}. Determinant requires a square matrix."
+            )
+            return []
+
+        omega = symbols("omega")
+        # Berkowitz is generally faster for these types of symbolic matrices
+        sol = solve(A.det(method="berkowitz"), omega)
         return sol
 
     def remove_exponential(self):
@@ -113,7 +109,16 @@ class ModelAnalyser:
         ]
         self.equations = equations
 
-    def linearize_system(self, q, qaux, constraints=None):
+    def linearize_system(self, q, qaux, source=None, constraints=None):
+        """
+        Linearize the system given the state vectors q and qaux.
+
+        Args:
+            q: State vector (prognostic variables)
+            qaux: Auxiliary state vector
+            source: (Optional) The source term vector S. If None, S=0.
+            constraints: (Optional) The constraint vector C. If None, C=empty.
+        """
         model = self.model
         t, x, y, z = self.get_time_space()
         dim = model.dimension
@@ -125,50 +130,48 @@ class ModelAnalyser:
         substitutions = {Q[i]: q[i] for i in range(len(q))}
         substitutions.update({Qaux[i]: qaux[i] for i in range(len(qaux))})
 
-        # --- FIX START ---
-        # The quasilinear matrix A is likely an immutable NDimArray/ZArray of shape (n, n, dim).
-        # We cannot modify it in place using A[d] = ...
-        # Instead, we slice it and convert each slice to a mutable Matrix.
+        # 1. Quasilinear Matrix (Flux Jacobian)
         A_raw = model.quasilinear_matrix()
         A_matrices = []
         for d in range(dim):
-            # Extract the 2D matrix for dimension d using array slicing
-            mat = Matrix(A_raw[:, :, d])
-            # Apply substitutions immediately
+            mat = Matrix(A_raw[:, :, d])  # Handle immutable arrays
             mat = mat.xreplace(substitutions)
             A_matrices.append(mat)
 
-        # Residual S might be an immutable ZArray. Convert to Matrix.
-        S = model.residual()
-        S = Matrix(S).xreplace(substitutions)
+        # 2. Source Terms (Optional)
+        if source is not None:
+            S = Matrix(source)  # Handle immutable arrays
+            S = S.xreplace(substitutions)
+        else:
+            S = zeros(len(q), 1)
 
-        # Constraints C might be an immutable ZArray. Convert to Matrix.
+        # 3. Constraints (Optional)
         if constraints is not None:
             C = Matrix(constraints)
+            C = C.xreplace(substitutions)
+            C = C.doit()
         else:
             C = zeros(0, 1)
-        # --- FIX END ---
-
-        # C substitutions
-        C = C.xreplace(substitutions)
-        C = C.doit()
 
         gradQ = Matrix(
             [diff(q[i], X[j]) for i in range(len(q)) for j in range(dim)]
         ).reshape(len(q), dim)
 
-        # Use the prepared list of matrices A_matrices
         AgradQ = A_matrices[0] * gradQ[:, 0]
         for d in range(1, dim):
             AgradQ += A_matrices[d] * gradQ[:, d]
 
-        # S and C are now valid Matrices, so vstack works
+        # 4. Assemble: Dynamics (lhs + flux - source) stacked on Constraints
         expr = list(Matrix.vstack((diff(q, t) + AgradQ - S), C))
+
+        # Cleanup and Linearization
         for i in range(len(expr)):
             expr[i] = nsimplify(expr[i], rational=True)
+
         expr = Matrix(expr)
         eps = self.get_eps()
         res = expr.copy()
+
         for i, e in enumerate(expr):
             collected = e
             collected = collected.series(eps, 0, 2).removeO()
@@ -183,3 +186,35 @@ class ModelAnalyser:
         linearized_system = [Eq((res[i]), 0) for i in range(res.shape[0])]
 
         self.equations = linearized_system
+        return self.equations
+    
+    def solve_for_constraints(self, list_of_selected_equations, list_of_variables):
+        """
+        Manually solve specific equations for specific variables and substitute
+        the results into the remaining system.
+
+        Args:
+            list_of_selected_equations: Indices of equations to solve (e.g., [3, 4, 7])
+            list_of_variables: Variables to solve for (e.g., [p0, p1, w2])
+        """
+        equations = self.equations
+
+        # 1. Solve the selected equations for the selected variables
+        # Note: solve returns a dictionary {variable: expression}
+        subset_eqs = [equations[i] for i in list_of_selected_equations]
+        sol = solve(subset_eqs, list_of_variables)
+
+        # 2. Substitute these solutions into ALL equations
+        # .xreplace is generally faster/safer than .subs for exact structural matches
+        equations = [eq.xreplace(sol).doit() for eq in equations]
+
+        # 3. Delete the equations we just used
+        # We keep only the equations whose indices were NOT in the selected list
+        equations = [
+            equations[i]
+            for i in range(len(equations))
+            if i not in list_of_selected_equations
+        ]
+
+        self.equations = equations
+        return sol
