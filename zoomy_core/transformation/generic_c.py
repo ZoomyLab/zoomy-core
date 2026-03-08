@@ -206,6 +206,25 @@ class GenericCppBase(CXX11CodePrinter):
             new_exprs.append(new_e)
         return definitions, new_exprs
 
+    def get_array_type(self, shape):
+        """Returns the C++ type string for the array."""
+        total_size = 1
+        for s in shape:
+            total_size *= s
+        return f"SimpleArray<T, {total_size}>"
+
+    def get_array_declaration(self, target_name, shape, init_zero=False):
+        """Returns the C++ declaration string for the array."""
+        arr_type = self.get_array_type(shape)
+        if init_zero:
+            return f"{arr_type} {target_name} = {{0}};"
+        return f"{arr_type} {target_name};"
+
+    def format_array_initialization(self, sym_name, elements):
+        """Hook to format how local argument arrays are initialized."""
+        init_str = ", ".join([self.doprint(e) for e in elements])
+        return f"{self.real_type} {sym_name}[] = {{ {init_str} }};"
+
     def convert_expression_body(self, expr, shape, target="res"):
         if isinstance(expr, sp.Piecewise):
             return self._print_piecewise_structure(expr, shape, target)
@@ -251,9 +270,8 @@ class GenericCppBase(CXX11CodePrinter):
                 size = arg_sizes[sym]
                 elements = simplified_args[offset : offset + size]
                 offset += size
-                init_str = ", ".join([self.doprint(e) for e in elements])
                 lines.append(
-                    f"{self.real_type} {self.doprint(sym)}[] = {{ {init_str} }};"
+                    self.format_array_initialization(self.doprint(sym), elements)
                 )
         for sym, call in clean_call_defs:
             lines.append(f"auto {self.doprint(sym)} = {self.doprint(call)};")
@@ -266,18 +284,18 @@ class GenericCppBase(CXX11CodePrinter):
             total_size = 1
             for s in shape:
                 total_size *= s
-            lines.append(f"SimpleArray<T, {total_size}> {target};")
+            lines.append(self.get_array_declaration(target, shape, init_zero=False))
             result_array = sp.Array(simplified_res).reshape(*shape)
             ranges = [range(s) for s in shape]
             for indices in itertools.product(*ranges):
                 val = self.doprint(result_array[indices])
                 idx = flatten_index(indices, shape)
-                lines.append(f"{target}[{idx}] = {val};")
+                lines.append(self.format_assignment(target, indices, val, shape))
         else:
             total_size = 1
             for s in shape:
                 total_size *= s
-            lines.append(f"SimpleArray<T, {total_size}> {target} = {{0}};")
+            lines.append(self.get_array_declaration(target, shape, init_zero=True))
         lines.append(f"return {target};")
         return "\n".join(["    " + line for line in lines])
 
@@ -303,7 +321,8 @@ class GenericCppBase(CXX11CodePrinter):
         total_size = 1
         for s in shape:
             total_size *= s
-        lines.append(f"    SimpleArray<T, {total_size}> default_{target} = {{0}};")
+        decl = self.get_array_declaration(f"default_{target}", shape, init_zero=True)
+        lines.append(f"    {decl}")
         lines.append(f"    return default_{target};")
         return "\n".join(lines)
 
@@ -380,10 +399,8 @@ struct SimpleArray {
 
     def wrap_function_signature(self, name, args_str, body_str, shape):
         qualifier = "PORTABLE_FN " if self.gpu_enabled else ""
-        total_size = 1
-        for s in shape:
-            total_size *= s
-        return f"""    {qualifier}static inline SimpleArray<T, {total_size}> {name}(
+        arr_type = self.get_array_type(shape)
+        return f"""    {qualifier}static inline {arr_type} {name}(
         {args_str})
     {{
 {body_str}
@@ -445,9 +462,7 @@ class GenericCppModel(GenericCppBase):
         self.register_map("n", model.normal.values())
         if hasattr(model, "position"):
             self.register_map("X", model.position.values())
-        self.symbol_maps.append(
-            {k: f"p[{i}]" for i, k in enumerate(model.parameters.values())}
-        )
+        self.register_map("p", self.model.parameters.values())
 
     @classmethod
     def write_code(cls, model, settings, filename="Model.H"):
@@ -461,7 +476,7 @@ class GenericCppModel(GenericCppBase):
             blocks.extend(self._process_kernel_from_function(func_obj))
 
         # Shared arguments for BC functions
-        bc_args = "const int bc_idx,\n        const T* Q,\n        const T* Qaux,\n        const T* n,\n        const T* X,\n        const T time,\n        const T dX"
+        bc_args = self.get_bc_args()
 
         # 1. Main Boundary Conditions
         bc_wrapper = self.model._boundary_conditions
@@ -540,6 +555,10 @@ class GenericCppModel(GenericCppBase):
     def get_file_footer(self):
         return "};\n"
 
+    def get_bc_args(self):
+        """Hook to define boundary condition arguments."""
+        return "const int bc_idx,\n        const T* Q,\n        const T* Qaux,\n        const T* n,\n        const T* X,\n        const T time,\n        const T dX"
+
 
 # =========================================================================
 #  4. GENERIC NUMERICS (Clean)
@@ -555,6 +574,7 @@ class GenericCppNumerics(GenericCppBase):
         self.model = numerics.model
         self.gpu_enabled = gpu_enabled
         self.n_dof_q = self.model.n_variables
+        self.n_dof_qaux = self.model.n_aux_variables
         self.register_map("Q", self.model.variables.values())
         self.register_map("Qaux", self.model.aux_variables.values())
         self.register_map("n", self.model.normal.values())
@@ -565,9 +585,7 @@ class GenericCppNumerics(GenericCppBase):
         self.register_map("flux_minus", numerics.flux_minus)
         self.register_map("flux_plus", numerics.flux_plus)
         self.register_map("source_term", numerics.source_term)
-        self.symbol_maps.append(
-            {k: f"p[{i}]" for i, k in enumerate(self.model.parameters.values())}
-        )
+        self.register_map("p", self.model.parameters.values())
 
     @classmethod
     def write_code(cls, numerics, settings, filename="Numerics.H", gpu_enabled=False):
