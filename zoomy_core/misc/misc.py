@@ -382,7 +382,7 @@ class Settings(Zstruct):
         for key, val in defaults.items():
             if not output.contains(key):
                 logger.warning(
-                    f"No '{key}' attribute found in output Zstruct. Default: '{val}'"
+                    f"No '{key}' attribute found in Settings.output Zstruct. Default: '{val}'"
                 )
                 setattr(output, key, val)
 

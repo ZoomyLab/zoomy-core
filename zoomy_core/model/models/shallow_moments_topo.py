@@ -16,11 +16,8 @@ class ShallowMomentsTopo(Model):
     State vector: Q = [b, h, alpha_0...k, beta_0...k (if 2D)].
     """
 
-    # --- 1. System Configuration (Params) ---
     level = param.Integer(default=0)
 
-    # FIX: Use class_=Basisfunction with is_instance=False.
-    # This means: "The value must be a class that inherits from Basisfunction"
     basis_type = param.ClassSelector(
         class_=Basisfunction, default=Legendre_shifted, is_instance=False
     )
@@ -36,8 +33,8 @@ class ShallowMomentsTopo(Model):
         if init_functions:
             self._initialize_functions()
 
-    # --- 2. Dynamic Properties ---
-
+    # --- Dynamic Properties ---
+    
     def _compute_variable_count(self):
         # b(1) + h(1) + dim * (level + 1)
         return 2 + self.dimension * (self.level + 1)
@@ -79,7 +76,6 @@ class ShallowMomentsTopo(Model):
         """
 
         # A. Setup Basis Functions & Matrices
-        # FIX: Use 'self.basisfunctions' as the name, as expected by project_2d_to_3d
         self.basisfunctions = self.basis_type(level=self.level)
         self.basismatrices = Basismatrices(self.basisfunctions)
         self.basismatrices.compute_matrices(self.level)

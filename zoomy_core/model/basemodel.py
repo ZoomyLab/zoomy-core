@@ -34,6 +34,8 @@ def parse_definition_to_zstruct(definition, prefix="q_"):
                 if constraint == "positive":
                     assumptions["positive"] = True
             attributes[str(name)] = sp.Symbol(str(name), **assumptions)
+    elif isinstance(definition, Zstruct):
+        return parse_definition_to_zstruct(definition.as_dict(), prefix=prefix)
 
     return Zstruct(**attributes)
 
@@ -49,6 +51,10 @@ def extract_parameter_defaults(definition):
                     defaults[name] = val[0]
             else:
                 defaults[name] = 0.0
+    elif isinstance(definition, Zstruct):
+        return extract_parameter_defaults(definition.as_dict())
+    else:
+        assert False
     return defaults
 
 
