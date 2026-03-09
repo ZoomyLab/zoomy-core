@@ -40,6 +40,41 @@ class AmrexCore:
         # Print the arguments recursively
         args_str = ", ".join(map(self._print, expr.args))
         return f"{name}({args_str})"
+    
+    def _print_Symbol(self, s):
+        """Overrides symbol printing to match by string name, bypassing SymPy assumptions."""
+        s_name = s.name
+        
+        # --- FIX: Map SymPy's 't' directly to AMReX's 'time' ---
+        if s_name == "t":
+            return "time"
+            
+        for m in self.symbol_maps:
+            for sym, val in m.items():
+                # Compare string names safely
+                if hasattr(sym, "name") and sym.name == s_name:
+                    return val
+                elif str(sym) == s_name:
+                    return val
+        return super()._print_Symbol(s)
+
+    def doprint(self, expr, **settings):
+        code = super().doprint(expr, **settings)
+        # AMReX uses std::pow for floating point powers
+        code = code.replace("amrex::Math::pow(", "std::pow(")
+        # AMReX min/max are in the amrex namespace, not amrex::Math
+        code = code.replace("amrex::Math::max(", "amrex::max(")
+        code = code.replace("amrex::Math::min(", "amrex::min(")
+        # SymPy's Abs generates fabs, AMReX prefers std::abs
+        code = code.replace("amrex::Math::fabs(", "std::abs(")
+        
+        # --- FIX: Map standard trigonometric functions to std:: ---
+        code = code.replace("amrex::Math::cos(", "std::cos(")
+        code = code.replace("amrex::Math::sin(", "std::sin(")
+        code = code.replace("amrex::Math::tan(", "std::tan(")
+        code = code.replace("amrex::Math::exp(", "std::exp(")
+        
+        return code
 
     def get_includes(self):
         return """#include <AMReX_Array4.H>
@@ -52,15 +87,12 @@ class AmrexCore:
 
     def get_array_type(self, shape):
         """Hook to use amrex::SmallMatrix natively for all mathematical arrays."""
-        if len(shape) == 1:
-            rows, cols = shape[0], 1
-        elif len(shape) == 2:
-            rows, cols = shape[0], shape[1]
-        else:
-            total_size = functools.reduce(lambda x, y: x * y, shape)
-            rows, cols = total_size, 1
-
-        return f"amrex::SmallMatrix<{self.real_type},{rows},{cols}>"
+        import functools
+        total_size = functools.reduce(lambda x, y: x * y, shape)
+        
+        # ALWAYS force a flat column vector! 
+        # This perfectly safely matches the res(k, 0) SymPy assignment generation.
+        return f"amrex::SmallMatrix<{self.real_type},{total_size},1>"
 
     def get_array_declaration(self, target_name, shape, init_zero=False):
         """Hook to declare amrex::SmallMatrix variables correctly."""

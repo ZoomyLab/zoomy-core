@@ -204,6 +204,13 @@ class ZArray(MutableDenseNDimArray):
             sym_val = sp.sympify(value)
             for coord in target_coords:
                 self._array[self._parse_index(coord)] = sym_val
+                
+    def flatten(self):
+        """
+        Flattens the N-dimensional array into a 1D ZArray.
+        Uses the internal _array list which is inherently flat in SymPy NDimArrays.
+        """
+        return ZArray(list(self._array))
 
     @property
     def flat(self):

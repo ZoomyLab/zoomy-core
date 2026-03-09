@@ -114,6 +114,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
 
         self.n_variables = self.variables.length()
         self.n_aux_variables = self.aux_variables.length()
+        self.n_parameters = self.parameters.length()
 
         self.time, self.distance = sp.symbols("t dX", real=True)
         self.position = parse_definition_to_zstruct(3, "X")
@@ -153,6 +154,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
         regs = [
             ("flux", self.flux, std_sig),
             ("dflux", self.dflux, std_sig),
+            ("hydrostatic_pressure", self.hydrostatic_pressure, std_sig),
             ("nonconservative_matrix", self.nonconservative_matrix, std_sig),
             ("quasilinear_matrix", self.quasilinear_matrix, std_sig),
             ("eigenvalues", self.eigenvalues, eig_sig),
@@ -263,6 +265,9 @@ class Model(param.Parameterized, SymbolicRegistrar):
 
     def dflux(self):
         return ZArray.zeros(self.n_variables, self.dimension)
+    
+    def hydrostatic_pressure(self):
+        return ZArray.zeros(self.n_variables, self.dimension)
 
     def nonconservative_matrix(self):
         return ZArray.zeros(self.n_variables, self.n_variables, self.dimension)
@@ -314,7 +319,10 @@ class Model(param.Parameterized, SymbolicRegistrar):
         JacF = ZArray(sp.derive_by_array(self.flux(), self.variables.get_list()))
         for d in range(self.dimension):
             JacF[:, :, d] = ZArray(JacF[:, :, d].tomatrix().T)
-        return self._simplify(JacF + self.nonconservative_matrix())
+        JacP = ZArray(sp.derive_by_array(self.hydrostatic_pressure(), self.variables.get_list()))
+        for d in range(self.dimension):
+            JacP[:, :, d] = ZArray(JacP[:, :, d].tomatrix().T)
+        return self._simplify(JacF + JacP + self.nonconservative_matrix())
 
     def source_jacobian_wrt_variables(self):
         if self.disable_differentiation:
@@ -346,3 +354,4 @@ class Model(param.Parameterized, SymbolicRegistrar):
 
     def right_eigenvectors(self):
         return ZArray.zeros(self.n_variables, self.n_variables)
+    
