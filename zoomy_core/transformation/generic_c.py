@@ -457,6 +457,7 @@ class GenericCppModel(GenericCppBase):
         self.model = model
         self.n_dof_q = model.n_variables
         self.n_dof_qaux = model.n_aux_variables
+        self.n_parameters = model.n_parameters
         self.register_map("Q", model.variables.values())
         self.register_map("Qaux", model.aux_variables.values())
         self.register_map("n", model.normal.values())
@@ -543,6 +544,7 @@ class GenericCppModel(GenericCppBase):
                 f"struct {self._wrapper_name} {{",
                 f"    static constexpr int n_dof_q    = {self.n_dof_q};",
                 f"    static constexpr int n_dof_qaux = {self.n_dof_qaux};",
+                f"    static constexpr int n_parameters = {self.n_parameters};",
                 f"    static constexpr int dimension  = {self.model.dimension};",
                 f"    static constexpr int n_boundary_tags = {len(bc_names)};",
                 f"    static const std::vector<std::string> get_boundary_tags() {{ return {{ {bc_str} }}; }}",

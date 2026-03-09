@@ -144,7 +144,7 @@ class ShallowMomentsTopo(Model):
 
         # --- X-Flux (Column 0) ---
         F[1, 0] = h * alpha[0]
-        F[2, 0] = p.g * p.ez * h**2 / 2
+        # F[2, 0] = p.g * p.ez * h**2 / 2
         for k in range(lvl + 1):
             for i in range(lvl + 1):
                 for j in range(lvl + 1):
@@ -167,8 +167,8 @@ class ShallowMomentsTopo(Model):
             # --- Y-Flux (Column 1) ---
             F[1, 1] = h * beta[0]
             # Pressure part for Y-momentum
-            F[2 + offset, 1] = p.g * p.ez * h**2 / 2
-
+            # F[2 + offset, 1] = p.g * p.ez * h**2 / 2 / M_basis[]
+# 
             # Y-momentum flux (transport of v by v)
             for k in range(lvl + 1):
                 for i in range(lvl + 1):
@@ -186,6 +186,28 @@ class ShallowMomentsTopo(Model):
                         )
 
         return ZArray(F)
+    
+    def hydrostatic_pressure(self):
+        dim = self.dimension
+        p = self.parameters
+        lvl = self.level
+        n_vars = self.n_variables
+        A_basis = self.basismatrices.A
+        M_basis = self.basismatrices.M
+
+        b, h, moments, hinv = self.get_primitives()
+        alpha = moments[0]
+        beta = moments[1]
+
+        F = Matrix.zeros(n_vars, dim)
+
+        # --- X-Flux (Column 0) ---
+        F[2, 0] = p.g * p.ez * h**2 / 2
+        if dim == 2:
+            offset = lvl+ 1
+            F[2 + offset, 1] = p.g * p.ez * h**2 / 2
+        return ZArray(F)
+    
 
     def nonconservative_matrix(self):
         """
@@ -326,6 +348,32 @@ class ShallowMomentsTopo(Model):
                 if self.dimension == 2:
                     term_y = (
                         -1.0 / p.lamda / p.rho * beta[i] / self.basismatrices.M[k, k]
+                    )
+                    out[2 + k + offset] += term_y
+        return out
+    
+    def surface_friction(self):
+        # Navier-slip boundary condition
+        p = self.parameters
+        out = Matrix.zeros(self.n_variables, 1)
+        b, h, moments, hinv = self.get_primitives()
+        alpha = moments[0]
+        beta = moments[1]
+        offset = self.level + 1
+        phi_s = [self.basisfunctions.eval(k, 1.) for k in range(self.level + 1)]
+        friction = self.aux_variables[1]
+        
+        us = sum([alpha[i] * phi_s[i] for i in range(len(alpha))])  
+        vs = sum([beta[i] * phi_s[i] for i in range(len(alpha))]) if self.dimension == 2 else 0
+
+        for k in range(1 + self.level):
+            for i in range(1 + self.level):
+                term_x = -1.0 * friction / p.rho * us * phi_s[k] / self.basismatrices.M[k, k]
+                out[2 + k] += term_x
+
+                if self.dimension == 2:
+                    term_y = (
+                        -1.0 * friction / p.rho * vs * phi_s[k]  / self.basismatrices.M[k, k]
                     )
                     out[2 + k + offset] += term_y
         return out
