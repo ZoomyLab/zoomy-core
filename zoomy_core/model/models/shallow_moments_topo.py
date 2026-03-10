@@ -185,7 +185,7 @@ class ShallowMomentsTopo(Model):
                             h * alpha[i] * beta[j] * A_basis[k, i, j] / M_basis[k, k]
                         )
 
-        return ZArray(F)
+        return (ZArray(F))
     
     def hydrostatic_pressure(self):
         dim = self.dimension
@@ -283,7 +283,7 @@ class ShallowMomentsTopo(Model):
                 if dim > 1:
                     A_tensor[r, c, 1] = nc_y[r, c]
 
-        return ZArray(A_tensor)
+        return (ZArray(A_tensor))
 
     def source(self):
         return Matrix.zeros(self.n_variables, 1)
@@ -569,6 +569,14 @@ class ShallowMomentsTopo(Model):
 
         return out
     
+    def _regularize(self, expr):
+        if self.level > 1:
+            b, h, moments, hinv = self.get_primitives()
+            for d in range(self.dimension):
+                for i in range(2, self.level + 1):
+                    expr = expr.subs(moments[d][i], 0)
+        return expr
+    
     def _eigenvalues(self, A):
 
         b, h, moments, hinv = self.get_primitives()
@@ -577,11 +585,8 @@ class ShallowMomentsTopo(Model):
         for d in range(self.dimension):
             An[:, :] += A[:, :, d] * n[d]
         An = An.tomatrix()
-        if self.level > 1:
-            for d in range(self.dimension):
-                for i in range(2, self.level + 1):
-                    An = An.subs(moments[d][i], 0)
-
+        An = self._regularize(An)
+                    
         lam = sp.Symbol("lam")
         char_poly = An.charpoly(lam)
 
@@ -610,6 +615,7 @@ class ShallowMomentsTopo(Model):
         #     offset = self.level + 1
         #     A[2 + offset, 0, 1] += p.ez * p.g * h
         evs = self._eigenvalues(A)
+        # evs = self._primitive_eigenvalues()
         return evs
 
     
@@ -628,7 +634,9 @@ class ShallowMomentsTopo(Model):
                 cons_var += [moments[d][i] * h]
                 primi_var += [moments[d][i]]
         
-        M = sp.Matrix(sp.derive_by_array(cons_var, primi_var))
+        primi_var = [primi_var]
+        cons_var = [cons_var]
+        M = sp.Matrix(sp.derive_by_array(ZArray(cons_var).tomatrix(), ZArray(primi_var).tomatrix()))
 
 
         # Using base implementation (symbolic):
@@ -695,9 +703,13 @@ class NumericalShallowMomentsTopo(ShallowMomentsTopo):
 
     def eigenvalues(self):
         b, h, moments, hinv = self.get_primitives()
-        analytical_model = ShallowMomentsTopo(level=self.level, dimension=self.dimension, basis_type=self.basis_type)
-        evs = analytical_model.eigenvalues()
+        # analytical_model = ShallowMomentsTopo(level=self.level, dimension=self.dimension, basis_type=self.basis_type)
+        analytical_model = ShallowMomentsTopo(level=1, dimension=self.dimension, basis_type=self.basis_type)
+        evs = analytical_model.functions.eigenvalues.definition
         eps = self.parameters.eps
-        return conditional(h > eps, evs, ZArray.zeros(self.n_variables))
+        evs_all = ZArray.zeros(self.n_variables)
+        for i, ev in enumerate(evs):
+            evs_all[i] = ev
+        return conditional(h > eps, evs_all, ZArray.zeros(self.n_variables))
         # evs = sp.Matrix(evs).subs(h, (h+eps))
         # return ZArray([ev for ev in evs])

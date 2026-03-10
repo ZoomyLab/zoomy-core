@@ -64,7 +64,8 @@ class ZArray(MutableDenseNDimArray):
         if args:
             final_shape = args[0]
         elif "shape" in kwargs:
-            final_shape = kwargs["shape"]
+            # FIX: Use .pop() to remove 'shape' from kwargs so it isn't passed twice!
+            final_shape = kwargs.pop("shape")
 
         return super().__new__(cls, flat_list, final_shape, **kwargs)
 
@@ -211,6 +212,26 @@ class ZArray(MutableDenseNDimArray):
         Uses the internal _array list which is inherently flat in SymPy NDimArrays.
         """
         return ZArray(list(self._array))
+    
+    def subs(self, *args, **kwargs):
+        """
+        Substitutes expressions within the ZArray.
+        Supports SymPy's standard subs API: 
+        .subs(old, new), .subs({old: new}), or .subs([(old, new)])
+        """
+        # 1. Store the shape
+        current_shape = self.shape
+        
+        # 2 & 3. Flatten implicitly (using _array) and substitute for each item
+        new_elements = []
+        for item in self._array:
+            if hasattr(item, "subs"):
+                new_elements.append(item.subs(*args, **kwargs))
+            else:
+                new_elements.append(item)
+                
+        # 4 & 5. Restore the shape and return a new ZArray
+        return ZArray(new_elements, shape=current_shape)
 
     @property
     def flat(self):
