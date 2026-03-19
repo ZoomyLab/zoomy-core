@@ -1,4 +1,3 @@
-from attrs import define
 import ufl
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
 
@@ -12,7 +11,6 @@ def _ufl_conditional(condition, true_val, false_val):
     else:
         return ufl.conditional(condition, true_val, false_val)
 
-@define(kw_only=False, slots=True, frozen=True)
 class UFLRuntimeModel(NumpyRuntimeModel):
     printer=None
     
