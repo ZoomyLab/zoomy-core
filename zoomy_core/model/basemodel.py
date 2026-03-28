@@ -354,4 +354,25 @@ class Model(param.Parameterized, SymbolicRegistrar):
 
     def right_eigenvectors(self):
         return ZArray.zeros(self.n_variables, self.n_variables)
+
+    def print_model_functions(self, function_names=None):
+        if function_names is None:
+            function_names = ["flux", "nonconservative_matrix", "source", "residual"]
+
+        print("=" * 80, flush=True)
+        print(f"Model: {self.__class__.__name__}", flush=True)
+        print("variables:", self.variables.keys(), flush=True)
+        print("aux_variables:", self.aux_variables.keys(), flush=True)
+        if hasattr(self, "derivative_specs"):
+            specs = [f"{s.field}:{''.join(s.axes)}" for s in self.derivative_specs]
+            print("derivative_specs:", specs, flush=True)
+        print("-" * 80, flush=True)
+
+        available = set(self.functions.keys()) if hasattr(self, "functions") else set()
+        for name in function_names:
+            if name not in available:
+                continue
+            print(f"{name}:", flush=True)
+            print(self.functions[name].definition, flush=True)
+            print("-" * 80, flush=True)
     

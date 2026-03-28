@@ -43,7 +43,11 @@ class NumpyRuntimeModel:
         args = self._flatten_signature_args(function_obj.args)
         expr = self._vectorize_expression(function_obj.definition, function_obj.args)
 
-        compiled = sp.lambdify(args, expr, modules=modules)
+        try:
+            compiled = sp.lambdify(args, expr, modules=modules, cse=True)
+        except TypeError:
+            # Fallback for SymPy versions without cse kwarg in lambdify.
+            compiled = sp.lambdify(args, expr, modules=modules)
         signature = function_obj.args
 
         def runtime_callable(*runtime_args):
@@ -115,6 +119,11 @@ class NumpyRuntimeModel:
     def _vectorize_expression(self, expr, signature):
         if not (hasattr(expr, "tolist") and callable(expr.tolist)):
             return expr
+        shape = getattr(expr, "shape", ())
+        if shape and any(int(s) == 0 for s in shape):
+            # SymPy currently fails tolist() for empty dimensions.
+            # Return an explicit SymPy empty array so lambdify can handle it.
+            return sp.Array([], tuple(int(s) for s in shape))
 
         arr = sp.Array(expr.tolist())
         vector_symbols = self._collect_vector_symbols(signature)
@@ -182,5 +191,35 @@ class NumpyRuntimeModel:
             )
 
         # Keep attribute-style access for existing solver code paths.
+        for name, function in self.runtime_functions.items():
+            setattr(self, name, function)
+
+
+class NumpyRuntimeSymbolic(NumpyRuntimeModel):
+    """
+    Runtime wrapper for generic symbolic registrars (e.g. Numerics).
+
+    Compiles all entries from ``symbolic_obj.functions`` using the same
+    lambdify/argument-flattening machinery as ``NumpyRuntimeModel``.
+    """
+
+    def __init__(
+        self,
+        symbolic_obj,
+        module: Optional[Dict[str, Callable]] = None,
+        printer: Optional[str] = None,
+    ):
+        self.symbolic_obj = symbolic_obj
+        self.module = dict(type(self).module) if module is None else dict(module)
+        self.printer = type(self).printer if printer is None else printer
+
+        modules = [self.module]
+        if self.printer:
+            modules.append(self.printer)
+
+        self.runtime_functions: Dict[str, Callable] = {}
+        for name, function_obj in symbolic_obj.functions.items():
+            self.runtime_functions[name] = self._lambdify_function(function_obj, modules)
+
         for name, function in self.runtime_functions.items():
             setattr(self, name, function)
