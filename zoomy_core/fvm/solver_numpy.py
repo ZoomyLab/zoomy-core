@@ -127,6 +127,7 @@ class HyperbolicSolver(Solver):
         factory=lambda: nonconservative_flux.Rusanov()
     )
     time_end: float = 0.1
+    min_dt: float = 1e-6
 
 
     def __attrs_post_init__(self):
@@ -257,6 +258,17 @@ class HyperbolicSolver(Solver):
                 dt = self.compute_dt(
                     Q, Qaux, parameters, cell_inradius_face, compute_max_abs_eigenvalue
                 )
+                dt = min(float(dt), float(self.time_end - time))
+                if not np.isfinite(dt) or dt <= 0.0:
+                    raise RuntimeError(
+                        f"Invalid time step detected: dt={dt}. "
+                        "Aborting to prevent unstable update."
+                    )
+                if dt < self.min_dt:
+                    raise RuntimeError(
+                        f"Time step below stability floor: dt={dt:.3e} < min_dt={self.min_dt:.3e}. "
+                        "Aborting to prevent unstable update."
+                    )
 
                 Q1 = ode.RK1(flux_operator, Q, Qaux, parameters, dt)
                 Q2 = ode.RK1(
