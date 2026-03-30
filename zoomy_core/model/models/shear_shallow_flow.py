@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.models.shear_shallow_flow`."""
+
 import sympy
 from sympy import Matrix
 
@@ -35,6 +37,7 @@ class ShearShallowFlow(Model):
         settings={},
         settings_default={"topography": False, "friction": []},
     ):
+        """Initialize the instance."""
         self.variables = register_sympy_attribute(fields, "q")
         self.n_variables = self.variables.length()
         super().__init__(
@@ -49,6 +52,7 @@ class ShearShallowFlow(Model):
         )
 
     def flux(self):
+        """Flux."""
         flux_x = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
         hu = self.variables[1]
@@ -64,6 +68,7 @@ class ShearShallowFlow(Model):
         return [flux_x]
 
     def nonconservative_matrix(self):
+        """Nonconservative matrix."""
         nc_x = Matrix([[0 for i in range(self.n_variables)] for j in range(self.n_variables)])
         h = self.variables[0]
         hu = self.variables[1]
@@ -78,10 +83,12 @@ class ShearShallowFlow(Model):
         return [nc_x]
 
     def source(self):
+        """Source."""
         out = Matrix([0 for i in range(self.n_variables)])
         return out
 
     def topography(self):
+        """Topography."""
         assert "dhdx" in vars(self.aux_variables)
         out = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
@@ -91,6 +98,7 @@ class ShearShallowFlow(Model):
         return out
 
     def eigenvalues(self):
+        """Eigenvalues."""
         evs = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
         hu = self.variables[1]
@@ -108,6 +116,7 @@ class ShearShallowFlow(Model):
         return evs
 
     def friction_paper(self):
+        """Friction paper."""
         assert "phi" in vars(self.parameters)
         out = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
@@ -135,6 +144,7 @@ class ShearShallowFlow(Model):
         return out
 
     def chezy(self):
+        """Chezy."""
         assert "Cf" in vars(self.parameters)
         out = Matrix([0 for i in range(self.n_variables)])
         Q = self.variables
@@ -170,6 +180,7 @@ class ShearShallowFlowEnergy(Model):
         settings={},
         settings_default={"topography": False, "friction": []},
     ):
+        """Initialize the instance."""
         self.variables = register_sympy_attribute(fields, "q")
         self.n_variables = self.variables.length()
         super().__init__(
@@ -184,6 +195,7 @@ class ShearShallowFlowEnergy(Model):
         )
 
     def flux(self):
+        """Flux."""
         flux_x = Matrix([0 for i in range(self.n_variables)])
 
         p = self.parameters
@@ -198,6 +210,7 @@ class ShearShallowFlowEnergy(Model):
         return [flux_x]
 
     def nonconservative_matrix(self):
+        """Nonconservative matrix."""
         nc_x = Matrix([[0 for i in range(self.n_variables)] for j in range(self.n_variables)])
         p = self.parameters
         Q = self.variables
@@ -207,6 +220,7 @@ class ShearShallowFlowEnergy(Model):
         return [nc_x]
 
     def chezy(self):
+        """Chezy."""
         assert "Cf" in vars(self.parameters)
         out = Matrix([0 for i in range(self.n_variables)])
         Q = self.variables
@@ -242,6 +256,7 @@ class ShearShallowFlowPathconservative(Model):
         settings={},
         settings_default={"topography": False, "friction": []},
     ):
+        """Initialize the instance."""
         self.variables = register_sympy_attribute(fields, "q")
         self.n_variables = self.variables.length()
         super().__init__(
@@ -256,6 +271,7 @@ class ShearShallowFlowPathconservative(Model):
         )
 
     def get_primitives(self, Q):
+        """Get primitives."""
         h = Q[0]
         u = Q[1] / Q[0]
         v = Q[2] / Q[0]
@@ -271,6 +287,7 @@ class ShearShallowFlowPathconservative(Model):
         return h, u, v, R11, R12, R22, E11, E12, E22, P11, P12, P22
 
     def flux(self):
+        """Flux."""
         flux_x = Matrix([0 for i in range(self.n_variables)])
 
         h, u, v, R11, R12, R22, E11, E12, E22, P11, P12, P22 = self.get_primitives(
@@ -287,6 +304,7 @@ class ShearShallowFlowPathconservative(Model):
         return [flux_x]
 
     def nonconservative_matrix(self):
+        """Nonconservative matrix."""
         nc_x = Matrix([[0 for i in range(self.n_variables)] for j in range(self.n_variables)])
 
         h, u, v, R11, R12, R22, E11, E12, E22, P11, P12, P22 = self.get_primitives(
@@ -299,10 +317,12 @@ class ShearShallowFlowPathconservative(Model):
         return [nc_x]
 
     def source(self):
+        """Source."""
         out = Matrix([0 for i in range(self.n_variables)])
         return out
 
     def topography(self):
+        """Topography."""
         assert "dhdx" in vars(self.aux_variables)
         out = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
@@ -312,6 +332,7 @@ class ShearShallowFlowPathconservative(Model):
         return out
 
     def eigenvalues(self):
+        """Eigenvalues."""
         evs = Matrix([0 for i in range(self.n_variables)])
 
         h, u, v, R11, R12, R22, E11, E12, E22, P11, P12, P22 = self.get_primitives(
@@ -332,6 +353,7 @@ class ShearShallowFlowPathconservative(Model):
         return evs
 
     def chezy(self):
+        """Chezy."""
         assert "Cf" in vars(self.parameters)
         out = Matrix([0 for i in range(self.n_variables)])
 
@@ -349,6 +371,7 @@ class ShearShallowFlowPathconservative(Model):
         return out
 
     def friction_paper(self):
+        """Friction paper."""
         assert "Cf" in vars(self.parameters)
         assert "Cr" in vars(self.parameters)
         assert "g" in vars(self.parameters)
@@ -398,6 +421,7 @@ class ShearShallowFlowPathconservative2(ShearShallowFlowPathconservative):
         settings={},
         settings_default={"topography": False, "friction": []},
     ):
+        """Initialize the instance."""
         self.variables = register_sympy_attribute(fields, "q")
         self.n_variables = self.variables.length()
         super().__init__(
@@ -412,6 +436,7 @@ class ShearShallowFlowPathconservative2(ShearShallowFlowPathconservative):
         )
 
     def flux(self):
+        """Flux."""
         SSF = ShearShallowFlowPathconservative(
             boundary_conditions=self.boundary_conditions,
             initial_conditions=self.initial_conditions,
@@ -422,6 +447,7 @@ class ShearShallowFlowPathconservative2(ShearShallowFlowPathconservative):
         return [flux_x]
 
     def nonconservative_matrix(self):
+        """Nonconservative matrix."""
         SSF = ShearShallowFlowPathconservative(
             boundary_conditions=self.boundary_conditions,
             initial_conditions=self.initial_conditions,
@@ -454,6 +480,7 @@ class ShearShallowFlow2d(Model):
         settings={},
         settings_default={"topography": False, "friction": []},
     ):
+        """Initialize the instance."""
         self.variables = register_sympy_attribute(fields, "q")
         self.n_variables = self.variables.length()
         super().__init__(
@@ -468,6 +495,7 @@ class ShearShallowFlow2d(Model):
         )
 
     def flux(self):
+        """Flux."""
         flux_x = Matrix([0 for i in range(self.n_variables)])
         flux_y = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
@@ -495,6 +523,7 @@ class ShearShallowFlow2d(Model):
         return [flux_x, flux_y]
 
     def nonconservative_matrix(self):
+        """Nonconservative matrix."""
         nc_x = Matrix([[0 for i in range(self.n_variables)] for j in range(self.n_variables)])
         nc_y = Matrix([[0 for i in range(self.n_variables)] for j in range(self.n_variables)])
         h = self.variables[0]
@@ -525,10 +554,12 @@ class ShearShallowFlow2d(Model):
         return [nc_x, nc_y]
 
     def source(self):
+        """Source."""
         out = Matrix([0 for i in range(self.n_variables)])
         return out
 
     def topography(self):
+        """Topography."""
         assert "dhdx" in vars(self.aux_variables)
         out = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
@@ -538,6 +569,7 @@ class ShearShallowFlow2d(Model):
         return out
 
     def eigenvalues(self):
+        """Eigenvalues."""
         evs = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
         hu = self.variables[1]
@@ -562,6 +594,7 @@ class ShearShallowFlow2d(Model):
         return evs
 
     def friction_paper(self):
+        """Friction paper."""
         assert "phi" in vars(self.parameters)
         assert "theta" in vars(self.parameters)
         assert "Cr" in vars(self.parameters)

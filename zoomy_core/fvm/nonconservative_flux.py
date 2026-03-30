@@ -1,21 +1,30 @@
+"""Module `zoomy_core.fvm.nonconservative_flux`."""
+
 import numpy as np
 from numpy.polynomial.legendre import leggauss
 from functools import partial
 
 class NonconservativeFlux:
+    """NonconservativeFlux. (class)."""
     def get_flux_operator(self, model):
+        """Get flux operator."""
         pass
 
 
 class Zero(NonconservativeFlux):
+    """Zero. (class)."""
     def get_flux_operator(self, model):
+        """Get flux operator."""
         def compute(Qi, Qj, Qauxi, Qauxj, parameters, normal, Vi, Vj, Vij, dt):
+            """Compute."""
             return np.zeros_like(Qi), np.zeros_like(Qi)
 
         return compute
     
 class Rusanov(NonconservativeFlux):
+    """Rusanov. (class)."""
     def __init__(self, integration_order=3, identity_matrix=None, eps=1e-10):
+        """Initialize the instance."""
         self.integration_order = integration_order
         samples, weights = leggauss(integration_order)
         # shift from [-1, 1] to [0,1]
@@ -27,19 +36,23 @@ class Rusanov(NonconservativeFlux):
         self.eps = eps
         
     def _get_A(self, model):
+        """Internal helper `_get_A`."""
         def A(q, qaux, parameters, n):                      
             # q : (n_dof,)
             # evaluate the matrices A_d
+            """A."""
             _A = model.quasilinear_matrix(q, qaux, parameters)
             return np.einsum('d...,ijd...->ij...', n, _A)
         return A
     
     def _integrate_path(self, model):
+        """Internal helper `_integrate_path`."""
         compute_A = self._get_A(model)
         def compute(Qi, Qj,
                             Qauxi, Qauxj,
                             parameters,
                             normal):
+            """Compute."""
             dQ     =  Qj    - Qi
             dQaux  =  Qauxj - Qauxi
             
@@ -57,6 +70,7 @@ class Rusanov(NonconservativeFlux):
 
 
     def get_flux_operator(self, model):
+        """Get flux operator."""
         compute_path_integral = self._integrate_path(model)
         Id_single = self.Id(model.n_variables)
         

@@ -1,3 +1,5 @@
+"""Shared utilities: SymPy-friendly arrays, dynamic structs, and runtime paths."""
+
 import os
 import numpy as np
 import subprocess
@@ -118,6 +120,7 @@ class ZArray(MutableDenseNDimArray):
         return ZArray(sp.Array(self._to_array(other)) + (-1 * self))
 
     def tomatrix(self):
+        """Return a SymPy ``Matrix`` (rank-2 arrays only)."""
         if self.rank() != 2:
             raise ValueError("Only rank-2 ZArrays can be converted to Matrix.")
         return sp.Matrix(self.tolist())
@@ -235,10 +238,12 @@ class ZArray(MutableDenseNDimArray):
 
     @property
     def flat(self):
+        """Flat."""
         return list(self)
 
 def get_main_directory():
     # 1. Environment variable overrides everything
+    """Get main directory."""
     env_dir = os.getenv("ZOOMY_DIR")
     if env_dir:
         return os.path.abspath(env_dir)
@@ -292,6 +297,7 @@ class Zstruct(SimpleNamespace):
         return f"Zstruct({args})"
 
     def __getitem__(self, key):
+        """Hook `__getitem__`."""
         if isinstance(key, str):
             return getattr(self, key)
         return self.values()[key]
@@ -316,6 +322,7 @@ class Zstruct(SimpleNamespace):
         return len(self._filter_dict())
 
     def get_list(self, recursive: bool = True):
+        """Nested list view of values (used when flattening symbolic trees)."""
         if recursive:
             output = []
             for item in self.values():
@@ -328,6 +335,7 @@ class Zstruct(SimpleNamespace):
             return self.values()
 
     def as_dict(self, recursive: bool = True):
+        """Serialize to plain dicts (recursive for nested ``Zstruct``)."""
         data = self._filter_dict()
         if recursive:
             output = {}
@@ -341,18 +349,23 @@ class Zstruct(SimpleNamespace):
             return data
 
     def items(self, recursive: bool = False):
+        """Items."""
         return self.as_dict(recursive=recursive).items()
 
     def keys(self):
+        """Keys."""
         return list(self._filter_dict().keys())
 
     def values(self):
+        """Values."""
         return list(self._filter_dict().values())
 
     def contains(self, key):
+        """Contains."""
         return hasattr(self, key)
 
     def update(self, zstruct, recursive: bool = True):
+        """Update."""
         if not hasattr(zstruct, "as_dict") and not isinstance(zstruct, dict):
             raise TypeError("Input must be a Zstruct or a dictionary.")
         data = (
@@ -376,6 +389,7 @@ class Zstruct(SimpleNamespace):
 
     @classmethod
     def from_dict(cls, d):
+        """Build a ``Zstruct`` tree from nested dicts."""
         if not isinstance(d, dict):
             raise TypeError("Input must be a dictionary.")
         data = d.copy()
@@ -386,6 +400,8 @@ class Zstruct(SimpleNamespace):
 
 
 class Settings(Zstruct):
+    """Run configuration (output paths, snapshots, etc.) for drivers and solvers."""
+
     def __init__(self, **kwargs):
         if "output" not in kwargs:
             logger.warning("No 'output' Zstruct found in Settings. Defaulting.")
@@ -418,6 +434,7 @@ class Settings(Zstruct):
 
     @classmethod
     def default(cls):
+        """Reasonable defaults for local runs and tests."""
         return cls(
             output=Zstruct(
                 directory="output",
@@ -429,6 +446,7 @@ class Settings(Zstruct):
 
     @classmethod
     def from_json(cls, filepath):
+        """Load settings from a JSON file on disk."""
         with open(filepath, "r") as f:
             data = json.load(f)
         if "output" in data:
@@ -436,6 +454,7 @@ class Settings(Zstruct):
         return cls(**data)
 
     def write_json(self, filepath=None):
+        """Persist settings next to the simulation output unless ``filepath`` is given."""
         if filepath is None:
             filepath = os.path.join(
                 get_main_directory(), self.output.directory, "settings.json"

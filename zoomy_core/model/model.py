@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.model`."""
+
 import os
 import numpy as np
 from typing import Union, Type
@@ -21,6 +23,7 @@ def create_default_mesh_and_model(
     parameters: Union[int, list, dict] = 0,
     settings: dict = {},
 ):
+    """Create default mesh and model."""
     main_dir = misc.get_main_directory()
 
     assert main_dir != ""

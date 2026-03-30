@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.models.shallow_moments_sediment`."""
+
 from zoomy_core.model.models.shallow_moments import (IC, Matrix, Model, eigenvalue_dict_to_matrix,
                                                   register_sympy_attribute, sympy)
 
@@ -26,6 +28,7 @@ class ShallowMomentsSediment(Model):
         settings_default={"topography": False, "friction": []},
         basis=Basis(),
     ):
+        """Initialize the instance."""
         self.basis = basis
         self.variables = register_sympy_attribute(fields, "q")
         self.n_variables = self.variables.length()
@@ -44,6 +47,7 @@ class ShallowMomentsSediment(Model):
         )
 
     def flux(self):
+        """Flux."""
         flux = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
         ha = self.variables[1 : 1 + self.level + 1]
@@ -59,6 +63,7 @@ class ShallowMomentsSediment(Model):
         return [flux]
 
     def nonconservative_matrix(self):
+        """Nonconservative matrix."""
         nc = Matrix([[0 for i in range(self.n_variables)] for j in range(self.n_variables)])
         h = self.variables[0]
         ha = self.variables[1 : 1 + self.level + 1]
@@ -76,6 +81,7 @@ class ShallowMomentsSediment(Model):
         return [nc]
 
     def eigenvalues(self):
+        """Eigenvalues."""
         A = self.normal[0] * self.sympy_quasilinear_matrix[0]
         for d in range(1, self.dimension):
             A += self.normal[d] * self.sympy_quasilinear_matrix[d]
@@ -85,10 +91,12 @@ class ShallowMomentsSediment(Model):
         return eigenvalue_dict_to_matrix(A.eigenvals())
 
     def source(self):
+        """Source."""
         out = Matrix([0 for i in range(self.n_variables)])
         return out
 
     def topography(self):
+        """Topography."""
         assert "dhdx" in vars(self.aux_variables)
         out = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
@@ -98,6 +106,7 @@ class ShallowMomentsSediment(Model):
         return out
 
     def inclined_plane(self):
+        """Inclined plane."""
         out = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
         p = self.parameters
@@ -180,6 +189,7 @@ class ShallowMomentsSediment(Model):
 
 
 class ShallowMomentsSediment2d(Model):
+    """ShallowMomentsSediment2d. (class)."""
     def __init__(
         self,
         boundary_conditions,
@@ -193,6 +203,7 @@ class ShallowMomentsSediment2d(Model):
         settings_default={"topography": False, "friction": []},
         basis=Basis(),
     ):
+        """Initialize the instance."""
         self.basis = basis
         self.variables = register_sympy_attribute(fields, "q")
         self.n_variables = self.variables.length()
@@ -210,6 +221,7 @@ class ShallowMomentsSediment2d(Model):
         )
 
     def flux(self):
+        """Flux."""
         offset = self.level + 1
         flux_x = Matrix([0 for i in range(self.n_variables)])
         flux_y = Matrix([0 for i in range(self.n_variables)])
@@ -253,6 +265,7 @@ class ShallowMomentsSediment2d(Model):
         return [flux_x, flux_y]
 
     def nonconservative_matrix(self):
+        """Nonconservative matrix."""
         offset = self.level + 1
         nc_x = Matrix([[0 for i in range(self.n_variables)] for j in range(self.n_variables)])
         nc_y = Matrix([[0 for i in range(self.n_variables)] for j in range(self.n_variables)])
@@ -291,6 +304,7 @@ class ShallowMomentsSediment2d(Model):
 
     def eigenvalues(self):
         # we delete heigher order moments (level >= 2) for analytical eigenvalues
+        """Eigenvalues."""
         offset = self.level + 1
         A = self.normal[0] * self.sympy_quasilinear_matrix[0]
         for d in range(1, self.dimension):
@@ -304,10 +318,12 @@ class ShallowMomentsSediment2d(Model):
         return eigenvalue_dict_to_matrix(A.eigenvals())
 
     def source(self):
+        """Source."""
         out = Matrix([0 for i in range(self.n_variables)])
         return out
 
     def topography(self):
+        """Topography."""
         assert "dhdx" in vars(self.aux_variables)
         assert "dhdy" in vars(self.aux_variables)
         offset = self.level + 1
@@ -321,6 +337,7 @@ class ShallowMomentsSediment2d(Model):
         return out
 
     def newtonian(self):
+        """Newtonian."""
         assert "nu" in vars(self.parameters)
         out = Matrix([0 for i in range(self.n_variables)])
         offset = self.level + 1
@@ -339,6 +356,7 @@ class ShallowMomentsSediment2d(Model):
         return out
 
     def slip(self):
+        """Slip."""
         assert "lamda" in vars(self.parameters)
         assert "rho" in vars(self.parameters)
         out = Matrix([0 for i in range(self.n_variables)])
@@ -357,6 +375,7 @@ class ShallowMomentsSediment2d(Model):
         return out
 
     def chezy(self):
+        """Chezy."""
         assert "C" in vars(self.parameters)
         out = Matrix([0 for i in range(self.n_variables)])
         offset = self.level + 1

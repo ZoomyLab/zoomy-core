@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.aux_boundary_conditions`."""
+
 import param
 from zoomy_core.misc.misc import ZArray
 from zoomy_core.model.boundary_conditions import BoundaryCondition
@@ -11,6 +13,7 @@ class Extrapolation(BoundaryCondition):
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
         # Return Qaux directly (No swapping needed in the model)
+        """Compute boundary condition."""
         return ZArray(Qaux)
 
 
@@ -23,6 +26,7 @@ class Lambda(BoundaryCondition):
     prescribe_fields = param.Dict(default={})
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
+        """Compute boundary condition."""
         Qout = ZArray(Qaux)
         for k, func in self.prescribe_fields.items():
             Qout[k] = func(time, X, dX, Q, Qaux, parameters, normal)

@@ -1,3 +1,5 @@
+"""Module `zoomy_core`."""
+
 from importlib.metadata import version, PackageNotFoundError
 
 try:

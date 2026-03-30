@@ -1,3 +1,5 @@
+"""Module `zoomy_core.fvm.solver_numpy`."""
+
 import os
 from time import time as gettime
 
@@ -22,9 +24,11 @@ from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
 
 @define(frozen=True, slots=True, kw_only=True)            
 class Solver():
+    """Solver. (class)."""
     settings: Zstruct = field(factory=lambda: Settings.default())
 
     def __attrs_post_init__(self):
+        """Hook `__attrs_post_init__`."""
         defaults = Settings.default()
         defaults.update(self.settings)
         object.__setattr__(self, 'settings', defaults)
@@ -42,6 +46,7 @@ class Solver():
         #     model.normal,
         # )
 
+        """Initialize."""
         n_variables = model.n_variables
         n_cells = mesh.n_cells
         n_aux_variables = model.aux_variables.length()
@@ -51,6 +56,7 @@ class Solver():
         return Q, Qaux
         
     def create_runtime(self, Q, Qaux, mesh, model):      
+        """Create runtime."""
         mesh.resolve_periodic_bcs(model.boundary_conditions)
         Q, Qaux = np.asarray(Q), np.asarray(Qaux)
         parameters = np.asarray(model.parameter_values)
@@ -58,7 +64,9 @@ class Solver():
         return Q, Qaux, parameters, mesh, runtime_model
 
     def get_compute_source(self, mesh, model):
+        """Get compute source."""
         def compute_source(dt, Q, Qaux, parameters, dQ):
+            """Compute source."""
             dQ = model.source(
                     Q[:, :],
                     Qaux[:, :],
@@ -69,7 +77,9 @@ class Solver():
         return compute_source
 
     def get_compute_source_jacobian_wrt_variables(self, mesh, model):
+        """Get compute source jacobian wrt variables."""
         def compute_source(dt, Q, Qaux, parameters, dQ):
+            """Compute source."""
             dQ = model.source_jacobian_wrt_variables(
                     Q[:, : mesh.n_inner_cells],
                     Qaux[:, : mesh.n_inner_cells],
@@ -81,7 +91,9 @@ class Solver():
     
     def get_apply_boundary_conditions(self, mesh, model):
         
+        """Get apply boundary conditions."""
         def apply_boundary_conditions(time, Q, Qaux, parameters):
+            """Apply boundary conditions."""
             for i in range(mesh.n_boundary_faces):
                 i_face = mesh.boundary_face_face_indices[i]
                 i_bc_func = mesh.boundary_face_function_numbers[i]
@@ -112,6 +124,7 @@ class Solver():
         return Qaux
     
     def solve(self, mesh, model):
+        """Solve."""
         logger.error(
             "Solver.solve() is not implemented. Please implement this method in the derived class."
         )
@@ -120,6 +133,7 @@ class Solver():
  
 @define(frozen=True, slots=True, kw_only=True)            
 class HyperbolicSolver(Solver):
+    """HyperbolicSolver. (class)."""
     settings: Zstruct = field(factory=lambda: Settings.default())
     compute_dt: Callable = field(factory=lambda: timestepping.adaptive(CFL=0.45))
     flux: fvmflux.Flux = field(factory=lambda: fvmflux.Zero())
@@ -131,6 +145,7 @@ class HyperbolicSolver(Solver):
 
 
     def __attrs_post_init__(self):
+        """Hook `__attrs_post_init__`."""
         super().__attrs_post_init__()
         defaults = Settings.default()
         defaults.output.update(Zstruct(snapshots=10))
@@ -139,13 +154,16 @@ class HyperbolicSolver(Solver):
         
 
     def initialize(self, mesh, model):
+        """Initialize."""
         Q, Qaux = super().initialize(mesh, model)
         Q = model.initial_conditions.apply(mesh.cell_centers, Q)
         Qaux = model.aux_initial_conditions.apply(mesh.cell_centers, Qaux)
         return Q, Qaux
 
     def get_compute_max_abs_eigenvalue(self, mesh, model):
+        """Get compute max abs eigenvalue."""
         def compute_max_abs_eigenvalue(Q, Qaux, parameters):
+            """Compute max abs eigenvalue."""
             max_abs_eigenvalue = -np.inf
             i_cellA = mesh.face_cells[0]
             i_cellB = mesh.face_cells[1]
@@ -161,11 +179,13 @@ class HyperbolicSolver(Solver):
         return compute_max_abs_eigenvalue
 
     def get_flux_operator(self, mesh, model):
+        """Get flux operator."""
         compute_num_flux = self.flux.get_flux_operator(model)
         compute_nc_flux = self.nc_flux.get_flux_operator(model)
         def flux_operator(dt, Q, Qaux, parameters, dQ):
 
             # Initialize dQ as zeros using jax.numpy
+            """Flux operator."""
             dQ = np.zeros_like(dQ)
 
             iA = mesh.face_cells[0]
@@ -206,6 +226,7 @@ class HyperbolicSolver(Solver):
         return flux_operator
 
     def solve(self, mesh, model, write_output=True):
+        """Solve."""
         Q, Qaux = self.initialize(mesh, model)
         
         Q, Qaux, parameters, mesh, model = self.create_runtime(Q, Qaux, mesh, model)
@@ -221,10 +242,12 @@ class HyperbolicSolver(Solver):
             save_fields = io.get_save_fields(output_hdf5_path, write_all=False)
         else:
             def save_fields(time, time_stamp, i_snapshot, Q, Qaux):
+                """Save fields."""
                 return i_snapshot
             
 
         def run(Q, Qaux, parameters, model):
+            """Run."""
             iteration = 0.0
             time = 0.0
 

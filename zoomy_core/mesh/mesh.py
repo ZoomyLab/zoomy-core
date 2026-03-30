@@ -1,3 +1,5 @@
+"""Unstructured/structured mesh container, LSQ reconstruction, and I/O used by FVM solvers."""
+
 import os
 
 try:
@@ -61,6 +63,7 @@ def build_monomial_indices(degree: int, dim: int):
 
 
 def scale_lsq_derivative(mon_indices):
+    """Monomial scaling factors for least-squares derivative operators."""
     from math import factorial
 
     import numpy as np
@@ -100,6 +103,7 @@ def find_derivative_indices(full_monomials_arr, requested_derivs_arr):
 
 
 def compute_derivatives(u, mesh, derivatives_multi_index=None):
+    """Cell-wise derivative estimates using the mesh LSQ stencil (``mesh.lsq_*`` fields)."""
     A_glob = mesh.lsq_gradQ  # shape (n_cells, n_neighbors, n_monomials)
     neighbors = mesh.lsq_neighbors  # list of neighbors per cell
     mon_indices = mesh.lsq_monomial_multi_index  # shape (n_monomials, dim)
@@ -111,6 +115,7 @@ def compute_derivatives(u, mesh, derivatives_multi_index=None):
     indices = find_derivative_indices(mon_indices, derivatives_multi_index)
 
     def reconstruct_cell(A_loc, neighbor_idx, u_i):
+        """Reconstruct cell."""
         u_neighbors = u[neighbor_idx]
         delta_u = u_neighbors - u_i
         return (scale_factors * (A_loc.T @ delta_u)).T  # shape (n_monomials,)
@@ -249,6 +254,7 @@ def least_squares_reconstruction_local(
 
 
 def get_physical_boundary_labels(filepath):
+    """Get physical boundary labels."""
     if not _HAVE_MESHIO:
         raise RuntimeError(
             "_write_to_vtk_from_vertices_edges requires meshio, which is not available."
@@ -299,6 +305,7 @@ def compute_cell_inradius(dm):
 
 
 def get_mesh_type_from_dm(num_faces_per_cell, dim):
+    """Get mesh type from dm."""
     if dim == 1:
         if num_faces_per_cell == 2:
             return "line"
@@ -324,6 +331,7 @@ def get_mesh_type_from_dm(num_faces_per_cell, dim):
 
 
 def _boundary_dict_to_list(d):
+    """Internal helper `_boundary_dict_to_list`."""
     l = []
     for i, vs in enumerate(d.values()):
         l += vs
@@ -331,6 +339,7 @@ def _boundary_dict_to_list(d):
 
 
 def _boundary_dict_indices(d):
+    """Internal helper `_boundary_dict_indices`."""
     indices = []
     index = 0
     for values in d.values():
@@ -340,6 +349,7 @@ def _boundary_dict_indices(d):
 
 
 def _get_neighberhood(dm, cell, cStart=0):
+    """Internal helper `_get_neighberhood`."""
     neighbors = (
         np.array(
             [dm.getSupport(f)[dm.getSupport(f) != cell][0]
@@ -352,6 +362,7 @@ def _get_neighberhood(dm, cell, cStart=0):
 
 
 def _fill_neighborhood(dm, neighbors, max_neighbors, cStart=0):
+    """Internal helper `_fill_neighborhood`."""
     new_potential_neighbors = []
     for cell in neighbors:
         new_potential_neighbors += list(_get_neighberhood(dm,
@@ -367,6 +378,8 @@ def _fill_neighborhood(dm, neighbors, max_neighbors, cStart=0):
 
 @define(slots=True, frozen=True)
 class Mesh:
+    """Immutable mesh topology/geometry plus precomputed FVM connectivity and LSQ data."""
+
     dimension: int
     type: str
     n_cells: int
@@ -477,6 +490,7 @@ class Mesh:
 
     @classmethod
     def create_1d(cls, domain: tuple[float, float], n_inner_cells: int, lsq_degree=1):
+        """Build a 1D interval mesh with two ghost cells and LSQ operators."""
         xL = domain[0]
         xR = domain[1]
 
@@ -624,6 +638,7 @@ class Mesh:
         )
 
     def _compute_ascending_order_structured_axis(self):
+        """Internal helper `_compute_ascending_order_structured_axis`."""
         cell_centers = self.cell_centers.T
         dimension = self.dimension
         if dimension == 1:
@@ -665,6 +680,7 @@ class Mesh:
 
     @classmethod
     def from_gmsh(cls, filepath, allow_z_integration=False, lsq_degree=1):
+        """Import a Gmsh ``.msh`` via PETSc DMPlex and build Zoomy connectivity/LSQ data."""
         if not _HAVE_PETSC:
             raise RuntimeError(
                 "Mesh.from_gmsh() requires petsc4py, which is not available."
@@ -741,6 +757,7 @@ class Mesh:
         vertex_coordinates = np.array(dm.getCoordinates()).reshape((-1, dim))
 
         def get_face_vertices(dim, gdm, vgStart, e):
+            """Get face vertices."""
             if dim == 2:
                 return gdm.getCone(e) - vgStart
             elif dim == 3:
@@ -958,6 +975,7 @@ class Mesh:
 
     @classmethod
     def extrude_mesh(cls, msh, n_layers=10):
+        """Extrude a lower-dimensional ``Mesh`` along a third axis (structured column mesh)."""
         Z = np.linspace(0, 1, n_layers + 1)
         dimension = msh.dimension + 1
         mesh_type = get_extruded_mesh_type(msh.type)
@@ -1058,6 +1076,7 @@ class Mesh:
         )
 
     def write_to_hdf5(self, filepath: str):
+        """Serialize the full mesh (topology + LSQ operators) for checkpointing and I/O."""
         if not _HAVE_H5PY:
             raise RuntimeError(
                 "Mesh.write_to_hdf5() requires h5py, which is not available."
@@ -1124,6 +1143,7 @@ class Mesh:
 
     @classmethod
     def from_hdf5(cls, filepath: str):
+        """Reconstruct a ``Mesh`` written by :meth:`write_to_hdf5` (also used for field files)."""
         if not _HAVE_H5PY:
             raise RuntimeError(
                 "Mesh.from_hdf5() requires h5py, which is not available."
@@ -1178,6 +1198,7 @@ class Mesh:
         field_names: Union[list[str], None] = None,
         point_data: dict = {},
     ):
+        """Export the mesh (and optional cell fields) to VTK for ParaView."""
         if not _HAVE_MESHIO:
             raise RuntimeError(
                 "_write_to_vtk_from_vertices_edges requires meshio, which is not available."
@@ -1212,6 +1233,7 @@ class Mesh:
 
 
 def msh_to_h5(path_to_msh_file: str):
+    """CLI-style helper: convert ``.msh`` to ``.h5`` next to the source file."""
     mesh = Mesh.from_gmsh(path_to_msh_file)
     base = os.path.splitext(os.path.basename(path_to_msh_file))[0]
     path = os.path.join(os.path.dirname(path_to_msh_file), base + ".h5")

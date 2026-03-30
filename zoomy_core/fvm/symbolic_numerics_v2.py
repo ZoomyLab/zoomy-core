@@ -1,3 +1,5 @@
+"""Module `zoomy_core.fvm.symbolic_numerics_v2`."""
+
 import numpy as np
 import param
 import sympy as sp
@@ -9,6 +11,7 @@ from zoomy_core.transformation.to_numpy import NumpyRuntimeSymbolic
 
 
 class Numerics(param.Parameterized, SymbolicRegistrar):
+    """Numerics. (class)."""
     name = param.String(default="NumericsV2")
     model = param.ClassSelector(class_=Model, is_instance=True)
 
@@ -28,6 +31,7 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
     scaled_q_indices = param.List(default=None, allow_None=True)
 
     def __init__(self, model, **params):
+        """Initialize the instance."""
         super().__init__(model=model, **params)
         self.functions, self.call = Zstruct(), Zstruct()
 
@@ -51,11 +55,13 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         self._initialize_functions()
 
     def _create_v(self, name, size):
+        """Internal helper `_create_v`."""
         v = ZArray([sp.Symbol(f"{name}_{i}", real=True) for i in range(size)])
         v._symbolic_name = name
         return v
 
     def _normalize_and_validate_field_map(self, field_map):
+        """Internal helper `_normalize_and_validate_field_map`."""
         if "h" not in field_map or "b" not in field_map:
             raise ValueError("field_map must define entries for both 'h' and 'b'.")
 
@@ -82,6 +88,7 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         return out
 
     def _resolve_scaled_q_indices(self, scaled_q_indices):
+        """Internal helper `_resolve_scaled_q_indices`."""
         if scaled_q_indices is not None:
             cleaned = [int(i) for i in scaled_q_indices]
             for i in cleaned:
@@ -99,11 +106,13 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         return [i for i in range(self.model.n_variables) if i not in excluded]
 
     def _field_value(self, field_name, q_state, qaux_state):
+        """Internal helper `_field_value`."""
         spec = self._field_map[field_name]
         arr = q_state if spec["container"] == "q" else qaux_state
         return arr[spec["index"]]
 
     def _set_field_value(self, field_name, q_state, qaux_state, value):
+        """Internal helper `_set_field_value`."""
         spec = self._field_map[field_name]
         if spec["container"] == "q":
             q_state[spec["index"]] = value
@@ -111,11 +120,13 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
             qaux_state[spec["index"]] = value
 
     def _eps_symbol(self):
+        """Internal helper `_eps_symbol`."""
         if hasattr(self.model.parameters, "contains") and self.model.parameters.contains("eps"):
             return self.model.parameters.eps
         return sp.Float(1e-12)
 
     def _initialize_functions(self):
+        """Internal helper `_initialize_functions`."""
         sig = Zstruct(
             q_minus=self.variables_minus,
             q_plus=self.variables_plus,
@@ -138,6 +149,7 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         )
 
     def local_max_eigenvalue_definition(self):
+        """Local max eigenvalue definition."""
         evs = self._model_eval(
             "eigenvalues",
             self.variables,
@@ -148,12 +160,14 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         return sp.Max(*[sp.Abs(e) for e in evs])
 
     def local_max_abs_eigenvalue(self, Q=None, Qaux=None, p=None, n=None):
+        """Local max abs eigenvalue."""
         if Q is None:
             return self.local_max_eigenvalue_definition()
         evs = self._model_eval("eigenvalues", Q, Qaux, p, n)
         return sp.Max(*[sp.Abs(e) for e in evs])
 
     def _model_eval(self, function_name, Q, Qaux, p, n=None):
+        """Internal helper `_model_eval`."""
         definition = self.model.functions[function_name].definition
         sub_map = {}
         for sym, val in zip(self.model.variables.get_list(), list(Q)):
@@ -178,27 +192,33 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         return out
 
     def to_runtime(self, backend="numpy"):
+        """To runtime."""
         backend = backend.lower()
         if backend == "numpy":
             return NumpyRuntimeSymbolic(self)
         raise ValueError(f"Unsupported runtime backend '{backend}'.")
 
     def to_runtime_numpy(self):
+        """To runtime numpy."""
         return self.to_runtime("numpy")
 
     def numerical_flux(self):
+        """Numerical flux."""
         zeros = [sp.Integer(0)] * self.model.n_variables
         return ZArray(zeros)
 
     def numerical_fluctuations(self):
+        """Numerical fluctuations."""
         zeros = ZArray.zeros(self.model.n_variables)
         return ZArray([zeros, zeros])
 
 
 class Rusanov(Numerics):
+    """Rusanov. (class)."""
     name = param.String(default="RusanovV2")
 
     def get_viscosity_identity_flux(self):
+        """Get viscosity identity flux."""
         n = self.model.n_variables
         Id = ZArray.zeros(n, n)
         for i in range(n):
@@ -214,10 +234,12 @@ class Rusanov(Numerics):
 
     def get_viscosity_identity_fluctuations(self):
         # Conservative Rusanov variants do not use fluctuation viscosity.
+        """Get viscosity identity fluctuations."""
         n = self.model.n_variables
         return ZArray.zeros(n, n)
 
     def numerical_flux(self):
+        """Numerical flux."""
         return self._compute_flux(
             self.variables_minus,
             self.variables_plus,
@@ -228,6 +250,7 @@ class Rusanov(Numerics):
         )
 
     def _compute_flux(self, qL, qR, auxL, auxR, p, n):
+        """Internal helper `_compute_flux`."""
         FL = self._model_eval("flux", qL, auxL, p)
         FR = self._model_eval("flux", qR, auxR, p)
         PL = self._model_eval("hydrostatic_pressure", qL, auxL, p)
@@ -241,9 +264,11 @@ class Rusanov(Numerics):
 
 
 class PositiveRusanov(Rusanov):
+    """PositiveRusanov. (class)."""
     name = param.String(default="PositiveRusanovV2")
 
     def hydrostatic_reconstruction(self, qL, qR, auxL, auxR):
+        """Hydrostatic reconstruction."""
         qLs = ZArray(qL)
         qRs = ZArray(qR)
         qauxL = ZArray(auxL)
@@ -278,6 +303,7 @@ class PositiveRusanov(Rusanov):
         return qLs, qRs, qauxL, qauxR
 
     def numerical_flux(self):
+        """Numerical flux."""
         qLs, qRs, qauxL, qauxR = self.hydrostatic_reconstruction(
             self.variables_minus,
             self.variables_plus,
@@ -287,6 +313,7 @@ class PositiveRusanov(Rusanov):
         return self._compute_flux(qLs, qRs, qauxL, qauxR, self.parameters, self.normal)
 
     def numerical_fluctuations(self):
+        """Numerical fluctuations."""
         qLs, qRs, qauxL, qauxR = self.hydrostatic_reconstruction(
             self.variables_minus,
             self.variables_plus,
@@ -327,10 +354,12 @@ class PositiveRusanov(Rusanov):
 
 
 class NonconservativeRusanov(Rusanov):
+    """NonconservativeRusanov. (class)."""
     name = param.String(default="NonconservativeRusanovV2")
     integration_order = param.Integer(default=3)
 
     def get_path_integral_states(self):
+        """Get path integral states."""
         return (
             self.variables_minus,
             self.variables_plus,
@@ -342,10 +371,12 @@ class NonconservativeRusanov(Rusanov):
         # Nonconservative/quasilinear variants place dissipation in
         # numerical_fluctuations to avoid double counting in flux + fluctuation
         # updates.
+        """Get viscosity identity flux."""
         n = self.model.n_variables
         return ZArray.zeros(n, n)
 
     def get_viscosity_identity_fluctuations(self):
+        """Get viscosity identity fluctuations."""
         n = self.model.n_variables
         Id = ZArray.zeros(n, n)
         for i in range(n):
@@ -359,6 +390,7 @@ class NonconservativeRusanov(Rusanov):
         return Id
 
     def numerical_fluctuations(self):
+        """Numerical fluctuations."""
         qLs, qRs, qauxL, qauxR = self.get_path_integral_states()
         nc_fluct = self._compute_fluctuations(
             qLs, qRs, qauxL, qauxR, self.parameters, self.normal
@@ -367,9 +399,11 @@ class NonconservativeRusanov(Rusanov):
         return out + nc_fluct
 
     def _call_model_matrix(self):
+        """Internal helper `_call_model_matrix`."""
         return lambda Q, Qaux, p: self._model_eval("nonconservative_matrix", Q, Qaux, p)
 
     def _compute_fluctuations(self, qL, qR, auxL, auxR, p, n):
+        """Internal helper `_compute_fluctuations`."""
         xi_np, wi_np = np.polynomial.legendre.leggauss(self.integration_order)
         xi_np = 0.5 * (xi_np + 1)
         wi_np = 0.5 * wi_np
@@ -411,9 +445,11 @@ class NonconservativeRusanov(Rusanov):
 
 
 class PositiveNonconservativeRusanov(PositiveRusanov, NonconservativeRusanov):
+    """PositiveNonconservativeRusanov. (class)."""
     name = param.String(default="PositiveNonconservativeRusanovV2")
 
     def get_path_integral_states(self):
+        """Get path integral states."""
         return self.hydrostatic_reconstruction(
             self.variables_minus,
             self.variables_plus,
@@ -423,24 +459,30 @@ class PositiveNonconservativeRusanov(PositiveRusanov, NonconservativeRusanov):
 
 
 class QuasilinearRusanov(NonconservativeRusanov):
+    """QuasilinearRusanov. (class)."""
     name = param.String(default="QuasilinearRusanovV2")
 
     def numerical_flux(self):
+        """Numerical flux."""
         zeros = [sp.Integer(0)] * self.model.n_variables
         return ZArray(zeros)
 
     def _call_model_matrix(self):
+        """Internal helper `_call_model_matrix`."""
         return lambda Q, Qaux, p: self._model_eval("quasilinear_matrix", Q, Qaux, p)
 
 
 class PositiveQuasilinearRusanov(PositiveRusanov, QuasilinearRusanov):
+    """PositiveQuasilinearRusanov. (class)."""
     name = param.String(default="PositiveQuasilinearRusanovV2")
 
     def numerical_flux(self):
+        """Numerical flux."""
         zeros = [sp.Integer(0)] * self.model.n_variables
         return ZArray(zeros)
 
     def get_path_integral_states(self):
+        """Get path integral states."""
         return self.hydrostatic_reconstruction(
             self.variables_minus,
             self.variables_plus,

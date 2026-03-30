@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.models.shallow_water`."""
+
 import sympy
 from sympy import Matrix, sqrt
 import param

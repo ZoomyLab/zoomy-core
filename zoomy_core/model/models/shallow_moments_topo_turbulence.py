@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.models.shallow_moments_topo_turbulence`."""
+
 import sympy as sp
 from sympy import Matrix, Symbol, S, Piecewise
 import param
@@ -36,6 +38,7 @@ class ShallowMomentsTopoTurbulence(ShallowMomentsTopo):
     
     def _compute_variable_count(self):
         # b(1) + h(1) + X-moments + Y-moments(if 2D) + k-moments + omega-moments
+        """Internal helper `_compute_variable_count`."""
         base_vars = 2 + self.dimension * (self.level + 1)
         turb_vars = 2 * (self.level + 1)  # k and omega
         return base_vars + turb_vars
@@ -44,6 +47,7 @@ class ShallowMomentsTopoTurbulence(ShallowMomentsTopo):
 
     def _compute_variable_count(self):
         # b(1) + h(1) + X-moments + Y-moments(if 2D) + k-moments + omega-moments
+        """Internal helper `_compute_variable_count`."""
         base_vars = 2 + self.dimension * (self.level + 1)
         turb_vars = 2 * (self.level + 1)  # k and omega
         return base_vars + turb_vars
@@ -175,6 +179,7 @@ class ShallowMomentsTopoTurbulence(ShallowMomentsTopo):
 
     def flux(self):
         # Get base momentum fluxes
+        """Flux."""
         F_base = super().flux()
 
         # We need to append the advection of k and omega

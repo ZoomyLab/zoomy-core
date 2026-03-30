@@ -1,7 +1,10 @@
+"""Module `zoomy_core.transformation.to_ufl`."""
+
 import ufl
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
 
 def _ufl_conditional(condition, true_val, false_val):
+    """Internal helper `_ufl_conditional`."""
     if condition is True:
         return true_val
     elif condition is False:
@@ -12,6 +15,7 @@ def _ufl_conditional(condition, true_val, false_val):
         return ufl.conditional(condition, true_val, false_val)
 
 class UFLRuntimeModel(NumpyRuntimeModel):
+    """UFLRuntimeModel. (class)."""
     printer=None
     
     module = {

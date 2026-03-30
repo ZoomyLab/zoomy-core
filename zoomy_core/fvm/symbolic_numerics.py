@@ -1,3 +1,5 @@
+"""Module `zoomy_core.fvm.symbolic_numerics`."""
+
 import sympy as sp
 import numpy as np
 import param
@@ -7,10 +9,12 @@ from zoomy_core.model.basefunction import Function, SymbolicRegistrar
 
 
 class Numerics(param.Parameterized, SymbolicRegistrar):
+    """Numerics. (class)."""
     name = param.String(default="Numerics")
     model = param.ClassSelector(class_=Model, is_instance=True)
 
     def __init__(self, model, **params):
+        """Initialize the instance."""
         super().__init__(model=model, **params)
         self.functions, self.call = Zstruct(), Zstruct()
 
@@ -31,6 +35,7 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         self._initialize_functions()
 
     def _create_v(self, name, size):
+        """Internal helper `_create_v`."""
         v = ZArray(
             [sp.Symbol(f"{name}_{i}", real=True) for i in range(size)]
         )
@@ -38,6 +43,7 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         return v
 
     def _initialize_functions(self):
+        """Internal helper `_initialize_functions`."""
         sig = Zstruct(
             q_minus=self.variables_minus,
             q_plus=self.variables_plus,
@@ -58,41 +64,49 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         )
 
     def local_max_eigenvalue_definition(self):
+        """Local max eigenvalue definition."""
         evs = self.model.call.eigenvalues(
             self.variables, self.aux_variables, self.parameters, self.normal
         )
         return sp.Max(*[sp.Abs(e) for e in evs])
 
     def local_max_abs_eigenvalue(self, Q=None, Qaux=None, p=None, n=None):
+        """Local max abs eigenvalue."""
         if Q is None:
             return self.call.local_max_abs_eigenvalue()
         evs = self.model.call.eigenvalues(Q, Qaux, p, n)
         return sp.Max(*[sp.Abs(e) for e in evs])
 
     def numerical_flux(self):
+        """Numerical flux."""
         zeros = [sp.Integer(0)] * self.model.n_variables
         return ZArray(zeros)
 
     def numerical_fluctuations(self):
         # Base class now returns a flat 1D array of size 2*N
+        """Numerical fluctuations."""
         zeros = [sp.Integer(0)] * (2 * self.model.n_variables)
         return ZArray(zeros)
 
 
 class Rusanov(Numerics):
+    """Rusanov. (class)."""
     name = param.String(default="Rusanov")
     
     def get_viscosity_identity_flux(self):
+        """Get viscosity identity flux."""
         Id = sp.Matrix(sp.Identity(self.model.n_variables))
         Id = 0 * Id
         return ZArray(Id)
     
     def get_viscosity_identity_fluctuations(self):
+        """Get viscosity identity fluctuations."""
         Id = sp.Matrix(sp.Identity(self.model.n_variables))
         Id[0,0] = 0
         return ZArray(Id)
 
     def numerical_flux(self):
+        """Numerical flux."""
         return self._compute_flux(
             self.variables_minus, self.variables_plus,
             self.aux_variables_minus, self.aux_variables_plus,
@@ -100,6 +114,7 @@ class Rusanov(Numerics):
         )
 
     def _compute_flux(self, qL, qR, auxL, auxR, p, n):
+        """Internal helper `_compute_flux`."""
         FL = self.model.call.flux(qL, auxL, p)
         FR = self.model.call.flux(qR, auxR, p)
         PL = self.model.call.hydrostatic_pressure(qL, auxL, p)
@@ -113,9 +128,11 @@ class Rusanov(Numerics):
 
 
 class PositiveRusanov(Rusanov):
+    """PositiveRusanov. (class)."""
     name = param.String(default="PositiveRusanov")
 
     def hydrostatic_reconstruction(self, qL, qR):
+        """Hydrostatic reconstruction."""
         b_star = sp.Max(qL[0], qR[0])
         hL_star, hR_star = (
             sp.Max(0.0, qL[1] + qL[0] - b_star),
@@ -130,6 +147,7 @@ class PositiveRusanov(Rusanov):
             [b_star, hR_star, *(qR[2:] / hR_eff) * hR_star]), hL_inv, hR_inv
 
     def numerical_flux(self):
+        """Numerical flux."""
         qLs, qRs, hinvL, hinvR = self.hydrostatic_reconstruction(
             self.variables_minus, self.variables_plus
         )
@@ -143,6 +161,7 @@ class PositiveRusanov(Rusanov):
         )
 
     def numerical_fluctuations(self):
+        """Numerical fluctuations."""
         qLs, qRs, hinvL, hinvR = self.hydrostatic_reconstruction(
             self.variables_minus, self.variables_plus
         )
@@ -174,13 +193,16 @@ class PositiveRusanov(Rusanov):
 
 
 class NonconservativeRusanov(Rusanov):
+    """NonconservativeRusanov. (class)."""
     name = param.String(default="NonconservativeRusanov")
     integration_order = param.Integer(default=3)
 
     def get_path_integral_states(self):
+        """Get path integral states."""
         return self.variables_minus, self.variables_plus, self.aux_variables_minus, self.aux_variables_plus
 
     def numerical_fluctuations(self):
+        """Numerical fluctuations."""
         qLs, qRs, qauxL, qauxR = self.get_path_integral_states()
         
         # nc_fluct is a flattened 1D array
@@ -193,9 +215,11 @@ class NonconservativeRusanov(Rusanov):
         return out + nc_fluct
         
     def _call_model_matrix(self):
+        """Internal helper `_call_model_matrix`."""
         return lambda Q, Qaux, p: self.model.call.nonconservative_matrix(Q, Qaux, p)
 
     def _compute_fluctuations(self, qL, qR, auxL, auxR, p, n):
+        """Internal helper `_compute_fluctuations`."""
         xi_np, wi_np = np.polynomial.legendre.leggauss(self.integration_order)
         xi_np = 0.5 * (xi_np + 1)
         wi_np = 0.5 * wi_np
@@ -238,9 +262,11 @@ class NonconservativeRusanov(Rusanov):
 
 
 class PositiveNonconservativeRusanov(PositiveRusanov, NonconservativeRusanov):
+    """PositiveNonconservativeRusanov. (class)."""
     name = param.String(default="PositiveNonconservativeRusanov")
 
     def get_path_integral_states(self):
+        """Get path integral states."""
         qLs, qRs, hinvL, hinvR = self.hydrostatic_reconstruction(
             self.variables_minus, self.variables_plus
         )
@@ -252,24 +278,30 @@ class PositiveNonconservativeRusanov(PositiveRusanov, NonconservativeRusanov):
 
 
 class QuasilinearRusanov(NonconservativeRusanov):
+    """QuasilinearRusanov. (class)."""
     name = param.String(default="QuasilinearRusanov")
     
     def numerical_flux(self):
+        """Numerical flux."""
         zeros = [sp.Integer(0)] * self.model.n_variables
         return ZArray(zeros)
 
     def _call_model_matrix(self):
+        """Internal helper `_call_model_matrix`."""
         return lambda Q, Qaux, p: self.model.call.quasilinear_matrix(Q, Qaux, p)
 
 
 class PositiveQuasilinearRusanov(PositiveRusanov, QuasilinearRusanov):
+    """PositiveQuasilinearRusanov. (class)."""
     name = param.String(default="PositiveQuasilinearRusanov")
 
     def numerical_flux(self):
+        """Numerical flux."""
         zeros = [sp.Integer(0)] * self.model.n_variables
         return ZArray(zeros)
 
     def get_path_integral_states(self):
+        """Get path integral states."""
         qLs, qRs, hinvL, hinvR = self.hydrostatic_reconstruction(
             self.variables_minus, self.variables_plus
         )

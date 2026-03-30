@@ -1,3 +1,5 @@
+"""Module `zoomy_core.transformation.to_amrex`."""
+
 from zoomy_core.transformation.generic_c import (
     GenericCppModel,
     GenericCppNumerics,
@@ -13,6 +15,7 @@ class AmrexCore:
     """
 
     def __init__(self, *args, **kwargs):
+        """Initialize the instance."""
         self.real_type = "amrex::Real"
         self.math_namespace = "amrex::Math::"
         super().__init__(*args, **kwargs)
@@ -59,6 +62,7 @@ class AmrexCore:
         return super()._print_Symbol(s)
 
     def doprint(self, expr, **settings):
+        """Doprint."""
         code = super().doprint(expr, **settings)
         # AMReX uses std::pow for floating point powers
         code = code.replace("amrex::Math::pow(", "std::pow(")
@@ -77,12 +81,14 @@ class AmrexCore:
         return code
 
     def get_includes(self):
+        """Get includes."""
         return """#include <AMReX_Array4.H>
 #include <AMReX_Vector.H>
 #include <AMReX_SmallMatrix.H>"""
 
     def get_simple_array_def(self):
         # We don't need SimpleArray in AMReX, so we return an empty string.
+        """Get simple array def."""
         return ""
 
     def get_array_type(self, shape):
@@ -103,9 +109,11 @@ class AmrexCore:
 
     def format_accessor(self, var_name, index):
         # Access elements using matrix index notation (row, col)
+        """Format accessor."""
         return f"{var_name}({index}, 0)"
 
     def format_assignment(self, target_name, indices, value, shape):
+        """Format assignment."""
         idx = flatten_index(indices, shape)
         return f"{target_name}({idx}, 0) = {value};"
 
@@ -164,6 +172,7 @@ class AmrexCore:
 """
 
     def _print_Pow(self, expr):
+        """Internal helper `_print_Pow`."""
         base, exp = expr.as_base_exp()
         if exp.is_Integer:
             n = int(exp)
@@ -192,12 +201,14 @@ class AmrexModel(AmrexCore, GenericCppModel):
 
     def get_file_header(self):
         # We inject a 'using T = amrex::Real;' just in case anything falls back to T
+        """Get file header."""
         header = super().get_file_header()
         struct_decl = f"struct {self._wrapper_name} {{"
         replacement = f"{struct_decl}\n    using T = {self.real_type};"
         return header.replace(struct_decl, replacement)
 
     def get_bc_args(self):
+        """Get bc args."""
         t_q = self.get_array_type((self.n_dof_q,))
         t_aux = self.get_array_type((self.n_dof_qaux,))
         t_n = self.get_array_type((self.model.dimension,))
@@ -214,10 +225,12 @@ class AmrexNumerics(AmrexCore, GenericCppNumerics):
     _is_template_class = False
 
     def __init__(self, numerics, *args, **kwargs):
+        """Initialize the instance."""
         super().__init__(numerics, *args, **kwargs)
         self.gpu_enabled = True  # Ensure GPU macros are enabled for AMReX numerics
 
     def get_file_header(self):
+        """Get file header."""
         header = super().get_file_header()
         struct_decl = f"struct {self._wrapper_name} {{"
         replacement = f"{struct_decl}\n    using T = {self.real_type};"

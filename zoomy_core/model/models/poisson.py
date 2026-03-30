@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.models.poisson`."""
+
 import numpy as np
 import numpy.polynomial.legendre as L
 import numpy.polynomial.chebyshev as C
@@ -22,12 +24,14 @@ import zoomy_core.model.initial_conditions as IC
 
 @define(kw_only=True, slots=True, frozen=True)
 class Poisson(Model):
+    """Poisson. (class)."""
     dimension: int = 1
     variables: Zstruct = field(init=False, default=1)
     aux_variables: Zstruct = field(factory = lambda: ['ddTdxx', 'ddTdyy', 'ddTdzz'])
     
             
     def residual(self):
+        """Residual."""
         R = Matrix([0 for i in range(self.n_variables)])
         T = self.variables[0]
         ddTdxx = self.aux_variables.ddTdxx

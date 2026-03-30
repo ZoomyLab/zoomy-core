@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.models.coupled_constrained`."""
+
 import numpy as np
 import numpy.polynomial.legendre as L
 import numpy.polynomial.chebyshev as C
@@ -18,6 +20,7 @@ from zoomy_core.model.basemodel import Model
 import zoomy_core.model.initial_conditions as IC
 
 class CoupledConstrained(Model):
+    """CoupledConstrained. (class)."""
     def __init__(
         self,
         boundary_conditions,
@@ -30,6 +33,7 @@ class CoupledConstrained(Model):
         settings={},
         settings_default={},
     ):
+        """Initialize the instance."""
         self.variables = register_sympy_attribute(fields, "q")
         self.n_variables = self.variables.length()
         super().__init__(
@@ -45,6 +49,7 @@ class CoupledConstrained(Model):
 
 
     def source_implicit(self):
+        """Source implicit."""
         out = Matrix([0 for i in range(2)])
         u = self.variables[0]
         p = self.variables[1]

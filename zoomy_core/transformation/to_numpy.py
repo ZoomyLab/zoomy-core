@@ -1,3 +1,5 @@
+"""Module `zoomy_core.transformation.to_numpy`."""
+
 from typing import Callable, Dict, Optional
 import sympy as sp
 import numpy as np
@@ -24,9 +26,11 @@ class NumpyRuntimeModel:
     printer = "numpy"
     
     def _flatten_signature_args(self, arg_struct):
+        """Internal helper `_flatten_signature_args`."""
         flat_args = []
 
         def _flatten(value):
+            """Internal helper `_flatten`."""
             if hasattr(value, "values") and callable(value.values):
                 for item in value.values():
                     _flatten(item)
@@ -40,6 +44,7 @@ class NumpyRuntimeModel:
         return flat_args
 
     def _lambdify_function(self, function_obj, modules):
+        """Internal helper `_lambdify_function`."""
         args = self._flatten_signature_args(function_obj.args)
         expr = self._vectorize_expression(function_obj.definition, function_obj.args)
 
@@ -51,12 +56,14 @@ class NumpyRuntimeModel:
         signature = function_obj.args
 
         def runtime_callable(*runtime_args):
+            """Runtime callable."""
             flat_runtime_args = self._flatten_runtime_args(signature, runtime_args)
             return compiled(*flat_runtime_args)
 
         return runtime_callable
 
     def _flatten_runtime_args(self, signature, runtime_args):
+        """Internal helper `_flatten_runtime_args`."""
         expected_args = signature.values() if hasattr(signature, "values") else signature
         expected_args = list(expected_args)
         if len(runtime_args) != len(expected_args):
@@ -70,6 +77,7 @@ class NumpyRuntimeModel:
         return flat
 
     def _flatten_runtime_value(self, expected, value):
+        """Internal helper `_flatten_runtime_value`."""
         if hasattr(expected, "values") and callable(expected.values):
             out = []
             keys = list(expected.keys()) if hasattr(expected, "keys") else None
@@ -88,10 +96,12 @@ class NumpyRuntimeModel:
         return [value]
 
     def _collect_vector_symbols(self, signature):
+        """Internal helper `_collect_vector_symbols`."""
         vector_symbols = []
         vector_keys = {"variables", "aux_variables", "normal", "position"}
 
         def _collect(node, key=None, in_vector_context=False):
+            """Internal helper `_collect`."""
             context = in_vector_context or (key in vector_keys)
             if hasattr(node, "values") and callable(node.values):
                 keys = list(node.keys()) if hasattr(node, "keys") else [None] * len(node.values())
@@ -108,6 +118,7 @@ class NumpyRuntimeModel:
         return tuple(vector_symbols)
 
     def _get_anchor_symbol(self, signature):
+        """Internal helper `_get_anchor_symbol`."""
         if hasattr(signature, "contains") and signature.contains("variables"):
             variables = signature["variables"]
             if hasattr(variables, "values") and len(variables.values()) > 0:
@@ -117,6 +128,7 @@ class NumpyRuntimeModel:
         return vector_symbols[0] if vector_symbols else None
 
     def _vectorize_expression(self, expr, signature):
+        """Internal helper `_vectorize_expression`."""
         if not (hasattr(expr, "tolist") and callable(expr.tolist)):
             return expr
         shape = getattr(expr, "shape", ())
@@ -146,6 +158,7 @@ class NumpyRuntimeModel:
 
     @staticmethod
     def _extract_component(value, index, key):
+        """Internal helper `_extract_component`."""
         if key is not None and hasattr(value, key):
             return getattr(value, key)
         try:
@@ -159,6 +172,7 @@ class NumpyRuntimeModel:
         module: Optional[Dict[str, Callable]] = None,
         printer: Optional[str] = None,
     ):
+        """Initialize the instance."""
         self.model = model
         self.name = model.name
         self.dimension = model.dimension
@@ -209,6 +223,7 @@ class NumpyRuntimeSymbolic(NumpyRuntimeModel):
         module: Optional[Dict[str, Callable]] = None,
         printer: Optional[str] = None,
     ):
+        """Initialize the instance."""
         self.symbolic_obj = symbolic_obj
         self.module = dict(type(self).module) if module is None else dict(module)
         self.printer = type(self).printer if printer is None else printer

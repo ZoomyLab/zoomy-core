@@ -1,3 +1,5 @@
+"""Module `zoomy_core.transformation.generic_c`."""
+
 import sympy as sp
 from sympy.printing.cxx import CXX11CodePrinter
 import re
@@ -13,6 +15,7 @@ from zoomy_core.misc.misc import Zstruct, ZArray
 
 
 def flatten_index(indices, shape):
+    """Flatten index."""
     flat_idx = 0
     stride = 1
     for i, size in zip(reversed(indices), reversed(shape)):
@@ -22,6 +25,7 @@ def flatten_index(indices, shape):
 
 
 def get_nested_shape(expr):
+    """Get nested shape."""
     shape = (1,)
     if hasattr(expr, "shape"):
         shape = expr.shape
@@ -49,6 +53,7 @@ def get_nested_shape(expr):
 
 
 class GenericCppBase(CXX11CodePrinter):
+    """GenericCppBase. (class)."""
     _output_subdir = "cpp_interface"
     _wrapper_name = "BaseWrapper"
     _is_template_class = False
@@ -86,36 +91,43 @@ class GenericCppBase(CXX11CodePrinter):
     }
 
     def __init__(self, *args, **kwargs):
+        """Initialize the instance."""
         super().__init__(*args, **kwargs)
         self.symbol_maps = []
         self._std_regex = re.compile(r"std::([A-Za-z_]\w*)")
 
     def register_map(self, name, keys):
+        """Register map."""
         new_map = {k: self.format_accessor(name, i) for i, k in enumerate(keys)}
         self.symbol_maps.append(new_map)
         return new_map
 
     def _print_Symbol(self, s):
+        """Internal helper `_print_Symbol`."""
         for m in self.symbol_maps:
             if s in m:
                 return m[s]
         return super()._print_Symbol(s)
 
     def _print_Function(self, expr):
+        """Internal helper `_print_Function`."""
         name = expr.func.__name__
         if name in self.c_functions:
             return self.c_functions[name](self, *expr.args)
         return f"{self._print(expr.func)}({', '.join(map(self._print, expr.args))})"
 
     def _print_IndexedBase(self, expr):
+        """Internal helper `_print_IndexedBase`."""
         return self._print(expr.label) if hasattr(expr, "label") else str(expr)
 
     def _print_Indexed(self, expr):
+        """Internal helper `_print_Indexed`."""
         base = self._print(expr.base)
         indices = [self._print(i) for i in expr.indices]
         return f"{base}[{']['.join(indices)}]"
 
     def _print_min_max(self, func_name, args):
+        """Internal helper `_print_min_max`."""
         if len(args) == 1:
             return self._print(args[0])
         if len(args) == 2:
@@ -125,6 +137,7 @@ class GenericCppBase(CXX11CodePrinter):
         return f"{self.math_namespace}{func_name}({arg0}, {rest})"
 
     def _expand_vector_conditionals(self, expr):
+        """Internal helper `_expand_vector_conditionals`."""
         if isinstance(expr, (list, tuple)):
             return [self._expand_vector_conditionals(e) for e in expr]
         if hasattr(expr, "__getitem__") and not isinstance(expr, sp.Symbol):
@@ -161,6 +174,7 @@ class GenericCppBase(CXX11CodePrinter):
         return expr
 
     def _flatten_ragged_list(self, expr_list):
+        """Internal helper `_flatten_ragged_list`."""
         flat = []
         for e in expr_list:
             if isinstance(e, (list, tuple, sp.NDimArray)):
@@ -170,10 +184,12 @@ class GenericCppBase(CXX11CodePrinter):
         return flat
 
     def _optimize_array_calls(self, expr_list):
+        """Internal helper `_optimize_array_calls`."""
         definitions = []
         call_cache = {}
 
         def replace_logic(node):
+            """Replace logic."""
             if isinstance(node, sp.Indexed):
                 base = node.base
                 label = base.label if hasattr(base, "label") else base
@@ -226,6 +242,7 @@ class GenericCppBase(CXX11CodePrinter):
         return f"{self.real_type} {sym_name}[] = {{ {init_str} }};"
 
     def convert_expression_body(self, expr, shape, target="res"):
+        """Convert expression body."""
         if isinstance(expr, sp.Piecewise):
             return self._print_piecewise_structure(expr, shape, target)
         flat_expr = (
@@ -300,6 +317,7 @@ class GenericCppBase(CXX11CodePrinter):
         return "\n".join(["    " + line for line in lines])
 
     def _print_piecewise_structure(self, expr, shape, target):
+        """Internal helper `_print_piecewise_structure`."""
         lines = []
         for i, arg in enumerate(expr.args):
             val, cond = (
@@ -327,6 +345,7 @@ class GenericCppBase(CXX11CodePrinter):
         return "\n".join(lines)
 
     def _generate_signature_from_function(self, func_obj):
+        """Internal helper `_generate_signature_from_function`."""
         decls = []
         for key, obj in func_obj.args.items():
             cpp_name = self.ARG_MAPPING.get(key, key)
@@ -354,6 +373,7 @@ class GenericCppBase(CXX11CodePrinter):
         return ",\n        ".join(decls)
 
     def _process_kernel_from_function(self, func_obj):
+        """Internal helper `_process_kernel_from_function`."""
         name = func_obj.name
         expr = func_obj.definition
         expr = self._expand_vector_conditionals(expr)
@@ -366,11 +386,13 @@ class GenericCppBase(CXX11CodePrinter):
         return [self.wrap_function_signature(name, args_str, body, shape)]
 
     def get_includes(self):
+        """Get includes."""
         return """#include <cmath>
 #include <array>
 """
 
     def get_simple_array_def(self):
+        """Get simple array def."""
         return """
 #ifndef ZOOMY_SIMPLE_ARRAY
 #define ZOOMY_SIMPLE_ARRAY
@@ -388,16 +410,20 @@ struct SimpleArray {
 """
 
     def format_accessor(self, var_name, index):
+        """Format accessor."""
         return f"{var_name}[{index}]"
 
     def format_assignment(self, target_name, indices, value, shape):
+        """Format assignment."""
         idx = flatten_index(indices, shape)
         return f"{target_name}[{idx}] = {value};"
 
     def get_variable_declaration(self, variable_name):
+        """Get variable declaration."""
         return f"const T* {variable_name}"
 
     def wrap_function_signature(self, name, args_str, body_str, shape):
+        """Wrap function signature."""
         qualifier = "PORTABLE_FN " if self.gpu_enabled else ""
         arr_type = self.get_array_type(shape)
         return f"""    {qualifier}static inline {arr_type} {name}(
@@ -408,6 +434,7 @@ struct SimpleArray {
 """
 
     def _print_Pow(self, expr):
+        """Internal helper `_print_Pow`."""
         base, exp = expr.as_base_exp()
         if exp.is_Integer:
             n = int(exp)
@@ -422,10 +449,12 @@ struct SimpleArray {
         return f"{self.math_namespace}pow({self._print(base)}, {self._print(exp)})"
 
     def doprint(self, expr, **settings):
+        """Doprint."""
         code = super().doprint(expr, **settings)
         if self.math_namespace != "std::":
 
             def _repl(match):
+                """Internal helper `_repl`."""
                 return f"{self.math_namespace}{match.group(1)}"
 
             return self._std_regex.sub(_repl, code)
@@ -433,6 +462,7 @@ struct SimpleArray {
 
     @classmethod
     def _write_file(cls, code, settings, filename):
+        """Internal helper `_write_file`."""
         main_dir = misc.get_main_directory()
         output_dir = os.path.join(
             main_dir, settings.output.directory, cls._output_subdir
@@ -450,9 +480,11 @@ struct SimpleArray {
 
 
 class GenericCppModel(GenericCppBase):
+    """GenericCppModel. (class)."""
     _wrapper_name = "Model"
 
     def __init__(self, model, *args, **kwargs):
+        """Initialize the instance."""
         super().__init__(*args, **kwargs)
         self.model = model
         self.n_dof_q = model.n_variables
@@ -467,11 +499,13 @@ class GenericCppModel(GenericCppBase):
 
     @classmethod
     def write_code(cls, model, settings, filename="Model.H"):
+        """Write code."""
         printer = cls(model)
         code = printer.create_code()
         return cls._write_file(code, settings, filename)
 
     def create_code(self):
+        """Create code."""
         blocks = [self.get_file_header()]
         for name, func_obj in self.model.functions.items():
             blocks.extend(self._process_kernel_from_function(func_obj))
@@ -503,6 +537,7 @@ class GenericCppModel(GenericCppBase):
         return "\n".join(blocks)
 
     def get_file_header(self):
+        """Get file header."""
         bc_names = sorted(
             self.model.boundary_conditions.boundary_conditions_list_dict.keys()
         )
@@ -555,6 +590,7 @@ class GenericCppModel(GenericCppBase):
         return "\n".join(lines)
 
     def get_file_footer(self):
+        """Get file footer."""
         return "};\n"
 
     def get_bc_args(self):
@@ -568,9 +604,11 @@ class GenericCppModel(GenericCppBase):
 
 
 class GenericCppNumerics(GenericCppBase):
+    """GenericCppNumerics. (class)."""
     _wrapper_name = "Numerics"
 
     def __init__(self, numerics, gpu_enabled=False, *args, **kwargs):
+        """Initialize the instance."""
         super().__init__(*args, **kwargs)
         self.numerics = numerics
         self.model = numerics.model
@@ -591,11 +629,13 @@ class GenericCppNumerics(GenericCppBase):
 
     @classmethod
     def write_code(cls, numerics, settings, filename="Numerics.H", gpu_enabled=False):
+        """Write code."""
         printer = cls(numerics, gpu_enabled=gpu_enabled)
         code = printer.create_code()
         return cls._write_file(code, settings, filename)
 
     def create_code(self):
+        """Create code."""
         blocks = [self.get_file_header()]
         for name, func_obj in self.numerics.functions.items():
             blocks.extend(self._process_kernel_from_function(func_obj))
@@ -603,6 +643,7 @@ class GenericCppNumerics(GenericCppBase):
         return "\n".join(blocks)
 
     def get_file_header(self):
+        """Get file header."""
         tpl = "template <typename T>" if self._is_template_class else ""
         lines = [
             "#pragma once",
@@ -636,6 +677,7 @@ class GenericCppNumerics(GenericCppBase):
         return "\n".join(lines)
 
     def get_file_footer(self):
+        """Get file footer."""
         return "};\n"
 
 
@@ -645,20 +687,24 @@ class GenericCppNumerics(GenericCppBase):
 
 
 class CppModel(GenericCppModel):
+    """CppModel. (class)."""
     _output_subdir = ".c_interface"
     _is_template_class = True
 
     def __init__(self, model, *args, **kwargs):
+        """Initialize the instance."""
         super().__init__(model, *args, **kwargs)
         self.real_type = "T"
         self.math_namespace = "std::"
 
 
 class CppNumerics(GenericCppNumerics):
+    """CppNumerics. (class)."""
     _output_subdir = ".c_interface"
     _is_template_class = True
 
     def __init__(self, numerics, *args, **kwargs):
+        """Initialize the instance."""
         super().__init__(numerics, *args, **kwargs)
         self.real_type = "T"
         self.math_namespace = "std::"

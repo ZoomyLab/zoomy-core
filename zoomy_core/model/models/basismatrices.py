@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.models.basismatrices`."""
+
 import os
 import numpy as np
 import sympy
@@ -13,13 +15,16 @@ from zoomy_core.misc import misc as misc
 
 
 class Basismatrices:
+    """Basismatrices. (class)."""
     def __init__(self, basis=Legendre_shifted(), use_cache=True, cache_path=".cache"):
+        """Initialize the instance."""
         self.basisfunctions = basis
         self.use_cache = use_cache
         self.cache_dir = cache_path
         self.cache_subdir = f"basismatrices/{basis.name}/{basis.level}"
 
     def load_cached_matrices(self):
+        """Load cached matrices."""
         main_dir = misc.get_main_directory()
 
         path = os.path.join(os.path.join(main_dir, self.cache_dir), self.cache_subdir)
@@ -40,6 +45,7 @@ class Basismatrices:
         return failed
 
     def save_cached_matrices(self):
+        """Save cached matrices."""
         main_dir = misc.get_main_directory()
 
         path = os.path.join(os.path.join(main_dir, self.cache_dir), self.cache_subdir)
@@ -58,6 +64,7 @@ class Basismatrices:
 
 
     def _compute_matrices(self, level):
+        """Internal helper `_compute_matrices`."""
         start = get_time()
         # object is key here, as we need to have a symbolic representation of the fractions.
         self.phib = np.empty((level + 1), dtype=object)
@@ -89,6 +96,7 @@ class Basismatrices:
             
 
     def compute_matrices(self, level):
+        """Compute matrices."""
         failed = True
         if self.use_cache:
             failed = self.load_cached_matrices()
@@ -97,6 +105,7 @@ class Basismatrices:
             self.save_cached_matrices()
 
     def enforce_boundary_conditions_lsq(self, rhs=np.zeros(2), dim=1):
+        """Enforce boundary conditions lsq."""
         level = len(self.basisfunctions.basis) - 1
         constraint_bottom = [self.basisfunctions.eval(i, 0.0) for i in range(level + 1)]
         constraint_top = [
@@ -117,6 +126,7 @@ class Basismatrices:
         A_enforce_inv = np.array((AtA + reg * np.eye(AtA.shape[0])).inv(), dtype=float)
 
         def f_1d(Q):
+            """F 1d."""
             for i, q in enumerate(Q.T):
                 # alpha_enforce = q[I_enforce+1]
                 alpha_free = q[I_free + 1]
@@ -130,6 +140,7 @@ class Basismatrices:
             return Q
 
         def f_2d(Q):
+            """F 2d."""
             i1 = [[0] + [i + 1 for i in range(1 + level)]]
             i2 = [[0] + [i + 1 + 1 + level for i in range(1 + level)]]
             Q1 = Q[i1]
@@ -148,6 +159,7 @@ class Basismatrices:
             assert False
 
     def enforce_boundary_conditions_lsq2(self, rhs=np.zeros(2), dim=1):
+        """Enforce boundary conditions lsq2."""
         level = len(self.basisfunctions.basis) - 1
         constraint_bottom = [self.basisfunctions.eval(i, 0.0) for i in range(level + 1)]
         constraint_top = [
@@ -165,7 +177,9 @@ class Basismatrices:
         A_free = np.array(A[:, list(I_free)], dtype=float)
 
         def obj(alpha0, lam):
+            """Obj."""
             def f(alpha):
+                """F."""
                 return np.sum((alpha - alpha0) ** 2) + lam * np.sum(
                     np.array(np.dot(A, alpha) ** 2, dtype=float)
                 )
@@ -173,6 +187,7 @@ class Basismatrices:
             return f
 
         def f_1d(Q):
+            """F 1d."""
             for i, q in enumerate(Q.T):
                 h = q[0]
                 alpha = q[1:] / h
@@ -182,6 +197,7 @@ class Basismatrices:
             return Q
 
         def f_2d(Q):
+            """F 2d."""
             i1 = [[0] + [i + 1 for i in range(1 + level)]]
             i2 = [[0] + [i + 1 + 1 + level for i in range(1 + level)]]
             Q1 = Q[i1]
@@ -202,6 +218,7 @@ class Basismatrices:
     def enforce_boundary_conditions(
         self, enforced_basis=[-2, -1], rhs=np.zeros(2), dim=1
     ):
+        """Enforce boundary conditions."""
         level = len(self.basisfunctions.basis) - 1
         constraint_bottom = [self.basisfunctions.eval(i, 0.0) for i in range(level + 1)]
         constraint_top = [
@@ -223,6 +240,7 @@ class Basismatrices:
         A_enforce_inv = np.array(A_enforce.inv(), dtype=float)
 
         def f_1d(Q):
+            """F 1d."""
             for i, q in enumerate(Q.T):
                 alpha_enforce = q[I_enforce + 1]
                 alpha_free = q[I_free + 1]
@@ -235,6 +253,7 @@ class Basismatrices:
             return Q
 
         def f_2d(Q):
+            """F 2d."""
             i1 = [[0] + [i + 1 for i in range(1 + level)]]
             i2 = [[0] + [i + 1 + 1 + level for i in range(1 + level)]]
             Q1 = Q[i1]
@@ -257,6 +276,7 @@ class Basismatrices:
     """
 
     def _phib(self, k):
+        """Internal helper `_phib`."""
         return self.basisfunctions.eval(k, self.basisfunctions.bounds()[0])
 
     """ 
@@ -264,6 +284,7 @@ class Basismatrices:
     """
 
     def _M(self, k, i):
+        """Internal helper `_M`."""
         return integrate(
             self.basisfunctions.weight(z) * self.basisfunctions.eval(k, z) * self.basisfunctions.eval(i, z), (z, self.basisfunctions.bounds()[0], self.basisfunctions.bounds()[1])
         )
@@ -273,6 +294,7 @@ class Basismatrices:
     """
 
     def _A(self, k, i, j):
+        """Internal helper `_A`."""
         return integrate(
             self.basisfunctions.weight(z) * self.basisfunctions.eval(k, z)
             * self.basisfunctions.eval(i, z)
@@ -285,6 +307,7 @@ class Basismatrices:
     """
 
     def _B(self, k, i, j):
+        """Internal helper `_B`."""
         return integrate(
             self.basisfunctions.weight(z) * diff(self.basisfunctions.eval(k, z), z)
             * integrate(self.basisfunctions.eval(j, z), z)
@@ -297,6 +320,7 @@ class Basismatrices:
     """
 
     def _D(self, k, i):
+        """Internal helper `_D`."""
         return integrate(
             self.basisfunctions.weight(z) * diff(self.basisfunctions.eval(k, z), z)
             * diff(self.basisfunctions.eval(i, z), z),
@@ -307,6 +331,7 @@ class Basismatrices:
     Compute <(phi')_k, (phi')_j * xi>
     """
     def _Dxi(self, k, i):
+        """Internal helper `_Dxi`."""
         return integrate(
             self.basisfunctions.weight(z) * diff(self.basisfunctions.eval(k, z), z)
             * diff(self.basisfunctions.eval(i, z), z) * z,
@@ -316,6 +341,7 @@ class Basismatrices:
     Compute <(phi')_k, (phi')_j * xi**2>
     """
     def _Dxi2(self, k, i):
+        """Internal helper `_Dxi2`."""
         return integrate(
             self.basisfunctions.weight(z) * diff(self.basisfunctions.eval(k, z), z)
             * diff(self.basisfunctions.eval(i, z), z) * z * z,
@@ -327,6 +353,7 @@ class Basismatrices:
     """
 
     def _D1(self, k, i):
+        """Internal helper `_D1`."""
         return integrate(
             self.basisfunctions.weight(z) * self.basisfunctions.eval(k, z) * diff(self.basisfunctions.eval(i, z), z),
             (z, self.basisfunctions.bounds()[0], self.basisfunctions.bounds()[1]),
@@ -337,6 +364,7 @@ class Basismatrices:
     """
 
     def _DD(self, k, i):
+        """Internal helper `_DD`."""
         return integrate(
             self.basisfunctions.weight(z) * self.basisfunctions.eval(k, z)
             * diff(diff(self.basisfunctions.eval(i, z), z), z),
@@ -349,6 +377,7 @@ class Basismatrices:
     """
 
     def _DT(self, k, i, j):
+        """Internal helper `_DT`."""
         return integrate(
             self.basisfunctions.weight(z) * diff(self.basisfunctions.eval(k, z), z)
             * diff(self.basisfunctions.eval(i, z), z)
@@ -358,7 +387,9 @@ class Basismatrices:
 
 
 class BasisNoHOM(Basismatrices):
+    """BasisNoHOM. (class)."""
     def _A(self, k, i, j):
+        """Internal helper `_A`."""
         count = 0
         # count += float(k > 0)
         count += float(i > 0)
@@ -369,6 +400,7 @@ class BasisNoHOM(Basismatrices):
         return 0
 
     def _B(self, k, i, j):
+        """Internal helper `_B`."""
         count = 0
         # count += float(k > 0)
         count += float(i > 0)

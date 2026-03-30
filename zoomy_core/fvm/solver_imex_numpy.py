@@ -1,3 +1,5 @@
+"""Module `zoomy_core.fvm.solver_imex_numpy`."""
+
 import time
 from dataclasses import dataclass
 
@@ -15,6 +17,7 @@ from zoomy_core.misc.logger_config import logger
 
 @dataclass
 class IMEXStats:
+    """IMEXStats. (class)."""
     n_steps: int = 0
     source_mode: str = "auto"
     implicit_calls: int = 0
@@ -46,10 +49,12 @@ class IMEXSourceSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
     fd_eps = 1e-7
 
     def __init__(self, **kwargs):
+        """Initialize the instance."""
         super().__init__(**kwargs)
         object.__setattr__(self, "last_stats", IMEXStats(source_mode=self.source_mode))
 
     def _resolve_source_mode(self, model):
+        """Internal helper `_resolve_source_mode`."""
         if self.source_mode in ("local", "global"):
             return self.source_mode
         symbolic_model = model.model if hasattr(model, "model") else model
@@ -59,12 +64,14 @@ class IMEXSourceSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
         return "global" if has_derivative_specs else "local"
 
     def _resolve_jv_backend(self):
+        """Internal helper `_resolve_jv_backend`."""
         if self.jv_backend in ("analytic", "fd"):
             return self.jv_backend
         # Compatibility mapping for existing scripts.
         return "analytic" if self.use_analytic_chain_jvp else "fd"
 
     def _implicit_source_local(self, Qe, Qaux, model, parameters, dt):
+        """Internal helper `_implicit_source_local`."""
         Q = np.array(Qe, copy=True)
         n_cells = Q.shape[1]
         n_vars = Q.shape[0]
@@ -86,11 +93,13 @@ class IMEXSourceSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
         return Q
 
     def _implicit_source_global(self, Qe, Qaux, Qold, Qauxold, mesh, model, parameters, time, dt, boundary_operator):
+        """Internal helper `_implicit_source_global`."""
         runtime_model = model
         symbolic_model = model.model if hasattr(model, "model") else None
         Q = np.array(Qe, copy=True)
 
         def residual(Qstate):
+            """Residual."""
             Qaux_state = self.update_qaux(
                 Qstate, Qaux, Qold, Qauxold, mesh, runtime_model, parameters, time, dt
             )
@@ -108,6 +117,7 @@ class IMEXSourceSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
             n = Q.size
 
             def matvec(v_flat):
+                """Matvec."""
                 V = v_flat.reshape(q_shape)
                 jv_source = self._compute_source_jvp_global(
                     runtime_model=runtime_model,
@@ -158,6 +168,7 @@ class IMEXSourceSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
         dt,
         base_residual=None,
     ):
+        """Internal helper `_compute_source_jvp_global`."""
         backend = self._resolve_jv_backend()
         if backend == "analytic":
             if symbolic_model is None:
@@ -188,6 +199,7 @@ class IMEXSourceSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
         raise ValueError(f"Unsupported jv_backend '{backend}'.")
 
     def solve(self, mesh, model, write_output=False):
+        """Solve."""
         t0 = time.time()
         t_init0 = time.time()
         Q, Qaux = self.initialize(mesh, model)
@@ -219,6 +231,7 @@ class IMEXSourceSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
             i_snapshot = save_fields(0.0, 0.0, i_snapshot, Q, Qaux)
         else:
             def save_fields(time, next_write_at, i_snapshot, Q, Qaux):
+                """Save fields."""
                 return i_snapshot
             dt_snapshot = self.time_end
             i_snapshot = 0.0
