@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.custom_sympy_functions`."""
+
 import sympy as sp
 import itertools
 from zoomy_core.misc.misc import ZArray
@@ -26,7 +28,9 @@ class conditional(sp.Function):
 
     def __new__(cls, condition, true_val, false_val, **kwargs):
         # 1. Helper to check for array-like inputs (excluding Symbols)
+        """Hook `__new__`."""
         def is_vec(x):
+            """Is vec."""
             return hasattr(x, "__getitem__") and not isinstance(
                 x, (sp.Symbol, sp.Function)
             )

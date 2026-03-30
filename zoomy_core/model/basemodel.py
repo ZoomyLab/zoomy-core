@@ -1,3 +1,5 @@
+"""Symbolic PDE model base: variables, parameters, registered flux/source callbacks, and BC wiring."""
+
 import sympy as sp
 import numpy as np
 import param
@@ -18,6 +20,7 @@ def default_simplify(expr):
 
 
 def parse_definition_to_zstruct(definition, prefix="q_"):
+    """Turn int/list/dict/:class:`~zoomy_core.misc.misc.Zstruct` specs into symbolic :class:`~zoomy_core.misc.misc.Zstruct` fields."""
     attributes = {}
     if isinstance(definition, int):
         for i in range(definition):
@@ -41,6 +44,7 @@ def parse_definition_to_zstruct(definition, prefix="q_"):
 
 
 def extract_parameter_defaults(definition):
+    """Numeric defaults for parameters (feeds ``parameter_values`` arrays in solvers)."""
     defaults = {}
     if isinstance(definition, dict):
         for name, val in definition.items():
@@ -59,6 +63,7 @@ def extract_parameter_defaults(definition):
 
 
 class Model(param.Parameterized, SymbolicRegistrar):
+    """Model. (class)."""
     name = param.String(default="Model")
     dimension = param.Integer(default=1)
     disable_differentiation = param.Boolean(default=False)
@@ -92,6 +97,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
         return val
 
     def _initialize_derived_properties(self):
+        """Internal helper `_initialize_derived_properties`."""
         p_def = self._resolve_input(self.parameters)
         var_def = self._resolve_input(self.variables)
         aux_def = self._resolve_input(self.aux_variables)
@@ -257,49 +263,64 @@ class Model(param.Parameterized, SymbolicRegistrar):
         self._aux_boundary_conditions.name = "aux_boundary_conditions"
 
     def print_boundary_conditions(self):
+        """Print boundary conditions."""
         return self._boundary_conditions.definition
 
     # --- Physics Methods (Unchanged) ---
     def flux(self):
+        """Flux."""
         return ZArray.zeros(self.n_variables, self.dimension)
 
     def dflux(self):
+        """Dflux."""
         return ZArray.zeros(self.n_variables, self.dimension)
     
     def hydrostatic_pressure(self):
+        """Hydrostatic pressure."""
         return ZArray.zeros(self.n_variables, self.dimension)
 
     def nonconservative_matrix(self):
+        """Nonconservative matrix."""
         return ZArray.zeros(self.n_variables, self.n_variables, self.dimension)
 
     def source(self):
+        """Source."""
         return ZArray.zeros(self.n_variables)
 
     def residual(self):
+        """Residual."""
         return ZArray.zeros(self.n_variables)
 
     def interpolate(self):
+        """Interpolate."""
         return ZArray(self.variables)
 
     def project_2d_to_3d(self):
+        """Project 2d to 3d."""
         return ZArray.zeros(6)
 
     def project_3d_to_2d(self):
+        """Project 3d to 2d."""
         return ZArray.zeros(self.n_variables)
 
     def initial_condition(self):
+        """Initial condition."""
         return ZArray.zeros(self.n_variables)
 
     def initial_aux_condition(self):
+        """Initial aux condition."""
         return ZArray.zeros(self.n_aux_variables)
 
     def update_variables(self):
+        """Update variables."""
         return ZArray(self.variables)
 
     def update_aux_variables(self):
+        """Update aux variables."""
         return ZArray(self.aux_variables)
 
     def update_variables_jacobian_wrt_variables(self):
+        """Update variables jacobian wrt variables."""
         if self.disable_differentiation:
             return ZArray.zeros(self.n_variables, self.n_variables)
         return self._simplify(
@@ -307,6 +328,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
         )
 
     def update_aux_variables_jacobian_wrt_variables(self):
+        """Update aux variables jacobian wrt variables."""
         if self.disable_differentiation:
             return ZArray.zeros(self.n_aux_variables, self.n_variables)
         return self._simplify(
@@ -314,6 +336,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
         )
 
     def quasilinear_matrix(self):
+        """Quasilinear matrix."""
         if self.disable_differentiation:
             return ZArray.zeros(self.n_variables, self.n_variables, self.dimension)
         JacF = ZArray(sp.derive_by_array(self.flux(), self.variables.get_list()))
@@ -325,6 +348,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
         return self._simplify(JacF + JacP + self.nonconservative_matrix())
 
     def source_jacobian_wrt_variables(self):
+        """Source jacobian wrt variables."""
         if self.disable_differentiation:
             return ZArray.zeros(self.n_variables, self.n_variables)
         return self._simplify(
@@ -332,6 +356,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
         )
 
     def source_jacobian_wrt_aux_variables(self):
+        """Source jacobian wrt aux variables."""
         if self.disable_differentiation:
             return ZArray.zeros(self.n_variables, self.n_aux_variables)
         return self._simplify(
@@ -339,6 +364,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
         )
 
     def eigenvalues(self):
+        """Eigenvalues."""
         q_mat = self.quasilinear_matrix()
         A = self.normal[0] * q_mat[:, :, 0]
         for i in range(1, self.dimension):
@@ -350,12 +376,15 @@ class Model(param.Parameterized, SymbolicRegistrar):
         return ZArray([self._simplify(ev) for ev in evs])
 
     def left_eigenvectors(self):
+        """Left eigenvectors."""
         return ZArray.zeros(self.n_variables, self.n_variables)
 
     def right_eigenvectors(self):
+        """Right eigenvectors."""
         return ZArray.zeros(self.n_variables, self.n_variables)
 
     def print_model_functions(self, function_names=None):
+        """Print model functions."""
         if function_names is None:
             function_names = ["flux", "nonconservative_matrix", "source", "residual"]
 

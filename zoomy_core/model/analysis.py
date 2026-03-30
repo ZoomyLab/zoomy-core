@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.analysis`."""
+
 from sympy import (
     Matrix,
     diff,
@@ -19,7 +21,9 @@ from IPython.display import display, Latex
 
 
 class ModelAnalyser:
+    """ModelAnalyser. (class)."""
     def __init__(self, model):
+        """Initialize the instance."""
         self.model = model
         self.t = model.time
         x, y, z = model.position
@@ -30,9 +34,11 @@ class ModelAnalyser:
         self.plane_wave_symbols = []
 
     def get_equations(self):
+        """Get equations."""
         return self.equations
 
     def print_equations(self):
+        """Print equations."""
         if not self.equations:
             print("No equations generated.")
             return
@@ -41,29 +47,35 @@ class ModelAnalyser:
         display(Latex(latex_block))
 
     def get_time_space(self):
+        """Get time space."""
         x, y, z = self.model.position
         t = self.model.time
         return t, x, y, z
 
     def _get_omega_k(self):
+        """Internal helper `_get_omega_k`."""
         omega, kx, ky, kz = symbols("omega k_x k_y k_z")
         return omega, kx, ky, kz
 
     def _get_exponential(self):
+        """Internal helper `_get_exponential`."""
         omega, kx, ky, kz = self._get_omega_k()
         t, x, y, z = self.get_time_space()
         exponential = exp(I * (kx * x + ky * y + kz * z - omega * t))
         return exponential
 
     def get_eps(self):
+        """Get eps."""
         eps = symbols("eps")
         return eps
 
     def create_functions_from_list(self, names):
+        """Create functions from list."""
         t, x, y, z = self.get_time_space()
         return [Function(name)(t, x, y, z) for name in names]
 
     def delete_equations(self, indices):
+        """Delete equations."""
         self.equations = [
             self.equations[i] for i in range(len(self.equations)) if i not in indices
         ]
@@ -85,6 +97,7 @@ class ModelAnalyser:
         self.equations = [eq.xreplace(f_bar_dict).doit() for eq in self.equations]
 
     def solve_for_dispersion_relation(self):
+        """Solve for dispersion relation."""
         assert self.equations is not None
         assert self.plane_wave_symbols, "No plane wave symbols defined."
 
@@ -102,6 +115,7 @@ class ModelAnalyser:
         return sol
 
     def remove_exponential(self):
+        """Remove exponential."""
         exponential = self._get_exponential()
         equations = self.equations
         equations = [

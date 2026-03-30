@@ -1,3 +1,5 @@
+"""Module `zoomy_core.postprocessing.postprocessing`."""
+
 import os
 import numpy as np
 
@@ -18,6 +20,7 @@ from zoomy_core.misc import misc as misc
 def vtk_project_2d_to_3d(
     model, settings, start_at_time=0, scale_h=1.0, filename='out_3d'
 ):
+    """Vtk project 2d to 3d."""
     if not _HAVE_H5PY:
         raise ImportError("h5py is required for vtk_project_2d_to_3d function.")
     Nz = model.number_of_points_3d

@@ -1,9 +1,12 @@
+"""Module `zoomy_core.mesh.petscmesh`."""
+
 import numpy as np
 from petsc4py import PETSc
 import os
 
 
 class PetscMesh:
+    """PetscMesh. (class)."""
     def __init__(self, filepath):
         """
         Initializes the PetscMesh with a path to a .msh file.
@@ -24,6 +27,7 @@ class PetscMesh:
     
     
     def to_h5(self, output_path, model=None):
+        """To h5."""
         import h5py
         import numpy as np
         import os

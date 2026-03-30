@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.derivative_workflow`."""
+
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Tuple
 
@@ -16,23 +18,29 @@ from zoomy_core.misc.misc import ZArray, Zstruct
 
 @dataclass(frozen=True)
 class DerivativeSpec:
+    """DerivativeSpec. (class)."""
     field: str
     axes: Tuple[str, ...]
 
     @property
     def key(self) -> Tuple[str, Tuple[str, ...]]:
+        """Key."""
         return (self.field, self.axes)
 
     def aux_name(self) -> str:
+        """Aux name."""
         axis_code = "".join(self.axes)
         return f"d_{axis_code}_{self.field}"
 
 
 class DerivativeNamespace:
+    """DerivativeNamespace. (class)."""
     def __init__(self, model: "StructuredDerivativeModel"):
+        """Initialize the instance."""
         self._model = model
 
     def diff(self, field, axes: Iterable[str]):
+        """Diff."""
         axes_tuple = tuple(axes)
         field_name = self._model.resolve_field_name(field)
         key = (field_name, axes_tuple)
@@ -43,15 +51,19 @@ class DerivativeNamespace:
         return self._model.derivative_key_to_symbol[key]
 
     def dt(self, field):
+        """Dt."""
         return self.diff(field, ("t",))
 
     def dx(self, field):
+        """Dx."""
         return self.diff(field, ("x",))
 
     def dxx(self, field):
+        """Dxx."""
         return self.diff(field, ("x", "x"))
 
     def dtxx(self, field):
+        """Dtxx."""
         return self.diff(field, ("t", "x", "x"))
 
 
@@ -67,9 +79,11 @@ class StructuredDerivativeModel(Model):
     aux_variables = lambda self: self.derivative_buffer_aux_names()
 
     def requested_derivatives(self) -> List[DerivativeSpec]:
+        """Requested derivatives."""
         return []
 
     def _canonicalize_axes(self, axes: Tuple[str, ...]) -> Tuple[str, ...]:
+        """Internal helper `_canonicalize_axes`."""
         mode = self.derivative_canonicalization
         if mode == "none":
             return axes
@@ -80,6 +94,7 @@ class StructuredDerivativeModel(Model):
         return axes
 
     def _canonicalize_specs(self, specs: List[DerivativeSpec]) -> List[DerivativeSpec]:
+        """Internal helper `_canonicalize_specs`."""
         dedup: Dict[Tuple[str, Tuple[str, ...]], DerivativeSpec] = {}
         for spec in specs:
             axes = self._canonicalize_axes(spec.axes)
@@ -98,6 +113,7 @@ class StructuredDerivativeModel(Model):
         specs: List[DerivativeSpec] = []
 
         def _axes_from_helper(name: str):
+            """Internal helper `_axes_from_helper`."""
             if not name.startswith("d"):
                 return None
             if name == "diff":
@@ -198,6 +214,7 @@ class StructuredDerivativeModel(Model):
         return specs
 
     def _user_aux_names(self) -> List[str]:
+        """Internal helper `_user_aux_names`."""
         definition = self._resolve_input(self.user_aux_variables)
         if isinstance(definition, int):
             return [f"aux_{i}" for i in range(definition)]
@@ -212,6 +229,7 @@ class StructuredDerivativeModel(Model):
         )
 
     def derivative_buffer_aux_names(self) -> List[str]:
+        """Derivative buffer aux names."""
         user_names = self._user_aux_names()
         specs = list(self.requested_derivatives())
         if self.auto_requested_derivatives:
@@ -221,6 +239,7 @@ class StructuredDerivativeModel(Model):
         return user_names + deriv_names
 
     def _initialize_derived_properties(self):
+        """Internal helper `_initialize_derived_properties`."""
         super()._initialize_derived_properties()
         self.Q = self.variables
         self.A = self.aux_variables
@@ -244,6 +263,7 @@ class StructuredDerivativeModel(Model):
         self.D = DerivativeNamespace(self)
 
     def resolve_field_name(self, field) -> str:
+        """Resolve field name."""
         if isinstance(field, str):
             return field
         if field in self._symbol_to_field:
@@ -255,6 +275,7 @@ class DerivativeAwareSolverMixin:
     """Computes declared derivative buffer entries and fills Qaux."""
 
     def update_qaux(self, Q, Qaux, Qold, Qauxold, mesh, model, parameters, time, dt):
+        """Update qaux."""
         symbolic_model = model.model if hasattr(model, "model") else model
         if not hasattr(symbolic_model, "derivative_specs"):
             return Qaux
@@ -273,6 +294,7 @@ class DerivativeAwareSolverMixin:
         return out
 
     def _compute_derivative(self, axes, q_now, q_old, mesh, dt):
+        """Internal helper `_compute_derivative`."""
         n_t = sum(a == "t" for a in axes)
         n_x = sum(a == "x" for a in axes)
         if len(axes) != (n_t + n_x):

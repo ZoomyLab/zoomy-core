@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.models.shallow_moments_topo`."""
+
 import sympy
 from sympy import Matrix, MutableDenseNDimArray, Symbol, S, sqrt, Piecewise
 import param
@@ -23,6 +25,7 @@ class ShallowMomentsTopo(Model):
     )
     
     def __init__(self, init_functions=True, **kwargs):
+        """Initialize the instance."""
         super().__init__(init_functions=False, **kwargs)
 
         # Enforce positivity for Depth 'h' (Index 1)
@@ -37,10 +40,12 @@ class ShallowMomentsTopo(Model):
     
     def _compute_variable_count(self):
         # b(1) + h(1) + dim * (level + 1)
+        """Internal helper `_compute_variable_count`."""
         return 2 + self.dimension * (self.level + 1)
 
     def _compute_aux_variable_count(self):
         # Original logic: 2 * (2 + dim*(level+1))
+        """Internal helper `_compute_aux_variable_count`."""
         return 2 * (2 + self.dimension * (self.level + 1))
 
     # Bind the methods so Model._resolve_input can call them
@@ -129,6 +134,7 @@ class ShallowMomentsTopo(Model):
     # --- 4. Conservation Laws ---
 
     def flux(self):
+        """Flux."""
         dim = self.dimension
         p = self.parameters
         lvl = self.level
@@ -188,6 +194,7 @@ class ShallowMomentsTopo(Model):
         return (ZArray(F))
     
     def hydrostatic_pressure(self):
+        """Hydrostatic pressure."""
         dim = self.dimension
         p = self.parameters
         lvl = self.level
@@ -286,11 +293,13 @@ class ShallowMomentsTopo(Model):
         return (ZArray(A_tensor))
 
     def source(self):
+        """Source."""
         return Matrix.zeros(self.n_variables, 1)
 
     # --- 5. Additional Source Terms ---
 
     def gravity(self):
+        """Gravity."""
         out = Matrix.zeros(self.n_variables, 1)
         out[2] = -self.parameters.g * self.parameters.ex * self.variables[0]
         if self.dimension == 2:
@@ -302,6 +311,7 @@ class ShallowMomentsTopo(Model):
 
     def newtonian(self):
         # Viscous terms
+        """Newtonian."""
         p = self.parameters
         out = Matrix.zeros(self.n_variables, 1)
         b, h, moments, hinv = self.get_primitives()
@@ -333,6 +343,7 @@ class ShallowMomentsTopo(Model):
 
     def slip(self):
         # Navier-slip boundary condition
+        """Slip."""
         p = self.parameters
         out = Matrix.zeros(self.n_variables, 1)
         b, h, moments, hinv = self.get_primitives()
@@ -354,6 +365,7 @@ class ShallowMomentsTopo(Model):
     
     def surface_friction(self):
         # Navier-slip boundary condition
+        """Surface friction."""
         p = self.parameters
         out = Matrix.zeros(self.n_variables, 1)
         b, h, moments, hinv = self.get_primitives()
@@ -380,6 +392,7 @@ class ShallowMomentsTopo(Model):
 
     def slip_mod(self):
         # Modified slip
+        """Slip mod."""
         p = self.parameters
         out = Matrix.zeros(self.n_variables, 1)
         b, h, moments, hinv = self.get_primitives()
@@ -410,6 +423,7 @@ class ShallowMomentsTopo(Model):
 
     def chezy(self):
         # Chezy friction
+        """Chezy."""
         p = self.parameters
         out = Matrix.zeros(self.n_variables, 1)
         b, h, moments, hinv = self.get_primitives()
@@ -448,6 +462,7 @@ class ShallowMomentsTopo(Model):
 
     def newtonian_turbulent_algebraic(self):
         # Algebraic turbulence model
+        """Newtonian turbulent algebraic."""
         p = self.parameters
         out = Matrix.zeros(self.n_variables, 1)
         b, h, moments, hinv = self.get_primitives()
@@ -570,6 +585,7 @@ class ShallowMomentsTopo(Model):
         return out
     
     def _regularize(self, expr):
+        """Internal helper `_regularize`."""
         if self.level > 1:
             b, h, moments, hinv = self.get_primitives()
             for d in range(self.dimension):
@@ -579,6 +595,7 @@ class ShallowMomentsTopo(Model):
     
     def _eigenvalues(self, A):
 
+        """Internal helper `_eigenvalues`."""
         b, h, moments, hinv = self.get_primitives()
         n = self.normal
         An = ZArray.zeros(self.n_variables, self.n_variables)
@@ -666,6 +683,7 @@ class NumericalShallowMomentsTopo(ShallowMomentsTopo):
     """
     
     def __init__(self, init_functions=True, **kwargs):
+        """Initialize the instance."""
         super().__init__(init_functions=False, **kwargs)
 
         if init_functions:
@@ -675,6 +693,7 @@ class NumericalShallowMomentsTopo(ShallowMomentsTopo):
     aux_variables = param.Parameter(default=1)      
 
     def get_primitives(self):
+        """Get primitives."""
         n_moments = self.level + 1
         b = self.variables[0]
         h = self.variables[1]
@@ -702,6 +721,7 @@ class NumericalShallowMomentsTopo(ShallowMomentsTopo):
         return b, h, moments, hinv
 
     def eigenvalues(self):
+        """Eigenvalues."""
         b, h, moments, hinv = self.get_primitives()
         # analytical_model = ShallowMomentsTopo(level=self.level, dimension=self.dimension, basis_type=self.basis_type)
         analytical_model = ShallowMomentsTopo(level=1, dimension=self.dimension, basis_type=self.basis_type)

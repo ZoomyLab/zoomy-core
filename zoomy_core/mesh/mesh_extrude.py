@@ -1,7 +1,10 @@
+"""Module `zoomy_core.mesh.mesh_extrude`."""
+
 import numpy as np
 
 
 def extrude_points(points, Z):
+    """Extrude points."""
     n_points = points.shape[0]
     dim = points.shape[1]
     Nz = Z.shape[0]
@@ -16,6 +19,7 @@ def extrude_points(points, Z):
 
 def extrude_element_vertices(element_vertices, n_vertices, Nz):
 
+    """Extrude element vertices."""
     n_elements = element_vertices.shape[0]
     n_vertices_per_element = element_vertices.shape[1]
     if n_vertices_per_element == 2:
@@ -35,6 +39,7 @@ def extrude_element_vertices(element_vertices, n_vertices, Nz):
     return element_vertices_ext
 
 def extrude_element_vertices_line(element_vertices, n_vertices, Nz):
+    """Extrude element vertices line."""
     n_elements = element_vertices.shape[0]
     n_vertices_per_element = 2
     element_vertices_ext = np.empty(

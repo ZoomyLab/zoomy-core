@@ -1,14 +1,21 @@
+"""Module `zoomy_core.fvm.flux`."""
+
 import numpy as np
 
 
 class Flux:
+    """Flux. (class)."""
     def get_flux_operator(self, model):
+        """Get flux operator."""
         pass
 
 
 class Zero(Flux):
+    """Zero. (class)."""
     def get_flux_operator(self, model):
+        """Get flux operator."""
         def compute(Qi, Qj, Qauxi, Qauxj, parameters, normal, Vi, Vj, Vij, dt):
+            """Compute."""
             return np.zeros_like(Qi)
 
         return compute
@@ -19,7 +26,9 @@ class LaxFriedrichs(Flux):
     Lax-Friedrichs flux implementation
     """
     def get_flux_operator(self, model):
+        """Get flux operator."""
         def compute(Qi, Qj, Qauxi, Qauxj, parameters, normal, Vi, Vj, Vij, dt):
+            """Compute."""
             Fi = np.einsum("id..., d...-> i...", model.flux(Qi, Qauxi, parameters), normal)
             Fj = np.einsum("id..., d...-> i...", model.flux(Qj, Qauxj, parameters), normal)
             Qout = 0.5 * (Fi + Fj)
@@ -28,7 +37,9 @@ class LaxFriedrichs(Flux):
         return compute
     
 class Rusanov(Flux):
+    """Rusanov. (class)."""
     def __init__(self, identity_matrix=None):
+        """Initialize the instance."""
         if not identity_matrix:
             self.Id = lambda n: np.eye(n)
         else:
@@ -37,8 +48,10 @@ class Rusanov(Flux):
     Rusanov (local Lax-Friedrichs) flux implementation
     """
     def get_flux_operator(self, model):
+        """Get flux operator."""
         Id_single = self.Id(model.n_variables)
         def compute(Qi, Qj, Qauxi, Qauxj, parameters, normal, Vi, Vj, Vij, dt):
+            """Compute."""
             EVi = model.eigenvalues(Qi, Qauxi, parameters, normal)
             EVj = model.eigenvalues(Qj, Qauxj, parameters, normal)
             smax = np.max(np.abs(np.hstack([EVi, EVj])))

@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.analysis_linear`."""
+
 import sympy as sp
 
 
@@ -13,6 +15,7 @@ class LinearWaveAnalyser:
     """
 
     def __init__(self, model):
+        """Initialize the instance."""
         self.model = model
         self.t = model.time
         self.x = model.position[0]
@@ -21,9 +24,11 @@ class LinearWaveAnalyser:
         self.I = sp.I
 
     def _exp_wave(self):
+        """Internal helper `_exp_wave`."""
         return sp.exp(self.I * (self.k * self.x - self.omega * self.t))
 
     def _build_equations(self, q_expr_map, aux_expr_map):
+        """Internal helper `_build_equations`."""
         Q = list(self.model.variables.values())
         F = self.model.flux()
         S = self.model.source()
@@ -43,6 +48,7 @@ class LinearWaveAnalyser:
         return equations
 
     def _build_quasilinear_equations(self, q_expr_map, aux_expr_map):
+        """Internal helper `_build_quasilinear_equations`."""
         Q = list(self.model.variables.values())
         A = sp.Matrix(self.model.quasilinear_matrix()[:, :, 0])
         S = sp.Matrix(self.model.source())
@@ -60,6 +66,7 @@ class LinearWaveAnalyser:
         return [sp.simplify(eq_vec[i]) for i in range(eq_vec.shape[0])]
 
     def _linearize_eps(self, equations):
+        """Internal helper `_linearize_eps`."""
         out = []
         for eq in equations:
             lin = sp.expand(eq).series(self.eps, 0, 2).removeO().coeff(self.eps, 1)
@@ -67,6 +74,7 @@ class LinearWaveAnalyser:
         return out
 
     def _build_aux_expr_map(self, q_expr_map):
+        """Internal helper `_build_aux_expr_map`."""
         aux_expr_map = {}
         specs = getattr(self.model, "derivative_specs", [])
         if not specs:

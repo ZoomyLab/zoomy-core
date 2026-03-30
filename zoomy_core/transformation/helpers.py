@@ -1,11 +1,15 @@
+"""Module `zoomy_core.transformation.helpers`."""
+
 from sympy import MatrixSymbol, fraction, cancel, Matrix
 
 from zoomy_core.misc.misc import Zstruct
 
 def regularize_denominator(expr, regularization_constant = 10**(-4), regularize = False):
+    """Regularize denominator."""
     if not regularize:
         return expr
     def regularize(expr):
+        """Regularize."""
         (nom, den) = fraction(cancel(expr))
         return nom * den / (den*2 + regularization_constant)
     for i in range(expr.shape[0]):
@@ -14,6 +18,7 @@ def regularize_denominator(expr, regularization_constant = 10**(-4), regularize 
     return expr
 
 def substitute_sympy_attributes_with_symbol_matrix(expr: Matrix, attr: Zstruct, attr_matrix: MatrixSymbol):
+    """Substitute sympy attributes with symbol matrix."""
     if expr is None:
         return None
     if type(attr) is Zstruct:

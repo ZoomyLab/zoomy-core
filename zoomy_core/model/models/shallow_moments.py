@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.models.shallow_moments`."""
+
 import numpy as np
 import numpy.polynomial.legendre as L
 import numpy.polynomial.chebyshev as C
@@ -28,6 +30,7 @@ from zoomy_core.model.models.basisfunctions import Legendre_shifted, Basisfuncti
 
 @define(frozen=True, slots=True, kw_only=True)
 class ShallowMoments2d(Model):
+    """ShallowMoments2d. (class)."""
     dimension: int = 2
     level: int
     variables: Union[list, int] = field(init=False)
@@ -41,6 +44,7 @@ class ShallowMoments2d(Model):
     )
 
     def __attrs_post_init__(self):
+        """Hook `__attrs_post_init__`."""
         object.__setattr__(self, "variables", ((self.level+1)*self.dimension)+1)
         # Recompute basis matrices
         object.__setattr__(
@@ -64,6 +68,7 @@ class ShallowMoments2d(Model):
 
 
     def project_2d_to_3d(self):
+        """Project 2d to 3d."""
         out = Matrix([0 for i in range(6)])
         level = self.level
         offset = level+1
@@ -85,6 +90,7 @@ class ShallowMoments2d(Model):
         b = 0
         dbdx = 0
         def dot(a, b):
+            """Dot."""
             s = 0
             for i in range(len(a)):
                 s += a[i] * b[i]
@@ -105,6 +111,7 @@ class ShallowMoments2d(Model):
         return out
 
     def flux(self):
+        """Flux."""
         offset = self.level + 1
         flux_x = Matrix([0 for i in range(self.n_variables)])
         flux_y = Matrix([0 for i in range(self.n_variables)])
@@ -162,6 +169,7 @@ class ShallowMoments2d(Model):
         return [flux_x, flux_y]
 
     def nonconservative_matrix(self):
+        """Nonconservative matrix."""
         offset = self.level + 1
         nc_x = Matrix([[0 for i in range(self.n_variables)] for j in range(self.n_variables)])
         nc_y = Matrix([[0 for i in range(self.n_variables)] for j in range(self.n_variables)])
@@ -216,6 +224,7 @@ class ShallowMoments2d(Model):
 
     def eigenvalues(self):
         # we delete heigher order moments (level >= 2) for analytical eigenvalues
+        """Eigenvalues."""
         offset = self.level + 1
         A = self.normal[0] * self.quasilinear_matrix()[0]
         for d in range(1, self.dimension):
@@ -230,10 +239,12 @@ class ShallowMoments2d(Model):
 
 
     def source(self):
+        """Source."""
         out = Matrix([0 for i in range(self.n_variables)])
         return out
     
     def gravity(self):
+        """Gravity."""
         out = Matrix([0 for i in range(self.n_variables)])
         out[1] = -self.parameters.g * self.parameters.ex * self.variables[0]
         if self.dimension == 2:
@@ -242,6 +253,7 @@ class ShallowMoments2d(Model):
         return out
     
     def newtonian_turbulent(self):
+        """Newtonian turbulent."""
         p = self.parameters
         nut1 = [
             1.06245397e-05,
@@ -315,6 +327,7 @@ class ShallowMoments2d(Model):
         return  out
     
     def newtonian_boundary_layer_classic(self):
+        """Newtonian boundary layer classic."""
         assert "nu" in vars(self.parameters)
         assert "eta" in vars(self.parameters)
         out = Matrix([0 for i in range(self.n_variables)])
@@ -344,6 +357,7 @@ class ShallowMoments2d(Model):
         return  out
 
     def newtonian(self):
+        """Newtonian."""
         assert "nu" in vars(self.parameters)
         out = Matrix([0 for i in range(self.n_variables)])
         offset = self.level + 1
@@ -374,6 +388,7 @@ class ShallowMoments2d(Model):
         return out
     
     def newtonian_turbulent_algebraic(self):
+        """Newtonian turbulent algebraic."""
         assert "nu" in vars(self.parameters)
         assert "l_bl" in vars(self.parameters)
         assert "l_turb" in vars(self.parameters)
@@ -482,6 +497,7 @@ class ShallowMoments2d(Model):
         return out
 
     def newtonian_boundary_layer(self):
+        """Newtonian boundary layer."""
         assert "nu" in vars(self.parameters)
         out = Matrix([0 for i in range(self.n_variables)])
         offset = self.level + 1
@@ -518,6 +534,7 @@ class ShallowMoments2d(Model):
         return out
 
     def sindy(self):
+        """Sindy."""
         assert "nu" in vars(self.parameters)
         out = Matrix([0 for i in range(self.n_variables)])
         offset = self.level + 1
@@ -552,6 +569,7 @@ class ShallowMoments2d(Model):
         return out
 
     def slip(self):
+        """Slip."""
         assert "lamda" in vars(self.parameters)
         assert "rho" in vars(self.parameters)
         out = Matrix([0 for i in range(self.n_variables)])
@@ -576,6 +594,7 @@ class ShallowMoments2d(Model):
         return out
 
     def chezy(self):
+        """Chezy."""
         assert "C" in vars(self.parameters)
         out = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
@@ -623,18 +642,21 @@ def reconstruct_uvw(Q, grad, lvl, phi, psi):
     dhbeta_dy = grad[1 + offset : 1 + 2 * offset, 1]
 
     def u(z):
+        """U."""
         u_z = 0
         for i in range(lvl + 1):
             u_z += alpha[i] * phi(z)[i]
         return u_z
 
     def v(z):
+        """V."""
         v_z = 0
         for i in range(lvl + 1):
             v_z += beta[i] * phi(z)[i]
         return v_z
 
     def w(z):
+        """W."""
         basis_0 = psi(0)
         basis_z = psi(z)
         u_z = 0
@@ -663,7 +685,9 @@ def generate_velocity_profiles(
     model: Model,
     list_of_positions: list[np.ndarray],
 ):
+    """Generate velocity profiles."""
     def find_closest_element(centers, pos):
+        """Find closest element."""
         assert centers.shape[1] == np.array(pos).shape[0]
         return np.argmin(np.linalg.norm(centers - pos, axis=1))
 
@@ -757,4 +781,5 @@ if __name__ == "__main__":
 
 @define(frozen=True, slots=True, kw_only=True)
 class ShallowMoments(ShallowMoments2d):
+    """ShallowMoments. (class)."""
     dimension: int = 1

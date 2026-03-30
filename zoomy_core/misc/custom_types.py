@@ -1,3 +1,5 @@
+"""NumPy typing aliases used across mesh, I/O, and model code."""
+
 import numpy as np
 import numpy.typing as npt
 

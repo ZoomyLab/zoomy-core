@@ -1,3 +1,5 @@
+"""HDF5 settings, field checkpoints, and mesh I/O helpers used by solvers and drivers."""
+
 import os
 import numpy as np
 import json
@@ -26,6 +28,7 @@ from zoomy_core.misc.logger_config import logger
 
 
 def init_output_directory(path, clean):
+    """Create (and optionally wipe) a run directory under the Zoomy project root."""
     main_dir = misc.get_main_directory()
 
     path = os.path.join(main_dir, path)
@@ -40,6 +43,7 @@ def init_output_directory(path, clean):
 
 
 def get_hdf5_type(value):
+    """Get hdf5 type."""
     out = type(value)
     if isinstance(value, str):
         out = h5py.string_dtype()
@@ -47,6 +51,7 @@ def get_hdf5_type(value):
 
 
 def write_dict_to_hdf5(group, d):
+    """Recursively store nested dicts / ``Zstruct``-like objects into an HDF5 group."""
     for key, value in d.items():
         if isinstance(value, dict):
             subgroup = group.create_group(key)
@@ -65,6 +70,7 @@ def write_dict_to_hdf5(group, d):
 
 
 def load_hdf5_to_dict(group):
+    """Inverse of :func:`write_dict_to_hdf5` for reading settings or metadata."""
     d = {}
     for key, value in group.items():
         if isinstance(value, h5py.Group):
@@ -81,6 +87,7 @@ def load_hdf5_to_dict(group):
 
 
 def save_settings(settings):
+    """Write ``settings`` to ``settings.h5`` inside the configured output directory."""
     main_dir = misc.get_main_directory()
 
     filepath = os.path.join(main_dir, settings.output.directory)
@@ -89,6 +96,7 @@ def save_settings(settings):
 
 
 def load_settings(filepath):
+    """Load a :class:`~zoomy_core.misc.misc.Settings` object from ``settings.h5``."""
     main_dir = misc.get_main_directory()
 
     filepath = os.path.join(main_dir, filepath)
@@ -100,6 +108,7 @@ def load_settings(filepath):
 
 
 def load_settings2(filepath):
+    """Legacy HDF5 layout: model/solver/output groups plus callbacks attribute."""
     main_dir = misc.get_main_directory()
 
     filepath = os.path.join(main_dir, filepath)
@@ -159,6 +168,7 @@ def load_settings2(filepath):
 
 
 def clean_files(filepath, filename=".vtk"):
+    """Clean files."""
     main_dir = misc.get_main_directory()
 
     abs_filepath = os.path.join(main_dir, filepath)
@@ -193,6 +203,8 @@ def _save_fields_to_hdf5(filepath, i_snapshot, time, Q, Qaux=None, overwrite=Tru
 
 
 def get_save_fields_simple(_filepath, write_all, overwrite=True):
+    """Return a plain callback that appends one snapshot to HDF5 (no time gating)."""
+
     def _save_hdf5(i_snapshot, time, Q, Qaux):
         i_snap = int(i_snapshot)
         main_dir = misc.get_main_directory()
@@ -246,6 +258,7 @@ def _save_hdf5(_filepath, i_snapshot, time, Q, Qaux, overwrite=True):
 
 
 def get_save_fields(_filepath, write_all=False, overwrite=True):
+    """Factory for a time-gated field writer compatible with solver time-stepping loops."""
     if _HAVE_H5PY:
 
         def save(time, next_write_at, i_snapshot, Q, Qaux):
@@ -258,6 +271,7 @@ def get_save_fields(_filepath, write_all=False, overwrite=True):
     else:
 
         def save(time, next_write_at, i_snapshot, Q, Qaux):
+            """Save."""
             if write_all or time >= next_write_at:
                 return i_snapshot + 1
             else:
@@ -267,6 +281,7 @@ def get_save_fields(_filepath, write_all=False, overwrite=True):
 
 
 def save_fields_test(a):
+    """Test helper: tuple interface around :func:`_save_fields_to_hdf5`."""
     filepath, time, next_write_at, i_snapshot, Q, Qaux, write_all = a
     if not write_all and time < next_write_at:
         return i_snapshot
@@ -276,11 +291,13 @@ def save_fields_test(a):
 
 
 def load_mesh_from_hdf5(filepath):
+    """Load a :class:`~zoomy_core.mesh.mesh.Mesh` from disk via ``Mesh.from_hdf5``."""
     mesh = Mesh.from_hdf5(filepath)
     return mesh
 
 
 def load_fields_from_hdf5(filepath, i_snapshot=-1):
+    """Read ``Q``, ``Qaux``, and time for one snapshot (default: latest)."""
     main_dir = misc.get_main_directory()
 
     filepath = os.path.join(main_dir, filepath)
@@ -298,6 +315,7 @@ def load_fields_from_hdf5(filepath, i_snapshot=-1):
 
 
 def load_timeline_of_fields_from_hdf5(filepath):
+    """Load all field snapshots plus mesh geometry from a combined HDF5 file."""
     main_dir = misc.get_main_directory()
 
     filepath = os.path.join(main_dir, filepath)
@@ -329,6 +347,7 @@ def _write_to_vtk_from_vertices_edges(
     point_fields=None,
     point_field_names=None,
 ):
+    """Internal helper `_write_to_vtk_from_vertices_edges`."""
     if not _HAVE_MESHIO:
         raise RuntimeError(
             "_write_to_vtk_from_vertices_edges requires meshio, which is not available."
@@ -374,6 +393,7 @@ def generate_vtk(
     filename="out",
     warp=False,
 ):
+    """Export VTK time series (and a ``.vtk.series`` manifest) from HDF5 mesh+fields."""
     main_dir = misc.get_main_directory()
     abs_filepath = os.path.join(main_dir, filepath)
     path = os.path.dirname(abs_filepath)

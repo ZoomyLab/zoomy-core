@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.basefunction`."""
+
 import sympy as sp
 import param
 from sympy import Tuple
@@ -5,6 +7,7 @@ from zoomy_core.misc.misc import Zstruct, ZArray
 
 
 def listify(expr):
+    """Listify."""
     if isinstance(expr, (ZArray, sp.NDimArray)):
         return Tuple(*expr.tolist())
     elif hasattr(expr, "args") and expr.args:
@@ -14,11 +17,13 @@ def listify(expr):
 
 
 class Function(param.Parameterized):
+    """Function. (class)."""
     name = param.String(default="Function")
     args = param.ClassSelector(class_=Zstruct, default=None)
     definition = param.Parameter(default=None)
 
     def __init__(self, **params):
+        """Initialize the instance."""
         super().__init__(**params)
         if self.args is None:
             self.args = Zstruct()
@@ -37,13 +42,16 @@ class Function(param.Parameterized):
 
 
 class SymbolicRegistrar:
+    """SymbolicRegistrar. (class)."""
     def register_symbolic_function(self, name, method_ref, sig_struct):
+        """Register symbolic function."""
         definition = method_ref()
         self.functions[name] = Function(
             name=name, definition=definition, args=sig_struct
         )
 
         def proxy_caller(*input_args):
+            """Proxy caller."""
             if not input_args:
                 return self.functions[name].definition
 

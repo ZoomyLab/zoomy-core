@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.models.sme_turbulent`."""
+
 import numpy as np
 import numpy.polynomial.legendre as L
 import numpy.polynomial.chebyshev as C
@@ -32,6 +34,7 @@ from sympy.integrals.quadrature import gauss_legendre
 
 @define(frozen=True, slots=True, kw_only=True)
 class SMET(Model):
+    """SMET. (class)."""
     dimension: int = 2
     level: int
     variables: Union[list, int] = field(init=False)
@@ -47,6 +50,7 @@ class SMET(Model):
     )
 
     def __attrs_post_init__(self):
+        """Hook `__attrs_post_init__`."""
         object.__setattr__(self, "variables", ((self.level+1)*self.dimension)+2)
         # [dQ_dx, dQ_dy, deltaX, user-defined]
         object.__setattr__(self, "aux_variables", 2*((self.level+1)*self.dimension+2)+1+self.aux_variables)
@@ -62,6 +66,7 @@ class SMET(Model):
         object.__setattr__(self, "basismatrices", basismatrices)
 
     def get_primitives(self):
+        """Get primitives."""
         offset = self.level + 1
         b = self.variables[0]
         h = self.variables[1]
@@ -76,6 +81,7 @@ class SMET(Model):
         return [b, h, alpha, beta, hinv]
 
     def get_gradient(self):
+        """Get gradient."""
         offset = self.level + 1
         z = sympy.Symbol('z')
         phi = [self.basisfunctions.eval(k, z) for k in range(self.level+1)]
@@ -113,6 +119,7 @@ class SMET(Model):
         return grad_b, grad_h, grad_alpha, grad_beta, grad_U
     
     def get_Up(self):
+        """Get Up."""
         b, h, alpha, beta, hinv = self.get_primitives()
         phi = self.basisfunctions.basis
         z = sympy.Symbol('z')
@@ -125,6 +132,7 @@ class SMET(Model):
         return [Up, Vp]
     
     def get_ustar(self):
+        """Get ustar."""
         p = self.parameters
         b, h, alpha, beta, hinv = self.get_primitives()
         phi = self.basisfunctions.basis
@@ -156,6 +164,7 @@ class SMET(Model):
 
     def get_taub(self):
         
+        """Get taub."""
         p = self.parameters
         b, h, alpha, beta, hinv = self.get_primitives()
         phi = self.basisfunctions.basis
@@ -181,6 +190,7 @@ class SMET(Model):
     
     def get_taub_linear_gradient(self):
         
+        """Get taub linear gradient."""
         p = self.parameters
         b, h, alpha, beta, hinv = self.get_primitives()
         phi = self.basisfunctions.basis
@@ -194,11 +204,13 @@ class SMET(Model):
     
     
     def get_deltaX(self):
+        """Get deltaX."""
         gradient_offset = self.n_variables
         return self.aux_variables[2*gradient_offset]
 
 
     def project_2d_to_3d(self):
+        """Project 2d to 3d."""
         out = Matrix([0 for i in range(6)])
         level = self.level
         offset = level+1
@@ -218,6 +230,7 @@ class SMET(Model):
         u_3d = self.basismatrices.basisfunctions.reconstruct_velocity_profile_at(alpha, z)
         v_3d = 0
         def dot(a, b):
+            """Dot."""
             s = 0
             for i in range(len(a)):
                 s += a[i] * b[i]
@@ -236,6 +249,7 @@ class SMET(Model):
         return out
 
     def flux(self):
+        """Flux."""
         flux_x = Matrix([0 for i in range(self.n_variables)])
         flux_y = Matrix([0 for i in range(self.n_variables)])
         b, h, alpha, beta, hinv = self.get_primitives()
@@ -283,6 +297,7 @@ class SMET(Model):
         return [flux_x, flux_y][:self.dimension]
 
     def nonconservative_matrix(self):
+        """Nonconservative matrix."""
         nc_x = Matrix([[0 for i in range(self.n_variables)] for j in range(self.n_variables)])
         nc_y = Matrix([[0 for i in range(self.n_variables)] for j in range(self.n_variables)])
         b, h, alpha, beta, hinv = self.get_primitives()
@@ -340,6 +355,7 @@ class SMET(Model):
 
     def eigenvalues(self):
         # we delete heigher order moments (level >= 2) for analytical eigenvalues
+        """Eigenvalues."""
         offset = self.level + 1
         A = self.normal[0] * self.quasilinear_matrix()[0]
         for d in range(1, self.dimension):
@@ -355,6 +371,7 @@ class SMET(Model):
     
 
     def Sij(self):
+        """Sij."""
         out = sympy.zeros(self.dimension, self.dimension)
 
         grad_b, grad_h, grad_alpha, grad_beta, grad_U = self.get_gradient()
@@ -365,6 +382,7 @@ class SMET(Model):
         return out
     
     def abs_Sij(self):
+        """Abs Sij."""
         Sij = self.Sij()
         out = 0
         for i in range(self.dimension):
@@ -374,6 +392,7 @@ class SMET(Model):
         return out
     
     def Szj(self):
+        """Szj."""
         out = sympy.zeros(self.dimension)
 
         b, h, alpha, beta, hinv = self.get_primitives()
@@ -387,6 +406,7 @@ class SMET(Model):
         return out
     
     def source(self):
+        """Source."""
         out = Matrix([0 for i in range(self.n_variables)])
         out += self.mixing_length_vertical()
         # out += self.mixing_length_vertical_linear_gradient()
@@ -394,11 +414,13 @@ class SMET(Model):
         return out
     
     def source_implicit(self):
+        """Source implicit."""
         out = sympy.zeros(self.n_variables, self.n_variables)
         # out += self.taub_implicit()
         return out
     
     def taub_implicit(self):
+        """Taub implicit."""
         out = sympy.zeros(self.n_variables, self.n_variables)
         b, h, alpha, beta, hinv = self.get_primitives()
         phi = self.basisfunctions.basis
@@ -417,6 +439,7 @@ class SMET(Model):
         return out
     
     def dflux(self):
+        """Dflux."""
         return self.smagorinsky_dflux()
     
     def smagorinsky_dflux(self):
@@ -456,6 +479,7 @@ class SMET(Model):
 
         
     def smagorinsky_source(self):
+        """Smagorinsky source."""
         out = Matrix([0 for i in range(self.n_variables)])
         z = sympy.Symbol('z')
         level = self.level
@@ -491,12 +515,14 @@ class SMET(Model):
         return out
 
     def lm(self):
+        """Lm."""
         p = self.parameters
         b, h, alpha, beta, hinv = self.get_primitives()
         z = sympy.Symbol('z')
         return p.kappa * (z + p.yp) * (1 - z)
     
     def mixing_length_numerical_term(self):
+        """Mixing length numerical term."""
         assert "kappa" in vars(self.parameters)
         out = 0
         b, h, alpha, beta, hinv = self.get_primitives()
@@ -518,6 +544,7 @@ class SMET(Model):
 
 
     def mixing_length_vertical(self):
+        """Mixing length vertical."""
         out = Matrix([0 for i in range(self.n_variables)])
         offset = self.level + 1
         b, h, alpha, beta, hinv = self.get_primitives()
@@ -545,6 +572,7 @@ class SMET(Model):
         return out
     
     def mixing_length_vertical_linear_gradient(self):
+        """Mixing length vertical linear gradient."""
         out = Matrix([0 for i in range(self.n_variables)])
         offset = self.level + 1
         b, h, alpha, beta, hinv = self.get_primitives()
@@ -575,37 +603,48 @@ class SMET(Model):
 
 @define(frozen=True, slots=True, kw_only=True)
 class SMETNum(SMET):
+    """SMETNum. (class)."""
     ref_model: Model = field(init=False)
     
     def __attrs_post_init__(self):
+        """Hook `__attrs_post_init__`."""
         super().__attrs_post_init__()
         object.__setattr__(self, "ref_model", SMET(level=self.level, dimension=self.dimension, boundary_conditions=self.boundary_conditions))
 
     def flux(self):
+        """Flux."""
         return [self.substitute_precomputed_denominator(f, self.variables[1], self.aux_variables.hinv) for f in self.ref_model.flux()]      
     
     def nonconservative_matrix(self):
+        """Nonconservative matrix."""
         return [self.substitute_precomputed_denominator(f, self.variables[1], self.aux_variables.hinv) for f in self.ref_model.nonconservative_matrix()]  
     
     def quasilinear_matrix(self):
+        """Quasilinear matrix."""
         return [self.substitute_precomputed_denominator(f, self.variables[1], self.aux_variables.hinv) for f in self.ref_model.quasilinear_matrix()]    
     
     def source(self):
+        """Source."""
         return self.substitute_precomputed_denominator(self.ref_model.source(), self.variables[1], self.aux_variables.hinv)
     
     def source_implicit(self):
+        """Source implicit."""
         return self.substitute_precomputed_denominator(self.ref_model.source_implicit(), self.variables[1], self.aux_variables.hinv)
     
     def residual(self):
+        """Residual."""
         return self.substitute_precomputed_denominator(self.ref_model.residual(), self.variables[1], self.aux_variables.hinv)
     
     def left_eigenvectors(self):
+        """Left eigenvectors."""
         return self.substitute_precomputed_denominator(self.ref_model.left_eigenvectors(), self.variables[1], self.aux_variables.hinv)
     
     def right_eigenvectors(self):
+        """Right eigenvectors."""
         return self.substitute_precomputed_denominator(self.ref_model.right_eigenvectors(), self.variables[1], self.aux_variables.hinv)
 
     def eigenvalues(self):
+        """Eigenvalues."""
         h = self.variables[1]
         evs = self.substitute_precomputed_denominator(self.ref_model.eigenvalues(), self.variables[1], self.aux_variables.hinv)
         for i in range(self.n_variables):

@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.models.shallow_water_topo`."""
+
 import sympy
 from sympy import Matrix, sqrt, MutableDenseNDimArray, Symbol, S
 
@@ -29,6 +31,7 @@ class ShallowWaterEquationsWithTopo(Model):
     }
 
     def __init__(self, **kwargs):
+        """Initialize the instance."""
         super().__init__(**kwargs)
 
         # Enforce positivity for Depth 'h' (Index 1)
@@ -124,6 +127,7 @@ class ShallowWaterEquationsWithTopo(Model):
         return ZArray(A_tensor)
 
     def source(self):
+        """Source."""
         return Matrix.zeros(self.n_variables, 1)
 
     # --- 5. Physics Terms ---
@@ -179,7 +183,9 @@ class ShallowWaterEquationsWithTopo(Model):
     
 class NumericalShallowWaterEquationsWithTopo(ShallowWaterEquationsWithTopo):
     
+    """NumericalShallowWaterEquationsWithTopo. (class)."""
     def get_primitives(self):
+        """Get primitives."""
         dim = self.dimension
         b = self.variables[0]
         h = self.variables[1]
@@ -189,6 +195,7 @@ class NumericalShallowWaterEquationsWithTopo(ShallowWaterEquationsWithTopo):
         return b, h, U, hinv
 
     def eigenvalues(self):
+        """Eigenvalues."""
         ev = super().eigenvalues()
         h = self.variables[1]
         return conditional(

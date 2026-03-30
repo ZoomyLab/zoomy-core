@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.boundary_conditions`."""
+
 import numpy as np
 from time import time as get_time
 import sympy
@@ -11,6 +13,7 @@ from zoomy_core.model.basefunction import Function
 
 # --- Helper Function (Unchanged) ---
 def _sympy_interpolate_data(time, timeline, data):
+    """Internal helper `_sympy_interpolate_data`."""
     assert timeline.shape[0] == data.shape[0]
     conditions = (((data[0], time <= timeline[0])),)
     for i in range(timeline.shape[0] - 1):
@@ -35,6 +38,7 @@ class BoundaryCondition(param.Parameterized):
     tag = param.String(default="bc")
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
+        """Compute boundary condition."""
         raise NotImplementedError(
             "BoundaryCondition is a virtual class. Use one of its derived classes!"
         )
@@ -44,14 +48,18 @@ class BoundaryCondition(param.Parameterized):
 
 
 class Extrapolation(BoundaryCondition):
+    """Extrapolation. (class)."""
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
+        """Compute boundary condition."""
         return ZArray(Q)
 
 
 class InflowOutflow(BoundaryCondition):
+    """InflowOutflow. (class)."""
     prescribe_fields = param.Dict(default={})
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
+        """Compute boundary condition."""
         Qout = ZArray(Q)
         for k, v in self.prescribe_fields.items():
             try:
@@ -63,9 +71,11 @@ class InflowOutflow(BoundaryCondition):
 
 
 class Lambda(BoundaryCondition):
+    """Lambda. (class)."""
     prescribe_fields = param.Dict(default={})
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
+        """Compute boundary condition."""
         Qout = ZArray(Q)
         for k, func in self.prescribe_fields.items():
             Qout[k] = func(time, X, dX, Q, Qaux, parameters, normal)
@@ -73,10 +83,12 @@ class Lambda(BoundaryCondition):
 
 
 class FromData(BoundaryCondition):
+    """FromData. (class)."""
     prescribe_fields = param.Dict(default={})
     timeline = param.Array(default=None)
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
+        """Compute boundary condition."""
         Qout = ZArray(Q)
         for k, v in self.prescribe_fields.items():
             interp_func = _sympy_interpolate_data(time, self.timeline, v)
@@ -85,6 +97,7 @@ class FromData(BoundaryCondition):
 
 
 class CharacteristicReflective(BoundaryCondition):
+    """CharacteristicReflective. (class)."""
     R = param.Parameter(default=None)
     L = param.Parameter(default=None)
     D = param.Parameter(default=None)
@@ -92,6 +105,7 @@ class CharacteristicReflective(BoundaryCondition):
     M = param.Parameter(default=None)
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
+        """Compute boundary condition."""
         q = Matrix(Q)
         q_n = self.S @ q
         W_int = self.L @ q_n
@@ -112,12 +126,14 @@ class CharacteristicReflective(BoundaryCondition):
 
 
 class Wall(BoundaryCondition):
+    """Wall. (class)."""
     momentum_field_indices = param.List(default=[[1, 2]])
     permeability = param.Number(default=0.0)
     wall_slip = param.Number(default=1.0)
     blending = param.Number(default=0.0)
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
+        """Compute boundary condition."""
         q = ZArray(Q)
         dim = len(self.momentum_field_indices[0])
         n_vec = Matrix(normal[:dim])
@@ -143,10 +159,12 @@ class Wall(BoundaryCondition):
 
 
 class RoughWall(Wall):
+    """RoughWall. (class)."""
     CsW = param.Number(default=0.5)
     Ks = param.Number(default=0.001)
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
+        """Compute boundary condition."""
         slip_length = dX * sympy.ln((dX * self.CsW) / self.Ks)
         f = dX / slip_length
         wall_slip = (1 - f) / (1 + f)
@@ -160,9 +178,11 @@ class RoughWall(Wall):
 
 
 class Periodic(BoundaryCondition):
+    """Periodic. (class)."""
     periodic_to_physical_tag = param.String(default="")
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
+        """Compute boundary condition."""
         return ZArray(Q)
 
 
@@ -170,11 +190,13 @@ class Periodic(BoundaryCondition):
 
 
 class BoundaryConditions(param.Parameterized):
+    """BoundaryConditions. (class)."""
     boundary_conditions_list = param.List(default=[], item_type=BoundaryCondition)
     _boundary_functions = param.List(default=[])
     _boundary_tags = param.List(default=[])
 
     def __init__(self, boundary_conditions=None, **params):
+        """Initialize the instance."""
         if boundary_conditions is not None:
             params["boundary_conditions_list"] = boundary_conditions
         elif "boundary_conditions" in params:
@@ -189,10 +211,12 @@ class BoundaryConditions(param.Parameterized):
 
     @property
     def list_sorted_function_names(self):
+        """List sorted function names."""
         return self._boundary_tags
 
     @property
     def boundary_conditions_list_dict(self):
+        """Boundary conditions list dict."""
         return {bc.tag: bc for bc in self.boundary_conditions_list}
 
     # [FIX] Added 'function_name' argument with default "boundary_conditions"
@@ -207,6 +231,7 @@ class BoundaryConditions(param.Parameterized):
         normal,
         function_name="boundary_conditions",
     ):
+        """Get boundary condition function."""
         bc_idx = sympy.Symbol("bc_idx", integer=True)
 
         if not self._boundary_functions:

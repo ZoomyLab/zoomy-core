@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.models.shallow_moments_variants`."""
+
 import numpy as np
 import numpy.polynomial.legendre as L
 import numpy.polynomial.chebyshev as C
@@ -25,6 +27,7 @@ from zoomy_core.model.models.basismatrices import Basismatrices, Legendre_shifte
 
 
 class HybridSFFSMM(Model):
+    """HybridSFFSMM. (class)."""
     def __init__(
         self,
         boundary_conditions,
@@ -37,6 +40,7 @@ class HybridSFFSMM(Model):
         _default_parameters={"g": 1.0, "ex": 0.0, "ez": 1.0},
         basismatrices=Basismatrices(),
     ):
+        """Initialize the instance."""
         self.basismatrices = basis
         self.variables = register_sympy_attribute(fields, "q")
         self.n_variables = self.variables.length()
@@ -55,6 +59,7 @@ class HybridSFFSMM(Model):
         )
 
     def get_alphas(self):
+        """Get alphas."""
         Q = self.variables
         h = Q[0]
         # exlude h and P
@@ -62,6 +67,7 @@ class HybridSFFSMM(Model):
         return ha
 
     def flux(self):
+        """Flux."""
         flux_x = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
         ha = self.get_alphas()
@@ -98,6 +104,7 @@ class HybridSFFSMM(Model):
         return [flux_x]
 
     def nonconservative_matrix(self):
+        """Nonconservative matrix."""
         nc = Matrix([[0 for i in range(self.n_variables)] for j in range(self.n_variables)])
         h = self.variables[0]
         ha = self.get_alphas()
@@ -127,6 +134,7 @@ class HybridSFFSMM(Model):
         return [nc]
 
     def eigenvalues(self):
+        """Eigenvalues."""
         A = self.normal[0] * self.sympy_quasilinear_matrix[0]
         for d in range(1, self.dimension):
             A += self.normal[d] * self.sympy_quasilinear_matrix[d]
@@ -151,10 +159,12 @@ class HybridSFFSMM(Model):
         return evs
 
     def source(self):
+        """Source."""
         out = Matrix([0 for i in range(self.n_variables)])
         return out
 
     def topography(self):
+        """Topography."""
         assert "dhdx" in vars(self.aux_variables)
         out = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
@@ -165,6 +175,7 @@ class HybridSFFSMM(Model):
 
 
 class ShallowMomentsAugmentedSSF(Model):
+    """ShallowMomentsAugmentedSSF. (class)."""
     def __init__(
         self,
         boundary_conditions,
@@ -179,6 +190,7 @@ class ShallowMomentsAugmentedSSF(Model):
         settings_default={"topography": False, "friction": []},
         basis=Legendre_shifted(),
     ):
+        """Initialize the instance."""
         self.basismatrices = basis
         self.variables = register_sympy_attribute(fields, "q")
         self.n_variables = self.variables.length()
@@ -197,6 +209,7 @@ class ShallowMomentsAugmentedSSF(Model):
         )
 
     def get_alphas(self):
+        """Get alphas."""
         Q = self.variables
         h = Q[0]
         # exlude u0 and P
@@ -214,6 +227,7 @@ class ShallowMomentsAugmentedSSF(Model):
         return ha
 
     def flux(self):
+        """Flux."""
         flux = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
         ha = self.get_alphas()
@@ -236,6 +250,7 @@ class ShallowMomentsAugmentedSSF(Model):
         return [flux]
 
     def nonconservative_matrix(self):
+        """Nonconservative matrix."""
         nc = Matrix([[0 for i in range(self.n_variables)] for j in range(self.n_variables)])
         h = self.variables[0]
         ha = self.get_alphas()
@@ -261,6 +276,7 @@ class ShallowMomentsAugmentedSSF(Model):
         return [nc]
 
     def eigenvalues(self):
+        """Eigenvalues."""
         A = self.normal[0] * self.sympy_quasilinear_matrix[0]
         for d in range(1, self.dimension):
             A += self.normal[d] * self.sympy_quasilinear_matrix[d]
@@ -270,10 +286,12 @@ class ShallowMomentsAugmentedSSF(Model):
         return eigenvalue_dict_to_matrix(A.eigenvals())
 
     def source(self):
+        """Source."""
         out = Matrix([0 for i in range(self.n_variables)])
         return out
 
     def topography(self):
+        """Topography."""
         assert "dhdx" in vars(self.aux_variables)
         out = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
@@ -307,6 +325,7 @@ class ShallowMoments(Model):
         settings_default={"topography": False, "friction": []},
         basis=Basismatrices(),
     ):
+        """Initialize the instance."""
         self.variables = register_sympy_attribute(fields, "q")
         self.n_variables = self.variables.length()
         self.level = self.n_variables - 2
@@ -328,6 +347,7 @@ class ShallowMoments(Model):
         )
 
     def flux(self):
+        """Flux."""
         flux = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
         ha = self.variables[1 : 1 + self.level + 1]
@@ -348,6 +368,7 @@ class ShallowMoments(Model):
         return [flux]
 
     def nonconservative_matrix(self):
+        """Nonconservative matrix."""
         nc = Matrix([[0 for i in range(self.n_variables)] for j in range(self.n_variables)])
         h = self.variables[0]
         ha = self.variables[1 : 1 + self.level + 1]
@@ -368,6 +389,7 @@ class ShallowMoments(Model):
         return [nc]
 
     def eigenvalues(self):
+        """Eigenvalues."""
         A = self.normal[0] * self.sympy_quasilinear_matrix[0]
         for d in range(1, self.dimension):
             A += self.normal[d] * self.sympy_quasilinear_matrix[d]
@@ -378,10 +400,12 @@ class ShallowMoments(Model):
 
 
     def source(self):
+        """Source."""
         out = Matrix([0 for i in range(self.n_variables)])
         return out
 
     def topography(self):
+        """Topography."""
         assert "dhdx" in vars(self.aux_variables)
         out = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
@@ -391,6 +415,7 @@ class ShallowMoments(Model):
         return out
 
     def inclined_plane(self):
+        """Inclined plane."""
         out = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
         p = self.parameters
@@ -398,6 +423,7 @@ class ShallowMoments(Model):
         return out
 
     def material_wave(self):
+        """Material wave."""
         assert "nu" in vars(self.parameters)
         assert "rho" in vars(self.parameters)
         out = Matrix([0 for i in range(self.n_variables)])
@@ -528,6 +554,7 @@ class ShallowMoments(Model):
         return out
 
     def newtonian_boundary_layer_classic(self):
+        """Newtonian boundary layer classic."""
         assert "nu" in vars(self.parameters)
         assert "eta" in vars(self.parameters)
         out = Matrix([0 for i in range(self.n_variables)])
@@ -558,6 +585,7 @@ class ShallowMoments(Model):
         return out
 
     def newtonian_boundary_layer(self):
+        """Newtonian boundary layer."""
         assert "nu" in vars(self.parameters)
         out = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
@@ -579,6 +607,7 @@ class ShallowMoments(Model):
         return out
 
     def steady_state_channel(self):
+        """Steady state channel."""
         assert "eta_ss" in vars(self.parameters)
         moments_ss = np.array(
             [
@@ -647,6 +676,7 @@ class ShallowMoments(Model):
         return out
 
     def no_slip(self):
+        """No slip."""
         out = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
         ha = self.variables[1 : 1 + self.level + 1]
@@ -661,6 +691,7 @@ class ShallowMoments(Model):
             phi_0[k] = self.basismatrices.basis.eval(k, x).subs(x, 0.0)
 
         def f(j, a, a0, basis_0):
+            """F."""
             out = 0
             for i in range(self.level + 1):
                 # out += -2*p.ns_1*(a[i] - a0[i]) -2*p.ns_2*basis_0[j] * a[i] * basis_0[i]
@@ -823,6 +854,7 @@ class ShallowMoments(Model):
         return out
 
     def steady_state(self):
+        """Steady state."""
         out = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
         ha = self.variables[1 : 1 + self.level + 1]
@@ -855,7 +887,9 @@ class ShallowMoments(Model):
 
 
 class ShallowMomentsSSF(ShallowMoments):
+    """ShallowMomentsSSF. (class)."""
     def eigenvalues(self):
+        """Eigenvalues."""
         A = self.normal[0] * self.sympy_quasilinear_matrix[0]
         for d in range(1, self.dimension):
             A += self.normal[d] * self.sympy_quasilinear_matrix[d]
@@ -866,7 +900,9 @@ class ShallowMomentsSSF(ShallowMoments):
 
 
 class ShallowMomentsSSFEnergy(ShallowMoments):
+    """ShallowMomentsSSFEnergy. (class)."""
     def flux(self):
+        """Flux."""
         flux = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
         ha = self.variables[1 : 1 + self.level + 1] - self.variables[1] / np.diag(
@@ -895,6 +931,7 @@ class ShallowMomentsSSFEnergy(ShallowMoments):
         return [flux]
 
     def nonconservative_matrix(self):
+        """Nonconservative matrix."""
         nc = Matrix([[0 for i in range(self.n_variables)] for j in range(self.n_variables)])
         h = self.variables[0]
         ha = self.variables[1 : 1 + self.level + 1] - self.variables[1] / np.diag(
@@ -945,6 +982,7 @@ class ShallowMomentsSSFEnergy(ShallowMoments):
         return out
 
     def eigenvalues(self):
+        """Eigenvalues."""
         A = self.normal[0] * self.sympy_quasilinear_matrix[0]
         for d in range(1, self.dimension):
             A += self.normal[d] * self.sympy_quasilinear_matrix[d]
@@ -952,6 +990,7 @@ class ShallowMomentsSSFEnergy(ShallowMoments):
 
 
 class ShallowMomentsTurbulenceSimple(ShallowMoments):
+    """ShallowMomentsTurbulenceSimple. (class)."""
     def __init__(
         self,
         boundary_conditions,
@@ -965,6 +1004,7 @@ class ShallowMomentsTurbulenceSimple(ShallowMoments):
         settings_default={"topography": False, "friction": []},
         basis=Legendre_shifted(),
     ):
+        """Initialize the instance."""
         super().__init__(
             dimension=dimension,
             fields=fields - 2,
@@ -983,6 +1023,7 @@ class ShallowMomentsTurbulenceSimple(ShallowMoments):
 
 @define(frozen=True, slots=True, kw_only=True)
 class ShallowMoments2d(Model):
+    """ShallowMoments2d. (class)."""
     dimension: int = 2
     level: int
     variables: Union[list, int] = field(init=False)
@@ -996,6 +1037,7 @@ class ShallowMoments2d(Model):
     )
 
     def __attrs_post_init__(self):
+        """Hook `__attrs_post_init__`."""
         object.__setattr__(self, "variables", (self.level+1*2)+1)
         super().__attrs_post_init__()
 
@@ -1008,6 +1050,7 @@ class ShallowMoments2d(Model):
 
 
     def project_2d_to_3d(self):
+        """Project 2d to 3d."""
         out = Matrix([0 for i in range(5)])
         level = self.level
         offset = level+1
@@ -1037,6 +1080,7 @@ class ShallowMoments2d(Model):
         return out
 
     def flux(self):
+        """Flux."""
         offset = self.level + 1
         flux_x = Matrix([0 for i in range(self.n_variables)])
         flux_y = Matrix([0 for i in range(self.n_variables)])
@@ -1096,6 +1140,7 @@ class ShallowMoments2d(Model):
         return [flux_x, flux_y]
 
     def nonconservative_matrix(self):
+        """Nonconservative matrix."""
         offset = self.level + 1
         nc_x = Matrix([[0 for i in range(self.n_variables)] for j in range(self.n_variables)])
         nc_y = Matrix([[0 for i in range(self.n_variables)] for j in range(self.n_variables)])
@@ -1146,6 +1191,7 @@ class ShallowMoments2d(Model):
 
     def eigenvalues(self):
         # we delete heigher order moments (level >= 2) for analytical eigenvalues
+        """Eigenvalues."""
         offset = self.level + 1
         A = self.normal[0] * self.sympy_quasilinear_matrix[0]
         for d in range(1, self.dimension):
@@ -1159,6 +1205,7 @@ class ShallowMoments2d(Model):
         return eigenvalue_dict_to_matrix(A.eigenvals())
 
     def constraints_implicit(self):
+        """Constraints implicit."""
         assert "dhdx" in vars(self.aux_variables)
         assert "dhdy" in vars(self.aux_variables)
         out = Matrix([0 for i in range(1)])
@@ -1178,10 +1225,12 @@ class ShallowMoments2d(Model):
         return out
 
     def source(self):
+        """Source."""
         out = Matrix([0 for i in range(self.n_variables)])
         return out
 
     def topography(self):
+        """Topography."""
         assert "dhdx" in vars(self.aux_variables)
         assert "dhdy" in vars(self.aux_variables)
         offset = self.level + 1
@@ -1195,6 +1244,7 @@ class ShallowMoments2d(Model):
         return out
 
     def newtonian(self):
+        """Newtonian."""
         assert "nu" in vars(self.parameters)
         out = Matrix([0 for i in range(self.n_variables)])
         offset = self.level + 1
@@ -1251,6 +1301,7 @@ class ShallowMoments2d(Model):
         return out
 
     def newtonian_boundary_layer(self):
+        """Newtonian boundary layer."""
         assert "nu" in vars(self.parameters)
         out = Matrix([0 for i in range(self.n_variables)])
         offset = self.level + 1
@@ -1287,6 +1338,7 @@ class ShallowMoments2d(Model):
         return out
 
     def sindy(self):
+        """Sindy."""
         assert "nu" in vars(self.parameters)
         out = Matrix([0 for i in range(self.n_variables)])
         offset = self.level + 1
@@ -1321,6 +1373,7 @@ class ShallowMoments2d(Model):
         return out
 
     def slip(self):
+        """Slip."""
         assert "lamda" in vars(self.parameters)
         assert "rho" in vars(self.parameters)
         out = Matrix([0 for i in range(self.n_variables)])
@@ -1341,6 +1394,7 @@ class ShallowMoments2d(Model):
         return out
 
     def chezy(self):
+        """Chezy."""
         assert "C" in vars(self.parameters)
         out = Matrix([0 for i in range(self.n_variables)])
         offset = self.level + 1
@@ -1376,18 +1430,21 @@ def reconstruct_uvw(Q, grad, lvl, phi, psi):
     dhbeta_dy = grad[1 + offset : 1 + 2 * offset, 1]
 
     def u(z):
+        """U."""
         u_z = 0
         for i in range(lvl + 1):
             u_z += alpha[i] * phi(z)[i]
         return u_z
 
     def v(z):
+        """V."""
         v_z = 0
         for i in range(lvl + 1):
             v_z += beta[i] * phi(z)[i]
         return v_z
 
     def w(z):
+        """W."""
         basis_0 = psi(0)
         basis_z = psi(z)
         u_z = 0
@@ -1416,7 +1473,9 @@ def generate_velocity_profiles(
     model: Model,
     list_of_positions: list[np.ndarray],
 ):
+    """Generate velocity profiles."""
     def find_closest_element(centers, pos):
+        """Find closest element."""
         assert centers.shape[1] == np.array(pos).shape[0]
         return np.argmin(np.linalg.norm(centers - pos, axis=1))
 

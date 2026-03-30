@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.models.advection`."""
+
 import numpy as np
 import os
 # import logging
@@ -20,7 +22,9 @@ from zoomy_core.model.basemodel import Model
 
 
 class Advection(Model):
+    """Advection. (class)."""
     def flux(self):
+        """Flux."""
         if self.dimension == 1:
             F = Matrix([0 for i in range(self.n_variables)])
             for i_field in range(self.n_variables):

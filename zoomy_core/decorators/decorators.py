@@ -1,3 +1,7 @@
+"""Runtime requirement checks for configuration-driven workflows."""
+
+from functools import wraps
+
 
 def require(requirement):
     """
@@ -10,7 +14,6 @@ def require(requirement):
     - wrapper: The decorated function that will check the requirement before executing.
     """
 
-    # decorator to check the assertion given in requirements given the settings
     def req_decorator(func):
         @wraps(func)
         def wrapper(settings, *args, **kwargs):

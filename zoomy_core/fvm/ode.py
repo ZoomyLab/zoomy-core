@@ -1,7 +1,10 @@
+"""Module `zoomy_core.fvm.ode`."""
+
 import numpy as np
 
 
 def RK1(func, Q, Qaux, param, dt, func_jac=None, func_bc=None):
+    """RK1."""
     dQ = np.zeros_like(Q)
     dQ = func(dt, Q, Qaux, param, dQ)
     return Q + dt * dQ

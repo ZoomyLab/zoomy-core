@@ -1,3 +1,5 @@
+"""Module `zoomy_core.preprocessing.openfoam_moments`."""
+
 try:
     _HAVE_MATPLOTLIB = True
     import matplotlib.pyplot as plt
@@ -26,6 +28,7 @@ main_dir = misc.get_main_directory()
 
 
 def load_file(filename):
+    """Load file."""
     if not _HAVE_PYVISTA:
         raise ImportError("pyvista is required for load_file function.")
     reader = pv.get_reader(filename)
@@ -35,6 +38,7 @@ def load_file(filename):
 
 
 def get_fields(vtkfile, fieldnames):
+    """Get fields."""
     fields = []
     for fieldname in fieldnames:
         # point field)s
@@ -49,20 +53,24 @@ def get_coordinates(vtkfile):
     # point coordinates
     # return np.array(vtkfile.points)
     # cell centers
+    """Get coordinates."""
     return vtkfile.cell_centers().points
 
 
 def get_time(vtkfile):
+    """Get time."""
     return vtkfile.field_data["TimeValue"][0]
 
 
 def sort_data(coordinates, fields):
     # Sort by z, y, x
+    """Sort data."""
     order = np.lexsort((coordinates[:, 0], coordinates[:, 1], coordinates[:, 2]))
     return order
 
 
 def apply_order(coordinates, fields, order):
+    """Apply order."""
     coordinates_copy = np.array(coordinates)
     fields_copy = deepcopy(fields)
     for d in range(coordinates.shape[1]):
@@ -73,18 +81,21 @@ def apply_order(coordinates, fields, order):
 
 
 def get_number_of_layers_and_elements_in_plane(coordinates):
+    """Get number of layers and elements in plane."""
     layers = len(np.unique(coordinates[:, 2]))
     n_elements_plane = int(coordinates[:, 0].size / layers)
     return layers, n_elements_plane
 
 
 def get_layer(data, layer, n_elements_plane):
+    """Get layer."""
     return data[layer * n_elements_plane : (layer + 1) * n_elements_plane]
 
 
 def compute_height(
     alpha, n_layers, n_elements_per_layer, total_height=1.0, threshold=0.5
 ):
+    """Compute height."""
     height = np.zeros(n_elements_per_layer)
     active = np.ones(n_elements_per_layer, dtype=bool)
     dh = total_height / n_layers
@@ -95,6 +106,7 @@ def compute_height(
 
 
 def extract_faces(mesh):
+    """Extract faces."""
     faces = []
     i, offset = 0, 0
     cc = mesh.cells  # fetch up front
@@ -107,6 +119,7 @@ def extract_faces(mesh):
 
 
 def sort_faces(faces, order):
+    """Sort faces."""
     for face in faces:
         for i, point in enumerate(face):
             face[i] = order[point]
@@ -115,6 +128,7 @@ def sort_faces(faces, order):
 
 
 def add_noslip_layer(U, n_elements_per_layer):
+    """Add noslip layer."""
     Unew = np.zeros((U.shape[0] + n_elements_per_layer, U.shape[1]))
     for d in range(U.shape[1]):
         Unew[n_elements_per_layer:, d] = U[:, d]
@@ -122,6 +136,7 @@ def add_noslip_layer(U, n_elements_per_layer):
 
 
 def extract_velocity_column_at_coordinate(U, n_elements_per_layer, n_layer, coordinate):
+    """Extract velocity column at coordinate."""
     u = np.array(
         [
             get_layer(U[:, 0], i, n_elements_per_layer)[coordinate]
@@ -144,10 +159,12 @@ def extract_velocity_column_at_coordinate(U, n_elements_per_layer, n_layer, coor
 
 
 def shift_integration_interval(xi):
+    """Shift integration interval."""
     return (xi + 1) / 2
 
 
 def plot_basis(basis_generator):
+    """Plot basis."""
     fig, ax = plt.subplots()
     basis = [basis_generator(n) for n in range(0, 8)]
     X = np.linspace(0, 1, 100)
@@ -157,6 +174,7 @@ def plot_basis(basis_generator):
 
 
 def moment_projection(field, n_layers, basis, integration_order=None):
+    """Moment projection."""
     if integration_order is None:
         integration_order = max(len(basis), n_layers)
     xi, wi = np.polynomial.legendre.leggauss(integration_order)
@@ -174,6 +192,7 @@ def moment_projection(field, n_layers, basis, integration_order=None):
 
 
 def convert_openfoam_to_moments_single(filename, n_levels):
+    """Convert openfoam to moments single."""
     vtkfile = load_file(filename)
     coordinates = get_coordinates(vtkfile)
     n_layer, n_elements_per_layer = get_number_of_layers_and_elements_in_plane(
@@ -191,6 +210,7 @@ def convert_openfoam_to_moments_single(filename, n_levels):
 def convert_openfoam_to_moments(
     filepath, n_levels, filepath_mesh_for_order, meshtype_order="triganle"
 ):
+    """Convert openfoam to moments."""
     filepath_vtk = os.path.join(filepath, "VTK")
     filename = "fields_openfoam.hdf5"
     sort_order = None
@@ -237,6 +257,7 @@ def convert_openfoam_to_moments(
 
 def sort_fields_by_mesh(mesh, coordinates, Q):
     # coordinates are still 3d, while Q is 2d and the mesh is 2d
+    """Sort fields by mesh."""
     n_layers, n_elements_per_layer = get_number_of_layers_and_elements_in_plane(
         coordinates
     )
@@ -254,10 +275,12 @@ def sort_fields_by_mesh(mesh, coordinates, Q):
 
 
 def apply_order_to_fields(order, Q):
+    """Apply order to fields."""
     return Q[:, order]
 
 
 def plot_contour(coordinates, field):
+    """Plot contour."""
     if not _HAVE_MATPLOTLIB:
         raise ImportError("matplotlib is required for plot_contour function.")
     fig, ax = plt.subplots()
@@ -280,7 +303,9 @@ def plot_contour(coordinates, field):
 
 
 def basis_legendre(i):
+    """Basis legendre."""
     def f(x):
+        """F."""
         basis = np.polynomial.legendre.Legendre.basis(i, domain=[0, 1], window=[-1, 1])
         return basis(x) * basis(0)
 
@@ -290,6 +315,7 @@ def basis_legendre(i):
 def compute_shallow_moment_projection(
     fields, coordinates, n_levels, basis_generator=basis_legendre
 ):
+    """Compute shallow moment projection."""
     n_layers, n_elements_per_layer = get_number_of_layers_and_elements_in_plane(
         coordinates
     )
@@ -309,6 +335,7 @@ def compute_shallow_moment_projection(
 
 
 def plot_data_vs_moments(fields, coordinates, Q, basis, coordinate_index):
+    """Plot data vs moments."""
     if _HAVE_MATPLOTLIB is False:
         raise ImportError("matplotlib is required for plot_data_vs_moments function.")
     n_layers, n_elements_per_layer = get_number_of_layers_and_elements_in_plane(
@@ -340,6 +367,7 @@ def plot_data_vs_moments(fields, coordinates, Q, basis, coordinate_index):
 
 
 def load_openfoam_file(filepath):
+    """Load openfoam file."""
     vtkfile = load_file(filepath)
     coordinates = get_coordinates(vtkfile)
     n_layer, n_elements_per_layer = get_number_of_layers_and_elements_in_plane(
@@ -354,6 +382,7 @@ def load_openfoam_file(filepath):
 
 
 def test_load():
+    """Test load."""
     filepath = os.path.join(
         os.path.join(main_dir, "openfoam_data/channelflow_coarse"),
         "channelflow_coarse_0.vtm",
@@ -362,6 +391,7 @@ def test_load():
 
 
 def test_moment_projection():
+    """Test moment projection."""
     filepath = os.path.join(
         os.path.join(main_dir, "openfoam_data/channelflow_coarse"),
         "channelflow_coarse_0.vtm",
@@ -371,6 +401,7 @@ def test_moment_projection():
 
 
 def test_convert_openfoam_single():
+    """Test convert openfoam single."""
     filepath = os.path.join(
         os.path.join(main_dir, "openfoam_data/channelflow_coarse"),
         "channelflow_coarse_0.vtm",
@@ -379,6 +410,7 @@ def test_convert_openfoam_single():
 
 
 def test_plots():
+    """Test plots."""
     if _HAVE_MATPLOTLIB is False:
         raise ImportError("matplotlib is required for test_plots function.")    
     filepath = os.path.join(
@@ -396,6 +428,7 @@ def test_plots():
 
 
 def test_sort():
+    """Test sort."""
     filepath = os.path.join(
         os.path.join(main_dir, "openfoam_data/channelflow_coarse"),
         "channelflow_coarse_0.vtm",
@@ -424,6 +457,7 @@ def test_sort():
 
 def test_convert_openfoam_to_moments(level=0):
     # filepath = os.path.join(main_dir, 'openfoam_data/channelflow_coarse')
+    """Test convert openfoam to moments."""
     foam_sim = os.getenv("FOAM_SIM")
     filepath = os.path.join(foam_sim, "multiphase/interFoam/RAS/channelflow_mid")
     filepath_target_mesh = os.path.join(

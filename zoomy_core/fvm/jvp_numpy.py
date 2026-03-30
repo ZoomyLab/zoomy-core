@@ -1,13 +1,17 @@
+"""Module `zoomy_core.fvm.jvp_numpy`."""
+
 import numpy as np
 
 from zoomy_core.mesh.mesh import compute_derivatives
 
 
 def fd_jvp(residual_fn, Q, V, eps=1e-7):
+    """Fd jvp."""
     return (residual_fn(Q + eps * V) - residual_fn(Q)) / eps
 
 
 def _dqaux_action_from_specs(symbolic_model, V, mesh, dt):
+    """Internal helper `_dqaux_action_from_specs`."""
     n_aux, n_cells = symbolic_model.n_aux_variables, V.shape[1]
     dQaux = np.zeros((n_aux, n_cells), dtype=float)
     if not hasattr(symbolic_model, "derivative_specs"):

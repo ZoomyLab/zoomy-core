@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.models.basisfunctions`."""
+
 from copy import deepcopy
 
 import numpy as np
@@ -8,43 +10,54 @@ from sympy.functions.special.polynomials import chebyshevu
 
 
 class Basisfunction:
+    """Basisfunction. (class)."""
     name = "Basisfunction"
     
     def bounds(self):
+        """Bounds."""
         return [0, 1]
 
     def basis_definition(self):
+        """Basis definition."""
         z = Symbol("z")
         b = lambda k, z: z**k
         return [b(k, z) for k in range(self.level + 1)]
     
     def weight(self, z):
+        """Weight."""
         return 1
     
     def weight_eval(self, z):
+        """Weight eval."""
         z = Symbol("z")
         f = sympy.lambdify(z, self.weight(z))
         return f(z)
 
     def __init__(self, level=0, **kwargs):
+        """Initialize the instance."""
         self.level = level
         self.basis = self.basis_definition(**kwargs)
 
     def get(self, k):
+        """Get."""
         return self.basis[k]
 
     def eval(self, k, _z):
+        """Eval."""
         return self.get(k).subs(z, _z)
     
     def eval_psi(self, k, _z):
+        """Eval psi."""
         z = sympy.Symbol('z')
         psi = sympy.integrate(self.get(k), (z, self.bounds()[0], z))
         return psi.subs(z, _z)
 
     def get_lambda(self, k):
+        """Get lambda."""
         f = lambdify(z, self.get(k))
 
         def lam(z):
+            """Lam."""
             if type(z) == int or type(z) == float:
                 return f(z)
             elif type(z) == list or type(z) == np.ndarray:
@@ -55,6 +68,7 @@ class Basisfunction:
         return lam
 
     def plot(self, ax):
+        """Plot."""
         X = np.linspace(self.bounds()[0], self.bounds()[1], 1000)
         for i in range(len(self.basis)):
             f = lambdify(z, self.get(i))
@@ -62,6 +76,7 @@ class Basisfunction:
             ax.plot(X, y, label=f"basis {i}")
 
     def reconstruct_velocity_profile(self, alpha, N=100):
+        """Reconstruct velocity profile."""
         Z = np.linspace(self.bounds()[0], self.bounds()[1], N)
         u = np.zeros_like(Z)
         for i in range(len(self.basis)):
@@ -70,6 +85,7 @@ class Basisfunction:
         return u
     
     def reconstruct_velocity_profile_at(self, alpha, z):
+        """Reconstruct velocity profile at."""
         u = 0
         for i in range(len(self.basis)):
             b = lambdify(z, self.eval(i, z))
@@ -77,6 +93,7 @@ class Basisfunction:
         return u
 
     def reconstruct_alpha(self, velocities, z):
+        """Reconstruct alpha."""
         n_basis = len(self.basis)
         alpha = np.zeros(n_basis)
         for i in range(n_basis):
@@ -91,6 +108,7 @@ class Basisfunction:
         return alpha
     
     def project_onto_basis(self, Y):
+        """Project onto basis."""
         Z = np.linspace(self.bounds()[0], self.bounds()[1], Y.shape[0])
         n_basis = len(self.basis)
         alpha = np.zeros(n_basis)
@@ -102,46 +120,58 @@ class Basisfunction:
         return alpha
 
     def get_diff_basis(self):
+        """Get diff basis."""
         db = [diff(b, z) for i, b in enumerate(self.basis)]
         return db
 
 
 class Monomials(Basisfunction):
+    """Monomials. (class)."""
     name = "Monomials"
 
 
 class Legendre_shifted(Basisfunction):
+    """Legendre shifted. (class)."""
     name = "Legendre_shifted"
 
     def basis_definition(self):
+        """Basis definition."""
         z = Symbol("z")
         b = lambda k, z: legendre(k, 2 * z - 1) * (-1) ** (k)
         return [b(k, z) for k in range(self.level + 1)]
     
 class Chebyshevu(Basisfunction):
+    """Chebyshevu. (class)."""
     name = "Chebyshevu"
     
     def bounds(self):
+        """Bounds."""
         return [-1, 1]
     
     def weight(self, z):
         # do not forget to include the jacobian of the coordinate transformation in the weight
+        """Weight."""
         return sympy.sqrt(1-z**2)
 
     def basis_definition(self):
+        """Basis definition."""
         z = Symbol("z")
         b = lambda k, z: sympy.sqrt(2 / sympy.pi) * chebyshevu(k, z)
         return [b(k, z) for k in range(self.level + 1)]
     
 class Legendre_DN(Basisfunction):
+    """Legendre DN. (class)."""
     name = "Legendre_DN - satifying no-slip and no-stress. This is a non-SWE basis"
 
     def bounds(self):
+        """Bounds."""
         return [-1, 1]
 
     def basis_definition(self):
+        """Basis definition."""
         z = Symbol("z")
         def b(k, z):
+            """B."""
             alpha = sympy.Rational((2*k+3), (k+2)**2)
             beta = -sympy.Rational((k+1),(k+2))**2
             return (legendre(k, z) ) + alpha * (legendre(k+1, z) ) + beta * (legendre(k+2, z))
@@ -150,21 +180,26 @@ class Legendre_DN(Basisfunction):
 
 
 class Spline(Basisfunction):
+    """Spline. (class)."""
     name = "Spline"
 
     def basis_definition(self, degree=1, knots=[0, 0, 0.001, 1, 1]):
+        """Basis definition."""
         z = Symbol("z")
         basis = bspline_basis_set(degree, knots, z)
         return basis
 
 
 class OrthogonalSplineWithConstant(Basisfunction):
+    """OrthogonalSplineWithConstant. (class)."""
     name = "OrthogonalSplineWithConstant"
 
     def basis_definition(self, degree=1, knots=[0, 0, 0.5, 1, 1]):
+        """Basis definition."""
         z = Symbol("z")
 
         def prod(u, v):
+            """Prod."""
             return integrate(u * v, (z, 0, 1))
 
         basis = bspline_basis_set(degree, knots, z)

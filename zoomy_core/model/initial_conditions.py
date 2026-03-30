@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.initial_conditions`."""
+
 import numpy as np
 import param
 import sympy as sp
@@ -36,7 +38,9 @@ def default_user_function(x: FArray) -> FArray:
 
 
 class InitialConditions(param.Parameterized):
+    """InitialConditions. (class)."""
     def apply(self, X, Q):
+        """Apply."""
         assert False, "InitialConditions is an abstract class."
         return Q
 
@@ -51,14 +55,17 @@ class InitialConditions(param.Parameterized):
 
 
 class Constant(InitialConditions):
+    """Constant. (class)."""
     constants = param.Callable(default=default_constant_func)
 
     def __init__(self, constants=None, **params):
+        """Initialize the instance."""
         if constants is not None:
             params["constants"] = constants
         super().__init__(**params)
 
     def apply(self, X, Q):
+        """Apply."""
         n_variables = Q.shape[0]
         const_vals = self.constants(n_variables)
         for i in range(Q.shape[1]):
@@ -66,16 +73,19 @@ class Constant(InitialConditions):
         return Q
 
     def get_definition(self, X, p, n_variables):
+        """Get definition."""
         vals = self.constants(n_variables)
         return ZArray(vals)
 
 
 class RP(InitialConditions):
+    """RP. (class)."""
     low = param.Callable(default=default_low_state)
     high = param.Callable(default=default_high_state)
     jump_position_x = param.Number(default=0.0)
 
     def apply(self, X, Q):
+        """Apply."""
         assert X.shape[1] == Q.shape[1]
         n_variables = Q.shape[0]
         val_low = self.low(n_variables)
@@ -88,6 +98,7 @@ class RP(InitialConditions):
         return Q
 
     def get_definition(self, X, p, n_variables):
+        """Get definition."""
         val_low = self.low(n_variables)
         val_high = self.high(n_variables)
 
@@ -101,12 +112,14 @@ class RP(InitialConditions):
 
 
 class RP2d(InitialConditions):
+    """RP2d. (class)."""
     low = param.Callable(default=default_low_state)
     high = param.Callable(default=default_high_state)
     jump_position_x = param.Number(default=0.0)
     jump_position_y = param.Number(default=0.0)
 
     def apply(self, X, Q):
+        """Apply."""
         assert X.shape[1] == Q.shape[1]
         n_variables = Q.shape[0]
         val_low = self.low(n_variables)
@@ -119,6 +132,7 @@ class RP2d(InitialConditions):
         return Q
 
     def get_definition(self, X, p, n_variables):
+        """Get definition."""
         val_low = self.low(n_variables)
         val_high = self.high(n_variables)
         cond = sp.And(X[0] < self.jump_position_x, X[1] < self.jump_position_y)
@@ -129,6 +143,7 @@ class RP2d(InitialConditions):
 
 
 class RP3d(InitialConditions):
+    """RP3d. (class)."""
     low = param.Callable(default=default_low_state)
     high = param.Callable(default=default_high_state)
     jump_position_x = param.Number(default=0.0)
@@ -136,6 +151,7 @@ class RP3d(InitialConditions):
     jump_position_z = param.Number(default=0.0)
 
     def apply(self, X, Q):
+        """Apply."""
         assert X.shape[1] == Q.shape[1]
         n_variables = Q.shape[0]
         val_low = self.low(n_variables)
@@ -152,6 +168,7 @@ class RP3d(InitialConditions):
         return Q
 
     def get_definition(self, X, p, n_variables):
+        """Get definition."""
         val_low = self.low(n_variables)
         val_high = self.high(n_variables)
         cond = sp.And(
@@ -166,11 +183,13 @@ class RP3d(InitialConditions):
 
 
 class RadialDambreak(InitialConditions):
+    """RadialDambreak. (class)."""
     low = param.Callable(default=default_low_state)
     high = param.Callable(default=default_high_state)
     radius = param.Number(default=0.1)
 
     def apply(self, X, Q):
+        """Apply."""
         dim = X.shape[0]
         center = np.zeros(dim)
         for d in range(dim):
@@ -189,6 +208,7 @@ class RadialDambreak(InitialConditions):
     def get_definition(self, X, p, n_variables):
         # NOTE: For C++ generation, we assume center is at (0,0,0) or needs explicit params.
         # This implementation assumes origin for simplicity.
+        """Get definition."""
         dist_sq = X[0] ** 2 + X[1] ** 2 + X[2] ** 2
         cond = dist_sq <= self.radius**2
 
@@ -202,14 +222,17 @@ class RadialDambreak(InitialConditions):
 
 
 class UserFunction(InitialConditions):
+    """UserFunction. (class)."""
     function = param.Callable(default=None)
 
     def __init__(self, function=None, **params):
+        """Initialize the instance."""
         if function is not None:
             params["function"] = function
         super().__init__(**params)
 
     def apply(self, X, Q):
+        """Apply."""
         assert X.shape[1] == Q.shape[1]
         func_to_use = self.function
         if func_to_use is None:
@@ -237,6 +260,7 @@ class UserFunction(InitialConditions):
 
 class RestartFromHdf5(InitialConditions):
     # Parameters omitted for brevity, functionality preserved
+    """RestartFromHdf5. (class)."""
     path_to_fields = param.String(default=None)
     mesh_new = param.ClassSelector(class_=Mesh, default=None)
     mesh_identical = param.Boolean(default=False)
@@ -246,10 +270,12 @@ class RestartFromHdf5(InitialConditions):
 
     def apply(self, X, Q):
         # (Standard Python implementation)
+        """Apply."""
         pass
 
     def get_definition(self, X, p, n_variables):
         # Restart is a RUNTIME operation.
         # Generate a dummy zero state for the compiled model.
         # The C++ VirtualSolver must handle the actual HDF5 loading.
+        """Get definition."""
         return ZArray.zeros(n_variables)

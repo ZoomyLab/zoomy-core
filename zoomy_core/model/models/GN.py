@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.models.GN`."""
+
 import numpy as np
 import numpy.polynomial.legendre as L
 import numpy.polynomial.chebyshev as C
@@ -20,6 +22,7 @@ import zoomy_core.model.initial_conditions as IC
 import zoomy_core.model.boundary_conditions as BC
 
 class GN(Model):
+    """GN. (class)."""
     def __init__(
         self,
         boundary_conditions= None,
@@ -33,6 +36,7 @@ class GN(Model):
         settings={},
         settings_default={},
     ):
+        """Initialize the instance."""
         self.variables = register_sympy_attribute(fields, "q")
         self.n_variables = self.variables.length()
         super().__init__(
@@ -47,6 +51,7 @@ class GN(Model):
         )
         
     def flux(self):
+        """Flux."""
         fx = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
         hu = self.variables[1]
@@ -60,6 +65,7 @@ class GN(Model):
     
 
     def source_implicit(self):
+        """Source implicit."""
         R = Matrix([0 for i in range(self.n_variables)])
         dD_dx = self.aux_variables.dD_dx
 

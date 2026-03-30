@@ -1,3 +1,5 @@
+"""Module `zoomy_core.postprocessing.plotting`."""
+
 import os
 import json
 import meshio
@@ -88,6 +90,7 @@ def list_available_fields(mesh, print_out=True):
 
 
 def get_cell_block(mesh, types):
+    """Get cell block."""
     for block in mesh.cells:
         if block.type in types:
             return block

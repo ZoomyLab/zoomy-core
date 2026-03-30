@@ -1,3 +1,5 @@
+"""Module `zoomy_core.model.models.vam`."""
+
 import numpy as np
 import numpy.polynomial.legendre as L
 import numpy.polynomial.chebyshev as C
@@ -19,6 +21,7 @@ from zoomy_core.model.basemodel import Model
 import zoomy_core.model.initial_conditions as IC
 
 class VAMHyperbolic(Model):
+    """VAMHyperbolic. (class)."""
     def __init__(
         self,
         boundary_conditions,
@@ -31,6 +34,7 @@ class VAMHyperbolic(Model):
         settings={},
         settings_default={},
     ):
+        """Initialize the instance."""
         self.variables = register_sympy_attribute(fields, "q")
         self.n_variables = self.variables.length()
         super().__init__(
@@ -45,6 +49,7 @@ class VAMHyperbolic(Model):
         )
         
     def flux(self):
+        """Flux."""
         fx = Matrix([0 for i in range(self.n_variables)])
         hw2 = self.aux_variables.hw2
         h = self.variables[0]
@@ -68,6 +73,7 @@ class VAMHyperbolic(Model):
         return [fx]
 
     def nonconservative_matrix(self):
+        """Nonconservative matrix."""
         nc = Matrix([[0 for i in range(self.n_variables)] for j in range(self.n_variables)])
 
         hw2 = self.aux_variables.hw2
@@ -91,6 +97,7 @@ class VAMHyperbolic(Model):
         return [-nc]
     
     def eigenvalues(self):
+        """Eigenvalues."""
         ev = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
         hu0 = self.variables[1]
@@ -110,6 +117,7 @@ class VAMHyperbolic(Model):
         return ev
 
     def source_implicit(self):
+        """Source implicit."""
         R = Matrix([0 for i in range(self.n_variables)])
         hw2 = self.aux_variables.hw2
         h = self.variables[0]
@@ -144,6 +152,7 @@ class VAMHyperbolic(Model):
         
 
 class VAMPoisson(Model):
+    """VAMPoisson. (class)."""
     def __init__(
         self,
         boundary_conditions,
@@ -156,6 +165,7 @@ class VAMPoisson(Model):
         settings={},
         settings_default={},
     ):
+        """Initialize the instance."""
         self.variables = register_sympy_attribute(fields, "q")
         self.n_variables = self.variables.length()
         super().__init__(
@@ -170,6 +180,7 @@ class VAMPoisson(Model):
         )
 
     def source_implicit(self):
+        """Source implicit."""
         R = Matrix([0 for i in range(self.n_variables)])
 
         h = self.aux_variables.h
@@ -216,11 +227,13 @@ class VAMPoisson(Model):
         return R
     
     def eigenvalues(self):
+        """Eigenvalues."""
         ev = Matrix([0 for i in range(self.n_variables)])
         return ev
 
 
 class VAMPoissonFull(Model):
+    """VAMPoissonFull. (class)."""
     def __init__(
         self,
         boundary_conditions,
@@ -233,6 +246,7 @@ class VAMPoissonFull(Model):
         settings={},
         settings_default={},
     ):
+        """Initialize the instance."""
         self.variables = register_sympy_attribute(fields, "q")
         self.n_variables = self.variables.length()
         super().__init__(
@@ -247,6 +261,7 @@ class VAMPoissonFull(Model):
         )
 
     def source_implicit(self):
+        """Source implicit."""
         R = Matrix([0 for i in range(self.n_variables)])
         hw2 = self.aux_variables.hw2
         h = self.variables[0]
@@ -301,10 +316,12 @@ class VAMPoissonFull(Model):
         return R
     
     def eigenvalues(self):
+        """Eigenvalues."""
         ev = Matrix([0 for i in range(self.n_variables)])
         return ev
 
 class VAMFullImplicit(Model):
+    """VAMFullImplicit. (class)."""
     def __init__(
         self,
         boundary_conditions,
@@ -317,6 +334,7 @@ class VAMFullImplicit(Model):
         settings={},
         settings_default={},
     ):
+        """Initialize the instance."""
         self.variables = register_sympy_attribute(fields, "q")
         self.n_variables = self.variables.length()
         super().__init__(
@@ -331,6 +349,7 @@ class VAMFullImplicit(Model):
         )
 
     def source_implicit(self):
+        """Source implicit."""
         R = Matrix([0 for i in range(self.n_variables)])
         hw2 = self.aux_variables.hw2
         h = self.variables[0]
@@ -385,6 +404,7 @@ class VAMFullImplicit(Model):
         return R
 
     def flux(self):
+        """Flux."""
         fx = Matrix([0 for i in range(self.n_variables)])
         hw2 = self.aux_variables.hw2
         h = self.variables[0]
@@ -408,6 +428,7 @@ class VAMFullImplicit(Model):
         return [fx]
 
     def nonconservative_matrix(self):
+        """Nonconservative matrix."""
         nc = Matrix([[0 for i in range(self.n_variables)] for j in range(self.n_variables)])
 
         hw2 = self.aux_variables.hw2
@@ -431,6 +452,7 @@ class VAMFullImplicit(Model):
         return [-nc]
     
     def eigenvalues(self):
+        """Eigenvalues."""
         ev = Matrix([0 for i in range(self.n_variables)])
         h = self.variables[0]
         hu0 = self.variables[1]
