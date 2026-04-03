@@ -31,11 +31,18 @@ class StateSpace:
     Shared symbolic state: coordinates, velocity fields, pressure,
     stress tensor, bathymetry, and physical parameters.
 
-    All equation systems, material models, and assumptions reference
-    the same StateSpace to ensure symbol consistency.
+    dimension is the physical space dimension:
+        2 = xz plane (1D horizontal shallow water)
+        3 = xyz space (2D horizontal shallow water)
+
+    The vertical coordinate is always z. Horizontal coordinates are
+    x (and y if dimension=3). The horizontal_dim property gives the
+    number of horizontal directions (1 or 2).
     """
 
     def __init__(self, dimension=2):
+        if dimension < 2 or dimension > 3:
+            raise ValueError(f"dimension must be 2 (xz) or 3 (xyz), got {dimension}")
         self.dim = dimension
 
         self.t = Symbol("t", real=True)
@@ -44,35 +51,51 @@ class StateSpace:
         self.z = Symbol("z", real=True)
         self.zeta = Symbol("zeta", real=True)
 
+        has_y = dimension > 2
+
         args_h = [self.t, self.x]
-        if dimension > 1:
+        if has_y:
             args_h.append(self.y)
         args_3d = args_h + [self.z]
         self._args_h = args_h
         self._args_3d = args_3d
 
         self.u = Function("u", real=True)(*args_3d)
-        self.v = Function("v", real=True)(*args_3d) if dimension > 1 else S.Zero
+        self.v = Function("v", real=True)(*args_3d) if has_y else S.Zero
         self.w = Function("w", real=True)(*args_3d)
         self.p = Function("p", real=True)(*args_3d)
 
         self.rho = Symbol("rho", positive=True)
         self.g = Symbol("g", positive=True)
 
-        self.tau = {}
-        for i in "xyz":
-            for j in "xyz":
-                self.tau[i + j] = Function(f"tau_{i}{j}", real=True)(*args_3d)
+        self._build_stress_tensor(has_y, args_3d)
 
         self.b = Function("b", real=True)(*args_h)
         self.H = Function("H", real=True)(*args_h)
         self.eta = self.b + self.H
 
-        self.coords_h = [self.x] + ([self.y] if dimension > 1 else [])
-        self.velocities_h = [self.u] + ([self.v] if dimension > 1 else [])
+        self.coords_h = [self.x] + ([self.y] if has_y else [])
+        self.velocities_h = [self.u] + ([self.v] if has_y else [])
+
+    def _build_stress_tensor(self, has_y, args_3d):
+        labels = ["x", "y", "z"] if has_y else ["x", "z"]
+        self.tau = {}
+        for i in labels:
+            for j in labels:
+                self.tau[i + j] = Function(f"tau_{i}{j}", real=True)(*args_3d)
+
+    @property
+    def horizontal_dim(self):
+        return self.dim - 1
+
+    @property
+    def has_y(self):
+        return self.dim > 2
 
     def __repr__(self):
-        return f"StateSpace(dim={self.dim}, fields=[u,v,w,p], tau=9 components)"
+        n_tau = len(self.tau)
+        fields = "[u,v,w,p]" if self.has_y else "[u,w,p]"
+        return f"StateSpace(dim={self.dim}, fields={fields}, tau={n_tau} components)"
 
 
 # ---------------------------------------------------------------------------
@@ -369,20 +392,18 @@ class FullINS:
 
     def _stress_divergence(self, row):
         s = self.state
-        labels = ["x", "y", "z"]
-        coords = [s.x, s.y, s.z]
+        labels = ["x", "y", "z"] if s.has_y else ["x", "z"]
+        coord_map = {"x": s.x, "y": s.y, "z": s.z}
         expr = S.Zero
-        for j in range(3):
-            if s.dim == 1 and labels[j] == "y":
-                continue
-            expr += Derivative(s.tau[row + labels[j]], coords[j])
+        for j in labels:
+            expr += Derivative(s.tau[row + j], coord_map[j])
         return expr
 
     @property
     def continuity(self):
         s = self.state
         expr = Derivative(s.u, s.x) + Derivative(s.w, s.z)
-        if s.dim > 1:
+        if s.has_y:
             expr += Derivative(s.v, s.y)
         return Expression(expr, "continuity")
 
@@ -390,7 +411,7 @@ class FullINS:
     def x_momentum(self):
         s = self.state
         inertia = Derivative(s.u, s.t) + Derivative(s.u * s.u, s.x) + Derivative(s.u * s.w, s.z)
-        if s.dim > 1:
+        if s.has_y:
             inertia += Derivative(s.u * s.v, s.y)
         pressure = Rational(1, 1) / s.rho * Derivative(s.p, s.x)
         stress = Rational(1, 1) / s.rho * self._stress_divergence("x")
@@ -399,7 +420,7 @@ class FullINS:
     @property
     def y_momentum(self):
         s = self.state
-        if s.dim < 2:
+        if not s.has_y:
             return None
         inertia = (
             Derivative(s.v, s.t) + Derivative(s.v * s.u, s.x)
@@ -413,7 +434,7 @@ class FullINS:
     def z_momentum(self):
         s = self.state
         inertia = Derivative(s.w, s.t) + Derivative(s.w * s.u, s.x) + Derivative(s.w * s.w, s.z)
-        if s.dim > 1:
+        if s.has_y:
             inertia += Derivative(s.w * s.v, s.y)
         pressure = Rational(1, 1) / s.rho * Derivative(s.p, s.z)
         gravity = s.g
@@ -423,7 +444,7 @@ class FullINS:
     @property
     def equations(self):
         eqs = [self.continuity, self.x_momentum]
-        if self.dim > 1:
+        if self.state.has_y:
             eqs.append(self.y_momentum)
         eqs.append(self.z_momentum)
         return eqs
@@ -444,15 +465,16 @@ class Newtonian(Material):
     @staticmethod
     def _build(s, nu):
         mu = nu * s.rho
-        u, v, w = s.u, s.v, s.w
-        x, y, z = s.x, s.y, s.z
+        u, w = s.u, s.w
+        x, z = s.x, s.z
         subs = {
             s.tau["xx"]: 2 * mu * Derivative(u, x),
             s.tau["xz"]: mu * (Derivative(u, z) + Derivative(w, x)),
             s.tau["zx"]: mu * (Derivative(w, x) + Derivative(u, z)),
             s.tau["zz"]: 2 * mu * Derivative(w, z),
         }
-        if s.dim > 1:
+        if s.has_y:
+            v, y = s.v, s.y
             subs.update({
                 s.tau["xy"]: mu * (Derivative(u, y) + Derivative(v, x)),
                 s.tau["yx"]: mu * (Derivative(v, x) + Derivative(u, y)),
@@ -460,9 +482,6 @@ class Newtonian(Material):
                 s.tau["yz"]: mu * (Derivative(v, z) + Derivative(w, y)),
                 s.tau["zy"]: mu * (Derivative(w, y) + Derivative(v, z)),
             })
-        else:
-            for key in ["xy", "yx", "yy", "yz", "zy"]:
-                subs[s.tau[key]] = S.Zero
         return subs
 
 
@@ -492,7 +511,7 @@ class KinematicBCBottom(Assumption):
         w_at_b = s.w.subs(s.z, s.b)
         u_at_b = s.u.subs(s.z, s.b)
         rhs = Derivative(s.b, s.t) + u_at_b * Derivative(s.b, s.x)
-        if s.dim > 1:
+        if s.has_y:
             v_at_b = s.v.subs(s.z, s.b)
             rhs += v_at_b * Derivative(s.b, s.y)
         super().__init__({w_at_b: rhs}, name="kinematic_bc_bottom")
@@ -506,7 +525,7 @@ class KinematicBCSurface(Assumption):
         w_at_s = s.w.subs(s.z, s.eta)
         u_at_s = s.u.subs(s.z, s.eta)
         rhs = Derivative(s.eta, s.t) + u_at_s * Derivative(s.eta, s.x)
-        if s.dim > 1:
+        if s.has_y:
             v_at_s = s.v.subs(s.z, s.eta)
             rhs += v_at_s * Derivative(s.eta, s.y)
         super().__init__({w_at_s: rhs}, name="kinematic_bc_surface")
