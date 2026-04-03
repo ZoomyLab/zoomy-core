@@ -75,7 +75,6 @@ Issues = "https://github.com/mbd-rwth/Zoomy/issues"
 
 
 [project.scripts]
-zoomy = "zoomy_core.cli.main:main"
 zoomy-serve = "zoomy_server.cli:main"
 
 [tool.setuptools.packages.find]
