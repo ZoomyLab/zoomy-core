@@ -1,13 +1,13 @@
 """
-Two-Pass PDE Model Derivation: Pass 1.
+Three-Phase PDE Model Derivation: Phase 1.
 
 Derives basis-independent shallow water moment equations from the full 3D INS.
 The user controls modeling assumptions (hydrostatic, material) explicitly.
 
 Usage:
-    state = StateSpace(dimension=1)
+    state = StateSpace(dimension=2)   # 2 = xz plane
     pre_projected = derive_shallow_moments(state, material=Newtonian(state))
-    # pre_projected contains tagged terms ready for ANY basis (Pass 2)
+    # pre_projected contains tagged terms ready for ANY basis (Phase 3)
 """
 
 from dataclasses import dataclass, field
@@ -63,14 +63,18 @@ class PreProjectedEquations:
     assumptions_applied: List[str] = field(default_factory=list)
     dimension: int = 1
 
+    @property
+    def horizontal_dim(self):
+        return self.dimension - 1
+
     def all_equations(self) -> Dict[str, List[TaggedTerm]]:
         eqs = {"continuity": self.continuity, "x_momentum": self.x_momentum}
-        if self.dimension > 1:
+        if self.dimension > 2:
             eqs["y_momentum"] = self.y_momentum
         return eqs
 
     def summary(self):
-        lines = [f"PreProjectedEquations (dim={self.dimension})"]
+        lines = [f"PreProjectedEquations (space_dim={self.dimension}, horizontal_dim={self.horizontal_dim})"]
         lines.append(f"  Assumptions: {self.assumptions_applied}")
         for name, terms in self.all_equations().items():
             roles = {}
@@ -111,7 +115,7 @@ def derive_shallow_moments(
 
     # --- Step 1-2: Apply material model ---
     xm = ins.x_momentum.apply(material)
-    ym = ins.y_momentum.apply(material) if dim > 1 else None
+    ym = ins.y_momentum.apply(material) if state.has_y else None
     cont = ins.continuity
 
     assumptions_applied = [f"material={material.name}"]
@@ -167,7 +171,7 @@ def derive_shallow_moments(
         origin="mass_flux",
     ))
 
-    if dim > 1:
+    if state.has_y:
         v_sym = Function("v", real=True)(state.t, state.y, state.z)
         result.continuity.append(TaggedTerm(
             expr=Expression(v_sym, "v_mass_flux"),
@@ -178,7 +182,7 @@ def derive_shallow_moments(
     # --- Tag x-momentum terms ---
     _tag_momentum(result.x_momentum, xm, state, "x", slip_length)
 
-    if dim > 1 and ym is not None:
+    if state.has_y and ym is not None:
         _tag_momentum(result.y_momentum, ym, state, "y", slip_length)
 
     return result
@@ -226,7 +230,7 @@ def _tag_momentum(tagged_list, momentum_expr, state, component, slip_length):
             origin=f"advection_{vel_label}",
         ))
 
-    if state.dim > 1:
+    if state.has_y:
         tagged_list.append(TaggedTerm(
             expr=Expression(
                 Function(vel_name)(t, x, z) * state.v,

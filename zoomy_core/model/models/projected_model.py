@@ -8,7 +8,7 @@ Usage:
     from zoomy_core.model.models.model_derivation import derive_shallow_moments
     from zoomy_core.model.models.projected_model import ProjectedModel
 
-    state = StateSpace(dimension=1)
+    state = StateSpace(dimension=2)
     pre = derive_shallow_moments(state)
     model = ProjectedModel(pre, basis_type=Legendre_shifted, level=2)
     # model has flux(), source(), eigenvalues(), etc.
@@ -48,9 +48,9 @@ class ProjectedModel(Model):
         self._pre = pre_projected
         self._state = pre_projected.state
 
-        dim = pre_projected.dimension
+        hdim = pre_projected.horizontal_dim
         n_mom = level + 1
-        n_vars = 2 + dim * n_layers * n_mom
+        n_vars = 2 + hdim * n_layers * n_mom
 
         var_names = ["b", "h"] + [f"q{i}" for i in range(2, n_vars)]
         param_dict = {
@@ -64,7 +64,7 @@ class ProjectedModel(Model):
 
         super().__init__(
             init_functions=False,
-            dimension=dim,
+            dimension=hdim,
             variables=var_names,
             parameters=param_dict,
             eigenvalue_mode=eigenvalue_mode,
