@@ -60,6 +60,9 @@ dev = [
   "Cython",
   "pytest-html"
 ]
+server = [
+  "zoomy-server",
+]
 
 # Example: pip install zoomy_core[viz,io]
 # Example: pip install zoomy_core[dev]
@@ -70,6 +73,10 @@ Documentation = "https://mbd-rwth.github.io/Zoomy"
 Source = "https://github.com/mbd-rwth/Zoomy"
 Issues = "https://github.com/mbd-rwth/Zoomy/issues"
 
+
+[project.scripts]
+zoomy = "zoomy_core.cli.main:main"
+zoomy-serve = "zoomy_server.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["*"]

@@ -7,6 +7,7 @@ import sympy as sp
 from zoomy_core.misc.misc import ZArray, Zstruct
 from zoomy_core.model.basefunction import SymbolicRegistrar
 from zoomy_core.model.basemodel import Model
+from zoomy_core.model.custom_sympy_functions import max_wavespeed
 from zoomy_core.transformation.to_numpy import NumpyRuntimeSymbolic
 
 
@@ -149,22 +150,23 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         )
 
     def local_max_eigenvalue_definition(self):
-        """Local max eigenvalue definition."""
-        evs = self._model_eval(
-            "eigenvalues",
-            self.variables,
-            self.aux_variables,
-            self.parameters,
-            self.normal,
+        """
+        Returns the opaque max_wavespeed function.
+        The actual implementation is provided by the backend at runtime.
+        """
+        return max_wavespeed(
+            *list(self.variables), *list(self.aux_variables),
+            *list(self.parameters), *list(self.normal),
         )
-        return sp.Max(*[sp.Abs(e) for e in evs])
 
     def local_max_abs_eigenvalue(self, Q=None, Qaux=None, p=None, n=None):
-        """Local max abs eigenvalue."""
+        """
+        Called during symbolic Rusanov construction.
+        Returns opaque max_wavespeed with the given state.
+        """
         if Q is None:
             return self.local_max_eigenvalue_definition()
-        evs = self._model_eval("eigenvalues", Q, Qaux, p, n)
-        return sp.Max(*[sp.Abs(e) for e in evs])
+        return max_wavespeed(*list(Q), *list(Qaux), *list(p), *list(n))
 
     def _model_eval(self, function_name, Q, Qaux, p, n=None):
         """Internal helper `_model_eval`."""

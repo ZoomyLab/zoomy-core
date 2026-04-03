@@ -22,6 +22,10 @@ class NumpyRuntimeModel:
         "zeros_like": np.zeros_like,
         "array": np.array,
         "squeeze": np.squeeze,
+        "conditional": lambda c, t, f: np.where(c, t, f),
+        "clamp_positive": lambda x: np.maximum(x, 0.0),
+        "clamp_momentum": lambda hu, h, u_max: np.clip(hu, -h * u_max, h * u_max),
+        "max_wavespeed": None,  # must be provided by the solver before compilation
     }
     printer = "numpy"
     
@@ -53,14 +57,59 @@ class NumpyRuntimeModel:
         except TypeError:
             # Fallback for SymPy versions without cse kwarg in lambdify.
             compiled = sp.lambdify(args, expr, modules=modules)
-        signature = function_obj.args
+
+        fast_flatten = self._compile_flattener(function_obj.args)
 
         def runtime_callable(*runtime_args):
             """Runtime callable."""
-            flat_runtime_args = self._flatten_runtime_args(signature, runtime_args)
-            return compiled(*flat_runtime_args)
+            return compiled(*fast_flatten(runtime_args))
 
         return runtime_callable
+
+    @staticmethod
+    def _compile_flattener(signature):
+        """
+        Pre-compute the arg extraction plan at compile time.
+
+        Returns a fast closure that converts runtime args to a flat list
+        using only integer indexing — no Zstruct iteration at runtime.
+        """
+        plan = []
+
+        def _build_plan(expected, arg_idx, path):
+            if hasattr(expected, "values") and callable(expected.values):
+                keys = list(expected.keys()) if hasattr(expected, "keys") else None
+                for i, child in enumerate(expected.values()):
+                    child_path = path + (("key", keys[i], i),)
+                    _build_plan(child, arg_idx, child_path)
+            elif isinstance(expected, (list, tuple)):
+                for i, child in enumerate(expected):
+                    _build_plan(child, arg_idx, path + (("idx", None, i),))
+            else:
+                plan.append((arg_idx, path))
+
+        sig_values = list(signature.values()) if hasattr(signature, "values") else list(signature)
+        for arg_idx, expected in enumerate(sig_values):
+            _build_plan(expected, arg_idx, ())
+
+        def fast_flatten(runtime_args):
+            result = []
+            for arg_idx, path in plan:
+                val = runtime_args[arg_idx]
+                for step_type, step_key, step_idx in path:
+                    if isinstance(val, np.ndarray):
+                        val = val[step_idx]
+                    elif step_type == "key" and hasattr(val, step_key):
+                        val = getattr(val, step_key)
+                    else:
+                        try:
+                            val = val[step_idx]
+                        except (TypeError, IndexError, KeyError):
+                            pass
+                result.append(val)
+            return result
+
+        return fast_flatten
 
     def _flatten_runtime_args(self, signature, runtime_args):
         """Internal helper `_flatten_runtime_args`."""
