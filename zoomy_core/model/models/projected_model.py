@@ -23,12 +23,47 @@ from zoomy_core.model.basemodel import Model
 from zoomy_core.misc.misc import ZArray, Zstruct
 from zoomy_core.model.models.basisfunctions import Legendre_shifted, Basisfunction
 from zoomy_core.model.models.symbolic_integrator import SymbolicIntegrator
+
+
+# ---------------------------------------------------------------------------
+# Basis matrix cache (model-agnostic, keyed by basis identity + level)
+# ---------------------------------------------------------------------------
+
+_basis_matrix_cache: dict = {}
+
+
+def _cache_key(basis_type, level):
+    if isinstance(basis_type, type):
+        name = getattr(basis_type, "name", basis_type.__name__)
+    else:
+        name = getattr(basis_type, "name", str(basis_type))
+    return (name, level)
+
+
+def get_cached_matrices(basis, level, integrator):
+    key = _cache_key(basis, level)
+    if key not in _basis_matrix_cache:
+        _basis_matrix_cache[key] = integrator.compute_all_matrices(level)
+    return _basis_matrix_cache[key]
+
+
+def clear_matrix_cache():
+    _basis_matrix_cache.clear()
 from zoomy_core.model.models.model_derivation import PreProjectedEquations, TaggedTerm
 
 
 class ProjectedModel(Model):
     """
     Model produced by projecting PreProjectedEquations onto a specific basis.
+
+    Construction modes:
+
+    1. From pre-computed equations (notebook / advanced):
+        ``ProjectedModel(pre_projected, level=2)``
+
+    2. From simple config (GUI / server / CLI):
+        ``ProjectedModel(dimension=2, level=2, n_layers=1)``
+       Auto-runs Phase 1 (derive_shallow_moments).
 
     The projection uses the SymbolicIntegrator to compute basis matrices (M, A, D, phib)
     and assembles the Model functions (flux, source, NC matrix) from the tagged terms.
@@ -37,14 +72,35 @@ class ProjectedModel(Model):
     The user can inspect both raw (with M) and resolved (with M^{-1}) forms.
     """
 
-    level = param.Integer(default=0)
-    n_layers = param.Integer(default=1)
+    level = param.Integer(default=0, doc="Vertical basis function order")
+    n_layers = param.Integer(default=1, doc="Number of vertical layers")
     basis_type = param.ClassSelector(
-        class_=Basisfunction, default=Legendre_shifted, is_instance=False
+        class_=Basisfunction, default=Legendre_shifted, is_instance=False,
+        doc="Vertical basis function family"
+    )
+    material = param.Selector(
+        objects=["newtonian", "inviscid"], default="newtonian",
+        doc="Material model for viscous stress"
     )
 
-    def __init__(self, pre_projected: PreProjectedEquations, basis_type=Legendre_shifted,
-                 level=0, n_layers=1, eigenvalue_mode="symbolic", **kwargs):
+    def __init__(self, pre_projected=None, basis_type=Legendre_shifted,
+                 level=0, n_layers=1, eigenvalue_mode="symbolic",
+                 dimension=2, material="newtonian", slip_length=None,
+                 **kwargs):
+        if pre_projected is None:
+            # Auto-derive: run Phase 1 from config
+            from zoomy_core.model.models.ins_generator import (
+                StateSpace, Newtonian, Inviscid,
+            )
+            from zoomy_core.model.models.model_derivation import derive_shallow_moments
+
+            state = StateSpace(dimension=dimension)
+            material_map = {"newtonian": Newtonian, "inviscid": Inviscid}
+            mat_cls = material_map.get(material)
+            mat_obj = mat_cls(state) if mat_cls else None
+            pre_projected = derive_shallow_moments(state, material=mat_obj,
+                                                    slip_length=slip_length)
+
         self._pre = pre_projected
         self._state = pre_projected.state
 
