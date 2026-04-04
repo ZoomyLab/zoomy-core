@@ -154,6 +154,17 @@ class Legendre_shifted(Basisfunction):
         z = Symbol("z")
         b = lambda k, z: legendre(k, 2 * z - 1) * (-1) ** (k)
         return [b(k, z) for k in range(self.level + 1)]
+
+    def analytical_weighted_integral(self, poly_expr, var):
+        """
+        Compute int_0^1 poly_expr(z) * 1 dz exactly via antiderivative.
+
+        Since the Legendre weight is 1, this is just the polynomial
+        antiderivative evaluated at the bounds.  ~100x faster than
+        sympy.integrate for polynomial integrands.
+        """
+        anti = sympy.integrate(poly_expr, var)
+        return anti.subs(var, 1) - anti.subs(var, 0)
     
 class Chebyshevu(Basisfunction):
     """Chebyshevu. (class)."""
@@ -201,6 +212,53 @@ class Chebyshevu_shifted(Basisfunction):
         """Basis definition."""
         z = Symbol("z")
         return [chebyshevu(k, 2 * z - 1) for k in range(self.level + 1)]
+
+    # Cache for the Vandermonde inverse, keyed by polynomial degree
+    _vandermonde_cache: dict = {}
+
+    def _u_vandermonde_inv(self, deg):
+        """Cached inverse of the monomial-to-U Vandermonde matrix for degree deg."""
+        if deg in self._vandermonde_cache:
+            return self._vandermonde_cache[deg]
+        z_sym = Symbol("z")
+        n = deg + 1
+        # V[power, k] = coefficient of z^power in U_k(2z-1)
+        U_polys = [sympy.Poly(chebyshevu(k, 2 * z_sym - 1), z_sym) for k in range(n)]
+        V = sympy.Matrix(n, n, lambda i, j: U_polys[j].nth(i))
+        Vinv = V.inv()
+        self._vandermonde_cache[deg] = Vinv
+        return Vinv
+
+    def analytical_weighted_integral(self, poly_expr, var):
+        """
+        Compute int_0^1 poly_expr(z) * sqrt(z*(1-z)) dz exactly.
+
+        Uses Chebyshev U orthogonality: expand poly_expr in the U_k(2z-1)
+        basis, then int U_k * w dz = pi/8 * delta_{k,0}.
+
+        Returns c_0 * pi/8 where c_0 is the U_0 expansion coefficient.
+        Returns None if poly_expr is not a polynomial.
+        """
+        expanded = sympy.expand(poly_expr)
+        try:
+            p = sympy.Poly(expanded, var)
+        except (sympy.GeneratorsNeeded, sympy.PolynomialError):
+            return None  # not a polynomial
+
+        deg = p.degree()
+        if deg < 0:
+            return sympy.Integer(0)
+
+        Vinv = self._u_vandermonde_inv(deg)
+        n = deg + 1
+
+        # Monomial coefficient vector
+        p_vec = sympy.Matrix(n, 1, lambda i, _: p.nth(i))
+
+        # U-expansion coefficients: c = Vinv @ p_vec
+        c = Vinv * p_vec
+
+        return c[0] * sympy.pi / 8
 
     def quadrature_nodes(self, n=None):
         """
