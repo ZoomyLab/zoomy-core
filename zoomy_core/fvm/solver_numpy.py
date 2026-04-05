@@ -4,14 +4,9 @@ import os
 from time import time as gettime
 
 import numpy as np
-from attr import define
-
-from typing import Callable
-from attrs import define, field
+import param
 
 from zoomy_core.misc.logger_config import logger
-
-
 
 import zoomy_core.fvm.flux as fvmflux
 import zoomy_core.fvm.nonconservative_flux as nonconservative_flux
@@ -22,30 +17,21 @@ import zoomy_core.fvm.timestepping as timestepping
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
 
 
-@define(frozen=True, slots=True, kw_only=True)            
-class Solver():
-    """Solver. (class)."""
-    settings: Zstruct = field(factory=lambda: Settings.default())
+class Solver(param.Parameterized):
+    """Base solver class."""
 
-    def __attrs_post_init__(self):
-        """Hook `__attrs_post_init__`."""
-        defaults = Settings.default()
-        defaults.update(self.settings)
-        object.__setattr__(self, 'settings', defaults)
-        
+    settings = param.Parameter(default=None, doc="Run configuration (Settings object)")
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if self.settings is None:
+            self.settings = Settings.default()
+        else:
+            defaults = Settings.default()
+            defaults.update(self.settings)
+            self.settings = defaults
 
     def initialize(self, mesh, model):
-        # model.boundary_conditions.initialize(
-        #     mesh,
-        #     model.time,
-        #     model.position,
-        #     model.distance,
-        #     model.variables,
-        #     model.aux_variables,
-        #     model.parameters,
-        #     model.normal,
-        # )
-
         """Initialize."""
         n_variables = model.n_variables
         n_cells = mesh.n_cells
@@ -54,13 +40,13 @@ class Solver():
         Q = np.empty((n_variables, n_cells), dtype=float)
         Qaux = np.empty((n_aux_variables, n_cells), dtype=float)
         return Q, Qaux
-        
-    def create_runtime(self, Q, Qaux, mesh, model):      
+
+    def create_runtime(self, Q, Qaux, mesh, model):
         """Create runtime."""
         mesh.resolve_periodic_bcs(model.boundary_conditions)
         Q, Qaux = np.asarray(Q), np.asarray(Qaux)
         parameters = np.asarray(model.parameter_values)
-        runtime_model = NumpyRuntimeModel(model)        
+        runtime_model = NumpyRuntimeModel(model)
         return Q, Qaux, parameters, mesh, runtime_model
 
     def get_compute_source(self, mesh, model):
@@ -88,9 +74,8 @@ class Solver():
             return dQ
 
         return compute_source
-    
+
     def get_apply_boundary_conditions(self, mesh, model):
-        
         """Get apply boundary conditions."""
         def apply_boundary_conditions(time, Q, Qaux, parameters):
             """Apply boundary conditions."""
@@ -108,21 +93,15 @@ class Solver():
             return Q
 
         return apply_boundary_conditions
-    
+
     def update_q(self, Q, Qaux, mesh, model, parameters):
-        """
-        Update variables before the solve step.
-        """
-        # This is a placeholder implementation. Replace with actual logic as needed.
+        """Update variables before the solve step."""
         return Q
-    
+
     def update_qaux(self, Q, Qaux, Qold, Qauxold, mesh, model, parameters, time, dt):
-        """
-        Update auxiliary variables
-        """
-        # This is a placeholder implementation. Replace with actual logic as needed.
+        """Update auxiliary variables."""
         return Qaux
-    
+
     def solve(self, mesh, model):
         """Solve."""
         logger.error(
@@ -130,28 +109,29 @@ class Solver():
         )
         raise NotImplementedError("Solver.solve() must be implemented in derived classes.")
 
- 
-@define(frozen=True, slots=True, kw_only=True)            
+
 class HyperbolicSolver(Solver):
-    """HyperbolicSolver. (class)."""
-    settings: Zstruct = field(factory=lambda: Settings.default())
-    compute_dt: Callable = field(factory=lambda: timestepping.adaptive(CFL=0.45))
-    flux: fvmflux.Flux = field(factory=lambda: fvmflux.Zero())
-    nc_flux: nonconservative_flux.NonconservativeFlux = field(
-        factory=lambda: nonconservative_flux.Rusanov()
-    )
-    time_end: float = 0.1
-    min_dt: float = 1e-6
+    """HyperbolicSolver with explicit time stepping."""
 
+    time_end = param.Number(default=0.1, bounds=(0, None), doc="Simulation end time")
+    min_dt = param.Number(default=1e-6, bounds=(0, None), doc="Minimum allowed timestep")
+    compute_dt = param.Parameter(default=None, doc="Time-stepping strategy (callable)")
+    flux = param.Parameter(default=None, doc="Conservative flux scheme")
+    nc_flux = param.Parameter(default=None, doc="Non-conservative flux scheme")
 
-    def __attrs_post_init__(self):
-        """Hook `__attrs_post_init__`."""
-        super().__attrs_post_init__()
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if self.compute_dt is None:
+            self.compute_dt = timestepping.adaptive(CFL=0.45)
+        if self.flux is None:
+            self.flux = fvmflux.Zero()
+        if self.nc_flux is None:
+            self.nc_flux = nonconservative_flux.Rusanov()
+        # Ensure settings has output.snapshots default
         defaults = Settings.default()
         defaults.output.update(Zstruct(snapshots=10))
         defaults.update(self.settings)
-        object.__setattr__(self, 'settings', defaults)
-        
+        self.settings = defaults
 
     def initialize(self, mesh, model):
         """Initialize."""
@@ -183,8 +163,6 @@ class HyperbolicSolver(Solver):
         compute_num_flux = self.flux.get_flux_operator(model)
         compute_nc_flux = self.nc_flux.get_flux_operator(model)
         def flux_operator(dt, Q, Qaux, parameters, dQ):
-
-            # Initialize dQ as zeros using jax.numpy
             """Flux operator."""
             dQ = np.zeros_like(dQ)
 
@@ -217,7 +195,6 @@ class HyperbolicSolver(Solver):
             flux_out = Dm * face_volumes / cell_volumesA
             flux_in = Dp * face_volumes / cell_volumesB
 
-        
             # dQ[:, iA]-= flux_out does not guarantee correct accumulation
             # dQ[:, iB]-= flux_in
             np.add.at(dQ, (slice(None), iA), -flux_out)
@@ -228,13 +205,12 @@ class HyperbolicSolver(Solver):
     def solve(self, mesh, model, write_output=True):
         """Solve."""
         Q, Qaux = self.initialize(mesh, model)
-        
+
         Q, Qaux, parameters, mesh, model = self.create_runtime(Q, Qaux, mesh, model)
-        
+
         # init once with dummy values for dt
         Qaux = self.update_qaux(Q, Qaux, Q, Qaux, mesh, model, parameters, 0.0, 1.0)
 
-        
         if write_output:
             output_hdf5_path = os.path.join(
                 self.settings.output.directory, f"{self.settings.output.filename}.h5"
@@ -244,7 +220,6 @@ class HyperbolicSolver(Solver):
             def save_fields(time, time_stamp, i_snapshot, Q, Qaux):
                 """Save fields."""
                 return i_snapshot
-            
 
         def run(Q, Qaux, parameters, model):
             """Run."""
@@ -270,14 +245,13 @@ class HyperbolicSolver(Solver):
             boundary_operator = self.get_apply_boundary_conditions(mesh, model)
             Qnew = boundary_operator(time, Qnew, Qaux, parameters)
 
-
             cell_inradius_face = np.minimum(mesh.cell_inradius[mesh.face_cells[0, :]], mesh.cell_inradius[mesh.face_cells[1,:]])
             cell_inradius_face = cell_inradius_face.min()
 
             while time < self.time_end:
                 Q = Qnew
                 Qaux = Qauxnew
-                
+
                 dt = self.compute_dt(
                     Q, Qaux, parameters, cell_inradius_face, compute_max_abs_eigenvalue
                 )
@@ -303,16 +277,15 @@ class HyperbolicSolver(Solver):
                 )
 
                 Q3 = boundary_operator(time, Q2, Qaux, parameters)
-                
+
                 # Update solution and time
                 time += dt
                 iteration += 1
 
                 time_stamp = (i_snapshot) * dt_snapshot
-                
+
                 Qnew = self.update_q(Q3, Qaux, mesh, model, parameters)
                 Qauxnew = self.update_qaux(Qnew, Qaux, Q, Qaux, mesh, model, parameters, time, dt)
-
 
                 i_snapshot = save_fields(time, time_stamp, i_snapshot, Qnew, Qauxnew)
 
@@ -329,4 +302,3 @@ class HyperbolicSolver(Solver):
         time = gettime() - time_start
         logger.info(f"Finished simulation with in {time:.3f} seconds")
         return Qnew, Qaux
-    
