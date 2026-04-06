@@ -148,7 +148,7 @@ class ProjectedModel(Model):
 
     def _compute_basis_matrices(self):
         """Compute all needed basis matrices via SymbolicIntegrator."""
-        matrices = self._integrator.compute_all_matrices(self.level)
+        matrices = get_cached_matrices(self.basis_type, self.level, self._integrator)
         self._M = matrices["M"]
         self._A = matrices["A"]
         self._D = matrices["D"]
