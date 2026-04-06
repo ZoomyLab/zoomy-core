@@ -93,7 +93,8 @@ class NumericalModel(Model):
             name=f"Numerical({analytical_model.name})",
             dimension=analytical_model.dimension,
             variables=list(var_keys),
-            aux_variables=0,
+            aux_variables=(list(analytical_model.aux_variables.keys())
+                          if analytical_model.n_aux_variables > 0 else 0),
             parameters=param_def,
             boundary_conditions=kwargs.get("boundary_conditions", analytical_model.boundary_conditions),
             initial_conditions=kwargs.get("initial_conditions", analytical_model.initial_conditions),
