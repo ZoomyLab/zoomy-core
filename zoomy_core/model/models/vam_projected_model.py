@@ -81,6 +81,12 @@ class VAMProjectedHyperbolic(Model):
                      + [f"hw{k}" for k in range(n_w)]
                      + ["b"])
 
+        # Auxiliary variables: closure mode + pressure + derivatives
+        aux_names = [f"hw{n_w}"]  # w-closure mode
+        aux_names += [f"hp{k}" for k in range(n_p)]
+        aux_names += ["dbdx", "dhdx"]
+        aux_names += [f"dhp{k}dx" for k in range(n_p)]
+
         param_dict = {
             "g": (9.81, "positive"),
             "eps": (1e-6, "positive"),
@@ -94,6 +100,7 @@ class VAMProjectedHyperbolic(Model):
             init_functions=False,
             dimension=1,
             variables=var_names,
+            aux_variables=aux_names,
             parameters=param_dict,
             eigenvalue_mode=eigenvalue_mode,
             level=level,
@@ -272,9 +279,8 @@ class VAMProjectedHyperbolic(Model):
 
         # --- cross-momentum flux: h A_uw[l,i,j] alpha_i gamma_j → M_w^{-1}
         #     PLUS closure: h A_uw_ext[l,i] alpha_i gamma_{L+1} ---
-        # gamma_{L+1} is the closure mode, stored as auxiliary hw_{n_w}
-        # We represent it as a Symbol that will be resolved via aux_variables
-        gamma_closure = Symbol(f"hw{n_w}", real=True) * hinv
+        # gamma_{L+1} is the closure mode, stored as aux_variables[0]
+        gamma_closure = self.aux_variables[0] * hinv
 
         for k_out in range(n_w):
             raw = [S.Zero] * n_w
@@ -375,12 +381,13 @@ class VAMProjectedHyperbolic(Model):
 
         R = ZArray.zeros(nv)
 
-        # Symbolic aux: pressure moments pi_k = hp_k / h
-        hp = [Symbol(f"hp{k}") for k in range(n_p)]
-        pi_ = [hp[k] * hinv for k in range(n_p)]      # pi_k = hp_k / h
-        dhpdx = [Symbol(f"dhp{k}dx") for k in range(n_p)]
-        dbdx = Symbol("dbdx")
-        dhdx = Symbol("dhdx")
+        # Pressure moments and derivatives from aux_variables
+        # aux layout: [hw_closure, hp0..hpN, dbdx, dhdx, dhp0dx..dhpNdx]
+        hp = [self.aux_variables[1 + k] for k in range(n_p)]
+        pi_ = [hp[k] * hinv for k in range(n_p)]
+        dbdx = self.aux_variables[1 + n_p]
+        dhdx = self.aux_variables[1 + n_p + 1]
+        dhpdx = [self.aux_variables[1 + n_p + 2 + k] for k in range(n_p)]
 
         D1 = self._D1_p
         phib_p = self._phib_p
