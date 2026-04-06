@@ -205,14 +205,28 @@ class NumericalModel(Model):
 
     def _compute_proxy_eigenvalues(self):
         """Compute eigenvalues from a lower-level model of the same basis."""
-        from zoomy_core.model.models.generated_shallow_model import GeneratedShallowModel
-        proxy = GeneratedShallowModel(
-            n_layers=getattr(self._analytical, "n_layers", 1),
-            level=self._eigenvalue_proxy_level,
-            dimension=self._analytical.dimension,
-            basis_type=getattr(self._analytical, "basis_type", None) or type(self._analytical.basisfunctions),
-            eigenvalue_mode="symbolic",
-        )
+        try:
+            from zoomy_core.model.models.projected_model import ProjectedModel
+            from zoomy_core.model.models.model_derivation import derive_shallow_moments
+            from zoomy_core.model.models.ins_generator import StateSpace, Newtonian
+            state = StateSpace(dimension=self._analytical.dimension + 1)
+            pre = derive_shallow_moments(state, material=Newtonian(state))
+            proxy = ProjectedModel(
+                pre,
+                basis_type=getattr(self._analytical, "basis_type", None) or type(self._analytical.basisfunctions),
+                level=self._eigenvalue_proxy_level,
+                n_layers=getattr(self._analytical, "n_layers", 1),
+                eigenvalue_mode="symbolic",
+            )
+        except Exception:
+            from zoomy_core.model.models.legacy.generated_shallow_model import GeneratedShallowModel
+            proxy = GeneratedShallowModel(
+                n_layers=getattr(self._analytical, "n_layers", 1),
+                level=self._eigenvalue_proxy_level,
+                dimension=self._analytical.dimension,
+                basis_type=getattr(self._analytical, "basis_type", None) or type(self._analytical.basisfunctions),
+                eigenvalue_mode="symbolic",
+            )
         proxy_evs = list(proxy.eigenvalues())
         n_needed = self.n_variables
         n_have = len(proxy_evs)
