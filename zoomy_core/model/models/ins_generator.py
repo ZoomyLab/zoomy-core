@@ -428,7 +428,12 @@ class Expression(SymbolicBase):
         for bc in bcs:
             bnd = bnd.apply(bc)
 
-        return total_volume + bnd
+        # Simplify: evaluate derivatives (to combine d(H+b)/dt - db/dt → dH/dt)
+        # but preserve Integrals (don't re-apply Leibniz)
+        result_expr = (total_volume + bnd).expr
+        result_expr = _simplify_derivatives_only(result_expr)
+
+        return Expression(result_expr, self.name)
 
     # ------------------------------------------------------------------
     # Term classification
@@ -927,6 +932,44 @@ class assumptions:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _simplify_derivatives_only(expr):
+    """Simplify Derivative sums without touching Integrals.
+
+    Turns ``d(H+b)/dt - db/dt`` into ``dH/dt`` while preserving
+    ``Derivative(Integral(...), x)`` and bare ``Integral(...)`` nodes.
+    """
+    if not isinstance(expr, sp.Basic):
+        return expr
+
+    # Protect anything involving Integrals
+    integral_map = {}
+    counter = [0]
+
+    def _protect(e):
+        # Protect Derivative(Integral(...), ...) as a unit
+        if isinstance(e, Derivative) and e.args[0].has(Integral):
+            key = sp.Dummy(f"_DINT{counter[0]}")
+            integral_map[key] = e
+            counter[0] += 1
+            return key
+        # Protect bare Integrals
+        if isinstance(e, Integral):
+            key = sp.Dummy(f"_INT{counter[0]}")
+            integral_map[key] = e
+            counter[0] += 1
+            return key
+        if e.args:
+            new_args = [_protect(a) for a in e.args]
+            return e.func(*new_args)
+        return e
+
+    protected = _protect(expr)
+    # Now safe to simplify — only pure Derivative(Function, var) remain
+    simplified = protected.doit() if protected.has(Derivative) else protected
+    # Restore integral-containing nodes
+    return simplified.subs(integral_map)
+
 
 def _extract_derivative(expr, var):
     expr = sp.sympify(expr)
