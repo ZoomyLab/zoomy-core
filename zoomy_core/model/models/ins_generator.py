@@ -366,6 +366,138 @@ class Expression(SymbolicBase):
             return sp.simplify(self.expr - other.expr) == 0
         return sp.simplify(self.expr - other) == 0
 
+    # ------------------------------------------------------------------
+    # Per-term operations
+    # ------------------------------------------------------------------
+
+    def map(self, fn):
+        """Apply fn to each term, reassemble into a single Expression.
+
+        fn receives an Expression (single term) and must return either
+        an Expression or a DepthIntegralResult.  DepthIntegralResults are
+        assembled (volume + boundaries) before summing.
+
+        Example:
+            integrated = expr.map(lambda t: t.depth_integrate(b, eta, z))
+        """
+        results = []
+        for term in self.terms:
+            r = fn(term)
+            if isinstance(r, DepthIntegralResult):
+                results.append(r.assemble())
+            elif isinstance(r, Expression):
+                results.append(r)
+            else:
+                results.append(Expression(r, term.name))
+        return sum(results, Expression(S.Zero))
+
+    def map_with_bcs(self, fn, bcs):
+        """Like map(), but collects boundary terms and applies BCs globally.
+
+        This is the correct way to depth-integrate a full equation:
+        boundary terms from ALL terms are combined first, then BCs are
+        applied once (so cross-term cancellations happen properly).
+
+        Parameters
+        ----------
+        fn : callable
+            Applied to each term.  Must return DepthIntegralResult or Expression.
+        bcs : list of Relation
+            Kinematic BCs etc. applied to the combined boundary expression.
+
+        Returns
+        -------
+        Expression
+            The fully depth-integrated equation with BCs applied.
+        """
+        total_volume = Expression(S.Zero)
+        total_boundary = Expression(S.Zero)
+
+        for term in self.terms:
+            r = fn(term)
+            if isinstance(r, DepthIntegralResult):
+                total_volume = total_volume + r.volume
+                total_boundary = total_boundary + r.boundary_upper + r.boundary_lower
+            elif isinstance(r, Expression):
+                total_volume = total_volume + r
+            else:
+                total_volume = total_volume + Expression(r)
+
+        # Apply all BCs to the combined boundary
+        bnd = total_boundary
+        for bc in bcs:
+            bnd = bnd.apply(bc)
+
+        return total_volume + bnd
+
+    # ------------------------------------------------------------------
+    # Term classification
+    # ------------------------------------------------------------------
+
+    def classify(self, t=None, x=None, z=None):
+        """Classify each term by its role in the PDE.
+
+        Returns a dict: {role: Expression} where role is one of:
+        'temporal', 'convective', 'diffusive', 'source'.
+
+        Detection rules:
+        - Has d/dt → temporal
+        - Has d/dx (first-order) of a product → convective flux
+        - Has d²/dz² or d/dz of d/dz → diffusive
+        - Otherwise → source (algebraic)
+        """
+        roles = {
+            "temporal": [],
+            "convective": [],
+            "diffusive": [],
+            "source": [],
+        }
+
+        for term in self.terms:
+            e = term.expr
+            classified = False
+
+            # Check temporal
+            if t is not None and e.has(Derivative) and any(
+                t in d.variables for d in e.atoms(Derivative)
+            ):
+                roles["temporal"].append(term)
+                classified = True
+
+            # Check diffusive (second derivatives in z)
+            if not classified and z is not None:
+                for d in e.atoms(Derivative):
+                    if d.variables.count(z) >= 2:
+                        roles["diffusive"].append(term)
+                        classified = True
+                        break
+
+            # Check convective (first derivative in x)
+            if not classified and x is not None:
+                for d in e.atoms(Derivative):
+                    if x in d.variables and d.variables.count(x) == 1:
+                        roles["convective"].append(term)
+                        classified = True
+                        break
+
+            if not classified:
+                roles["source"].append(term)
+
+        return {k: Expression(sum((t.expr for t in v), S.Zero), k)
+                for k, v in roles.items() if v}
+
+    @property
+    def temporal(self):
+        """View: only temporal (d/dt) terms."""
+        c = self.classify(t=Symbol("t"))
+        return c.get("temporal", Expression(S.Zero))
+
+    @property
+    def convective(self):
+        """View: only convective flux (d/dx) terms."""
+        c = self.classify(x=Symbol("x"))
+        return c.get("convective", Expression(S.Zero))
+
 
 class DepthIntegralResult:
     """
