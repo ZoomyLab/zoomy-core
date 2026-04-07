@@ -498,6 +498,116 @@ class Expression(SymbolicBase):
         c = self.classify(x=Symbol("x"))
         return c.get("convective", Expression(S.Zero))
 
+    # ------------------------------------------------------------------
+    # Basis projection
+    # ------------------------------------------------------------------
+
+    def project_onto_basis(self, basis, level, field_map, z_var,
+                           lower=None, upper=None, test_mode=None):
+        """
+        Project a depth-integrated equation onto a polynomial basis.
+
+        Replaces every ``Integral(f(u,...), (z, b, eta))`` by substituting
+        the basis expansion ``u(z) = sum alpha_k phi_k(zeta)`` and evaluating
+        the resulting integrals using the ``SymbolicIntegrator``.
+
+        If ``test_mode`` is an integer, multiplies each integral by the test
+        function phi_{test_mode}(zeta) before evaluating (Galerkin projection
+        for a specific mode).  If ``test_mode=None``, returns the scalar
+        integral (e.g. for the mass equation where no test function is needed).
+
+        Parameters
+        ----------
+        basis : Basisfunction class (e.g. Legendre_shifted)
+        level : int
+        field_map : dict
+            Maps the original Function name to a list of SymPy Symbols
+            for the basis coefficients.
+            Example: {'u': [alpha_0, alpha_1, alpha_2]}
+        z_var : Symbol
+            The vertical coordinate (z) that appears in the integrals.
+        lower, upper : sympy expressions (optional)
+            The integration bounds (b, eta).  If None, detected from
+            the first Integral found.
+        test_mode : int or None
+            If int, project onto test function phi_{test_mode}.
+
+        Returns
+        -------
+        Expression
+            With all depth integrals replaced by basis matrix products.
+        """
+        from zoomy_core.model.models.symbolic_integrator import SymbolicIntegrator
+        from zoomy_core.model.models.projected_model import get_cached_matrices
+
+        basis_obj = basis(level=level)
+        integrator = SymbolicIntegrator(basis_obj)
+        matrices = get_cached_matrices(basis, level, integrator)
+
+        M = matrices["M"]
+        A = matrices["A"]
+        n = level + 1
+        zeta = Symbol("zeta")
+        c_mean = basis_obj.mean_coefficients()
+
+        def _replace_integral(expr):
+            """Walk the expression tree, replacing Integral nodes."""
+            if not isinstance(expr, sp.Basic):
+                return expr
+
+            if isinstance(expr, Integral):
+                integrand = expr.args[0]
+                limits = expr.args[1]
+                int_var = limits[0]
+
+                if int_var != z_var:
+                    return expr
+
+                lo, hi = limits[1], limits[2]
+
+                # Transform to zeta-space:
+                # z = lo + (hi - lo)*zeta, dz = (hi-lo)*dzeta
+                h_expr = hi - lo  # water depth H
+                integrand_zeta = integrand.subs(int_var, lo + h_expr * zeta)
+
+                # Substitute basis expansion for each field
+                for fname, coeffs in field_map.items():
+                    expansion = sum(
+                        coeffs[k] * basis_obj.eval(k, zeta)
+                        for k in range(min(len(coeffs), n))
+                    )
+                    # Find all applications of this function and replace
+                    for atom in integrand_zeta.atoms(sp.Function):
+                        if atom.func.__name__ == fname:
+                            integrand_zeta = integrand_zeta.subs(atom, expansion)
+
+                # Multiply by Jacobian H and test function
+                integrand_final = h_expr * integrand_zeta
+                if test_mode is not None:
+                    integrand_final *= basis_obj.eval(test_mode, zeta)
+
+                # Evaluate the integral using the integrator
+                result = integrator.integrate(
+                    sp.expand(integrand_final) * basis_obj.weight(zeta),
+                    zeta,
+                    tuple(basis_obj.bounds()),
+                )
+                return result
+
+            # Recurse into Derivative, Mul, Add, etc.
+            if isinstance(expr, Derivative):
+                new_expr = _replace_integral(expr.args[0])
+                return Derivative(new_expr, *expr.args[1:])
+
+            if expr.args:
+                new_args = [_replace_integral(a) for a in expr.args]
+                return expr.func(*new_args)
+
+            return expr
+
+        result = _replace_integral(self.expr)
+        return Expression(result, f"projected({self.name})")
+
 
 class DepthIntegralResult:
     """
