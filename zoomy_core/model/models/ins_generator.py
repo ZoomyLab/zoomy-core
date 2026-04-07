@@ -129,11 +129,15 @@ class Expression(SymbolicBase):
     - Notebook: _repr_latex_
     """
 
-    def __init__(self, expr, name=""):
+    def __init__(self, expr, name="", _parent=None, _operation=None, _op_args=None):
         super().__init__(name)
         if isinstance(expr, Expression):
             expr = expr.expr
         self.expr = sp.sympify(expr) if not isinstance(expr, sp.Basic) else expr
+        # Provenance: lightweight derivation tracking
+        self._parent = _parent        # parent Expression or None
+        self._operation = _operation  # "apply", "depth_integrate", "project", ...
+        self._op_args = _op_args or {}  # operation details for the graph
 
     @property
     def terms(self):
@@ -237,7 +241,11 @@ class Expression(SymbolicBase):
                             result = result.subs(pair[0], pair[1])
             elif hasattr(cond, 'apply_to'):
                 result = cond.apply_to(result)
-        return Expression(result, self.name)
+        cond_names = [c.name if hasattr(c, 'name') else str(c)[:30]
+                      for c in conditions]
+        return Expression(result, self.name,
+                          _parent=self, _operation="apply",
+                          _op_args={"conditions": cond_names})
 
     def depth_integrate(self, lower, upper, var, method="auto"):
         """
@@ -433,7 +441,10 @@ class Expression(SymbolicBase):
         result_expr = (total_volume + bnd).expr
         result_expr = _simplify_derivatives_only(result_expr)
 
-        return Expression(result_expr, self.name)
+        bc_names = [bc.name if hasattr(bc, 'name') else str(bc)[:30] for bc in bcs]
+        return Expression(result_expr, self.name,
+                          _parent=self, _operation="depth_integrate",
+                          _op_args={"bcs": bc_names})
 
     # ------------------------------------------------------------------
     # Term classification
@@ -611,7 +622,133 @@ class Expression(SymbolicBase):
             return expr
 
         result = _replace_integral(self.expr)
-        return Expression(result, f"projected({self.name})")
+        basis_name = getattr(basis, 'name', str(basis))
+        return Expression(result, f"projected({self.name})",
+                          _parent=self, _operation="project_onto_basis",
+                          _op_args={"basis": basis_name, "level": level,
+                                    "test_mode": test_mode})
+
+    # ------------------------------------------------------------------
+    # Derivation graph + description
+    # ------------------------------------------------------------------
+
+    def derivation_chain(self):
+        """Walk the parent chain, return list from root to self."""
+        chain = []
+        node = self
+        while node is not None:
+            chain.append(node)
+            node = getattr(node, '_parent', None)
+        return list(reversed(chain))
+
+    def derivation_mermaid(self):
+        """Generate a Mermaid diagram of the derivation history."""
+        chain = self.derivation_chain()
+        if len(chain) <= 1:
+            return f'graph TD\n    A["{self.name}<br/>{len(self)} terms"]'
+
+        lines = ["graph TD"]
+        for i, node in enumerate(chain):
+            label = node.name or f"expr_{i}"
+            n_terms = len(node)
+            node_id = chr(65 + i) if i < 26 else f"N{i}"
+            lines.append(f'    {node_id}["{label}<br/>{n_terms} terms"]')
+            if i > 0:
+                parent_id = chr(65 + i - 1) if i - 1 < 26 else f"N{i-1}"
+                op = node._operation or "?"
+                op_detail = ""
+                if node._op_args:
+                    if "conditions" in node._op_args:
+                        op_detail = ", ".join(node._op_args["conditions"])
+                    elif "basis" in node._op_args:
+                        op_detail = f"{node._op_args['basis']} L{node._op_args.get('level','?')}"
+                    elif "bcs" in node._op_args:
+                        op_detail = "+" + "+".join(node._op_args["bcs"])
+                edge_label = f"{op}({op_detail})" if op_detail else op
+                lines.append(f'    {parent_id} -->|"{edge_label}"| {node_id}')
+
+        return "\n".join(lines)
+
+    def latex(self, strip_args=False):
+        """LaTeX representation, optionally stripping function arguments.
+
+        With ``strip_args=True``, ``u(t, x, z)`` renders as just ``u``.
+        This is display-only — the underlying expression is unchanged.
+        """
+        if not strip_args:
+            return sp.latex(self.expr)
+
+        # Replace Function applications with bare symbols in the LaTeX
+        import re
+        raw = sp.latex(self.expr)
+        # Pattern: \operatorname{name}{\left(args\right)} → name
+        raw = re.sub(
+            r'\\operatorname\{(\w+)\}\{\\left\([^)]*\\right\)\}',
+            r'\1', raw)
+        # Pattern: name{\left(args\right)} → name (for single-char functions)
+        raw = re.sub(
+            r'(\b[a-zA-Z])\{\\left\([^)]*\\right\)\}',
+            r'\1', raw)
+        return raw
+
+    def describe(self, mode="current", strip_args=False, format="markdown"):
+        """Generate a description of this expression.
+
+        Parameters
+        ----------
+        mode : str
+            'current'  — the expression + parameter info
+            'full'     — derivation graph (mermaid) + equation at each step
+            'summary'  — one-line summary
+        strip_args : bool
+            If True, display ``u`` instead of ``u(t,x,z)``
+        format : str
+            'markdown' — markdown + mermaid (default)
+            'latex'    — pure LaTeX
+            'text'     — plain text
+
+        Returns
+        -------
+        str
+        """
+        tex = self.latex(strip_args=strip_args)
+
+        if mode == "summary":
+            chain = self.derivation_chain()
+            ops = " → ".join(n._operation or n.name for n in chain if n._operation or n.name)
+            return f"{self.name}: {len(self)} terms | {ops}"
+
+        if mode == "current":
+            if format == "latex":
+                return tex + " = 0"
+            return f"**{self.name}** ({len(self)} terms)\n\n$$\n{tex} = 0\n$$"
+
+        # mode == "full"
+        chain = self.derivation_chain()
+        parts = []
+        if format == "markdown":
+            parts.append(f"## Derivation of {self.name}\n")
+            parts.append("```mermaid")
+            parts.append(self.derivation_mermaid())
+            parts.append("```\n")
+            for i, node in enumerate(chain):
+                step_tex = node.latex(strip_args=strip_args)
+                op_label = node._operation or "start"
+                parts.append(f"### Step {i}: {op_label}")
+                if node._op_args:
+                    parts.append(f"*{node._op_args}*\n")
+                parts.append(f"$$\n{step_tex} = 0\n$$\n")
+        elif format == "latex":
+            for i, node in enumerate(chain):
+                step_tex = node.latex(strip_args=strip_args)
+                parts.append(f"% Step {i}: {node._operation or 'start'}")
+                parts.append(f"\\begin{{equation}}\n{step_tex} = 0\n\\end{{equation}}\n")
+        else:
+            for i, node in enumerate(chain):
+                parts.append(f"Step {i} ({node._operation or 'start'}): "
+                             f"{node.expr} = 0")
+
+        return "\n".join(parts)
 
 
 class DepthIntegralResult:
