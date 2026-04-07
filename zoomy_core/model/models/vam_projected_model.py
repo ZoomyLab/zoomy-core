@@ -245,7 +245,8 @@ class VAMProjectedHyperbolic(Model):
     def get_primitives(self):
         n_u, n_w = self._n_u, self._n_w
         h = self.variables[0]
-        hinv = 1 / h
+        eps = getattr(self.parameters, 'eps', S.Zero)
+        hinv = 1 / (h + eps)
         b = self.variables[self._b_idx]
         alpha = [self.variables[1 + k] * hinv for k in range(n_u)]
         gamma = [self.variables[1 + n_u + k] * hinv for k in range(n_w)]
@@ -445,8 +446,9 @@ class VAMProjectedHyperbolic(Model):
             u0, u1 = alpha[0], alpha[1]
             ev[1] = u0 + u1 / sqrt(3)
             ev[2] = u0 - u1 / sqrt(3)
-            ev[1 + n_u] = u0 + sqrt(p.g * h + u1**2)
-            ev[2 + n_u] = u0 - sqrt(p.g * h + u1**2)
+            eps = getattr(p, 'eps', S.Zero)
+            ev[1 + n_u] = u0 + sqrt(p.g * (h + eps) + u1**2)
+            ev[2 + n_u] = u0 - sqrt(p.g * (h + eps) + u1**2)
         ev[nv - 1] = S.Zero
         return ev
 
