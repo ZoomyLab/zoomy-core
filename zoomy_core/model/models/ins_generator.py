@@ -239,6 +239,96 @@ class Expression(SymbolicBase):
                 result = cond.apply_to(result)
         return Expression(result, self.name)
 
+    def depth_integrate(self, lower, upper, var, method="auto"):
+        """
+        Depth-integrate this expression over [lower, upper] w.r.t. var.
+
+        Parameters
+        ----------
+        lower, upper : sympy expressions for the integration bounds
+            (typically b and b+H, both functions of t and x)
+        var : Symbol
+            The vertical coordinate (z)
+        method : str
+            'auto'    : detect derivative direction and choose method
+            'leibniz' : pull horizontal derivative outside:
+                        int df/dx dz = d/dx[int f dz] - f(upper)*d(upper)/dx + f(lower)*d(lower)/dx
+            'fundamental_theorem' : for vertical derivatives:
+                        int df/dz dz = f(upper) - f(lower)
+            'direct'  : keep as Integral(expr, (var, lower, upper))
+
+        Returns
+        -------
+        DepthIntegralResult with .volume, .boundary_upper, .boundary_lower
+        or a plain Expression for 'direct' and 'fundamental_theorem'.
+        """
+        expr = self.expr
+
+        if method == "auto":
+            # Detect: does the expression contain d/dz?
+            inner_z, coeff_z = _extract_derivative(expr, var)
+            if inner_z is not None:
+                method = "fundamental_theorem"
+            else:
+                # Check for d/dx (or any horizontal derivative)
+                method = "direct"
+                for s in expr.free_symbols:
+                    if s != var:
+                        inner_h, coeff_h = _extract_derivative(expr, s)
+                        if inner_h is not None:
+                            method = "leibniz"
+                            break
+
+        if method == "fundamental_theorem":
+            # int df/dz dz = f(upper) - f(lower)
+            # Convention: upper = +f(upper), lower = -f(lower)
+            inner, coeff = _extract_derivative(expr, var)
+            if inner is None:
+                raise ValueError(
+                    f"No Derivative w.r.t. {var} found for fundamental theorem: {expr}"
+                )
+            f_upper = (coeff * inner).subs(var, upper)
+            f_lower = (coeff * inner).subs(var, lower)
+            return DepthIntegralResult(
+                volume=Expression(S.Zero, f"ft_volume({self.name})"),
+                boundary_upper=Expression(f_upper, f"ft_upper({self.name})"),
+                boundary_lower=Expression(-f_lower, f"ft_lower({self.name})"),
+            )
+
+        elif method == "leibniz":
+            # int df/dx dz = d/dx[int f dz] - f(upper)*d(upper)/dx + f(lower)*d(lower)/dx
+            # Find the horizontal derivative
+            for s in list(expr.free_symbols) + [Symbol("x"), Symbol("t")]:
+                if s == var:
+                    continue
+                inner, coeff = _extract_derivative(expr, s)
+                if inner is not None:
+                    break
+            else:
+                raise ValueError(f"No horizontal Derivative found for Leibniz: {expr}")
+
+            # Volume: d/dx[int f dz] (the integral stays symbolic)
+            int_f = Integral(coeff * inner, (var, lower, upper))
+            volume = Derivative(int_f, s)
+
+            # Boundary terms (from Leibniz)
+            f_at_upper = (coeff * inner).subs(var, upper)
+            f_at_lower = (coeff * inner).subs(var, lower)
+            bnd_upper = -f_at_upper * Derivative(upper, s)
+            bnd_lower = f_at_lower * Derivative(lower, s)
+
+            return DepthIntegralResult(
+                volume=Expression(volume, f"leibniz_volume({self.name})"),
+                boundary_upper=Expression(bnd_upper, f"leibniz_upper({self.name})"),
+                boundary_lower=Expression(bnd_lower, f"leibniz_lower({self.name})"),
+            )
+
+        else:  # direct
+            return Expression(
+                Integral(expr, (var, lower, upper)),
+                f"integral({self.name})",
+            )
+
     def subs(self, *args, **kwargs):
         return Expression(self.expr.subs(*args, **kwargs), self.name)
 
@@ -275,6 +365,50 @@ class Expression(SymbolicBase):
         if isinstance(other, Expression):
             return sp.simplify(self.expr - other.expr) == 0
         return sp.simplify(self.expr - other) == 0
+
+
+class DepthIntegralResult:
+    """
+    Result of depth-integrating a term over [lower, upper].
+
+    Attributes:
+        volume:          the volume integral (Expression)
+        boundary_upper:  boundary term at z=upper (Expression)
+        boundary_lower:  boundary term at z=lower (Expression)
+
+    The full integral = volume + boundary_upper - boundary_lower.
+    Kinematic BCs can be applied to the boundary terms via .apply_bcs().
+    """
+
+    def __init__(self, volume, boundary_upper, boundary_lower):
+        self.volume = volume
+        self.boundary_upper = boundary_upper
+        self.boundary_lower = boundary_lower
+
+    def apply_bcs(self, bc_lower=None, bc_upper=None):
+        upper = self.boundary_upper
+        lower = self.boundary_lower
+        if bc_upper is not None:
+            upper = upper.apply(bc_upper)
+        if bc_lower is not None:
+            lower = lower.apply(bc_lower)
+        return DepthIntegralResult(self.volume, upper, lower)
+
+    def assemble(self):
+        """Combine all terms: volume + boundary_upper + boundary_lower.
+
+        The sign convention is that each component already carries its
+        correct sign.  For Leibniz: upper = -f(eta)*d(eta)/dx,
+        lower = +f(b)*db/dx.  For fundamental theorem: upper = +f(eta),
+        lower = -f(b).
+        """
+        return self.volume + self.boundary_upper + self.boundary_lower
+
+    def __repr__(self):
+        return (f"DepthIntegralResult(\n"
+                f"  volume={self.volume},\n"
+                f"  upper={self.boundary_upper},\n"
+                f"  lower={self.boundary_lower}\n)")
 
 
 class IBPResult:
