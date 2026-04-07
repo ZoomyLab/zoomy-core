@@ -219,4 +219,8 @@ def regularize_model(model, h_index=None, eps=1e-8, eps_wet=1e-3):
     model._eps_wet_sym = eps_wet_sym
     model._scaled_indices = scaled_indices
 
+    # Re-initialize compiled functions with regularized expressions
+    if hasattr(model, '_initialize_functions'):
+        model._initialize_functions()
+
     return model
