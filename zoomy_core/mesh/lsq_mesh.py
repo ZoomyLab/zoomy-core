@@ -164,3 +164,9 @@ class LSQMesh(FVMMesh):
     def create_2d(cls, domain: tuple, nx: int, ny: int, lsq_degree: int = 1) -> "LSQMesh":
         fvm = FVMMesh.create_2d(domain, nx, ny)
         return cls.from_fvm(fvm, lsq_degree)
+
+    @classmethod
+    def create_3d(cls, domain: tuple, nx: int, ny: int, nz: int,
+                  lsq_degree: int = 1) -> "LSQMesh":
+        fvm = FVMMesh.create_3d(domain, nx, ny, nz)
+        return cls.from_fvm(fvm, lsq_degree)

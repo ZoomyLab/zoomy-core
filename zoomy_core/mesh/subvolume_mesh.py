@@ -71,3 +71,8 @@ class SubVolumeMesh(FVMMesh):
     def create_2d(cls, domain: tuple, nx: int, ny: int) -> "SubVolumeMesh":
         fvm = FVMMesh.create_2d(domain, nx, ny)
         return cls.from_fvm(fvm)
+
+    @classmethod
+    def create_3d(cls, domain: tuple, nx: int, ny: int, nz: int) -> "SubVolumeMesh":
+        fvm = FVMMesh.create_3d(domain, nx, ny, nz)
+        return cls.from_fvm(fvm)
