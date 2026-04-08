@@ -11,7 +11,7 @@ import param
 import sympy as sp
 
 from zoomy_core.fvm.solver_numpy import HyperbolicSolver
-from zoomy_core.mesh.mesh import compute_derivatives
+from zoomy_core.mesh.lsq_reconstruction import compute_derivatives
 from zoomy_core.model.basemodel import Model
 from zoomy_core.misc.misc import ZArray, Zstruct
 

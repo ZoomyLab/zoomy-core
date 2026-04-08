@@ -20,7 +20,7 @@ import numpy as np
 
 from zoomy_core.model.basemodel import Model
 from zoomy_core.misc.misc import ZArray, Zstruct
-from zoomy_core.model.custom_sympy_functions import conditional, clamp_positive, clamp_momentum
+from zoomy_core.model.kernel_functions import conditional, clamp_positive, clamp_momentum
 from zoomy_core.model.boundary_conditions import BoundaryConditions
 from zoomy_core.model.initial_conditions import Constant, InitialConditions
 

@@ -12,13 +12,11 @@ import param
 
 from zoomy_core.mesh.base_mesh import BaseMesh
 from zoomy_core.mesh.fvm_mesh import FVMMesh
-from zoomy_core.mesh.mesh import (
+from zoomy_core.mesh.lsq_reconstruction import (
     least_squares_reconstruction_local,
     scale_lsq_derivative,
     find_derivative_indices,
     build_monomial_indices,
-    _get_neighberhood,
-    _fill_neighborhood,
 )
 
 
@@ -160,4 +158,9 @@ class LSQMesh(FVMMesh):
     @classmethod
     def create_1d(cls, domain: tuple, n_inner_cells: int, lsq_degree: int = 1) -> "LSQMesh":
         fvm = FVMMesh.create_1d(domain, n_inner_cells)
+        return cls.from_fvm(fvm, lsq_degree)
+
+    @classmethod
+    def create_2d(cls, domain: tuple, nx: int, ny: int, lsq_degree: int = 1) -> "LSQMesh":
+        fvm = FVMMesh.create_2d(domain, nx, ny)
         return cls.from_fvm(fvm, lsq_degree)

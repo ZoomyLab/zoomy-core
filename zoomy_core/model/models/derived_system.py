@@ -73,12 +73,12 @@ class DerivedSystem:
     def with_assumption(self, assumption):
         """Apply an additional assumption to all equations."""
         new_eqs = {k: eq.apply(assumption) for k, eq in self.equations.items()}
+        a_name = assumption.name if hasattr(assumption, 'name') else str(assumption)
         return DerivedSystem(
             self.name,
             new_eqs,
             self.state,
-            self.assumptions + [assumption.name if hasattr(assumption, 'name')
-                                 else str(assumption)],
+            self.assumptions + [a_name],
         )
 
     def with_basis(self, basis, level, field_map, z_var=None, test_mode=None):
@@ -106,38 +106,56 @@ class DerivedSystem:
             for name, eq in self.equations.items()
         }
 
-    def describe(self, mode="current", strip_args=False, format="markdown"):
-        """Describe the system.
+    def describe(self, header=True, assumptions=True, final_equation=True,
+                 parameters=False, strip_args=False):
+        """Composable description of this equation system.
+
+        Returns a ``Description`` that renders as markdown in Jupyter.
 
         Parameters
         ----------
-        mode : str
-            'current' — equations + assumptions
-            'full'    — derivation graphs for each equation
-            'summary' — one-line per equation
+        header : bool
+            System name and equation list.
+        assumptions : bool
+            List assumptions applied.
+        final_equation : bool
+            Show equations.
+        parameters : bool
+            List free symbols.
         strip_args : bool
-            Strip function arguments in display
-        format : str
-            'markdown', 'latex', 'text'
+            Display ``u`` instead of ``u(t, x, z)``.
         """
+        from zoomy_core.misc.description import Description
+        import sympy as sp
+
         parts = []
-        if format == "markdown":
-            parts.append(f"# {self.name}\n")
-            parts.append(f"**Assumptions:** {', '.join(self.assumptions)}\n")
+
+        if header:
+            eq_names = ", ".join(self.equations.keys())
+            parts.append(f"**{self.name}** ({eq_names})\n")
+
+        if assumptions and self.assumptions:
+            parts.append("**Assumptions:** " + ", ".join(self.assumptions) + "\n")
+
+        if final_equation:
             for eq_name, eq in self.equations.items():
-                parts.append(f"## {eq_name}\n")
-                parts.append(eq.describe(mode=mode, strip_args=strip_args,
-                                         format=format))
-                parts.append("")
-        elif format == "text":
-            parts.append(f"{self.name} ({', '.join(self.assumptions)})")
-            for eq_name, eq in self.equations.items():
-                parts.append(f"  {eq_name}: {eq.describe(mode='summary')}")
-        else:
-            for eq_name, eq in self.equations.items():
-                parts.append(eq.describe(mode=mode, strip_args=strip_args,
-                                         format=format))
-        return "\n".join(parts)
+                # Use multiline if term groups are available
+                tex = eq.latex(strip_args=strip_args, multiline=bool(eq._term_groups))
+                parts.append(f"**{eq_name}:**\n$$\n{tex} = 0\n$$\n")
+
+        if parameters:
+            all_syms = set()
+            for eq in self.equations.values():
+                all_syms |= eq.expr.free_symbols
+            syms = sorted([s for s in all_syms if isinstance(s, sp.Symbol)], key=str)
+            if syms:
+                sym_str = ", ".join(f"${sp.latex(s)}$" for s in syms)
+                parts.append(f"**Parameters:** {sym_str}")
+
+        return Description("\n".join(parts))
+
+    def _repr_markdown_(self):
+        return self.describe()._repr_markdown_()
 
     def save(self, path):
         """Save to file for reuse without re-derivation."""

@@ -220,6 +220,7 @@ class NumpyRuntimeModel:
         model: Model,
         module: Optional[Dict[str, Callable]] = None,
         printer: Optional[str] = None,
+        kernel=None,
     ):
         """Initialize the instance."""
         self.model = model
@@ -233,6 +234,12 @@ class NumpyRuntimeModel:
         # Copy the class-level mapping to avoid shared mutable state.
         self.module = dict(type(self).module) if module is None else dict(module)
         self.printer = type(self).printer if printer is None else printer
+
+        # If a Kernel is provided, compile its functions and merge into module
+        if kernel is not None:
+            kernel_rt = NumpyRuntimeSymbolic(kernel, module=self.module, printer=self.printer)
+            for name, fn in kernel_rt.runtime_functions.items():
+                self.module[name] = fn
 
         modules = [self.module]
         if self.printer:

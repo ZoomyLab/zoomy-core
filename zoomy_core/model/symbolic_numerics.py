@@ -28,7 +28,7 @@ Usage:
 import sympy as sp
 from sympy import Symbol, Pow, Rational, S
 
-from zoomy_core.model.custom_sympy_functions import (
+from zoomy_core.model.kernel_functions import (
     clamp_positive, clamp_momentum, conditional,
 )
 from zoomy_core.misc.misc import ZArray

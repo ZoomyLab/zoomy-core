@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from zoomy_core.mesh.mesh import compute_derivatives
+from zoomy_core.mesh.lsq_reconstruction import compute_derivatives
 
 
 def fd_jvp(residual_fn, Q, V, eps=1e-7):

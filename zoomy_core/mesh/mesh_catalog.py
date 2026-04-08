@@ -391,7 +391,7 @@ class MeshCatalog:
         Requires ``zoomy_core.mesh.mesh.Mesh`` to be importable.
         """
         path = self.download(name, size=size, filetype="h5", folder=folder)
-        from zoomy_core.mesh.mesh import Mesh
+        from zoomy_core.mesh.lsq_mesh import LSQMesh as Mesh
 
         return Mesh.from_hdf5(str(path))
 
@@ -404,7 +404,7 @@ class MeshCatalog:
     ):
         """Async variant of :meth:`load`."""
         path = await self.download_async(name, size=size, filetype="h5", folder=folder)
-        from zoomy_core.mesh.mesh import Mesh
+        from zoomy_core.mesh.lsq_mesh import LSQMesh as Mesh
 
         return Mesh.from_hdf5(str(path))
 

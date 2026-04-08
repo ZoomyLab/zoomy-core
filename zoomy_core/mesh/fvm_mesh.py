@@ -41,6 +41,31 @@ class FVMMesh(BaseMesh):
     def face_centers_computed(self) -> np.ndarray:
         return self._face_centers
 
+    # Public property accessors (compatible with old Mesh flat attributes)
+    @property
+    def cell_centers(self):
+        return self._cell_centers
+
+    @property
+    def cell_volumes(self):
+        return self._cell_volumes
+
+    @property
+    def cell_inradius(self):
+        return self._cell_inradius
+
+    @property
+    def face_normals(self):
+        return self._face_normals
+
+    @property
+    def face_volumes(self):
+        return self._face_volumes
+
+    @property
+    def face_centers(self):
+        return self._face_centers
+
     @classmethod
     def from_base(cls, base: BaseMesh) -> "FVMMesh":
         """Build an FVMMesh by computing geometry from a BaseMesh."""
@@ -97,4 +122,9 @@ class FVMMesh(BaseMesh):
     @classmethod
     def create_1d(cls, domain: tuple, n_inner_cells: int) -> "FVMMesh":
         base = BaseMesh.create_1d(domain, n_inner_cells)
+        return cls.from_base(base)
+
+    @classmethod
+    def create_2d(cls, domain: tuple, nx: int, ny: int) -> "FVMMesh":
+        base = BaseMesh.create_2d(domain, nx, ny)
         return cls.from_base(base)
