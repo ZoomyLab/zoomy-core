@@ -514,10 +514,11 @@ def compute_subvolume(face_vertices, cell_center, dim):
             v0, v1, v2 = face_vertices
             return np.abs(np.dot(np.cross(v1 - v0, v2 - v0), cell_center - v0)) / 6.0
         elif face_vertices.shape[0] == 4:
-            # 3D: Volume of the pyramid
-            # WARNING crude approximation
-            v0, v1, v2 = face_vertices
-            return np.abs(np.dot(np.cross(v1 - v0, v2 - v0), cell_center - v0)) / 6.0
+            # 3D: Volume of pyramid with quad base, split into 2 tetrahedra
+            v0, v1, v2, v3 = face_vertices
+            vol1 = np.abs(np.dot(np.cross(v1 - v0, v2 - v0), cell_center - v0)) / 6.0
+            vol2 = np.abs(np.dot(np.cross(v2 - v0, v3 - v0), cell_center - v0)) / 6.0
+            return vol1 + vol2
         else:
             assert False
 
