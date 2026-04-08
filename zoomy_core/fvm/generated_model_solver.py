@@ -7,7 +7,7 @@ Wet/dry threshold from model parameter 'eps_wet'.
 
 import numpy as np
 
-from zoomy_core.fvm.symbolic_numerics_v2 import PositiveNonconservativeRusanov
+from zoomy_core.fvm.riemann_solvers import PositiveNonconservativeRusanov
 from zoomy_core.model.derivative_workflow import (
     DerivativeAwareSolver,
     DerivativeAwareSolverMixin,
@@ -93,9 +93,10 @@ class _GeneratedModelFluxMixin:
         fi = self._field_indices(symbolic_model)
         i_h = fi["h"]
         dry_thr = self._get_dry_threshold(symbolic_model)
+        dim = symbolic_model.dimension
         i_cellA = mesh.face_cells[0]
         i_cellB = mesh.face_cells[1]
-        normals = mesh.face_normals
+        normals = mesh.face_normals[:dim, :]
         has_aux = symbolic_model.n_aux_variables > 0
 
         def compute_max_eigenvalue(Q, Qaux, parameters):
@@ -189,7 +190,8 @@ class _GeneratedModelFluxMixin:
 
         iA = mesh.face_cells[0]
         iB = mesh.face_cells[1]
-        normals_arr = mesh.face_normals
+        dim = symbolic_model.dimension
+        normals_arr = mesh.face_normals[:dim, :]
         face_volumes = mesh.face_volumes
         cell_volumesA = mesh.cell_volumes[iA]
         cell_volumesB = mesh.cell_volumes[iB]

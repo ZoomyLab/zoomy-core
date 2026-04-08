@@ -10,7 +10,7 @@ try:
 except ImportError:
     _HAVE_H5PY = False
 
-import zoomy_core.mesh.mesh as petscMesh
+import zoomy_core.mesh.lsq_reconstruction as petscMesh
 import zoomy_core.misc.io as io
 from zoomy_core.misc.logger_config import logger
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel

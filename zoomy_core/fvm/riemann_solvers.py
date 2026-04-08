@@ -1,4 +1,4 @@
-"""Module `zoomy_core.fvm.symbolic_numerics_v2`."""
+"""Symbolic Riemann solvers: Rusanov, positive, nonconservative variants."""
 
 import numpy as np
 import param
@@ -7,7 +7,7 @@ import sympy as sp
 from zoomy_core.misc.misc import ZArray, Zstruct
 from zoomy_core.model.basefunction import SymbolicRegistrar
 from zoomy_core.model.basemodel import Model
-from zoomy_core.model.custom_sympy_functions import max_wavespeed
+from zoomy_core.model.kernel_functions import max_wavespeed
 from zoomy_core.transformation.to_numpy import NumpyRuntimeSymbolic
 
 

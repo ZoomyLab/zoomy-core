@@ -15,6 +15,7 @@ from zoomy_core.misc.misc import Zstruct, Settings
 import zoomy_core.fvm.ode as ode
 import zoomy_core.fvm.timestepping as timestepping
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
+from zoomy_core.mesh import ensure_lsq_mesh
 
 
 class Solver(param.Parameterized):
@@ -43,7 +44,8 @@ class Solver(param.Parameterized):
 
     def create_runtime(self, Q, Qaux, mesh, model):
         """Create runtime."""
-        mesh.resolve_periodic_bcs(model.boundary_conditions)
+        if hasattr(mesh, "resolve_periodic_bcs"):
+            mesh.resolve_periodic_bcs(model.boundary_conditions)
         Q, Qaux = np.asarray(Q), np.asarray(Qaux)
         parameters = np.asarray(model.parameter_values)
         runtime_model = NumpyRuntimeModel(model)
@@ -204,6 +206,7 @@ class HyperbolicSolver(Solver):
 
     def solve(self, mesh, model, write_output=True):
         """Solve."""
+        mesh = ensure_lsq_mesh(mesh, model)
         Q, Qaux = self.initialize(mesh, model)
 
         Q, Qaux, parameters, mesh, model = self.create_runtime(Q, Qaux, mesh, model)

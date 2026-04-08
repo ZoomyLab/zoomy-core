@@ -7,7 +7,7 @@ from typing import Callable, Optional
 
 from zoomy_core.misc.custom_types import FArray
 from zoomy_core.misc.misc import ZArray
-from zoomy_core.mesh.mesh import Mesh
+from zoomy_core.mesh.lsq_mesh import LSQMesh as Mesh
 import zoomy_core.misc.io as io
 import zoomy_core.misc.interpolation as interpolate_mesh
 

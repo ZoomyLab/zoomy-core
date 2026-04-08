@@ -263,7 +263,7 @@ class BaseMesh(param.Parameterized):
         centers = np.zeros((3, n_cells), dtype=float)
         for ic in range(n_inner):
             vert_ids = self.cell_vertices[:, ic]
-            coords = self.vertex_coordinates[:, vert_ids]  # (dim, verts_per_cell)
+            coords = self.vertex_coordinates[:dim, vert_ids]  # (dim, verts_per_cell)
             centers[:dim, ic] = coords.mean(axis=1)
 
         # Ghost cell centers: reflect inner cell across boundary face
@@ -314,7 +314,7 @@ class BaseMesh(param.Parameterized):
         Uses the same projection-based approach as PETSc's
         ``computeCellGeometryFVM`` for consistency.
         """
-        from zoomy_core.mesh.mesh import _compute_inradius_generic
+        from zoomy_core.mesh.lsq_reconstruction import compute_inradius_generic as _compute_inradius_generic
 
         n_inner = self.n_inner_cells
         n_cells = self.n_cells
@@ -527,7 +527,7 @@ class BaseMesh(param.Parameterized):
     def compute_derivatives(self, u: np.ndarray, degree: int = 1,
                             derivatives_multi_index=None) -> np.ndarray:
         """Compute derivatives using on-the-fly LSQ reconstruction."""
-        from zoomy_core.mesh.mesh import (
+        from zoomy_core.mesh.lsq_reconstruction import (
             least_squares_reconstruction_local,
             scale_lsq_derivative,
             find_derivative_indices,
@@ -744,6 +744,129 @@ class BaseMesh(param.Parameterized):
             boundary_face_face_indices=boundary_face_face_indices,
             boundary_conditions_sorted_physical_tags=np.array([0, 1], dtype=int),
             boundary_conditions_sorted_names=["left", "right"],
+        )
+
+    @classmethod
+    def create_2d(cls, domain: tuple, nx: int, ny: int) -> "BaseMesh":
+        """Build a uniform 2D quad mesh.
+
+        Parameters
+        ----------
+        domain : (x_min, x_max, y_min, y_max)
+        nx, ny : number of inner cells in x and y directions
+        """
+        x_min, x_max, y_min, y_max = domain
+        n_inner_cells = nx * ny
+
+        # ── vertices on a regular grid ──
+        xs = np.linspace(x_min, x_max, nx + 1)
+        ys = np.linspace(y_min, y_max, ny + 1)
+        gx, gy = np.meshgrid(xs, ys, indexing="ij")  # (nx+1, ny+1)
+        n_vertices = (nx + 1) * (ny + 1)
+        # vertex_coordinates: (3, n_vertices), row-major over (ix, iy)
+        vertex_coordinates = np.zeros((3, n_vertices), dtype=float)
+        vertex_coordinates[0] = gx.ravel()
+        vertex_coordinates[1] = gy.ravel()
+
+        def vid(ix, iy):
+            return ix * (ny + 1) + iy
+
+        # ── cell-vertex connectivity: (4, n_inner_cells) ──
+        cell_vertices = np.empty((4, n_inner_cells), dtype=int)
+        for ix in range(nx):
+            for iy in range(ny):
+                ic = ix * ny + iy
+                cell_vertices[0, ic] = vid(ix, iy)
+                cell_vertices[1, ic] = vid(ix + 1, iy)
+                cell_vertices[2, ic] = vid(ix + 1, iy + 1)
+                cell_vertices[3, ic] = vid(ix, iy + 1)
+
+        # ── build face topology via _build_face_topology ──
+        cell_faces, face_cells_raw, face_list = _build_face_topology(
+            cell_vertices, "quad"
+        )
+        n_faces = len(face_list)
+
+        # ── identify boundary faces and assign ghost cells ──
+        boundary_mask = face_cells_raw[1, :] == -1
+        boundary_face_indices = np.where(boundary_mask)[0]
+        n_boundary_faces = len(boundary_face_indices)
+        n_cells = n_inner_cells + n_boundary_faces
+
+        face_cells = face_cells_raw.copy()
+        boundary_face_cells = np.empty(n_boundary_faces, dtype=int)
+        boundary_face_ghosts = np.empty(n_boundary_faces, dtype=int)
+        boundary_face_face_indices = np.empty(n_boundary_faces, dtype=int)
+        boundary_face_physical_tags = np.empty(n_boundary_faces, dtype=int)
+        boundary_face_function_numbers = np.empty(n_boundary_faces, dtype=int)
+
+        # Classify boundary faces by position of face center
+        tag_map = {"left": 0, "right": 1, "bottom": 2, "top": 3}
+        tol = 1e-12 * max(x_max - x_min, y_max - y_min)
+
+        for i_bf, fidx in enumerate(boundary_face_indices):
+            ghost_idx = n_inner_cells + i_bf
+            inner_cell = face_cells_raw[0, fidx]
+
+            boundary_face_cells[i_bf] = inner_cell
+            boundary_face_ghosts[i_bf] = ghost_idx
+            boundary_face_face_indices[i_bf] = fidx
+            face_cells[1, fidx] = ghost_idx
+
+            # Compute face center from vertices
+            fverts = face_list[fidx]
+            fc = vertex_coordinates[:2, list(fverts)].mean(axis=1)
+
+            if abs(fc[0] - x_min) < tol:
+                tag = tag_map["left"]
+            elif abs(fc[0] - x_max) < tol:
+                tag = tag_map["right"]
+            elif abs(fc[1] - y_min) < tol:
+                tag = tag_map["bottom"]
+            elif abs(fc[1] - y_max) < tol:
+                tag = tag_map["top"]
+            else:
+                tag = 0  # fallback
+
+            boundary_face_physical_tags[i_bf] = tag
+            boundary_face_function_numbers[i_bf] = tag
+
+        # ── cell neighbors ──
+        cell_neighbors = _build_cell_neighbors(
+            face_cells, cell_faces, n_cells, n_inner_cells
+        )
+
+        # Ghost cell neighbors: each ghost mirrors its inner cell's stencil
+        for i_bf in range(n_boundary_faces):
+            ghost_idx = n_inner_cells + i_bf
+            inner_cell = boundary_face_cells[i_bf]
+            # Ghost cell's neighbors = inner cell's neighbors
+            cell_neighbors[ghost_idx, :] = cell_neighbors[inner_cell, :]
+
+        sorted_tags = np.array([0, 1, 2, 3], dtype=int)
+        sorted_names = ["left", "right", "bottom", "top"]
+
+        return cls(
+            dimension=2,
+            type="quad",
+            n_cells=n_cells,
+            n_inner_cells=n_inner_cells,
+            n_faces=n_faces,
+            n_vertices=n_vertices,
+            n_boundary_faces=n_boundary_faces,
+            n_faces_per_cell=4,
+            vertex_coordinates=vertex_coordinates,
+            cell_vertices=cell_vertices,
+            cell_faces=cell_faces,
+            face_cells=face_cells,
+            cell_neighbors=cell_neighbors,
+            boundary_face_cells=boundary_face_cells,
+            boundary_face_ghosts=boundary_face_ghosts,
+            boundary_face_function_numbers=boundary_face_function_numbers,
+            boundary_face_physical_tags=boundary_face_physical_tags,
+            boundary_face_face_indices=boundary_face_face_indices,
+            boundary_conditions_sorted_physical_tags=sorted_tags,
+            boundary_conditions_sorted_names=sorted_names,
         )
 
     def write_to_hdf5(self, filepath: str):

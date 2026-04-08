@@ -129,15 +129,15 @@ class Expression(SymbolicBase):
     - Notebook: _repr_latex_
     """
 
-    def __init__(self, expr, name="", _parent=None, _operation=None, _op_args=None):
+    def __init__(self, expr, name="", term_groups=None):
         super().__init__(name)
         if isinstance(expr, Expression):
             expr = expr.expr
         self.expr = sp.sympify(expr) if not isinstance(expr, sp.Basic) else expr
-        # Provenance: lightweight derivation tracking
-        self._parent = _parent        # parent Expression or None
-        self._operation = _operation  # "apply", "depth_integrate", "project", ...
-        self._op_args = _op_args or {}  # operation details for the graph
+        # Optional ordered term groups for display:
+        # {"temporal": sp.Expr, "convection": sp.Expr, ...}
+        # When set, latex() renders groups in this order.
+        self._term_groups = term_groups
 
     @property
     def terms(self):
@@ -225,27 +225,40 @@ class Expression(SymbolicBase):
         """
         Apply conditions: dicts, (old, new) tuples, or Relation objects.
         Relation objects use their .apply_to() method.
+        Preserves term_groups if present.
         """
-        result = self.expr
-        for cond in conditions:
+        def _apply_one(expr, cond):
             if isinstance(cond, Relation):
-                result = cond.apply_to(result)
+                return cond.apply_to(expr)
             elif isinstance(cond, dict):
-                result = result.subs(cond)
+                return expr.subs(cond)
             elif isinstance(cond, (list, tuple)):
                 if len(cond) == 2 and isinstance(cond[0], sp.Basic):
-                    result = result.subs(cond[0], cond[1])
+                    return expr.subs(cond[0], cond[1])
                 else:
                     for pair in cond:
                         if isinstance(pair, (list, tuple)) and len(pair) == 2:
-                            result = result.subs(pair[0], pair[1])
+                            expr = expr.subs(pair[0], pair[1])
+                    return expr
             elif hasattr(cond, 'apply_to'):
-                result = cond.apply_to(result)
-        cond_names = [c.name if hasattr(c, 'name') else str(c)[:30]
-                      for c in conditions]
-        return Expression(result, self.name,
-                          _parent=self, _operation="apply",
-                          _op_args={"conditions": cond_names})
+                return cond.apply_to(expr)
+            return expr
+
+        result = self.expr
+        for cond in conditions:
+            result = _apply_one(result, cond)
+
+        # Propagate term groups
+        new_groups = None
+        if self._term_groups:
+            new_groups = {}
+            for role, group_expr in self._term_groups.items():
+                g = group_expr
+                for cond in conditions:
+                    g = _apply_one(g, cond)
+                new_groups[role] = g
+
+        return Expression(result, self.name, term_groups=new_groups)
 
     def depth_integrate(self, lower, upper, var, method="auto"):
         """
@@ -441,10 +454,7 @@ class Expression(SymbolicBase):
         result_expr = (total_volume + bnd).expr
         result_expr = _simplify_derivatives_only(result_expr)
 
-        bc_names = [bc.name if hasattr(bc, 'name') else str(bc)[:30] for bc in bcs]
-        return Expression(result_expr, self.name,
-                          _parent=self, _operation="depth_integrate",
-                          _op_args={"bcs": bc_names})
+        return Expression(result_expr, self.name)
 
     # ------------------------------------------------------------------
     # Term classification
@@ -622,133 +632,115 @@ class Expression(SymbolicBase):
             return expr
 
         result = _replace_integral(self.expr)
-        basis_name = getattr(basis, 'name', str(basis))
-        return Expression(result, f"projected({self.name})",
-                          _parent=self, _operation="project_onto_basis",
-                          _op_args={"basis": basis_name, "level": level,
-                                    "test_mode": test_mode})
+        return Expression(result, f"projected({self.name})")
 
     # ------------------------------------------------------------------
-    # Derivation graph + description
+    # Description
     # ------------------------------------------------------------------
 
-    def derivation_chain(self):
-        """Walk the parent chain, return list from root to self."""
-        chain = []
-        node = self
-        while node is not None:
-            chain.append(node)
-            node = getattr(node, '_parent', None)
-        return list(reversed(chain))
-
-    def derivation_mermaid(self):
-        """Generate a Mermaid diagram of the derivation history."""
-        chain = self.derivation_chain()
-        if len(chain) <= 1:
-            return f'graph TD\n    A["{self.name}<br/>{len(self)} terms"]'
-
-        lines = ["graph TD"]
-        for i, node in enumerate(chain):
-            label = node.name or f"expr_{i}"
-            n_terms = len(node)
-            node_id = chr(65 + i) if i < 26 else f"N{i}"
-            lines.append(f'    {node_id}["{label}<br/>{n_terms} terms"]')
-            if i > 0:
-                parent_id = chr(65 + i - 1) if i - 1 < 26 else f"N{i-1}"
-                op = node._operation or "?"
-                op_detail = ""
-                if node._op_args:
-                    if "conditions" in node._op_args:
-                        op_detail = ", ".join(node._op_args["conditions"])
-                    elif "basis" in node._op_args:
-                        op_detail = f"{node._op_args['basis']} L{node._op_args.get('level','?')}"
-                    elif "bcs" in node._op_args:
-                        op_detail = "+" + "+".join(node._op_args["bcs"])
-                edge_label = f"{op}({op_detail})" if op_detail else op
-                lines.append(f'    {parent_id} -->|"{edge_label}"| {node_id}')
-
-        return "\n".join(lines)
-
-    def latex(self, strip_args=False):
-        """LaTeX representation, optionally stripping function arguments.
-
-        With ``strip_args=True``, ``u(t, x, z)`` renders as just ``u``.
-        This is display-only — the underlying expression is unchanged.
-        """
-        if not strip_args:
-            return sp.latex(self.expr)
-
-        # Replace Function applications with bare symbols in the LaTeX
-        import re
-        raw = sp.latex(self.expr)
-        # Pattern: \operatorname{name}{\left(args\right)} → name
-        raw = re.sub(
-            r'\\operatorname\{(\w+)\}\{\\left\([^)]*\\right\)\}',
-            r'\1', raw)
-        # Pattern: name{\left(args\right)} → name (for single-char functions)
-        raw = re.sub(
-            r'(\b[a-zA-Z])\{\\left\([^)]*\\right\)\}',
-            r'\1', raw)
-        return raw
-
-    def describe(self, mode="current", strip_args=False, format="markdown"):
-        """Generate a description of this expression.
+    def latex(self, strip_args=False, multiline=False):
+        """LaTeX representation.
 
         Parameters
         ----------
-        mode : str
-            'current'  — the expression + parameter info
-            'full'     — derivation graph (mermaid) + equation at each step
-            'summary'  — one-line summary
         strip_args : bool
-            If True, display ``u`` instead of ``u(t,x,z)``
-        format : str
-            'markdown' — markdown + mermaid (default)
-            'latex'    — pure LaTeX
-            'text'     — plain text
-
-        Returns
-        -------
-        str
+            ``u(t,x,z)`` → ``u``. Partial derivatives preserved.
+        multiline : bool
+            Render as ``\\begin{aligned}`` with one group per line
+            (requires ``term_groups``).
         """
-        tex = self.latex(strip_args=strip_args)
+        printer = _StripArgsLatexPrinter() if strip_args else None
 
-        if mode == "summary":
-            chain = self.derivation_chain()
-            ops = " → ".join(n._operation or n.name for n in chain if n._operation or n.name)
-            return f"{self.name}: {len(self)} terms | {ops}"
+        def _tex(expr):
+            return printer.doprint(expr) if printer else sp.latex(expr)
 
-        if mode == "current":
-            if format == "latex":
-                return tex + " = 0"
-            return f"**{self.name}** ({len(self)} terms)\n\n$$\n{tex} = 0\n$$"
+        if self._term_groups and multiline:
+            lines = []
+            first = True
+            for role, g in self._term_groups.items():
+                if g == S.Zero:
+                    continue
+                tex = _tex(g)
+                if first:
+                    lines.append(f"  & \\underbrace{{{tex}}}_{{{role}}}")
+                    first = False
+                elif tex.startswith("-"):
+                    lines.append(f"  & \\underbrace{{{tex}}}_{{{role}}}")
+                else:
+                    lines.append(f"  & + \\underbrace{{{tex}}}_{{{role}}}")
+            return "\\begin{aligned}\n" + " \\\\\n".join(lines) + "\n  &= 0\n\\end{aligned}"
 
-        # mode == "full"
-        chain = self.derivation_chain()
+        if self._term_groups:
+            # Render in group order (single line) — preserves physical ordering
+            parts = []
+            for role, g in self._term_groups.items():
+                if g == S.Zero:
+                    continue
+                tex = _tex(g)
+                if parts and not tex.startswith("-"):
+                    tex = "+ " + tex
+                parts.append(tex)
+            return " ".join(parts)
+
+        return _tex(self.expr)
+
+
+from sympy.printing.latex import LatexPrinter as _LatexPrinter
+
+
+class _StripArgsLatexPrinter(_LatexPrinter):
+    """LaTeX printer that renders ``u(t,x,z)`` as just ``u``.
+
+    All other behaviour (partial derivatives, integrals, Subs, etc.)
+    is inherited from the default printer and stays correct.
+    """
+
+    def _print_Function(self, expr, exp=None):
+        # Render the function name without arguments.
+        name = expr.func.__name__
+        tex = self._deal_with_super_sub(name)
+        if exp is not None:
+            tex = r"%s^{%s}" % (tex, exp)
+        return tex
+
+    def describe(self, header=True, final_equation=True, parameters=False,
+                 strip_args=False):
+        """Composable description of this expression.
+
+        Returns a ``Description`` that renders as markdown in Jupyter.
+
+        Parameters
+        ----------
+        header : bool
+            Show expression name + term count.
+        final_equation : bool
+            Show the symbolic equation.
+        parameters : bool
+            List free symbols.
+        strip_args : bool
+            Display ``u`` instead of ``u(t, x, z)``.
+        """
+        from zoomy_core.misc.description import Description
+
         parts = []
-        if format == "markdown":
-            parts.append(f"## Derivation of {self.name}\n")
-            parts.append("```mermaid")
-            parts.append(self.derivation_mermaid())
-            parts.append("```\n")
-            for i, node in enumerate(chain):
-                step_tex = node.latex(strip_args=strip_args)
-                op_label = node._operation or "start"
-                parts.append(f"### Step {i}: {op_label}")
-                if node._op_args:
-                    parts.append(f"*{node._op_args}*\n")
-                parts.append(f"$$\n{step_tex} = 0\n$$\n")
-        elif format == "latex":
-            for i, node in enumerate(chain):
-                step_tex = node.latex(strip_args=strip_args)
-                parts.append(f"% Step {i}: {node._operation or 'start'}")
-                parts.append(f"\\begin{{equation}}\n{step_tex} = 0\n\\end{{equation}}\n")
-        else:
-            for i, node in enumerate(chain):
-                parts.append(f"Step {i} ({node._operation or 'start'}): "
-                             f"{node.expr} = 0")
 
-        return "\n".join(parts)
+        if header:
+            parts.append(f"**{self.name}** ({len(self)} terms)")
+
+        if final_equation:
+            tex = self.latex(strip_args=strip_args)
+            parts.append(f"\n$$\n{tex} = 0\n$$")
+
+        if parameters:
+            from sympy import Symbol
+            syms = sorted([s for s in self.expr.free_symbols
+                          if isinstance(s, Symbol) and not s.is_Function],
+                         key=str)
+            if syms:
+                sym_str = ", ".join(f"${sp.latex(s)}$" for s in syms)
+                parts.append(f"\n**Parameters:** {sym_str}")
+
+        return Description("\n".join(parts))
 
 
 class DepthIntegralResult:
@@ -893,6 +885,47 @@ class Material(Relation):
 
 
 # ---------------------------------------------------------------------------
+# Operation: callable transformation applied to all equations
+# ---------------------------------------------------------------------------
+
+class Operation(SymbolicBase):
+    """An operation that transforms each equation (e.g. depth integration).
+
+    Unlike a ``Relation`` (which substitutes symbols), an ``Operation``
+    applies a function to each ``Expression``.  Used with
+    ``DerivedModel.apply()`` alongside Relations.
+    """
+
+    def __init__(self, name="", description=None):
+        super().__init__(name)
+        self.description = description
+
+    def apply_to_equation(self, eq, state):
+        """Transform a single Expression. Override in subclasses."""
+        raise NotImplementedError
+
+    def _repr_latex_(self):
+        return f"${self.name}$" if self.name else ""
+
+
+class DepthIntegrate(Operation):
+    """Depth-integrate all equations with kinematic BCs (Leibniz rule)."""
+
+    def __init__(self, state):
+        super().__init__(name="depth integrate + kinematic BCs")
+        self._state = state
+        self._kbc_b = KinematicBCBottom(state)
+        self._kbc_s = KinematicBCSurface(state)
+
+    def apply_to_equation(self, eq, state):
+        z, b, eta = state.z, state.b, state.eta
+        return eq.map_with_bcs(
+            lambda t: t.depth_integrate(b, eta, z),
+            bcs=[self._kbc_s, self._kbc_b],
+        )
+
+
+# ---------------------------------------------------------------------------
 # FullINS: 3D INS equations built from a StateSpace
 # ---------------------------------------------------------------------------
 
@@ -925,39 +958,44 @@ class FullINS:
             expr += Derivative(s.v, s.y)
         return Expression(expr, "continuity")
 
+    def _momentum(self, vel, name, gravity=S.Zero):
+        """Build a momentum equation with canonical term ordering.
+
+        Order: temporal → convection → pressure → stress → source
+        """
+        s = self.state
+        row = name.split("_")[0]  # "x", "y", "z"
+
+        temporal = Derivative(vel, s.t)
+
+        convection = Derivative(vel * s.u, s.x) + Derivative(vel * s.w, s.z)
+        if s.has_y:
+            convection += Derivative(vel * s.v, s.y)
+
+        pressure = Rational(1, 1) / s.rho * Derivative(s.p, {"x": s.x, "y": s.y, "z": s.z}[row])
+        stress = -Rational(1, 1) / s.rho * self._stress_divergence(row)
+
+        groups = {"temporal": temporal, "convection": convection,
+                  "pressure": pressure, "stress": stress}
+        if gravity != S.Zero:
+            groups["source"] = gravity
+
+        full_expr = sum(groups.values())
+        return Expression(full_expr, name, term_groups=groups)
+
     @property
     def x_momentum(self):
-        s = self.state
-        inertia = Derivative(s.u, s.t) + Derivative(s.u * s.u, s.x) + Derivative(s.u * s.w, s.z)
-        if s.has_y:
-            inertia += Derivative(s.u * s.v, s.y)
-        pressure = Rational(1, 1) / s.rho * Derivative(s.p, s.x)
-        stress = Rational(1, 1) / s.rho * self._stress_divergence("x")
-        return Expression(inertia + pressure - stress, "x_momentum")
+        return self._momentum(self.state.u, "x_momentum")
 
     @property
     def y_momentum(self):
-        s = self.state
-        if not s.has_y:
+        if not self.state.has_y:
             return None
-        inertia = (
-            Derivative(s.v, s.t) + Derivative(s.v * s.u, s.x)
-            + Derivative(s.v * s.v, s.y) + Derivative(s.v * s.w, s.z)
-        )
-        pressure = Rational(1, 1) / s.rho * Derivative(s.p, s.y)
-        stress = Rational(1, 1) / s.rho * self._stress_divergence("y")
-        return Expression(inertia + pressure - stress, "y_momentum")
+        return self._momentum(self.state.v, "y_momentum")
 
     @property
     def z_momentum(self):
-        s = self.state
-        inertia = Derivative(s.w, s.t) + Derivative(s.w * s.u, s.x) + Derivative(s.w * s.w, s.z)
-        if s.has_y:
-            inertia += Derivative(s.w * s.v, s.y)
-        pressure = Rational(1, 1) / s.rho * Derivative(s.p, s.z)
-        gravity = s.g
-        stress = Rational(1, 1) / s.rho * self._stress_divergence("z")
-        return Expression(inertia + pressure + gravity - stress, "z_momentum")
+        return self._momentum(self.state.w, "z_momentum", gravity=self.state.g)
 
     @property
     def equations(self):
@@ -966,6 +1004,29 @@ class FullINS:
             eqs.append(self.y_momentum)
         eqs.append(self.z_momentum)
         return eqs
+
+    def describe(self, header=True, final_equation=True, strip_args=False,
+                 **kwargs):
+        """Composable description of the full INS system.
+
+        Returns a ``Description`` that renders as markdown in Jupyter.
+        """
+        from zoomy_core.misc.description import Description
+
+        parts = []
+        if header:
+            dim_label = "3D (x,y,z)" if self.state.has_y else "2D (x,z)"
+            parts.append(f"**Incompressible Navier-Stokes** ({dim_label})")
+
+        if final_equation:
+            for eq in self.equations:
+                tex = eq.latex(strip_args=strip_args)
+                parts.append(f"\n**{eq.name}:**\n$$\n{tex} = 0\n$$")
+
+        return Description("\n".join(parts))
+
+    def _repr_markdown_(self):
+        return self.describe()._repr_markdown_()
 
 
 # ---------------------------------------------------------------------------

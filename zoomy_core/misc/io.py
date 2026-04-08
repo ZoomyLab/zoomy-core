@@ -20,7 +20,7 @@ except ImportError:
     _HAVE_H5PY = False
 
 # import zoomy_core.mesh.fvm_mesh as fvm_mesh
-from zoomy_core.mesh.mesh import Mesh
+from zoomy_core.mesh.lsq_mesh import LSQMesh as Mesh
 import zoomy_core.mesh.mesh_util as mesh_util
 from zoomy_core.misc.misc import Zstruct, Settings
 from zoomy_core.misc import misc as misc
