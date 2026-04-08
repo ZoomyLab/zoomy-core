@@ -128,3 +128,8 @@ class FVMMesh(BaseMesh):
     def create_2d(cls, domain: tuple, nx: int, ny: int) -> "FVMMesh":
         base = BaseMesh.create_2d(domain, nx, ny)
         return cls.from_base(base)
+
+    @classmethod
+    def create_3d(cls, domain: tuple, nx: int, ny: int, nz: int) -> "FVMMesh":
+        base = BaseMesh.create_3d(domain, nx, ny, nz)
+        return cls.from_base(base)

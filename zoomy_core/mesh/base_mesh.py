@@ -869,6 +869,139 @@ class BaseMesh(param.Parameterized):
             boundary_conditions_sorted_names=sorted_names,
         )
 
+    @classmethod
+    def create_3d(cls, domain: tuple, nx: int, ny: int, nz: int) -> "BaseMesh":
+        """Build a uniform 3D hexahedral mesh.
+
+        Parameters
+        ----------
+        domain : (x_min, x_max, y_min, y_max, z_min, z_max)
+        nx, ny, nz : number of inner cells in each direction
+        """
+        x_min, x_max, y_min, y_max, z_min, z_max = domain
+        n_inner_cells = nx * ny * nz
+
+        # ── vertices on a regular grid ──
+        xs = np.linspace(x_min, x_max, nx + 1)
+        ys = np.linspace(y_min, y_max, ny + 1)
+        zs = np.linspace(z_min, z_max, nz + 1)
+        gx, gy, gz = np.meshgrid(xs, ys, zs, indexing="ij")
+        n_vertices = (nx + 1) * (ny + 1) * (nz + 1)
+        vertex_coordinates = np.zeros((3, n_vertices), dtype=float)
+        vertex_coordinates[0] = gx.ravel()
+        vertex_coordinates[1] = gy.ravel()
+        vertex_coordinates[2] = gz.ravel()
+
+        def vid(ix, iy, iz):
+            return ix * (ny + 1) * (nz + 1) + iy * (nz + 1) + iz
+
+        # ── cell-vertex connectivity: (8, n_inner_cells) ──
+        # Hexahedron vertex ordering (VTK convention):
+        #   bottom face: 0,1,2,3   top face: 4,5,6,7
+        #   0=(ix,iy,iz), 1=(ix+1,iy,iz), 2=(ix+1,iy+1,iz), 3=(ix,iy+1,iz)
+        #   4=(ix,iy,iz+1), 5=(ix+1,iy,iz+1), 6=(ix+1,iy+1,iz+1), 7=(ix,iy+1,iz+1)
+        cell_vertices = np.empty((8, n_inner_cells), dtype=int)
+        for ix in range(nx):
+            for iy in range(ny):
+                for iz in range(nz):
+                    ic = ix * ny * nz + iy * nz + iz
+                    cell_vertices[0, ic] = vid(ix, iy, iz)
+                    cell_vertices[1, ic] = vid(ix + 1, iy, iz)
+                    cell_vertices[2, ic] = vid(ix + 1, iy + 1, iz)
+                    cell_vertices[3, ic] = vid(ix, iy + 1, iz)
+                    cell_vertices[4, ic] = vid(ix, iy, iz + 1)
+                    cell_vertices[5, ic] = vid(ix + 1, iy, iz + 1)
+                    cell_vertices[6, ic] = vid(ix + 1, iy + 1, iz + 1)
+                    cell_vertices[7, ic] = vid(ix, iy + 1, iz + 1)
+
+        # ── build face topology ──
+        cell_faces, face_cells_raw, face_list = _build_face_topology(
+            cell_vertices, "hexahedron"
+        )
+        n_faces = len(face_list)
+
+        # ── boundary faces + ghost cells ──
+        boundary_mask = face_cells_raw[1, :] == -1
+        boundary_face_indices = np.where(boundary_mask)[0]
+        n_boundary_faces = len(boundary_face_indices)
+        n_cells = n_inner_cells + n_boundary_faces
+
+        face_cells = face_cells_raw.copy()
+        boundary_face_cells = np.empty(n_boundary_faces, dtype=int)
+        boundary_face_ghosts = np.empty(n_boundary_faces, dtype=int)
+        boundary_face_face_indices = np.empty(n_boundary_faces, dtype=int)
+        boundary_face_physical_tags = np.empty(n_boundary_faces, dtype=int)
+        boundary_face_function_numbers = np.empty(n_boundary_faces, dtype=int)
+
+        tag_map = {"left": 0, "right": 1, "front": 2, "back": 3,
+                   "bottom": 4, "top": 5}
+        tol = 1e-12 * max(x_max - x_min, y_max - y_min, z_max - z_min)
+
+        for i_bf, fidx in enumerate(boundary_face_indices):
+            ghost_idx = n_inner_cells + i_bf
+            inner_cell = face_cells_raw[0, fidx]
+
+            boundary_face_cells[i_bf] = inner_cell
+            boundary_face_ghosts[i_bf] = ghost_idx
+            boundary_face_face_indices[i_bf] = fidx
+            face_cells[1, fidx] = ghost_idx
+
+            fverts = face_list[fidx]
+            fc = vertex_coordinates[:, list(fverts)].mean(axis=1)
+
+            if abs(fc[0] - x_min) < tol:
+                tag = tag_map["left"]
+            elif abs(fc[0] - x_max) < tol:
+                tag = tag_map["right"]
+            elif abs(fc[1] - y_min) < tol:
+                tag = tag_map["front"]
+            elif abs(fc[1] - y_max) < tol:
+                tag = tag_map["back"]
+            elif abs(fc[2] - z_min) < tol:
+                tag = tag_map["bottom"]
+            elif abs(fc[2] - z_max) < tol:
+                tag = tag_map["top"]
+            else:
+                tag = 0
+
+            boundary_face_physical_tags[i_bf] = tag
+            boundary_face_function_numbers[i_bf] = tag
+
+        # ── cell neighbors ──
+        cell_neighbors = _build_cell_neighbors(
+            face_cells, cell_faces, n_cells, n_inner_cells
+        )
+        for i_bf in range(n_boundary_faces):
+            ghost_idx = n_inner_cells + i_bf
+            inner_cell = boundary_face_cells[i_bf]
+            cell_neighbors[ghost_idx, :] = cell_neighbors[inner_cell, :]
+
+        sorted_tags = np.array(list(tag_map.values()), dtype=int)
+        sorted_names = list(tag_map.keys())
+
+        return cls(
+            dimension=3,
+            type="hexahedron",
+            n_cells=n_cells,
+            n_inner_cells=n_inner_cells,
+            n_faces=n_faces,
+            n_vertices=n_vertices,
+            n_boundary_faces=n_boundary_faces,
+            n_faces_per_cell=6,
+            vertex_coordinates=vertex_coordinates,
+            cell_vertices=cell_vertices,
+            cell_faces=cell_faces,
+            face_cells=face_cells,
+            cell_neighbors=cell_neighbors,
+            boundary_face_cells=boundary_face_cells,
+            boundary_face_ghosts=boundary_face_ghosts,
+            boundary_face_function_numbers=boundary_face_function_numbers,
+            boundary_face_physical_tags=boundary_face_physical_tags,
+            boundary_face_face_indices=boundary_face_face_indices,
+            boundary_conditions_sorted_physical_tags=sorted_tags,
+            boundary_conditions_sorted_names=sorted_names,
+        )
+
     def write_to_hdf5(self, filepath: str):
         """Serialize topology-only fields to HDF5."""
         if not _HAVE_H5PY:

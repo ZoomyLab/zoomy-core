@@ -245,18 +245,20 @@ def _volume_tetra(coordinates, element) -> float:
 
 
 def _volume_hex(coordinates, element) -> float:
-    # devide into tetraheda and use formula above
-    # e.g. make up a point in the middle
-    """Internal helper `_volume_hex`."""
-    volume = 0
-    center_point = center(coordinates, element)
+    """Volume of a hexahedron via decomposition into tetrahedra.
+
+    Each quad face is split into 2 triangles, each forming a tet with
+    the cell center.  6 faces × 2 triangles = 12 tets.
+    """
+    volume = 0.0
+    d = center(coordinates, element)
     faces = _face_order_hex(element)
     for face in faces:
-        a = coordinates[face[0]]
-        b = coordinates[face[1]]
-        c = coordinates[face[2]]
-        d = center_point
-        volume += np.abs(np.dot((a - d), np.cross((b - d), (c - d)))) / 6
+        # Split quad face (0,1,2,3) into triangles (0,1,2) and (0,2,3)
+        a, b, c = coordinates[face[0]], coordinates[face[1]], coordinates[face[2]]
+        volume += np.abs(np.dot(a - d, np.cross(b - d, c - d))) / 6
+        a, b, c = coordinates[face[0]], coordinates[face[2]], coordinates[face[3]]
+        volume += np.abs(np.dot(a - d, np.cross(b - d, c - d))) / 6
     return volume
 
 
