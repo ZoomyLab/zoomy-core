@@ -66,6 +66,12 @@ class FVMMesh(BaseMesh):
     def face_centers(self):
         return self._face_centers
 
+    @property
+    def face_subvolumes(self):
+        if not hasattr(self, '_face_subvolumes') or self._face_subvolumes is None:
+            self._face_subvolumes = self.face_subvolumes_computed()
+        return self._face_subvolumes
+
     @classmethod
     def from_base(cls, base: BaseMesh) -> "FVMMesh":
         """Build an FVMMesh by computing geometry from a BaseMesh."""
