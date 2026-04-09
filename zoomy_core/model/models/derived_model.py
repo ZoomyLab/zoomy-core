@@ -317,9 +317,12 @@ class DerivedModel(Model):
                     if sys:
                         for eq_name, eq in sys.equations.items():
                             tex = eq.latex(strip_args=strip, multiline=True)
-                            # Mermaid needs single-line strings — collapse newlines
                             tex = tex.replace("\n", " ")
-                            lines.append(f"*{eq_name}*: $${tex} = 0$$")
+                            # multiline already includes = 0, don't add another
+                            if "\\end{aligned}" in tex:
+                                lines.append(f"*{eq_name}*: $${tex}$$")
+                            else:
+                                lines.append(f"*{eq_name}*: $${tex} = 0$$")
                     return "<br/>".join(lines)
 
                 def _mermaid_edge(ops):

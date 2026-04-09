@@ -1234,10 +1234,12 @@ def _simplify_derivatives_only(expr):
 
 
 def _simplify_preserve_integrals(expr):
-    """Expand + simplify while protecting Integral and Derivative(Integral) terms.
+    """Expand + cancel while protecting Integral and Derivative(Integral) terms.
 
-    This cancels terms like u²·d(b+h)/dx - u²·db/dx → u²·dh/dx and
+    Cancels terms like u²·d(b+h)/dx - u²·db/dx → u²·dh/dx and
     (-gρ(b+h) + gρb + gρh)·... → 0, while leaving ∫...dz terms intact.
+
+    Uses expand + powsimp (not simplify) to avoid common denominator wrapping.
     """
     if not isinstance(expr, sp.Basic):
         return expr
@@ -1262,7 +1264,12 @@ def _simplify_preserve_integrals(expr):
         return e
 
     protected = _protect(expr)
-    simplified = sp.simplify(sp.expand(protected))
+    # Step 1: evaluate derivatives (d(b+h)/dt → db/dt + dh/dt) so terms can cancel
+    evaled = protected.doit() if protected.has(Derivative) else protected
+    # Step 2: expand to reveal cancellations (u²·db/dx - u²·db/dx → 0)
+    expanded = sp.expand(evaled)
+    # Step 3: collect like terms
+    simplified = sp.powsimp(expanded, combine="all")
     return simplified.subs(integral_map)
 
 
