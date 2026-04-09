@@ -945,11 +945,7 @@ class DepthIntegrate(Operation):
 
     def apply_to_equation(self, eq, state):
         z, b, eta = state.z, state.b, state.eta
-        # map_with_bcs with empty BCs: collects boundary terms but does not substitute
-        return eq.map_with_bcs(
-            lambda t: t.depth_integrate(b, eta, z),
-            bcs=[],
-        )
+        return eq.map(lambda t: t.depth_integrate(b, eta, z))
 
     def _repr_latex_(self):
         s = self._state
