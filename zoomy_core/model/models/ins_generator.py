@@ -229,18 +229,19 @@ class Expression(SymbolicBase):
         """
         def _apply_one(expr, cond):
             if isinstance(cond, Operation):
-                # Operation: transforms the full Expression
-                eq = Expression(expr, self.name, term_groups=self._term_groups)
-                state = getattr(cond, '_state', None)
-                result = cond.apply_to_equation(eq, state)
-                return result.expr
-            if isinstance(cond, (Relation,)) or hasattr(cond, 'apply_to'):
-                # Evaluate Subs objects first so BC patterns match
+                # Operations may need the Expression (for .map, .terms etc.)
+                if hasattr(cond, 'apply_to_expression'):
+                    try:
+                        eq = Expression(expr, self.name, term_groups=self._term_groups)
+                        return cond.apply_to_expression(eq).expr
+                    except NotImplementedError:
+                        pass
+                return cond.apply_to(expr)
+            if isinstance(cond, Relation) or hasattr(cond, 'apply_to'):
+                # Evaluate Subs first so BC patterns match
                 if expr.has(sp.Subs):
                     subs_map = {s: s.doit() for s in expr.atoms(sp.Subs)}
                     expr = expr.subs(subs_map)
-                if isinstance(cond, Relation):
-                    return cond.apply_to(expr)
                 return cond.apply_to(expr)
             elif isinstance(cond, dict):
                 return expr.subs(cond)
@@ -957,31 +958,36 @@ class Material(Relation):
 # ---------------------------------------------------------------------------
 
 class Operation(SymbolicBase):
-    """An operation that transforms each equation (e.g. depth integration).
+    """An operation that transforms an Expression (e.g. depth integration).
 
     Unlike a ``Relation`` (which substitutes symbols), an ``Operation``
-    applies a function to each ``Expression``.  Used with
-    ``DerivedModel.apply()`` and ``Expression.apply()`` alongside Relations.
+    applies a structural transformation.  Works with both
+    ``Expression.apply()`` and ``DerivedModel.apply()``.
 
-    Parameters
-    ----------
-    name : str
-        Short identifier (used in mermaid edge labels).
-    description : str, optional
-        Human-readable description (used in markdown output instead of name).
+    Subclasses override ``apply_to(expr)`` which receives and returns
+    a sympy expression, or ``apply_to_expression(expression)`` which
+    receives and returns an ``Expression`` object.
     """
 
-    def __init__(self, name="", description=None, state=None):
+    def __init__(self, name="", description=None):
         super().__init__(name)
         self.description = description or name
-        self._state = state
 
-    def apply_to_equation(self, eq, state):
-        """Transform a single Expression. Override in subclasses."""
-        raise NotImplementedError
+    def apply_to(self, expr):
+        """Transform a sympy expression. Override for simple operations."""
+        # Default: wrap in Expression, call apply_to_expression, unwrap
+        eq = Expression(expr, "")
+        result = self.apply_to_expression(eq)
+        return result.expr
+
+    def apply_to_expression(self, expression):
+        """Transform an Expression object. Override for operations that
+        need access to .terms, .map(), etc."""
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement apply_to or apply_to_expression"
+        )
 
     def _repr_latex_(self):
-        """Override to show equations. Default: no equation, just description."""
         return ""
 
 
@@ -990,20 +996,19 @@ class DepthIntegrate(Operation):
 
     Applies Leibniz rule and fundamental theorem term-by-term.
     Boundary values (w at z=b, u at z=b+h, etc.) remain as ``Subs``
-    objects.  Apply ``KinematicBCSurface`` and ``KinematicBCBottom``
-    separately to see the cancellations happen.
+    objects.  Apply ``ApplyKinematicBCs`` to see the cancellations.
     """
 
     def __init__(self, state):
         super().__init__(
-            name="depth_integrate", state=state,
+            name="depth_integrate",
             description="Depth integration over [b, b+h] (Leibniz rule)",
         )
         self._state = state
 
-    def apply_to_equation(self, eq, state):
-        z, b, eta = state.z, state.b, state.eta
-        return eq.map(lambda t: t.depth_integrate(b, eta, z))
+    def apply_to_expression(self, eq):
+        s = self._state
+        return eq.map(lambda t: t.depth_integrate(s.b, s.eta, s.z))
 
     def _repr_latex_(self):
         s = self._state
@@ -1016,38 +1021,31 @@ class DepthIntegrate(Operation):
 class ApplyKinematicBCs(Operation):
     """Apply kinematic BCs globally to combined boundary terms.
 
-    Collects all boundary terms from the expression, applies
-    kinematic BCs at surface and bottom, and simplifies.
-    This causes the Leibniz boundary u-terms to cancel with the
-    fundamental theorem w-terms.
+    Evaluates ``Subs`` boundary values, applies kinematic BCs at
+    surface and bottom, and simplifies. The Leibniz boundary u-terms
+    cancel with the fundamental theorem w-terms.
 
     Must be applied immediately after ``DepthIntegrate``.
     """
 
     def __init__(self, state):
         super().__init__(
-            name="kinematic_bcs", state=state,
+            name="kinematic_bcs",
             description="Kinematic BCs (surface + bottom): w = u·∂b/∂x + ∂b/∂t",
         )
-        self._state = state
         self._kbc_s = KinematicBCSurface(state)
         self._kbc_b = KinematicBCBottom(state)
 
-    def apply_to_equation(self, eq, state):
-        """Apply kinematic BCs: evaluate only Subs, then substitute w patterns."""
-        expr = eq.expr
-        # Evaluate only Subs objects (NOT Derivative(Integral) etc.)
+    def apply_to(self, expr):
+        # Evaluate only Subs objects (NOT Derivative(Integral))
         if expr.has(sp.Subs):
-            subs_map = {}
-            for s in expr.atoms(sp.Subs):
-                subs_map[s] = s.doit()
+            subs_map = {s: s.doit() for s in expr.atoms(sp.Subs)}
             expr = expr.subs(subs_map)
         # Apply both BCs
         for bc in [self._kbc_s, self._kbc_b]:
             expr = bc.apply_to(expr)
-        # Simplify (cancels d(b+h)/dt - db/dt → dh/dt etc.)
-        expr = _simplify_preserve_integrals(expr)
-        return Expression(expr, eq.name)
+        # Simplify (cancels d(b+h)/dt - db/dt → dh/dt)
+        return _simplify_preserve_integrals(expr)
 
     def _repr_latex_(self):
         parts = [self._kbc_s._repr_latex_(), self._kbc_b._repr_latex_()]
@@ -1068,30 +1066,25 @@ class SimplifyIntegrals(Operation):
 
     def __init__(self, state):
         super().__init__(
-            name="simplify_integrals", state=state,
+            name="simplify_integrals",
             description="Evaluate constant/zero integrals",
         )
-        self._z = state.z
 
-    def apply_to_equation(self, eq, state):
+    def apply_to(self, expr):
         from sympy import Integral, Derivative
-        expr = eq.expr
 
         def _simplify_int(e):
             if isinstance(e, Integral):
                 integrand = e.args[0]
-                limits = e.args[1]  # (z, lower, upper)
+                limits = e.args[1]
                 var = limits[0]
                 lower, upper = limits[1], limits[2]
-                # Zero integrand
                 if integrand == S.Zero:
                     return S.Zero
-                # Constant integrand (no z dependence)
                 if not integrand.has(var):
                     return integrand * (upper - lower)
                 return e
             if isinstance(e, Derivative):
-                # d/dx ∫ 0 dz → 0
                 inner = _simplify_int(e.args[0])
                 if inner == S.Zero:
                     return S.Zero
@@ -1104,42 +1097,36 @@ class SimplifyIntegrals(Operation):
                     return e.func(*new_args)
             return e
 
-        return Expression(_simplify_int(expr), eq.name)
+        return _simplify_int(expr)
 
 
 class ZetaTransform(Operation):
     """Transform vertical coordinate: z = ζ·h + b, dz = h·dζ.
 
     Transforms integrals: ∫_b^{b+h} f(z) dz → h·∫_0^1 f(ζ·h+b) dζ.
-    Also substitutes z → ζ·h + b in boundary evaluations.
     """
 
     def __init__(self, state):
         super().__init__(
             name="zeta_transform",
             description="Coordinate transform z = ζ·h + b",
-            state=state,
         )
+        self._z = state.z
+        self._b = state.b
+        self._h = state.H
         self._zeta = state.zeta
 
-    def apply_to_equation(self, eq, state):
+    def apply_to(self, expr):
         from sympy import Integral, Derivative
-        z = state.z
-        b = state.b
-        h_func = state.H  # h(t,x)
-        zeta = self._zeta
-        expr = eq.expr
+        z, b, h, zeta = self._z, self._b, self._h, self._zeta
 
         def _transform(e):
             if isinstance(e, Integral):
                 integrand = e.args[0]
                 limits = e.args[1]
                 var = limits[0]
-                lower, upper = limits[1], limits[2]
-                # Only transform z-integrals over [b, b+h]
                 if var == z:
-                    # z = ζ·h + b → dz = h·dζ, limits [0, 1]
-                    new_integrand = integrand.subs(z, zeta * h_func + b) * h_func
+                    new_integrand = integrand.subs(z, zeta * h + b) * h
                     return Integral(new_integrand, (zeta, S.Zero, S.One))
                 return e
             if isinstance(e, Derivative):
@@ -1153,7 +1140,7 @@ class ZetaTransform(Operation):
                     return e.func(*new_args)
             return e
 
-        return Expression(_transform(expr), eq.name)
+        return _transform(expr)
 
     def _repr_latex_(self):
         return f"$z = \\zeta \\cdot h + b, \\quad dz = h \\, d\\zeta$"
@@ -1186,17 +1173,10 @@ class ProductRule(Operation):
         self._flux = flux_form
         self._var = variable
 
-    def apply_to_equation(self, eq, state):
+    def apply_to(self, expr):
         from sympy import Derivative
-        expr = eq.expr
-        # Replace the pattern with ∂(flux)/∂x minus the remainder
-        # For exact match: pattern = ∂(flux)/∂x - remainder
         flux_deriv = Derivative(self._flux, self._var)
-        # Expand flux_deriv to get: pattern + remainder
-        # The user specifies pattern and flux, so:
-        # pattern → ∂(flux)/∂x  (user guarantees equivalence)
-        result = expr.subs(self._pattern, flux_deriv)
-        return Expression(result, eq.name)
+        return expr.subs(self._pattern, flux_deriv)
 
     def _repr_latex_(self):
         return (f"${sp.latex(self._pattern)} \\to "

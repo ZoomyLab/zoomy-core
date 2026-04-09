@@ -198,29 +198,11 @@ class DerivedModel(Model):
         state = self._system.state
         a_name = operation.name if hasattr(operation, 'name') else str(operation)
 
-        if isinstance(operation, Operation):
-            # Callable operation: transform each equation
-            new_eqs = {
-                k: operation.apply_to_equation(eq, state)
-                for k, eq in self._system.equations.items()
-            }
-        elif isinstance(operation, Relation):
-            # Substitution: apply relation to each equation
-            new_eqs = {
-                k: eq.apply(operation)
-                for k, eq in self._system.equations.items()
-            }
-        elif callable(operation):
-            # Raw callable fallback
-            new_eqs = {
-                k: operation(eq)
-                for k, eq in self._system.equations.items()
-            }
-        else:
-            raise TypeError(
-                f"apply() expects a Relation, Operation, or callable, "
-                f"got {type(operation)}"
-            )
+        # All operations (Relation, Operation, callable) go through Expression.apply()
+        new_eqs = {
+            k: eq.apply(operation)
+            for k, eq in self._system.equations.items()
+        }
 
         self._system = DerivedSystem(
             self._system.name,
