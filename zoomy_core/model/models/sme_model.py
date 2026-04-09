@@ -48,8 +48,6 @@ class SMEModel(INSModel):
         super().derive_model()
         self.apply(HydrostaticPressure(self.state))
         self.apply(DepthIntegrate(self.state))
-        self.apply(KinematicBCSurface(self.state))
-        self.apply(KinematicBCBottom(self.state))
         self.apply(StressFreeSurface(self.state))
         self.apply(ZeroAtmosphericPressure(self.state))
         self.apply(Newtonian(self.state))
@@ -66,14 +64,11 @@ class SMEInviscid(INSModel):
     def derive_model(self):
         from zoomy_core.model.models.ins_generator import (
             HydrostaticPressure, Inviscid, DepthIntegrate,
-            KinematicBCBottom, KinematicBCSurface,
             StressFreeSurface, ZeroAtmosphericPressure,
         )
         super().derive_model()
         self.apply(HydrostaticPressure(self.state))
         self.apply(DepthIntegrate(self.state))
-        self.apply(KinematicBCSurface(self.state))
-        self.apply(KinematicBCBottom(self.state))
         self.apply(StressFreeSurface(self.state))
         self.apply(ZeroAtmosphericPressure(self.state))
         self.apply(Inviscid(self.state))

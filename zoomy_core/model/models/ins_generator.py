@@ -981,28 +981,40 @@ class DepthIntegrate(Operation):
     """Depth-integrate all equations over [b, b+h] w.r.t. z.
 
     Applies Leibniz rule and fundamental theorem term-by-term.
-    Does NOT apply kinematic BCs — boundary values (u at z=b, w at z=b+h, etc.)
-    remain in the result.  Apply BCs separately via ``self.apply(KinematicBCBottom(state))``
-    etc.
+    Kinematic BCs at top and bottom are applied to the combined
+    boundary terms so that cancellations happen properly
+    (e.g., Leibniz boundary terms cancel with kinematic w terms).
+
+    The result contains only volume integrals and the clean
+    depth-integrated equation (e.g., ∂h/∂t + ∂/∂x ∫u dz = 0
+    for continuity).
     """
 
     def __init__(self, state):
         super().__init__(
             name="depth_integrate",
-            description="Depth integration over [b, b+h] (Leibniz rule)",
+            description="Depth integration [b, b+h] with Leibniz rule + kinematic BCs",
         )
         self._state = state
+        self._kbc_s = KinematicBCSurface(state)
+        self._kbc_b = KinematicBCBottom(state)
 
     def apply_to_equation(self, eq, state):
         z, b, eta = state.z, state.b, state.eta
-        return eq.map(lambda t: t.depth_integrate(b, eta, z))
+        return eq.map_with_bcs(
+            lambda t: t.depth_integrate(b, eta, z),
+            bcs=[self._kbc_s, self._kbc_b],
+        )
 
     def _repr_latex_(self):
         s = self._state
-        return (
+        parts = [
             f"$\\int_{{{sp.latex(s.b)}}}^{{{sp.latex(s.eta)}}} "
-            f"(\\cdot)\\, d{sp.latex(s.z)}$"
-        )
+            f"(\\cdot)\\, d{sp.latex(s.z)}$",
+        ]
+        parts.append(self._kbc_s._repr_latex_())
+        parts.append(self._kbc_b._repr_latex_())
+        return " \\\\ ".join(p for p in parts if p)
 
 
 # ---------------------------------------------------------------------------
