@@ -258,7 +258,9 @@ class Expression(SymbolicBase):
                     g = _apply_one(g, cond)
                 new_groups[role] = g
 
-        return Expression(result, self.name, term_groups=new_groups)
+        return Expression(
+            _simplify_preserve_integrals(result), self.name, term_groups=new_groups
+        )
 
     def simplify(self):
         """Return a new Expression with sympy simplification applied."""
@@ -370,10 +372,17 @@ class Expression(SymbolicBase):
         return Expression(self.expr.subs(*args, **kwargs), self.name)
 
     def simplify(self):
-        return Expression(sp.simplify(self.expr), self.name)
+        """Simplify: expand + cancel, preserving Integral and Derivative(Integral) terms."""
+        return Expression(_simplify_preserve_integrals(self.expr), self.name,
+                          term_groups=({role: _simplify_preserve_integrals(g)
+                                        for role, g in self._term_groups.items()}
+                                       if self._term_groups else None))
 
     def expand(self):
-        return Expression(sp.expand(self.expr), self.name)
+        return Expression(sp.expand(self.expr), self.name,
+                          term_groups=({role: sp.expand(g)
+                                        for role, g in self._term_groups.items()}
+                                       if self._term_groups else None))
 
     def doit(self):
         return Expression(self.expr.doit(), self.name)
@@ -670,7 +679,7 @@ class Expression(SymbolicBase):
         def _tex(expr):
             return printer.doprint(expr) if printer else sp.latex(expr)
 
-        if self._term_groups and multiline:
+        if multiline and self._term_groups:
             lines = []
             first = True
             for role, g in self._term_groups.items():
@@ -685,6 +694,22 @@ class Expression(SymbolicBase):
                 else:
                     lines.append(f"  & + \\underbrace{{{tex}}}_{{{role}}}")
             return "\\begin{aligned}\n" + " \\\\\n".join(lines) + "\n  &= 0\n\\end{aligned}"
+
+        if multiline and not self._term_groups:
+            # No term groups — split by additive terms for multiline rendering
+            from sympy import Add
+            terms = Add.make_args(self.expr)
+            if len(terms) > 1:
+                lines = []
+                for i, term in enumerate(terms):
+                    tex = _tex(term)
+                    if i == 0:
+                        lines.append(f"  & {tex}")
+                    elif tex.startswith("-"):
+                        lines.append(f"  & {tex}")
+                    else:
+                        lines.append(f"  & + {tex}")
+                return "\\begin{aligned}\n" + " \\\\\n".join(lines) + "\n  &= 0\n\\end{aligned}"
 
         if self._term_groups:
             # Render in group order (single line) — preserves physical ordering
@@ -1205,6 +1230,39 @@ def _simplify_derivatives_only(expr):
     # Now safe to simplify — only pure Derivative(Function, var) remain
     simplified = protected.doit() if protected.has(Derivative) else protected
     # Restore integral-containing nodes
+    return simplified.subs(integral_map)
+
+
+def _simplify_preserve_integrals(expr):
+    """Expand + simplify while protecting Integral and Derivative(Integral) terms.
+
+    This cancels terms like u²·d(b+h)/dx - u²·db/dx → u²·dh/dx and
+    (-gρ(b+h) + gρb + gρh)·... → 0, while leaving ∫...dz terms intact.
+    """
+    if not isinstance(expr, sp.Basic):
+        return expr
+
+    integral_map = {}
+    counter = [0]
+
+    def _protect(e):
+        if isinstance(e, Derivative) and e.args[0].has(Integral):
+            key = sp.Dummy(f"_DINT{counter[0]}")
+            integral_map[key] = e
+            counter[0] += 1
+            return key
+        if isinstance(e, Integral):
+            key = sp.Dummy(f"_INT{counter[0]}")
+            integral_map[key] = e
+            counter[0] += 1
+            return key
+        if e.args:
+            new_args = [_protect(a) for a in e.args]
+            return e.func(*new_args)
+        return e
+
+    protected = _protect(expr)
+    simplified = sp.simplify(sp.expand(protected))
     return simplified.subs(integral_map)
 
 
