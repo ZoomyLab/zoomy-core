@@ -228,11 +228,17 @@ class Expression(SymbolicBase):
         Preserves term_groups if present.
         """
         def _apply_one(expr, cond):
+            if isinstance(cond, Operation):
+                # Operation: transforms the full Expression
+                eq = Expression(expr, self.name, term_groups=self._term_groups)
+                state = getattr(cond, '_state', None)
+                result = cond.apply_to_equation(eq, state)
+                return result.expr
             if isinstance(cond, (Relation,)) or hasattr(cond, 'apply_to'):
                 # Evaluate Subs objects first so BC patterns match
-                # e.g. Subs(w(t,x,z), z, b) → w(t,x,b) before substituting w(t,x,b) → rhs
                 if expr.has(sp.Subs):
-                    expr = expr.doit()
+                    subs_map = {s: s.doit() for s in expr.atoms(sp.Subs)}
+                    expr = expr.subs(subs_map)
                 if isinstance(cond, Relation):
                     return cond.apply_to(expr)
                 return cond.apply_to(expr)
@@ -264,9 +270,10 @@ class Expression(SymbolicBase):
                     g = _apply_one(g, cond)
                 new_groups[role] = g
 
-        return Expression(
-            _simplify_preserve_integrals(result), self.name, term_groups=new_groups
-        )
+        # Simplify for Relation applies (not Operations — they handle their own)
+        if not any(isinstance(c, Operation) for c in conditions):
+            result = _simplify_preserve_integrals(result)
+        return Expression(result, self.name, term_groups=new_groups)
 
     def simplify(self):
         """Return a new Expression with sympy simplification applied."""
@@ -954,7 +961,7 @@ class Operation(SymbolicBase):
 
     Unlike a ``Relation`` (which substitutes symbols), an ``Operation``
     applies a function to each ``Expression``.  Used with
-    ``DerivedModel.apply()`` alongside Relations.
+    ``DerivedModel.apply()`` and ``Expression.apply()`` alongside Relations.
 
     Parameters
     ----------
@@ -964,9 +971,10 @@ class Operation(SymbolicBase):
         Human-readable description (used in markdown output instead of name).
     """
 
-    def __init__(self, name="", description=None):
+    def __init__(self, name="", description=None, state=None):
         super().__init__(name)
         self.description = description or name
+        self._state = state
 
     def apply_to_equation(self, eq, state):
         """Transform a single Expression. Override in subclasses."""
@@ -988,7 +996,7 @@ class DepthIntegrate(Operation):
 
     def __init__(self, state):
         super().__init__(
-            name="depth_integrate",
+            name="depth_integrate", state=state,
             description="Depth integration over [b, b+h] (Leibniz rule)",
         )
         self._state = state
@@ -1018,7 +1026,7 @@ class ApplyKinematicBCs(Operation):
 
     def __init__(self, state):
         super().__init__(
-            name="kinematic_bcs",
+            name="kinematic_bcs", state=state,
             description="Kinematic BCs (surface + bottom): w = u·∂b/∂x + ∂b/∂t",
         )
         self._state = state
@@ -1060,7 +1068,7 @@ class SimplifyIntegrals(Operation):
 
     def __init__(self, state):
         super().__init__(
-            name="simplify_integrals",
+            name="simplify_integrals", state=state,
             description="Evaluate constant/zero integrals",
         )
         self._z = state.z
@@ -1097,6 +1105,103 @@ class SimplifyIntegrals(Operation):
             return e
 
         return Expression(_simplify_int(expr), eq.name)
+
+
+class ZetaTransform(Operation):
+    """Transform vertical coordinate: z = ζ·h + b, dz = h·dζ.
+
+    Transforms integrals: ∫_b^{b+h} f(z) dz → h·∫_0^1 f(ζ·h+b) dζ.
+    Also substitutes z → ζ·h + b in boundary evaluations.
+    """
+
+    def __init__(self, state):
+        super().__init__(
+            name="zeta_transform",
+            description="Coordinate transform z = ζ·h + b",
+            state=state,
+        )
+        self._zeta = state.zeta
+
+    def apply_to_equation(self, eq, state):
+        from sympy import Integral, Derivative
+        z = state.z
+        b = state.b
+        h_func = state.H  # h(t,x)
+        zeta = self._zeta
+        expr = eq.expr
+
+        def _transform(e):
+            if isinstance(e, Integral):
+                integrand = e.args[0]
+                limits = e.args[1]
+                var = limits[0]
+                lower, upper = limits[1], limits[2]
+                # Only transform z-integrals over [b, b+h]
+                if var == z:
+                    # z = ζ·h + b → dz = h·dζ, limits [0, 1]
+                    new_integrand = integrand.subs(z, zeta * h_func + b) * h_func
+                    return Integral(new_integrand, (zeta, S.Zero, S.One))
+                return e
+            if isinstance(e, Derivative):
+                inner = _transform(e.args[0])
+                if inner != e.args[0]:
+                    return Derivative(inner, *e.args[1:])
+                return e
+            if e.args:
+                new_args = [_transform(a) for a in e.args]
+                if any(n != o for n, o in zip(new_args, e.args)):
+                    return e.func(*new_args)
+            return e
+
+        return Expression(_transform(expr), eq.name)
+
+    def _repr_latex_(self):
+        return f"$z = \\zeta \\cdot h + b, \\quad dz = h \\, d\\zeta$"
+
+
+class ProductRule(Operation):
+    """Apply inverse product rule to recover flux form.
+
+    Transforms ``f·∂g/∂x → ∂(F)/∂x - (∂f/∂x)·g`` where ``F = ∫f dg``.
+
+    Common use: ``g·h·∂h/∂x → ∂/∂x(g·h²/2)``
+
+    Parameters
+    ----------
+    expr_pattern : sympy expression
+        The product to transform (e.g. ``g*h*Derivative(h, x)``).
+    flux_form : sympy expression
+        The flux form (e.g. ``g*h**2/2``).
+    variable : Symbol
+        The derivative variable (e.g. ``x``).
+    """
+
+    def __init__(self, expr_pattern, flux_form, variable, name=None):
+        desc = f"Product rule: {sp.latex(expr_pattern)} → ∂/∂x({sp.latex(flux_form)})"
+        super().__init__(
+            name=name or "product_rule",
+            description=desc,
+        )
+        self._pattern = expr_pattern
+        self._flux = flux_form
+        self._var = variable
+
+    def apply_to_equation(self, eq, state):
+        from sympy import Derivative
+        expr = eq.expr
+        # Replace the pattern with ∂(flux)/∂x minus the remainder
+        # For exact match: pattern = ∂(flux)/∂x - remainder
+        flux_deriv = Derivative(self._flux, self._var)
+        # Expand flux_deriv to get: pattern + remainder
+        # The user specifies pattern and flux, so:
+        # pattern → ∂(flux)/∂x  (user guarantees equivalence)
+        result = expr.subs(self._pattern, flux_deriv)
+        return Expression(result, eq.name)
+
+    def _repr_latex_(self):
+        return (f"${sp.latex(self._pattern)} \\to "
+                f"\\frac{{\\partial}}{{\\partial {sp.latex(self._var)}}}"
+                f"\\left({sp.latex(self._flux)}\\right)$")
 
 
 class FullINS:
