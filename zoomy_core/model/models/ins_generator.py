@@ -228,7 +228,13 @@ class Expression(SymbolicBase):
         Preserves term_groups if present.
         """
         def _apply_one(expr, cond):
-            if isinstance(cond, Relation):
+            if isinstance(cond, (Relation,)) or hasattr(cond, 'apply_to'):
+                # Evaluate Subs objects first so BC patterns match
+                # e.g. Subs(w(t,x,z), z, b) → w(t,x,b) before substituting w(t,x,b) → rhs
+                if expr.has(sp.Subs):
+                    expr = expr.doit()
+                if isinstance(cond, Relation):
+                    return cond.apply_to(expr)
                 return cond.apply_to(expr)
             elif isinstance(cond, dict):
                 return expr.subs(cond)
@@ -320,14 +326,14 @@ class Expression(SymbolicBase):
 
         if method == "fundamental_theorem":
             # int df/dz dz = f(upper) - f(lower)
-            # Convention: upper = +f(upper), lower = -f(lower)
             inner, coeff = _extract_derivative(expr, var)
             if inner is None:
                 raise ValueError(
                     f"No Derivative w.r.t. {var} found for fundamental theorem: {expr}"
                 )
-            f_upper = (coeff * inner).subs(var, upper)
-            f_lower = (coeff * inner).subs(var, lower)
+            f = coeff * inner
+            f_upper = sp.Subs(f, var, upper)
+            f_lower = sp.Subs(f, var, lower)
             return DepthIntegralResult(
                 volume=Expression(S.Zero, f"ft_volume({self.name})"),
                 boundary_upper=Expression(f_upper, f"ft_upper({self.name})"),
@@ -336,7 +342,6 @@ class Expression(SymbolicBase):
 
         elif method == "leibniz":
             # int df/dx dz = d/dx[int f dz] - f(upper)*d(upper)/dx + f(lower)*d(lower)/dx
-            # Find the horizontal derivative
             for s in list(expr.free_symbols) + [Symbol("x"), Symbol("t")]:
                 if s == var:
                     continue
@@ -346,13 +351,14 @@ class Expression(SymbolicBase):
             else:
                 raise ValueError(f"No horizontal Derivative found for Leibniz: {expr}")
 
-            # Volume: d/dx[int f dz] (the integral stays symbolic)
+            # Volume: d/dx[int f dz]
             int_f = Integral(coeff * inner, (var, lower, upper))
             volume = Derivative(int_f, s)
 
-            # Boundary terms (from Leibniz)
-            f_at_upper = (coeff * inner).subs(var, upper)
-            f_at_lower = (coeff * inner).subs(var, lower)
+            # Boundary terms: use Subs to keep evaluation explicit
+            f = coeff * inner
+            f_at_upper = sp.Subs(f, var, upper)
+            f_at_lower = sp.Subs(f, var, lower)
             bnd_upper = -f_at_upper * Derivative(upper, s)
             bnd_lower = f_at_lower * Derivative(lower, s)
 
@@ -769,7 +775,10 @@ from sympy.printing.latex import LatexPrinter as _LatexPrinter
 
 
 class _StripArgsLatexPrinter(_LatexPrinter):
-    """LaTeX printer that renders ``u(t,x,z)`` as just ``u``."""
+    """LaTeX printer that renders ``u(t,x,z)`` as just ``u``.
+
+    ``Subs`` objects render as ``u|_{z=b+h}`` via sympy's default Subs printing.
+    """
 
     def _print_Function(self, expr, exp=None):
         name = expr.func.__name__
