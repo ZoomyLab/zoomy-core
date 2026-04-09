@@ -2,21 +2,25 @@
 
 Derivation::
 
-    INSModel (continuity + x_momentum + z_momentum)
-      |  z_momentum.apply({w: 0, τ_zz: 0, τ_zx: 0})  — hydrostatic scaling
-      |  → z_momentum reduces to ∂p/∂z/ρ + g = 0
-      |  → integrate: p = p_atm + ρg(η - z)
-      |  system.apply({p: p_hydro})  — substitute into x_momentum
-      |  remove z_momentum (consumed)
-      |  apply(DepthIntegrate + KinematicBCs + ...)
-      v
-    SMEModel  (solver-ready: continuity + x_momentum)
+    system = FullINS(state).system()
+    system.equations["z_momentum"].apply({w: 0, τ_zz: 0, τ_zx: 0})
+    → ∂p/∂z/ρ + g = 0  →  p = p_atm + ρg(η - z)
+    system.apply({p: p_hydro})
+    del system.equations["z_momentum"]
+    system.apply(DepthIntegrate)
+    system.apply(ApplyKinematicBCs)
+    ...
 """
 
 import sympy as sp
 from sympy import Function, S
 
 from zoomy_core.model.models.derived_model import DerivedModel
+
+
+def hydrostatic_scaling(state):
+    """Dict that drops w, τ_zz, τ_zx from an equation (hydrostatic assumption)."""
+    return {state.w: S.Zero, state.tau["zz"]: S.Zero, state.tau["zx"]: S.Zero}
 
 
 class INSModel(DerivedModel):
@@ -47,21 +51,16 @@ class SMEModel(INSModel):
         super().derive_model()
         s = self.state
 
-        # 1. Hydrostatic scaling on z-momentum only
+        # Hydrostatic: scale z-momentum, derive pressure, apply to system
         self._system.equations["z_momentum"] = (
             self._system.equations["z_momentum"]
-            .apply({s.w: S.Zero, s.tau["zz"]: S.Zero, s.tau["zx"]: S.Zero})
+            .apply(hydrostatic_scaling(s))
             .simplify()
         )
-        # z-momentum is now: ∂p/∂z/ρ + g = 0 → p = p_atm + ρg(η - z)
-
-        # 2. Apply derived pressure to all equations
         self.apply(HydrostaticPressure(s))
-
-        # 3. Remove z-momentum (consumed by the derivation)
         del self._system.equations["z_momentum"]
 
-        # 4. Depth integrate + BCs + closures
+        # Depth integrate + closures
         self.apply(DepthIntegrate(s))
         self.apply(ApplyKinematicBCs(s))
         self.apply(StressFreeSurface(s))
@@ -89,7 +88,7 @@ class SMEInviscid(INSModel):
 
         self._system.equations["z_momentum"] = (
             self._system.equations["z_momentum"]
-            .apply({s.w: S.Zero, s.tau["zz"]: S.Zero, s.tau["zx"]: S.Zero})
+            .apply(hydrostatic_scaling(s))
             .simplify()
         )
         self.apply(HydrostaticPressure(s))
