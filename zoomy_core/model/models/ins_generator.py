@@ -684,25 +684,6 @@ class Expression(SymbolicBase):
 
         return _tex(self.expr)
 
-
-from sympy.printing.latex import LatexPrinter as _LatexPrinter
-
-
-class _StripArgsLatexPrinter(_LatexPrinter):
-    """LaTeX printer that renders ``u(t,x,z)`` as just ``u``.
-
-    All other behaviour (partial derivatives, integrals, Subs, etc.)
-    is inherited from the default printer and stays correct.
-    """
-
-    def _print_Function(self, expr, exp=None):
-        # Render the function name without arguments.
-        name = expr.func.__name__
-        tex = self._deal_with_super_sub(name)
-        if exp is not None:
-            tex = r"%s^{%s}" % (tex, exp)
-        return tex
-
     def describe(self, header=True, final_equation=True, parameters=False,
                  strip_args=False):
         """Composable description of this expression.
@@ -741,6 +722,20 @@ class _StripArgsLatexPrinter(_LatexPrinter):
                 parts.append(f"\n**Parameters:** {sym_str}")
 
         return Description("\n".join(parts))
+
+
+from sympy.printing.latex import LatexPrinter as _LatexPrinter
+
+
+class _StripArgsLatexPrinter(_LatexPrinter):
+    """LaTeX printer that renders ``u(t,x,z)`` as just ``u``."""
+
+    def _print_Function(self, expr, exp=None):
+        name = expr.func.__name__
+        tex = self._deal_with_super_sub(name)
+        if exp is not None:
+            tex = r"%s^{%s}" % (tex, exp)
+        return tex
 
 
 class DepthIntegralResult:
