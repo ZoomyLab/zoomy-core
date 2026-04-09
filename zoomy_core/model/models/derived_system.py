@@ -57,16 +57,23 @@ class DerivedSystem:
         self.assumptions = assumptions or []
 
     def apply(self, operation):
-        """Apply an operation or relation to all equations in place.
-
-        Works with Relations (substitutions), Operations (transforms),
-        and dicts (manual substitutions).
-        """
+        """Apply an operation or relation to all equations in place."""
         self.equations = {
             k: eq.apply(operation) for k, eq in self.equations.items()
         }
         a_name = getattr(operation, 'description', None) or getattr(operation, 'name', str(operation))
         self.assumptions.append(a_name)
+
+    def apply_to_term(self, equation_name, term_index, *operations):
+        """Apply operations to a specific term of a specific equation in place.
+
+        Usage::
+
+            system.apply_to_term("x_momentum", 5, ProductRule())
+        """
+        self.equations[equation_name] = self.equations[equation_name].apply_to_term(
+            term_index, *operations
+        )
 
     def with_material(self, material):
         """Apply a material model. Returns a new DerivedSystem (immutable)."""
