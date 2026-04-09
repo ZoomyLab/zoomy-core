@@ -56,12 +56,20 @@ class DerivedSystem:
         self.state = state
         self.assumptions = assumptions or []
 
-    def with_material(self, material):
-        """Apply a material model to all equations.
+    def apply(self, operation):
+        """Apply an operation or relation to all equations in place.
 
-        Returns a new ``DerivedSystem`` with the material applied.
-        The original is unchanged.
+        Works with Relations (substitutions), Operations (transforms),
+        and dicts (manual substitutions).
         """
+        self.equations = {
+            k: eq.apply(operation) for k, eq in self.equations.items()
+        }
+        a_name = getattr(operation, 'description', None) or getattr(operation, 'name', str(operation))
+        self.assumptions.append(a_name)
+
+    def with_material(self, material):
+        """Apply a material model. Returns a new DerivedSystem (immutable)."""
         new_eqs = {k: eq.apply(material) for k, eq in self.equations.items()}
         return DerivedSystem(
             f"{self.name}+{material.name}",
@@ -71,7 +79,7 @@ class DerivedSystem:
         )
 
     def with_assumption(self, assumption):
-        """Apply an additional assumption to all equations."""
+        """Apply an assumption. Returns a new DerivedSystem (immutable)."""
         new_eqs = {k: eq.apply(assumption) for k, eq in self.equations.items()}
         a_name = assumption.name if hasattr(assumption, 'name') else str(assumption)
         return DerivedSystem(
