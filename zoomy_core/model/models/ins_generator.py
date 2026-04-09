@@ -1147,41 +1147,60 @@ class ZetaTransform(Operation):
 
 
 class ProductRule(Operation):
-    """Apply inverse product rule to recover flux form.
+    """Inverse product rule: combine ``coeff · d(f)/dx`` into ``d(F)/dx``.
 
-    Transforms ``f·∂g/∂x → ∂(F)/∂x - (∂f/∂x)·g`` where ``F = ∫f dg``.
+    Applied to a single term (use ``expr.terms[i].apply(ProductRule())``).
+    Detects the derivative in the term, checks if the remaining coefficient
+    can be integrated w.r.t. the differentiated variable, and combines.
 
-    Common use: ``g·h·∂h/∂x → ∂/∂x(g·h²/2)``
-
-    Parameters
-    ----------
-    expr_pattern : sympy expression
-        The product to transform (e.g. ``g*h*Derivative(h, x)``).
-    flux_form : sympy expression
-        The flux form (e.g. ``g*h**2/2``).
-    variable : Symbol
-        The derivative variable (e.g. ``x``).
+    Example: ``g·h·∂h/∂x → ∂/∂x(g·h²/2)``
     """
 
-    def __init__(self, expr_pattern, flux_form, variable, name=None):
-        desc = f"Product rule: {sp.latex(expr_pattern)} → ∂/∂x({sp.latex(flux_form)})"
+    def __init__(self):
         super().__init__(
-            name=name or "product_rule",
-            description=desc,
+            name="product_rule",
+            description="Inverse product rule: coeff·∂f/∂x → ∂(F)/∂x",
         )
-        self._pattern = expr_pattern
-        self._flux = flux_form
-        self._var = variable
 
     def apply_to(self, expr):
-        from sympy import Derivative
-        flux_deriv = Derivative(self._flux, self._var)
-        return expr.subs(self._pattern, flux_deriv)
+        from sympy import Derivative, Mul
+
+        # Find the derivative factor in the term
+        factors = Mul.make_args(expr)
+        deriv_factor = None
+        other_factors = []
+        for f in factors:
+            if isinstance(f, Derivative) and deriv_factor is None:
+                deriv_factor = f
+            else:
+                other_factors.append(f)
+
+        if deriv_factor is None:
+            return expr  # no derivative found, nothing to do
+
+        inner = deriv_factor.args[0]
+        var = deriv_factor.variables[0]
+        coeff = sp.Mul(*other_factors) if other_factors else S.One
+
+        # Check if coeff is proportional to inner^n
+        # Common case: coeff = c * inner → term = c * inner * d(inner)/dx = c * d(inner²/2)/dx
+        if coeff.has(inner):
+            ratio = sp.simplify(coeff / inner)
+            if not ratio.has(inner):
+                flux = ratio * inner**2 / 2
+                return Derivative(flux, var)
+
+        # General case: coeff doesn't contain inner
+        # term = coeff * d(inner)/dx = d(coeff * inner)/dx - d(coeff)/dx * inner
+        # Only useful if d(coeff)/dx = 0 (coeff is constant w.r.t. var)
+        if not coeff.has(var):
+            flux = coeff * inner
+            return Derivative(flux, var)
+
+        return expr  # can't simplify
 
     def _repr_latex_(self):
-        return (f"${sp.latex(self._pattern)} \\to "
-                f"\\frac{{\\partial}}{{\\partial {sp.latex(self._var)}}}"
-                f"\\left({sp.latex(self._flux)}\\right)$")
+        return ""
 
 
 class FullINS:
