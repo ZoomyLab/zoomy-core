@@ -1,18 +1,20 @@
-"""GeneratedModelSolver — backward-compatible alias for ShallowWaterSolver.
+"""Solver for free-surface flow models with derivative-aware auxiliary variables.
 
-The functionality that was in GeneratedModelSolver is now split:
-- HyperbolicSolver: general models (any variable layout)
-- ShallowWaterSolver: models with b/h (hydrostatic reconstruction, wet/dry)
+``GeneratedModelSolver`` = ``FreeSurfaceFlowSolver`` + ``DerivativeAwareSolverMixin``.
+
+The mixin computes spatial derivatives (from ``model.derivative_specs``)
+at each timestep and fills the ``Qaux`` array.  This enables models whose
+source terms reference ``self.D.dx(self.Q.h)`` etc.
 """
 
-from zoomy_core.fvm.solver_numpy import ShallowWaterSolver
+from zoomy_core.fvm.solver_numpy import FreeSurfaceFlowSolver
 from zoomy_core.model.derivative_workflow import DerivativeAwareSolverMixin
 
 
-class GeneratedModelSolver(DerivativeAwareSolverMixin, ShallowWaterSolver):
-    """ShallowWaterSolver with derivative-aware auxiliary variable updates.
+class GeneratedModelSolver(DerivativeAwareSolverMixin, FreeSurfaceFlowSolver):
+    """FreeSurfaceFlowSolver with derivative-aware Qaux updates.
 
-    Backward-compatible alias. For new code, use ShallowWaterSolver or
-    HyperbolicSolver directly.
+    This is the standard solver for SWE / SME models.  For models without
+    derivative-dependent source terms, ``FreeSurfaceFlowSolver`` is sufficient.
     """
     pass

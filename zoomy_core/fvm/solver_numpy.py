@@ -385,11 +385,12 @@ class HyperbolicSolver(Solver):
 
 # ── Shallow water variant ─────────────────────────────────────────────────────
 
-class ShallowWaterSolver(HyperbolicSolver):
+class FreeSurfaceFlowSolver(HyperbolicSolver):
     """HyperbolicSolver with positive (hydrostatic reconstruction) Rusanov.
 
-    Requires model variables to include 'b' (bathymetry) and 'h' (depth).
-    Adds wet/dry handling and hydrostatic reconstruction at faces.
+    For free-surface flow models (SWE, SME, VAM) that have 'b' (bathymetry)
+    and 'h' (water depth) variables.  Adds hydrostatic reconstruction at
+    faces and wet/dry handling.
     """
 
     def _build_numerics(self, symbolic_model):
