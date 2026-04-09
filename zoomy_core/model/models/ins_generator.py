@@ -166,6 +166,34 @@ class Expression(SymbolicBase):
                      for i, t in enumerate(terms)]
         return Expression(sum(new_terms, S.Zero), self.name)
 
+    def keep_groups(self, *group_names):
+        """Return a new Expression keeping only the specified term groups.
+
+        Usage::
+
+            zmom.keep_groups("pressure", "source")  # drops temporal, convection, stress
+        """
+        if not self._term_groups:
+            raise ValueError("Expression has no term_groups.")
+        kept = {k: v for k, v in self._term_groups.items() if k in group_names}
+        if not kept:
+            return Expression(S.Zero, self.name)
+        return Expression(sum(kept.values(), S.Zero), self.name, term_groups=kept)
+
+    def drop_groups(self, *group_names):
+        """Return a new Expression dropping the specified term groups.
+
+        Usage::
+
+            zmom.drop_groups("temporal", "convection", "stress")
+        """
+        if not self._term_groups:
+            raise ValueError("Expression has no term_groups.")
+        kept = {k: v for k, v in self._term_groups.items() if k not in group_names}
+        if not kept:
+            return Expression(S.Zero, self.name)
+        return Expression(sum(kept.values(), S.Zero), self.name, term_groups=kept)
+
     def __len__(self):
         return len(Add.make_args(sp.expand(self.expr)))
 
@@ -1476,7 +1504,7 @@ class ZeroAtmosphericPressure(Assumption):
 
 
 class assumptions:
-    """Assumptions library. Usage: assumptions.kinematic_bc_bottom(state)"""
+    """Assumptions library."""
     kinematic_bc_bottom = KinematicBCBottom
     kinematic_bc_surface = KinematicBCSurface
     hydrostatic_pressure = HydrostaticPressure

@@ -198,7 +198,6 @@ class DerivedModel(Model):
         state = self._system.state
         a_name = operation.name if hasattr(operation, 'name') else str(operation)
 
-        # All operations (Relation, Operation, callable) go through Expression.apply()
         new_eqs = {
             k: eq.apply(operation)
             for k, eq in self._system.equations.items()
