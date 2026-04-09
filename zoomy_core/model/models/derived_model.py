@@ -102,12 +102,7 @@ class DerivedModel(Model):
 
         # Name the system after this class
         if self._system is not None:
-            self._system = DerivedSystem(
-                type(self).__name__,
-                self._system.equations,
-                self._system.state,
-                self._system.assumptions,
-            )
+            self._system.name = type(self).__name__
 
         # Infer dimension from system state if not given
         if dimension is None and self._system is not None:
@@ -170,7 +165,7 @@ class DerivedModel(Model):
 
     def _init_system(self, name, equations, state, assumptions=None):
         """Set the initial equation system (used by root classes)."""
-        self._system = DerivedSystem(name, equations, state, assumptions)
+        self._system = DerivedSystem(name, state, equations, assumptions)
 
     # ── apply: mutate system + auto-register ──────────────────────────
 
@@ -195,30 +190,15 @@ class DerivedModel(Model):
                 "self._init_system() before apply()."
             )
 
-        state = self._system.state
-        a_name = operation.name if hasattr(operation, 'name') else str(operation)
+        # Apply to all equations in place
+        self._system.apply(operation)
 
-        new_eqs = {
-            k: eq.apply(operation)
-            for k, eq in self._system.equations.items()
-        }
-
-        self._system = DerivedSystem(
-            self._system.name,
-            new_eqs,
-            self._system.state,
-            self._system.assumptions + [a_name],
-        )
-        # Use description if available (user-friendly), fall back to name
-        display_name = getattr(operation, 'description', None) or a_name
+        # Track for describe()
+        display_name = getattr(operation, 'description', None) or getattr(operation, 'name', str(operation))
         latex = operation._repr_latex_() if hasattr(operation, '_repr_latex_') else None
-        # Don't store empty latex strings
         if latex is not None and not latex.strip():
             latex = None
-        self._applied.append({
-            "name": display_name,
-            "latex": latex,
-        })
+        self._applied.append({"name": display_name, "latex": latex})
 
     # ── public API ────────────────────────────────────────────────────
 

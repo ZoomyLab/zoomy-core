@@ -97,29 +97,55 @@ class _EquationProxy:
         return len(self._expr)
 
 
-class DerivedSystem:
-    """A reusable set of depth-integrated equations, basis-independent.
+class System:
+    """A mutable system of symbolic PDE equations.
 
-    Each equation is an ``Expression`` that may contain ``Integral(...)``
-    terms.  These are resolved when you call ``.with_basis()``.
+    Equations are ``Expression`` objects accessed by name via dot syntax
+    (``system.continuity``) or dict syntax (``system.equations["continuity"]``).
+
+    Operations are applied in place::
+
+        system = System("INS", state)
+        system.add_equation("continuity", du_dx + dw_dz)
+        system.add_equation("x_momentum", ..., term_groups={...})
+        system.apply(HydrostaticPressure(state))
+        system.x_momentum.apply_to_term(5, ProductRule())
+        system.describe()
 
     Attributes
     ----------
     name : str
-        Human-readable name (e.g. "SME", "VAM")
+        Human-readable name (e.g. "INS", "SME")
     equations : dict
-        ``{name: Expression}`` — the depth-integrated equations
+        ``{name: Expression}``
     state : StateSpace
-        The shared symbolic state (coordinates, fields, etc.)
+        The shared symbolic state
     assumptions : list of str
-        Names of assumptions applied during derivation
+        Operations applied during derivation
     """
 
-    def __init__(self, name, equations, state, assumptions=None):
+    def __init__(self, name, state, equations=None, assumptions=None):
         self.name = name
-        self.equations = equations
         self.state = state
+        self.equations = dict(equations) if equations else {}
         self.assumptions = assumptions or []
+
+    def add_equation(self, name, expr, term_groups=None):
+        """Add an equation to the system.
+
+        Parameters
+        ----------
+        name : str
+            Equation name (e.g. "continuity", "x_momentum").
+        expr : Expression or sympy expr
+            The equation (= 0).
+        term_groups : dict, optional
+            Named term groups for ordered display.
+        """
+        if isinstance(expr, Expression):
+            self.equations[name] = expr
+        else:
+            self.equations[name] = Expression(expr, name, term_groups=term_groups)
 
     def __getattr__(self, name):
         # Dot access to equations: system.x_momentum, system.continuity, etc.
@@ -154,21 +180,21 @@ class DerivedSystem:
     def with_material(self, material):
         """Apply a material model. Returns a new DerivedSystem (immutable)."""
         new_eqs = {k: eq.apply(material) for k, eq in self.equations.items()}
-        return DerivedSystem(
+        return System(
             f"{self.name}+{material.name}",
-            new_eqs,
             self.state,
+            new_eqs,
             self.assumptions + [f"material={material.name}"],
         )
 
     def with_assumption(self, assumption):
-        """Apply an assumption. Returns a new DerivedSystem (immutable)."""
+        """Apply an assumption. Returns a new System (immutable)."""
         new_eqs = {k: eq.apply(assumption) for k, eq in self.equations.items()}
         a_name = assumption.name if hasattr(assumption, 'name') else str(assumption)
-        return DerivedSystem(
+        return System(
             self.name,
-            new_eqs,
             self.state,
+            new_eqs,
             self.assumptions + [a_name],
         )
 
@@ -261,7 +287,11 @@ class DerivedSystem:
 
     def __repr__(self):
         eqs = ", ".join(f"{k}({len(v)} terms)" for k, v in self.equations.items())
-        return f"DerivedSystem('{self.name}', [{eqs}], assumptions={self.assumptions})"
+        return f"System('{self.name}', [{eqs}], assumptions={self.assumptions})"
+
+
+# Backward-compatible alias
+DerivedSystem = System
 
 
 # =========================================================================
@@ -312,8 +342,7 @@ def sme(state=None, material=None):
         bcs=[kbc_s, kbc_b],
     )
 
-    return DerivedSystem("SME", {"mass": mass, "x_momentum": xmom},
-                         state, assumptions)
+    return System("SME", state, {"mass": mass, "x_momentum": xmom}, assumptions)
 
 
 def vam(state=None, material=None):
@@ -359,6 +388,6 @@ def vam(state=None, material=None):
         bcs=[kbc_s, kbc_b],
     )
 
-    return DerivedSystem("VAM", {"mass": mass, "x_momentum": xmom,
-                                  "z_momentum": zmom},
-                         state, assumptions)
+    return System("VAM", state,
+                  {"mass": mass, "x_momentum": xmom, "z_momentum": zmom},
+                  assumptions)
