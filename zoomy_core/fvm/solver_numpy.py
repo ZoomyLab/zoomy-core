@@ -271,14 +271,45 @@ class HyperbolicSolver(Solver):
         n_vars = symbolic_model.n_variables
         has_aux = symbolic_model.n_aux_variables > 0
 
+        # Check if model has non-trivial diffusive flux
+        has_diffusion = hasattr(model, 'diffusive_flux')
+        compiled_diff = None
+        if has_diffusion:
+            try:
+                compiled_diff = model.diffusive_flux
+                # Test if it's callable (compiled runtime model)
+                if not callable(compiled_diff):
+                    compiled_diff = None
+            except Exception:
+                compiled_diff = None
+
+        cell_centers = mesh.cell_centers[:dim, :]
+
         def flux_operator(dt, Q, Qaux, parameters, dQ):
             dQ = np.zeros_like(dQ)
+
+            # Compute cell-center gradients via Green-Gauss (for diffusion)
+            gradQ_cells = None
+            if compiled_diff is not None:
+                gradQ_cells = np.zeros((n_vars * dim, mesh.n_cells))
+                for f in range(mesh.n_faces):
+                    a, b = iA[f], iB[f]
+                    n = normals_arr[:, f]
+                    for v in range(n_vars):
+                        u_face = 0.5 * (Q[v, a] + Q[v, b])
+                        for d in range(dim):
+                            contrib = u_face * n[d] * face_volumes[f]
+                            gradQ_cells[v * dim + d, a] += contrib / cell_volumesA[f]
+                            gradQ_cells[v * dim + d, b] -= contrib / cell_volumesB[f]
+
             for f in range(mesh.n_faces):
                 qA = Q[:, iA[f]]
                 qB = Q[:, iB[f]]
                 qauxA = Qaux[:, iA[f]] if has_aux else _EMPTY_AUX
                 qauxB = Qaux[:, iB[f]] if has_aux else _EMPTY_AUX
                 n = normals_arr[:, f]
+
+                # Convective flux (Riemann solver)
                 fluct = np.asarray(
                     runtime_numerics.numerical_fluctuations(
                         qA, qB, qauxA, qauxB, parameters, n
@@ -293,6 +324,21 @@ class HyperbolicSolver(Solver):
                 Dm = fluct[n_vars:]
                 dQ[:, iA[f]] -= (num_flux + Dm) * face_volumes[f] / cell_volumesA[f]
                 dQ[:, iB[f]] -= (-num_flux + Dp) * face_volumes[f] / cell_volumesB[f]
+
+                # Diffusive flux (central, no upwinding)
+                if compiled_diff is not None:
+                    q_face = 0.5 * (qA + qB)
+                    qaux_face = 0.5 * (qauxA + qauxB) if has_aux else _EMPTY_AUX
+                    gradQ_face = 0.5 * (gradQ_cells[:, iA[f]] + gradQ_cells[:, iB[f]])
+                    F_diff = np.asarray(
+                        compiled_diff(q_face, qaux_face, gradQ_face, parameters),
+                        dtype=float,
+                    ).reshape(n_vars, dim)
+                    # Diffusive flux contribution: F_diff · n * face_area
+                    diff_flux_n = F_diff @ n
+                    dQ[:, iA[f]] -= diff_flux_n * face_volumes[f] / cell_volumesA[f]
+                    dQ[:, iB[f]] += diff_flux_n * face_volumes[f] / cell_volumesB[f]
+
             return dQ
         return flux_operator
 

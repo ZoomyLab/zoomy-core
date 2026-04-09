@@ -189,8 +189,26 @@ class Model(param.Parameterized, SymbolicRegistrar):
 
         ic_sig = Zstruct(position=self.position, p=self.parameters)
 
+        # Gradient symbols for diffusive_flux: gradQ[var, dim]
+        grad_syms = []
+        for v in self.variables.keys():
+            for d in range(self.dimension):
+                grad_syms.append(sp.Symbol(f"dQ_{v}_d{d}", real=True))
+        self.gradient_variables = parse_definition_to_zstruct(
+            [str(s) for s in grad_syms], "gradQ"
+        )
+        self.gradient_variables._symbolic_name = "gradQ"
+
+        diff_sig = Zstruct(
+            variables=self.variables,
+            aux_variables=self.aux_variables,
+            gradient_variables=self.gradient_variables,
+            p=self.parameters,
+        )
+
         regs = [
             ("flux", self.flux, std_sig),
+            ("diffusive_flux", self.diffusive_flux, diff_sig),
             ("dflux", self.dflux, std_sig),
             ("hydrostatic_pressure", self.hydrostatic_pressure, std_sig),
             ("nonconservative_matrix", self.nonconservative_matrix, std_sig),
@@ -303,8 +321,16 @@ class Model(param.Parameterized, SymbolicRegistrar):
         """Flux."""
         return ZArray.zeros(self.n_variables, self.dimension)
 
+    def diffusive_flux(self):
+        """Diffusive flux F_diff(Q, ∇Q). Shape (n_variables, dimension).
+
+        Evaluated at faces using reconstructed gradients.
+        Default: zero (no diffusion).
+        """
+        return ZArray.zeros(self.n_variables, self.dimension)
+
     def dflux(self):
-        """Dflux."""
+        """Dflux (legacy)."""
         return ZArray.zeros(self.n_variables, self.dimension)
     
     def hydrostatic_pressure(self):
