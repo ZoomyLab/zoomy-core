@@ -775,14 +775,30 @@ from sympy.printing.latex import LatexPrinter as _LatexPrinter
 
 
 class _StripArgsLatexPrinter(_LatexPrinter):
-    """LaTeX printer that renders ``u(t,x,z)`` as just ``u``.
+    """LaTeX printer that renders function calls cleanly:
 
-    ``Subs`` objects render as ``u|_{z=b+h}`` via sympy's default Subs printing.
+    - ``u(t,x,z)`` → ``u``  (standard args stripped)
+    - ``u(t,x,b+h)`` → ``u|_{z=b+h}``  (boundary evaluation shown)
+    - ``Subs(u(t,x,z), z, b)`` → ``u|_{z=b}``  (via sympy Subs printing)
+
+    Horizontal functions (b, h, p_atm with fewer args) always stripped.
     """
+
+    # The vertical coordinate symbol — functions with this as last arg are "standard"
+    _z = sp.Symbol("z", real=True)
 
     def _print_Function(self, expr, exp=None):
         name = expr.func.__name__
         tex = self._deal_with_super_sub(name)
+        args = expr.args
+
+        # Check if this is a 3D function (u, w, tau_xx, ...) evaluated at a boundary
+        # Heuristic: if last arg is NOT z and the function has 3+ args, it's a boundary eval
+        if len(args) >= 3 and args[-1] != self._z:
+            z_val = args[-1]
+            z_tex = self.doprint(z_val)
+            tex = r"\left. %s \right|_{\substack{ z=%s }}" % (tex, z_tex)
+
         if exp is not None:
             tex = r"%s^{%s}" % (tex, exp)
         return tex
