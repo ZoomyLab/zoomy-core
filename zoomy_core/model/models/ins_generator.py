@@ -71,7 +71,7 @@ class StateSpace:
         self._build_stress_tensor(has_y, args_3d)
 
         self.b = Function("b", real=True)(*args_h)
-        self.H = Function("H", real=True)(*args_h)
+        self.H = Function("h", real=True)(*args_h)
         self.eta = self.b + self.H
 
         self.coords_h = [self.x] + ([self.y] if has_y else [])
@@ -259,6 +259,22 @@ class Expression(SymbolicBase):
                 new_groups[role] = g
 
         return Expression(result, self.name, term_groups=new_groups)
+
+    def simplify(self):
+        """Return a new Expression with sympy simplification applied."""
+        simplified = sp.simplify(self.expr)
+        new_groups = None
+        if self._term_groups:
+            new_groups = {role: sp.simplify(g) for role, g in self._term_groups.items()}
+        return Expression(simplified, self.name, term_groups=new_groups)
+
+    def expand(self):
+        """Return a new Expression with sympy expand applied."""
+        expanded = sp.expand(self.expr)
+        new_groups = None
+        if self._term_groups:
+            new_groups = {role: sp.expand(g) for role, g in self._term_groups.items()}
+        return Expression(expanded, self.name, term_groups=new_groups)
 
     def depth_integrate(self, lower, upper, var, method="auto"):
         """
@@ -889,25 +905,36 @@ class Operation(SymbolicBase):
     Unlike a ``Relation`` (which substitutes symbols), an ``Operation``
     applies a function to each ``Expression``.  Used with
     ``DerivedModel.apply()`` alongside Relations.
+
+    Parameters
+    ----------
+    name : str
+        Short identifier (used in mermaid edge labels).
+    description : str, optional
+        Human-readable description (used in markdown output instead of name).
     """
 
     def __init__(self, name="", description=None):
         super().__init__(name)
-        self.description = description
+        self.description = description or name
 
     def apply_to_equation(self, eq, state):
         """Transform a single Expression. Override in subclasses."""
         raise NotImplementedError
 
     def _repr_latex_(self):
-        return f"${self.name}$" if self.name else ""
+        """Override to show equations. Default: no equation, just description."""
+        return ""
 
 
 class DepthIntegrate(Operation):
     """Depth-integrate all equations with kinematic BCs (Leibniz rule)."""
 
     def __init__(self, state):
-        super().__init__(name="depth integrate + kinematic BCs")
+        super().__init__(
+            name="depth_integrate",
+            description="Depth integration (Leibniz rule) with kinematic BCs",
+        )
         self._state = state
         self._kbc_b = KinematicBCBottom(state)
         self._kbc_s = KinematicBCSurface(state)
@@ -918,6 +945,13 @@ class DepthIntegrate(Operation):
             lambda t: t.depth_integrate(b, eta, z),
             bcs=[self._kbc_s, self._kbc_b],
         )
+
+    def _repr_latex_(self):
+        """Show the kinematic BC equations."""
+        parts = []
+        parts.append(self._kbc_s._repr_latex_())
+        parts.append(self._kbc_b._repr_latex_())
+        return " \\\\ ".join(p for p in parts if p)
 
 
 # ---------------------------------------------------------------------------
