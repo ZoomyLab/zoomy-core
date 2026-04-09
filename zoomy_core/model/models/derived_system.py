@@ -74,6 +74,9 @@ class DerivedSystem:
         self.equations[equation_name] = self.equations[equation_name].apply_to_term(
             term_index, *operations
         )
+        for op in operations:
+            a_name = getattr(op, 'description', None) or getattr(op, 'name', str(op))
+            self.assumptions.append(f"{a_name} on {equation_name}[{term_index}]")
 
     def with_material(self, material):
         """Apply a material model. Returns a new DerivedSystem (immutable)."""
