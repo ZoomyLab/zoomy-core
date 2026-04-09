@@ -3,12 +3,12 @@
 Derivation graph::
 
     INSModel
-      |  apply(hydrostatic)
-      |  apply(Newtonian)
-      |  apply(DepthIntegrate)     — Leibniz rule, leaves boundary values
-      |  apply(KinematicBCSurface) — w|_surface = ...
-      |  apply(KinematicBCBottom)  — w|_bottom = ...
+      |  apply(HydrostaticPressure)
+      |  apply(DepthIntegrate)
+      |  apply(KinematicBCSurface)
+      |  apply(KinematicBCBottom)
       |  apply(ZeroAtmosphericPressure)
+      |  apply(Newtonian)           — material last: keeps τ symbols in intermediate steps
       v
     SMEModel  (solver-ready)
 
@@ -35,7 +35,7 @@ class INSModel(DerivedModel):
 
 
 class SMEModel(INSModel):
-    """Shallow Moment Equations — hydrostatic + Newtonian, depth-integrated."""
+    """Shallow Moment Equations — hydrostatic, depth-integrated, Newtonian."""
 
     projectable = True
 
@@ -47,11 +47,11 @@ class SMEModel(INSModel):
         )
         super().derive_model()
         self.apply(HydrostaticPressure(self.state))
-        self.apply(Newtonian(self.state))
         self.apply(DepthIntegrate(self.state))
         self.apply(KinematicBCSurface(self.state))
         self.apply(KinematicBCBottom(self.state))
         self.apply(ZeroAtmosphericPressure(self.state))
+        self.apply(Newtonian(self.state))
 
     def source(self):
         return self.newtonian_viscosity() + self.navier_slip()
@@ -70,8 +70,8 @@ class SMEInviscid(INSModel):
         )
         super().derive_model()
         self.apply(HydrostaticPressure(self.state))
-        self.apply(Inviscid(self.state))
         self.apply(DepthIntegrate(self.state))
         self.apply(KinematicBCSurface(self.state))
         self.apply(KinematicBCBottom(self.state))
         self.apply(ZeroAtmosphericPressure(self.state))
+        self.apply(Inviscid(self.state))
