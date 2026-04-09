@@ -1379,7 +1379,7 @@ class _INSBuilder:
 
 
 def FullINS(state, equations=None):
-    """Build the incompressible Navier-Stokes as a ``DerivedSystem``.
+    """Build the incompressible Navier-Stokes as a ``System``.
 
     Returns a mutable system with ``.apply()`` for in-place transformations.
 
@@ -1397,17 +1397,23 @@ def FullINS(state, equations=None):
         ins.x_momentum.apply(HydrostaticPressure(state))
         ins.describe()
     """
-    from zoomy_core.model.models.derived_system import DerivedSystem
+    from zoomy_core.model.models.derived_system import System
     builder = _INSBuilder(state)
-    all_eqs = {"continuity": builder.continuity, "x_momentum": builder.x_momentum}
+    system = System("INS", state)
+
+    eq_builders = {
+        "continuity": lambda: builder.continuity,
+        "x_momentum": lambda: builder.x_momentum,
+        "z_momentum": lambda: builder.z_momentum,
+    }
     if state.has_y:
-        all_eqs["y_momentum"] = builder.y_momentum
-    all_eqs["z_momentum"] = builder.z_momentum
+        eq_builders["y_momentum"] = lambda: builder.y_momentum
 
-    if equations is not None:
-        all_eqs = {k: v for k, v in all_eqs.items() if k in equations}
+    for name, build_fn in eq_builders.items():
+        if equations is None or name in equations:
+            system.add_equation(name, build_fn())
 
-    return DerivedSystem("INS", all_eqs, state)
+    return system
 
 
 # ---------------------------------------------------------------------------

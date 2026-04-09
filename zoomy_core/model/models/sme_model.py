@@ -28,9 +28,7 @@ class INSModel(DerivedModel):
 
     def derive_model(self):
         from zoomy_core.model.models.ins_generator import StateSpace, FullINS
-        state = StateSpace(dimension=2)
-        system = FullINS(state)
-        self._system = system
+        self._system = FullINS(StateSpace(dimension=2))
 
 
 class SMEModel(INSModel):
