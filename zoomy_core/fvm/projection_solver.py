@@ -16,7 +16,6 @@ from zoomy_core.misc.logger_config import logger
 from zoomy_core.mesh import ensure_lsq_mesh
 from zoomy_core.mesh.lsq_reconstruction import compute_derivatives
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
-import zoomy_core.fvm.flux as fvmflux
 import zoomy_core.fvm.ode as ode
 import zoomy_core.fvm.timestepping as timestepping
 

@@ -1,4 +1,12 @@
-"""Module `zoomy_core.fvm.solver_numpy`."""
+"""FVM solver for hyperbolic PDE systems (numpy backend).
+
+Uses the symbolic Riemann solver (riemann_solvers.py) for flux computation.
+No dependency on legacy flux.py or nonconservative_flux.py.
+
+Solver hierarchy:
+    Solver (base: init, create_runtime, BCs)
+      └→ HyperbolicSolver (explicit time stepping + symbolic Riemann flux)
+"""
 
 import os
 from time import time as gettime
@@ -7,19 +15,66 @@ import numpy as np
 import param
 
 from zoomy_core.misc.logger_config import logger
-
-import zoomy_core.fvm.flux as fvmflux
-import zoomy_core.fvm.nonconservative_flux as nonconservative_flux
 import zoomy_core.misc.io as io
 from zoomy_core.misc.misc import Zstruct, Settings
 import zoomy_core.fvm.ode as ode
 import zoomy_core.fvm.timestepping as timestepping
-from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
+from zoomy_core.transformation.to_numpy import NumpyRuntimeModel, NumpyRuntimeSymbolic
 from zoomy_core.mesh import ensure_lsq_mesh
+from zoomy_core.fvm.riemann_solvers import (
+    PositiveNonconservativeRusanov,
+    NonconservativeRusanov,
+)
 
+
+_EMPTY_AUX = np.array([])
+
+
+# ── Field detection helpers ───────────────────────────────────────────────────
+
+def _var_index(model, name, fallback=None):
+    keys = list(model.variables.keys())
+    if name in keys:
+        return keys.index(name)
+    if fallback is not None:
+        return fallback
+    raise KeyError(f"Variable '{name}' not found in model variables: {keys}")
+
+
+def _param_value(model, name, default=None):
+    if hasattr(model.parameters, "contains") and model.parameters.contains(name):
+        idx = list(model.parameters.keys()).index(name)
+        return float(model.parameter_values[idx])
+    return default
+
+
+def _detect_field_map(model):
+    if hasattr(model, "get_field_map"):
+        return model.get_field_map()
+    keys = list(model.variables.keys())
+    field_map = {}
+    if "h" in keys:
+        field_map["h"] = {"container": "q", "index": keys.index("h")}
+    if "b" in keys:
+        field_map["b"] = {"container": "q", "index": keys.index("b")}
+    return field_map
+
+
+def _detect_scaled_q_indices(model):
+    if hasattr(model, "numerics_scaled_q_indices"):
+        return model.numerics_scaled_q_indices
+    keys = list(model.variables.keys())
+    excluded = set()
+    for name in ["b", "h"]:
+        if name in keys:
+            excluded.add(keys.index(name))
+    return [i for i in range(model.n_variables) if i not in excluded]
+
+
+# ── Base Solver ───────────────────────────────────────────────────────────────
 
 class Solver(param.Parameterized):
-    """Base solver class."""
+    """Base solver class: initialization, runtime creation, boundary conditions."""
 
     settings = param.Parameter(default=None, doc="Run configuration (Settings object)")
 
@@ -33,17 +88,14 @@ class Solver(param.Parameterized):
             self.settings = defaults
 
     def initialize(self, mesh, model):
-        """Initialize."""
         n_variables = model.n_variables
         n_cells = mesh.n_cells
         n_aux_variables = model.aux_variables.length()
-
         Q = np.empty((n_variables, n_cells), dtype=float)
         Qaux = np.empty((n_aux_variables, n_cells), dtype=float)
         return Q, Qaux
 
     def create_runtime(self, Q, Qaux, mesh, model):
-        """Create runtime."""
         if hasattr(mesh, "resolve_periodic_bcs"):
             mesh.resolve_periodic_bcs(model.boundary_conditions)
         Q, Qaux = np.asarray(Q), np.asarray(Qaux)
@@ -51,167 +103,220 @@ class Solver(param.Parameterized):
         runtime_model = NumpyRuntimeModel(model)
         return Q, Qaux, parameters, mesh, runtime_model
 
-    def get_compute_source(self, mesh, model):
-        """Get compute source."""
-        def compute_source(dt, Q, Qaux, parameters, dQ):
-            """Compute source."""
-            dQ = model.source(
-                    Q[:, :],
-                    Qaux[:, :],
-                    parameters,
-            )
-            return dQ
-
-        return compute_source
-
-    def get_compute_source_jacobian_wrt_variables(self, mesh, model):
-        """Get compute source jacobian wrt variables."""
-        def compute_source(dt, Q, Qaux, parameters, dQ):
-            """Compute source."""
-            dQ = model.source_jacobian_wrt_variables(
-                    Q[:, : mesh.n_inner_cells],
-                    Qaux[:, : mesh.n_inner_cells],
-                    parameters,
-                )
-            return dQ
-
-        return compute_source
-
     def get_apply_boundary_conditions(self, mesh, model):
-        """Get apply boundary conditions."""
         def apply_boundary_conditions(time, Q, Qaux, parameters):
-            """Apply boundary conditions."""
             for i in range(mesh.n_boundary_faces):
                 i_face = mesh.boundary_face_face_indices[i]
                 i_bc_func = mesh.boundary_face_function_numbers[i]
-                q_cell = Q[:, mesh.boundary_face_cells[i]]  # Shape: (Q_dim,)
+                q_cell = Q[:, mesh.boundary_face_cells[i]]
                 qaux_cell = Qaux[:, mesh.boundary_face_cells[i]]
                 normal = mesh.face_normals[:, i_face]
                 position = mesh.face_centers[i_face, :]
                 position_ghost = mesh.cell_centers[:, mesh.boundary_face_ghosts[i]]
                 distance = np.linalg.norm(position - position_ghost)
-                q_ghost = model.boundary_conditions(i_bc_func, time, position, distance, q_cell, qaux_cell, parameters, normal)
-                Q[:,  mesh.boundary_face_ghosts[i]] = q_ghost
+                q_ghost = model.boundary_conditions(
+                    i_bc_func, time, position, distance, q_cell, qaux_cell, parameters, normal
+                )
+                Q[:, mesh.boundary_face_ghosts[i]] = q_ghost
             return Q
-
         return apply_boundary_conditions
 
     def update_q(self, Q, Qaux, mesh, model, parameters):
-        """Update variables before the solve step."""
+        """Apply model.update_variables (h clamp, momentum ramp) at each cell."""
+        n_vars = Q.shape[0]
+        for c in range(Q.shape[1]):
+            aux = Qaux[:, c] if Qaux.shape[0] > 0 else _EMPTY_AUX
+            Q[:, c] = np.asarray(
+                model.update_variables(Q[:, c], aux, parameters), dtype=float,
+            ).ravel()[:n_vars]
         return Q
 
     def update_qaux(self, Q, Qaux, Qold, Qauxold, mesh, model, parameters, time, dt):
-        """Update auxiliary variables."""
         return Qaux
 
-    def solve(self, mesh, model):
-        """Solve."""
-        logger.error(
-            "Solver.solve() is not implemented. Please implement this method in the derived class."
-        )
-        raise NotImplementedError("Solver.solve() must be implemented in derived classes.")
 
+# ── HyperbolicSolver ──────────────────────────────────────────────────────────
 
 class HyperbolicSolver(Solver):
-    """HyperbolicSolver with explicit time stepping."""
+    """Explicit time-stepping solver using the symbolic Riemann solver.
+
+    Uses PositiveNonconservativeRusanov from riemann_solvers.py.
+    No dependency on legacy flux.py or nonconservative_flux.py.
+    """
 
     time_end = param.Number(default=0.1, bounds=(0, None), doc="Simulation end time")
     min_dt = param.Number(default=1e-6, bounds=(0, None), doc="Minimum allowed timestep")
     compute_dt = param.Parameter(default=None, doc="Time-stepping strategy (callable)")
-    flux = param.Parameter(default=None, doc="Conservative flux scheme")
-    nc_flux = param.Parameter(default=None, doc="Non-conservative flux scheme")
+    eigenvalue_regularization = 1e-8
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         if self.compute_dt is None:
             self.compute_dt = timestepping.adaptive(CFL=0.45)
-        if self.flux is None:
-            self.flux = fvmflux.Zero()
-        if self.nc_flux is None:
-            self.nc_flux = nonconservative_flux.Rusanov()
-        # Ensure settings has output.snapshots default
         defaults = Settings.default()
         defaults.output.update(Zstruct(snapshots=10))
         defaults.update(self.settings)
         self.settings = defaults
 
     def initialize(self, mesh, model):
-        """Initialize."""
         Q, Qaux = super().initialize(mesh, model)
         Q = model.initial_conditions.apply(mesh.cell_centers, Q)
         Qaux = model.aux_initial_conditions.apply(mesh.cell_centers, Qaux)
         return Q, Qaux
 
+    # ── Symbolic model helpers ────────────────────────────────────────
+
+    def _get_symbolic_model(self, model):
+        return model.model if hasattr(model, "model") else model
+
+    def _get_dry_threshold(self, symbolic_model):
+        return _param_value(symbolic_model, "eps_wet", default=1e-3)
+
+    # ── Max wavespeed (for CFL + Rusanov dissipation) ─────────────────
+
+    def _build_max_wavespeed(self, symbolic_model):
+        eig_mode = getattr(symbolic_model, "eigenvalue_mode", "symbolic")
+        n_vars = symbolic_model.n_variables
+        n_aux = symbolic_model.n_aux_variables
+        n_params = symbolic_model.n_parameters
+        dim = symbolic_model.dimension
+
+        if eig_mode != "numerical":
+            rt = NumpyRuntimeModel(symbolic_model)
+            compiled_eig = rt.eigenvalues
+            def max_ws(*args):
+                Q = np.array(args[:n_vars])
+                Qaux = np.array(args[n_vars:n_vars + n_aux])
+                p = np.array(args[n_vars + n_aux:n_vars + n_aux + n_params])
+                n = np.array(args[n_vars + n_aux + n_params:])
+                evs = np.asarray(compiled_eig(Q, Qaux, p, n), dtype=float).ravel()
+                return float(np.max(np.abs(evs)))
+            return max_ws
+
+        rt = NumpyRuntimeModel(symbolic_model)
+        ql_fn = rt.quasilinear_matrix
+        keys = list(symbolic_model.variables.keys())
+        fi_h = keys.index("h") if "h" in keys else None
+        dry_thr = self._get_dry_threshold(symbolic_model) if fi_h is not None else 0.0
+        eps_reg = self.eigenvalue_regularization
+        reg_diag = eps_reg * np.eye(n_vars)
+        if fi_h is not None and "b" in keys:
+            reg_diag[keys.index("b"), keys.index("b")] = 0.0
+
+        def max_ws_numerical(*args):
+            Q = np.array(args[:n_vars])
+            Qaux = np.array(args[n_vars:n_vars + n_aux])
+            p = np.array(args[n_vars + n_aux:n_vars + n_aux + n_params])
+            n_vec = np.array(args[n_vars + n_aux + n_params:])
+            if fi_h is not None and Q[fi_h] < dry_thr:
+                return 0.0
+            ql = np.asarray(ql_fn(Q, Qaux, p), dtype=float).reshape(n_vars, n_vars, dim)
+            A_n = sum(ql[:, :, d] * float(n_vec[d]) for d in range(dim))
+            A_n += reg_diag
+            evs = np.real(np.linalg.eigvals(A_n))
+            return float(np.max(np.abs(evs)))
+
+        return max_ws_numerical
+
     def get_compute_max_abs_eigenvalue(self, mesh, model):
-        """Get compute max abs eigenvalue."""
-        def compute_max_abs_eigenvalue(Q, Qaux, parameters):
-            """Compute max abs eigenvalue."""
-            max_abs_eigenvalue = -np.inf
-            i_cellA = mesh.face_cells[0]
-            i_cellB = mesh.face_cells[1]
-            qA = Q[:, i_cellA]
-            qB = Q[:, i_cellB]
-            qauxA = Qaux[:, i_cellA]
-            qauxB = Qaux[:, i_cellB]
-            normal = mesh.face_normals
-            evA = model.eigenvalues(qA, qauxA, parameters, normal)
-            evB = model.eigenvalues(qB, qauxB, parameters, normal)
-            max_abs_eigenvalue = np.maximum(np.abs(evA).max(axis=0), np.abs(evB).max(axis=0))
-            return max_abs_eigenvalue
-        return compute_max_abs_eigenvalue
+        symbolic_model = self._get_symbolic_model(model)
+        max_ws = self._build_max_wavespeed(symbolic_model)
+        keys = list(symbolic_model.variables.keys())
+        fi_h = keys.index("h") if "h" in keys else None
+        dry_thr = self._get_dry_threshold(symbolic_model) if fi_h is not None else 0.0
+        dim = symbolic_model.dimension
+        iA = mesh.face_cells[0]
+        iB = mesh.face_cells[1]
+        normals = mesh.face_normals[:dim, :]
+        has_aux = symbolic_model.n_aux_variables > 0
+
+        def compute_max_eigenvalue(Q, Qaux, parameters):
+            max_ev = np.zeros(mesh.n_faces)
+            for f in range(mesh.n_faces):
+                if fi_h is not None and Q[fi_h, iA[f]] < dry_thr and Q[fi_h, iB[f]] < dry_thr:
+                    continue
+                n = normals[:, f]
+                for i_cell in [iA[f], iB[f]]:
+                    q = Q[:, i_cell]
+                    qaux = Qaux[:, i_cell] if has_aux else _EMPTY_AUX
+                    ev = max_ws(*q, *qaux, *parameters, *n)
+                    max_ev[f] = max(max_ev[f], ev)
+            return max_ev
+        return compute_max_eigenvalue
+
+    # ── Flux operator (symbolic Riemann solver) ───────────────────────
+
+    def _build_numerics(self, symbolic_model):
+        """Build the symbolic Riemann solver. Override for SWE-specific variants."""
+        return NonconservativeRusanov(symbolic_model)
 
     def get_flux_operator(self, mesh, model):
-        """Get flux operator."""
-        compute_num_flux = self.flux.get_flux_operator(model)
-        compute_nc_flux = self.nc_flux.get_flux_operator(model)
+        symbolic_model = self._get_symbolic_model(model)
+        max_wavespeed_fn = self._build_max_wavespeed(symbolic_model)
+        dim = symbolic_model.dimension
+
+        numerics = self._build_numerics(symbolic_model)
+        NumpyRuntimeSymbolic.module["max_wavespeed"] = max_wavespeed_fn
+        runtime_numerics = numerics.to_runtime_numpy()
+        runtime_numerics.local_max_abs_eigenvalue = (
+            lambda Q, Qaux, p, n: max_wavespeed_fn(*Q, *Qaux, *p, *n)
+        )
+
+        iA = mesh.face_cells[0]
+        iB = mesh.face_cells[1]
+        normals_arr = mesh.face_normals[:dim, :]
+        face_volumes = mesh.face_volumes
+        cell_volumesA = mesh.cell_volumes[iA]
+        cell_volumesB = mesh.cell_volumes[iB]
+        n_vars = symbolic_model.n_variables
+        has_aux = symbolic_model.n_aux_variables > 0
+
         def flux_operator(dt, Q, Qaux, parameters, dQ):
-            """Flux operator."""
             dQ = np.zeros_like(dQ)
-
-            iA = mesh.face_cells[0]
-            iB = mesh.face_cells[1]
-
-            qA = Q[:, iA]
-            qB = Q[:, iB]
-            qauxA = Qaux[:, iA]
-            qauxB = Qaux[:, iB]
-            normals = mesh.face_normals
-            face_volumes = mesh.face_volumes
-            cell_volumesA = mesh.cell_volumes[iA]
-            cell_volumesB = mesh.cell_volumes[iB]
-            svA = mesh.face_subvolumes[:, 0]
-            svB = mesh.face_subvolumes[:, 1]
-
-            Dp, Dm = compute_nc_flux(
-                qA,
-                qB,
-                qauxA,
-                qauxB,
-                parameters,
-                normals,
-                svA,
-                svB,
-                face_volumes,
-                dt,
-            )
-            flux_out = Dm * face_volumes / cell_volumesA
-            flux_in = Dp * face_volumes / cell_volumesB
-
-            # dQ[:, iA]-= flux_out does not guarantee correct accumulation
-            # dQ[:, iB]-= flux_in
-            np.add.at(dQ, (slice(None), iA), -flux_out)
-            np.add.at(dQ, (slice(None), iB), -flux_in)
+            for f in range(mesh.n_faces):
+                qA = Q[:, iA[f]]
+                qB = Q[:, iB[f]]
+                qauxA = Qaux[:, iA[f]] if has_aux else _EMPTY_AUX
+                qauxB = Qaux[:, iB[f]] if has_aux else _EMPTY_AUX
+                n = normals_arr[:, f]
+                fluct = np.asarray(
+                    runtime_numerics.numerical_fluctuations(
+                        qA, qB, qauxA, qauxB, parameters, n
+                    ), dtype=float,
+                ).reshape(-1)
+                num_flux = np.asarray(
+                    runtime_numerics.numerical_flux(
+                        qA, qB, qauxA, qauxB, parameters, n
+                    ), dtype=float,
+                ).reshape(-1)
+                Dp = fluct[:n_vars]
+                Dm = fluct[n_vars:]
+                dQ[:, iA[f]] -= (num_flux + Dm) * face_volumes[f] / cell_volumesA[f]
+                dQ[:, iB[f]] -= (-num_flux + Dp) * face_volumes[f] / cell_volumesB[f]
             return dQ
         return flux_operator
 
+    # ── Source operator ───────────────────────────────────────────────
+
+    def get_compute_source(self, mesh, model):
+        def compute_source(dt, Q, Qaux, parameters, dQ):
+            dQ = model.source(Q[:, :], Qaux[:, :], parameters)
+            return dQ
+        return compute_source
+
+    def get_compute_source_jacobian_wrt_variables(self, mesh, model):
+        def compute(dt, Q, Qaux, parameters, dQ):
+            return model.source_jacobian_wrt_variables(
+                Q[:, :mesh.n_inner_cells], Qaux[:, :mesh.n_inner_cells], parameters
+            )
+        return compute
+
+    # ── Solve loop ────────────────────────────────────────────────────
+
     def solve(self, mesh, model, write_output=True):
-        """Solve."""
         mesh = ensure_lsq_mesh(mesh, model)
         Q, Qaux = self.initialize(mesh, model)
-
         Q, Qaux, parameters, mesh, model = self.create_runtime(Q, Qaux, mesh, model)
-
-        # init once with dummy values for dt
         Qaux = self.update_qaux(Q, Qaux, Q, Qaux, mesh, model, parameters, 0.0, 1.0)
 
         if write_output:
@@ -221,87 +326,83 @@ class HyperbolicSolver(Solver):
             save_fields = io.get_save_fields(output_hdf5_path, write_all=False)
         else:
             def save_fields(time, time_stamp, i_snapshot, Q, Qaux):
-                """Save fields."""
                 return i_snapshot
 
         def run(Q, Qaux, parameters, model):
-            """Run."""
-            iteration = 0.0
-            time = 0.0
-
-            i_snapshot = 0.0
-            dt_snapshot = self.time_end / (self.settings.output.snapshots - 1)
-            if write_output:
-                io.init_output_directory(
-                    self.settings.output.directory, self.settings.output.clean_directory
-                )
-                mesh.write_to_hdf5(output_hdf5_path)
-                io.save_settings(self.settings)
-            i_snapshot = save_fields(time, 0.0, i_snapshot, Q, Qaux)
-
-            Qnew = Q
-            Qauxnew = Qaux
-
+            t_start = gettime()
             compute_max_abs_eigenvalue = self.get_compute_max_abs_eigenvalue(mesh, model)
-            flux_operator = self.get_flux_operator(mesh, model)
-            source_operator = self.get_compute_source(mesh, model)
             boundary_operator = self.get_apply_boundary_conditions(mesh, model)
-            Qnew = boundary_operator(time, Qnew, Qaux, parameters)
+            Q = boundary_operator(0.0, Q, Qaux, parameters)
+            Q = self.update_q(Q, Qaux, mesh, model, parameters)
 
-            cell_inradius_face = np.minimum(mesh.cell_inradius[mesh.face_cells[0, :]], mesh.cell_inradius[mesh.face_cells[1,:]])
-            cell_inradius_face = cell_inradius_face.min()
+            time_now = 0.0
+            next_write_at = 0.0
+            i_snapshot = 0.0
+            dt_snapshot = self.time_end / max(self.settings.output.snapshots - 1, 1)
+            iteration = 0
 
-            while time < self.time_end:
+            cell_inradius_face = np.minimum(
+                mesh.cell_inradius[mesh.face_cells[0, :]],
+                mesh.cell_inradius[mesh.face_cells[1, :]],
+            ).min()
+
+            flux_operator = self.get_flux_operator(mesh, model)
+
+            while time_now < self.time_end:
+                dt = self.compute_dt(Q, Qaux, parameters, cell_inradius_face,
+                                     compute_max_abs_eigenvalue)
+                dt = min(float(dt), float(self.time_end - time_now))
+                if not np.isfinite(dt) or dt <= 0.0:
+                    break
+
+                Q1 = ode.RK1(flux_operator, Q, Qaux, parameters, dt)
+                Qnew = Q1
+                Qnew = boundary_operator(time_now, Qnew, Qaux, parameters)
+                Qnew = self.update_q(Qnew, Qaux, mesh, model, parameters)
+                Qauxnew = self.update_qaux(Qnew, Qaux, Q, Qaux, mesh, model,
+                                           parameters, time_now, dt)
                 Q = Qnew
                 Qaux = Qauxnew
 
-                dt = self.compute_dt(
-                    Q, Qaux, parameters, cell_inradius_face, compute_max_abs_eigenvalue
-                )
-                dt = min(float(dt), float(self.time_end - time))
-                if not np.isfinite(dt) or dt <= 0.0:
-                    raise RuntimeError(
-                        f"Invalid time step detected: dt={dt}. "
-                        "Aborting to prevent unstable update."
-                    )
-                if dt < self.min_dt:
-                    raise RuntimeError(
-                        f"Time step below stability floor: dt={dt:.3e} < min_dt={self.min_dt:.3e}. "
-                        "Aborting to prevent unstable update."
-                    )
-
-                Q1 = ode.RK1(flux_operator, Q, Qaux, parameters, dt)
-                Q2 = ode.RK1(
-                    source_operator,
-                    Q1,
-                    Qaux,
-                    parameters,
-                    dt,
-                )
-
-                Q3 = boundary_operator(time, Q2, Qaux, parameters)
-
-                # Update solution and time
-                time += dt
+                time_now += dt
                 iteration += 1
 
-                time_stamp = (i_snapshot) * dt_snapshot
-
-                Qnew = self.update_q(Q3, Qaux, mesh, model, parameters)
-                Qauxnew = self.update_qaux(Qnew, Qaux, Q, Qaux, mesh, model, parameters, time, dt)
-
-                i_snapshot = save_fields(time, time_stamp, i_snapshot, Qnew, Qauxnew)
+                if time_now >= next_write_at:
+                    i_snapshot = save_fields(time_now, next_write_at, i_snapshot, Q, Qaux)
+                    next_write_at += dt_snapshot
 
                 if iteration % 10 == 0:
                     logger.info(
-                        f"iteration: {int(iteration)}, time: {float(time):.6f}, "
-                        f"dt: {float(dt):.6f}, next write at time: {float(time_stamp):.6f}"
+                        f"iteration: {iteration}, time: {time_now:.6f}, "
+                        f"dt: {dt:.6f}, next write at time: {next_write_at:.6f}"
                     )
 
-            return Qnew, Qaux
+            logger.info(f"Finished simulation with in {gettime() - t_start:.3f} seconds")
+            return Q, Qaux
 
-        time_start = gettime()
-        Qnew, Qaux = run(Q, Qaux, parameters, model)
-        time = gettime() - time_start
-        logger.info(f"Finished simulation with in {time:.3f} seconds")
-        return Qnew, Qaux
+        return run(Q, Qaux, parameters, model)
+
+
+# ── Shallow water variant ─────────────────────────────────────────────────────
+
+class ShallowWaterSolver(HyperbolicSolver):
+    """HyperbolicSolver with positive (hydrostatic reconstruction) Rusanov.
+
+    Requires model variables to include 'b' (bathymetry) and 'h' (depth).
+    Adds wet/dry handling and hydrostatic reconstruction at faces.
+    """
+
+    def _build_numerics(self, symbolic_model):
+        keys = list(symbolic_model.variables.keys())
+        if "h" not in keys or "b" not in keys:
+            raise ValueError(
+                f"ShallowWaterSolver requires 'h' and 'b' in model variables, "
+                f"got {keys}. Use HyperbolicSolver for general models."
+            )
+        field_map = _detect_field_map(symbolic_model)
+        scaled_q_indices = _detect_scaled_q_indices(symbolic_model)
+        return PositiveNonconservativeRusanov(
+            symbolic_model,
+            field_map=field_map,
+            scaled_q_indices=scaled_q_indices,
+        )

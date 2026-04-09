@@ -1,65 +1,50 @@
-"""Module `zoomy_core.fvm.flux`."""
+"""Conservative numerical flux functions for FVM."""
 
 import numpy as np
 
 
 class Flux:
-    """Flux. (class)."""
+    """Base class for numerical flux functions."""
     def get_flux_operator(self, model):
-        """Get flux operator."""
         pass
 
 
 class Zero(Flux):
-    """Zero. (class)."""
+    """Zero flux."""
     def get_flux_operator(self, model):
-        """Get flux operator."""
         def compute(Qi, Qj, Qauxi, Qauxj, parameters, normal, Vi, Vj, Vij, dt):
-            """Compute."""
             return np.zeros_like(Qi)
-
         return compute
 
 
-class LaxFriedrichs(Flux):    
-    """
-    Lax-Friedrichs flux implementation
-    """
+class LaxFriedrichs(Flux):
+    """Global Lax-Friedrichs flux."""
     def get_flux_operator(self, model):
-        """Get flux operator."""
         def compute(Qi, Qj, Qauxi, Qauxj, parameters, normal, Vi, Vj, Vij, dt):
-            """Compute."""
             Fi = np.einsum("id..., d...-> i...", model.flux(Qi, Qauxi, parameters), normal)
             Fj = np.einsum("id..., d...-> i...", model.flux(Qj, Qauxj, parameters), normal)
-            Qout = 0.5 * (Fi + Fj)
-            Qout -= 0.5 * dt / (Vi + Vj) * (Qj - Qi)
-            return Qout
-        return compute
-    
-class Rusanov(Flux):
-    """Rusanov. (class)."""
-    def __init__(self, identity_matrix=None):
-        """Initialize the instance."""
-        if not identity_matrix:
-            self.Id = lambda n: np.eye(n)
-        else:
-            self.Id = identity_matrix
-    """
-    Rusanov (local Lax-Friedrichs) flux implementation
-    """
-    def get_flux_operator(self, model):
-        """Get flux operator."""
-        Id_single = self.Id(model.n_variables)
-        def compute(Qi, Qj, Qauxi, Qauxj, parameters, normal, Vi, Vj, Vij, dt):
-            """Compute."""
             EVi = model.eigenvalues(Qi, Qauxi, parameters, normal)
             EVj = model.eigenvalues(Qj, Qauxj, parameters, normal)
             smax = np.max(np.abs(np.hstack([EVi, EVj])))
-            Id = np.stack([Id_single]*Qi.shape[1], axis=2)  # (n_eq, n_eq, n_points)
+            return 0.5 * (Fi + Fj) - 0.5 * smax * (Qj - Qi)
+        return compute
+
+
+class Rusanov(Flux):
+    """Local Lax-Friedrichs (Rusanov) flux."""
+    def __init__(self, identity_matrix=None):
+        self.Id = identity_matrix if identity_matrix else lambda n: np.eye(n)
+
+    def get_flux_operator(self, model):
+        Id_single = self.Id(model.n_variables)
+        def compute(Qi, Qj, Qauxi, Qauxj, parameters, normal, Vi, Vj, Vij, dt):
+            EVi = model.eigenvalues(Qi, Qauxi, parameters, normal)
+            EVj = model.eigenvalues(Qj, Qauxj, parameters, normal)
+            smax = np.max(np.abs(np.hstack([EVi, EVj])))
+            Id = np.stack([Id_single] * Qi.shape[1], axis=2)
             Fi = np.einsum("id..., d...-> i...", model.flux(Qi, Qauxi, parameters), normal)
             Fj = np.einsum("id..., d...-> i...", model.flux(Qj, Qauxj, parameters), normal)
             Qout = 0.5 * (Fi + Fj)
             Qout -= 0.5 * smax * np.einsum("ij..., jk...-> ik...", Id, (Qj - Qi))
             return Qout
-        return compute 
-            
+        return compute
