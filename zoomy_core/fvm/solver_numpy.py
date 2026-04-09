@@ -272,16 +272,15 @@ class HyperbolicSolver(Solver):
         has_aux = symbolic_model.n_aux_variables > 0
 
         # Check if model has non-trivial diffusive flux
-        has_diffusion = hasattr(model, 'diffusive_flux')
+        # Detect at compile time: check symbolic definition for zero
         compiled_diff = None
-        if has_diffusion:
-            try:
+        if hasattr(symbolic_model, 'diffusive_flux'):
+            sym_dflux = symbolic_model.diffusive_flux()
+            is_zero = hasattr(sym_dflux, 'tolist') and all(
+                e == 0 for row in sym_dflux.tolist() for e in (row if isinstance(row, list) else [row])
+            )
+            if not is_zero:
                 compiled_diff = model.diffusive_flux
-                # Test if it's callable (compiled runtime model)
-                if not callable(compiled_diff):
-                    compiled_diff = None
-            except Exception:
-                compiled_diff = None
 
         cell_centers = mesh.cell_centers[:dim, :]
 
