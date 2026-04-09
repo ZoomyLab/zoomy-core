@@ -1326,22 +1326,30 @@ class FullINS:
     def _repr_markdown_(self):
         return self.describe()._repr_markdown_()
 
-    def system(self):
-        """Return a ``DerivedSystem`` with all equations.
+    def system(self, equations=None):
+        """Return a ``DerivedSystem`` with selected equations.
 
-        The system has mutable ``.apply()`` for in-place transformations::
+        Parameters
+        ----------
+        equations : list of str, optional
+            Which equations to include.  Default: all.
+            Options: "continuity", "x_momentum", "y_momentum", "z_momentum".
 
-            system = FullINS(state).system()
-            system.apply(HydrostaticPressure(state))
-            system.apply(DepthIntegrate(state))
-            system.describe()
+        Example::
+
+            system = FullINS(state).system()                    # all
+            system = FullINS(state).system(["continuity", "x_momentum"])  # SME
         """
         from zoomy_core.model.models.derived_system import DerivedSystem
-        eqs = {"continuity": self.continuity, "x_momentum": self.x_momentum}
+        all_eqs = {"continuity": self.continuity, "x_momentum": self.x_momentum}
         if self.state.has_y:
-            eqs["y_momentum"] = self.y_momentum
-        eqs["z_momentum"] = self.z_momentum
-        return DerivedSystem("INS", eqs, self.state)
+            all_eqs["y_momentum"] = self.y_momentum
+        all_eqs["z_momentum"] = self.z_momentum
+
+        if equations is not None:
+            all_eqs = {k: v for k, v in all_eqs.items() if k in equations}
+
+        return DerivedSystem("INS", all_eqs, self.state)
 
 
 # ---------------------------------------------------------------------------
