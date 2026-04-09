@@ -78,11 +78,13 @@ class StateSpace:
         self.velocities_h = [self.u] + ([self.v] if has_y else [])
 
     def _build_stress_tensor(self, has_y, args_3d):
+        from zoomy_core.misc.misc import Zstruct
         labels = ["x", "y", "z"] if has_y else ["x", "z"]
-        self.tau = {}
+        tau_dict = {}
         for i in labels:
             for j in labels:
-                self.tau[i + j] = Function(f"tau_{i}{j}", real=True)(*args_3d)
+                tau_dict[i + j] = Function(f"tau_{i}{j}", real=True)(*args_3d)
+        self.tau = Zstruct(**tau_dict)
 
     @property
     def horizontal_dim(self):
@@ -1281,23 +1283,8 @@ class ProductRule(Operation):
         return ""
 
 
-class FullINS:
-    """
-    Full 3D Incompressible Navier-Stokes equations.
-
-    Built from a StateSpace. Call as a function to get a ``DerivedSystem``
-    with mutable ``.apply()``::
-
-        ins = FullINS(state)       # builds equations
-        system = ins.system()      # returns DerivedSystem
-        system.apply(Hydrostatic(state))
-        system.describe()
-
-    Or use directly for individual equations::
-
-        ins.continuity             # Expression
-        ins.x_momentum             # Expression
-    """
+class _INSBuilder:
+    """Internal: builds INS equations from a StateSpace."""
 
     def __init__(self, state: StateSpace):
         self.state = state
@@ -1390,30 +1377,37 @@ class FullINS:
     def _repr_markdown_(self):
         return self.describe()._repr_markdown_()
 
-    def system(self, equations=None):
-        """Return a ``DerivedSystem`` with selected equations.
 
-        Parameters
-        ----------
-        equations : list of str, optional
-            Which equations to include.  Default: all.
-            Options: "continuity", "x_momentum", "y_momentum", "z_momentum".
+def FullINS(state, equations=None):
+    """Build the incompressible Navier-Stokes as a ``DerivedSystem``.
 
-        Example::
+    Returns a mutable system with ``.apply()`` for in-place transformations.
 
-            system = FullINS(state).system()                    # all
-            system = FullINS(state).system(["continuity", "x_momentum"])  # SME
-        """
-        from zoomy_core.model.models.derived_system import DerivedSystem
-        all_eqs = {"continuity": self.continuity, "x_momentum": self.x_momentum}
-        if self.state.has_y:
-            all_eqs["y_momentum"] = self.y_momentum
-        all_eqs["z_momentum"] = self.z_momentum
+    Parameters
+    ----------
+    state : StateSpace
+    equations : list of str, optional
+        Which equations to include.  Default: all.
+        Options: "continuity", "x_momentum", "y_momentum", "z_momentum".
 
-        if equations is not None:
-            all_eqs = {k: v for k, v in all_eqs.items() if k in equations}
+    Usage::
 
-        return DerivedSystem("INS", all_eqs, self.state)
+        ins = FullINS(state)
+        ins.z_momentum.apply({state.w: 0})
+        ins.x_momentum.apply(HydrostaticPressure(state))
+        ins.describe()
+    """
+    from zoomy_core.model.models.derived_system import DerivedSystem
+    builder = _INSBuilder(state)
+    all_eqs = {"continuity": builder.continuity, "x_momentum": builder.x_momentum}
+    if state.has_y:
+        all_eqs["y_momentum"] = builder.y_momentum
+    all_eqs["z_momentum"] = builder.z_momentum
+
+    if equations is not None:
+        all_eqs = {k: v for k, v in all_eqs.items() if k in equations}
+
+    return DerivedSystem("INS", all_eqs, state)
 
 
 # ---------------------------------------------------------------------------
