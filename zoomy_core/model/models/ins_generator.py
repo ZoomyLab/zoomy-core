@@ -1221,8 +1221,18 @@ class FullINS:
     """
     Full 3D Incompressible Navier-Stokes equations.
 
-    Built from a StateSpace. Does not own the symbols — references them.
-    Includes continuity, x/y/z momentum with full stress tensor divergence.
+    Built from a StateSpace. Call as a function to get a ``DerivedSystem``
+    with mutable ``.apply()``::
+
+        ins = FullINS(state)       # builds equations
+        system = ins.system()      # returns DerivedSystem
+        system.apply(Hydrostatic(state))
+        system.describe()
+
+    Or use directly for individual equations::
+
+        ins.continuity             # Expression
+        ins.x_momentum             # Expression
     """
 
     def __init__(self, state: StateSpace):
@@ -1315,6 +1325,23 @@ class FullINS:
 
     def _repr_markdown_(self):
         return self.describe()._repr_markdown_()
+
+    def system(self):
+        """Return a ``DerivedSystem`` with all equations.
+
+        The system has mutable ``.apply()`` for in-place transformations::
+
+            system = FullINS(state).system()
+            system.apply(HydrostaticPressure(state))
+            system.apply(DepthIntegrate(state))
+            system.describe()
+        """
+        from zoomy_core.model.models.derived_system import DerivedSystem
+        eqs = {"continuity": self.continuity, "x_momentum": self.x_momentum}
+        if self.state.has_y:
+            eqs["y_momentum"] = self.y_momentum
+        eqs["z_momentum"] = self.z_momentum
+        return DerivedSystem("INS", eqs, self.state)
 
 
 # ---------------------------------------------------------------------------
