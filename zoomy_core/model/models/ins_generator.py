@@ -1200,6 +1200,30 @@ class HydrostaticPressure(Assumption):
         super().__init__({s.p: p_hydro}, name="hydrostatic_pressure")
 
 
+class StressFreeSurface(Assumption):
+    """Stress-free surface: τ·n|_{z=η} = 0.
+
+    For a free surface with normal n ≈ (0,0,1), this gives:
+      τ_xz|_{z=η} = 0,  τ_zz|_{z=η} = 0  (and τ_yz|_{z=η} = 0 in 3D)
+    """
+
+    def __init__(self, state: StateSpace):
+        s = state
+        subs = {}
+        # τ_xz at surface = 0
+        subs[s.tau["xz"].subs(s.z, s.eta)] = S.Zero
+        # τ_zx at surface = 0 (symmetric)
+        if "zx" in s.tau:
+            subs[s.tau["zx"].subs(s.z, s.eta)] = S.Zero
+        # τ_zz at surface = 0
+        subs[s.tau["zz"].subs(s.z, s.eta)] = S.Zero
+        if s.has_y:
+            subs[s.tau["yz"].subs(s.z, s.eta)] = S.Zero
+            if "zy" in s.tau:
+                subs[s.tau["zy"].subs(s.z, s.eta)] = S.Zero
+        super().__init__(subs, name="stress_free_surface")
+
+
 class ZeroAtmosphericPressure(Assumption):
     """p_atm = 0 (no atmospheric pressure)."""
 
@@ -1213,6 +1237,7 @@ class assumptions:
     kinematic_bc_bottom = KinematicBCBottom
     kinematic_bc_surface = KinematicBCSurface
     hydrostatic_pressure = HydrostaticPressure
+    stress_free_surface = StressFreeSurface
     zero_atmospheric_pressure = ZeroAtmosphericPressure
 
 
@@ -1289,11 +1314,11 @@ def _simplify_preserve_integrals(expr):
         return e
 
     protected = _protect(expr)
-    # Step 1: evaluate derivatives (d(b+h)/dt → db/dt + dh/dt) so terms can cancel
+    # Evaluate simple derivatives like d(b+h)/dt → db/dt + dh/dt
+    # but NOT Derivative(Integral) (already protected as dummies)
     evaled = protected.doit() if protected.has(Derivative) else protected
-    # Step 2: expand to reveal cancellations (u²·db/dx - u²·db/dx → 0)
+    # Expand to reveal cancellations, then collect like terms
     expanded = sp.expand(evaled)
-    # Step 3: collect like terms
     simplified = sp.powsimp(expanded, combine="all")
     return simplified.subs(integral_map)
 
