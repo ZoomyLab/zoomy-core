@@ -4,18 +4,14 @@ Derivation graph::
 
     INSModel
       |  apply(HydrostaticPressure)
-      |  apply(DepthIntegrate)
-      |  apply(KinematicBCSurface)
-      |  apply(KinematicBCBottom)
+      |  apply(DepthIntegrate)        — Leibniz rule, boundary values remain
+      |  apply(ApplyKinematicBCs)     — w terms cancel with Leibniz terms
+      |  apply(StressFreeSurface)     — τ·n|_surface = 0
       |  apply(ZeroAtmosphericPressure)
-      |  apply(Newtonian)           — material last: keeps τ symbols in intermediate steps
+      |  apply(SimplifyIntegrals)     — evaluate constant/zero integrals
+      |  apply(Newtonian)             — τ → ν expressions
       v
     SMEModel  (solver-ready)
-
-Usage::
-
-    model = SMEModel(level=2)
-    model.describe(derivation='mermaid')
 """
 
 from zoomy_core.model.models.derived_model import DerivedModel
@@ -42,14 +38,16 @@ class SMEModel(INSModel):
     def derive_model(self):
         from zoomy_core.model.models.ins_generator import (
             HydrostaticPressure, Newtonian, DepthIntegrate,
-            KinematicBCBottom, KinematicBCSurface,
-            StressFreeSurface, ZeroAtmosphericPressure,
+            ApplyKinematicBCs, StressFreeSurface,
+            ZeroAtmosphericPressure, SimplifyIntegrals,
         )
         super().derive_model()
         self.apply(HydrostaticPressure(self.state))
         self.apply(DepthIntegrate(self.state))
+        self.apply(ApplyKinematicBCs(self.state))
         self.apply(StressFreeSurface(self.state))
         self.apply(ZeroAtmosphericPressure(self.state))
+        self.apply(SimplifyIntegrals(self.state))
         self.apply(Newtonian(self.state))
 
     def source(self):
@@ -64,11 +62,14 @@ class SMEInviscid(INSModel):
     def derive_model(self):
         from zoomy_core.model.models.ins_generator import (
             HydrostaticPressure, Inviscid, DepthIntegrate,
-            StressFreeSurface, ZeroAtmosphericPressure,
+            ApplyKinematicBCs, StressFreeSurface,
+            ZeroAtmosphericPressure, SimplifyIntegrals,
         )
         super().derive_model()
         self.apply(HydrostaticPressure(self.state))
         self.apply(DepthIntegrate(self.state))
+        self.apply(ApplyKinematicBCs(self.state))
         self.apply(StressFreeSurface(self.state))
         self.apply(ZeroAtmosphericPressure(self.state))
+        self.apply(SimplifyIntegrals(self.state))
         self.apply(Inviscid(self.state))
