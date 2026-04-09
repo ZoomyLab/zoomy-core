@@ -238,10 +238,10 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
 
 # ── Free-surface IMEX variant ─────────────────────────────────────────────────
 
-from zoomy_core.fvm.solver_numpy import _FreeSurfaceMixin
+from zoomy_core.fvm.solver_numpy import _build_free_surface_numerics
 
 
-class FSFIMEXSolver(_FreeSurfaceMixin, IMEXSolver):
+class FSFIMEXSolver(IMEXSolver):
     """IMEX solver for free-surface flows (SWE, SME, VAM).
 
     Combines:
@@ -251,4 +251,6 @@ class FSFIMEXSolver(_FreeSurfaceMixin, IMEXSolver):
 
     Requires model variables 'b' and 'h'.
     """
-    pass
+
+    def _build_numerics(self, symbolic_model):
+        return _build_free_surface_numerics(symbolic_model)

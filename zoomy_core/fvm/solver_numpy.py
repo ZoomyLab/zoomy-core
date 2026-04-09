@@ -383,34 +383,31 @@ class HyperbolicSolver(Solver):
         return run(Q, Qaux, parameters, model)
 
 
-# ── Free-surface mixin ────────────────────────────────────────────────────────
+# ── Free-surface variant ──────────────────────────────────────────────────────
 
-class _FreeSurfaceMixin:
-    """Mixin: overrides Riemann solver to use positive (hydrostatic) Rusanov.
-
-    Requires model to have 'b' (bathymetry) and 'h' (depth) variables.
-    """
-
-    def _build_numerics(self, symbolic_model):
-        keys = list(symbolic_model.variables.keys())
-        if "h" not in keys or "b" not in keys:
-            raise ValueError(
-                f"Free-surface solver requires 'h' and 'b' in model variables, "
-                f"got {keys}. Use HyperbolicSolver for general models."
-            )
-        field_map = _detect_field_map(symbolic_model)
-        scaled_q_indices = _detect_scaled_q_indices(symbolic_model)
-        return PositiveNonconservativeRusanov(
-            symbolic_model,
-            field_map=field_map,
-            scaled_q_indices=scaled_q_indices,
+def _build_free_surface_numerics(symbolic_model):
+    """Build positive Rusanov for free-surface models (requires h/b)."""
+    keys = list(symbolic_model.variables.keys())
+    if "h" not in keys or "b" not in keys:
+        raise ValueError(
+            f"Free-surface solver requires 'h' and 'b' in model variables, "
+            f"got {keys}. Use HyperbolicSolver for general models."
         )
+    field_map = _detect_field_map(symbolic_model)
+    scaled_q_indices = _detect_scaled_q_indices(symbolic_model)
+    return PositiveNonconservativeRusanov(
+        symbolic_model,
+        field_map=field_map,
+        scaled_q_indices=scaled_q_indices,
+    )
 
 
-class FreeSurfaceFlowSolver(_FreeSurfaceMixin, HyperbolicSolver):
+class FreeSurfaceFlowSolver(HyperbolicSolver):
     """Explicit FVM for free-surface flows (SWE, SME, VAM).
 
     Uses positive (hydrostatic reconstruction) Rusanov with wet/dry handling.
     Requires model variables 'b' and 'h'.
     """
-    pass
+
+    def _build_numerics(self, symbolic_model):
+        return _build_free_surface_numerics(symbolic_model)
