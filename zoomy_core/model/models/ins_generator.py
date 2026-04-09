@@ -1142,6 +1142,42 @@ class SimplifyIntegrals(Operation):
         return _simplify_int(expr)
 
 
+class Integrate(Operation):
+    """Integrate the expression w.r.t. a variable over given bounds.
+
+    Sympy performs the integration analytically. For an equation like
+    ``∂p/∂z/ρ + g = 0``, integrating from ``η`` to ``z`` gives
+    ``p(z)/ρ - p(η)/ρ + g(z - η) = 0``, i.e. the hydrostatic pressure.
+
+    Usage::
+
+        zmom.apply(Integrate(z, lower=eta, upper=z))
+    """
+
+    def __init__(self, var, lower, upper):
+        super().__init__(
+            name="integrate",
+            description=f"Integrate w.r.t. {var} from {lower} to {upper}",
+        )
+        self._var = var
+        self._lower = lower
+        self._upper = upper
+
+    def apply_to(self, expr):
+        # Use a dummy variable to avoid z appearing as both integration
+        # variable and limit
+        dummy = sp.Dummy("_z_int")
+        integrand = expr.subs(self._var, dummy)
+        result = sp.integrate(integrand, (dummy, self._lower, self._upper))
+        return result
+
+    def _repr_latex_(self):
+        return (
+            f"$\\int_{{{sp.latex(self._lower)}}}^{{{sp.latex(self._upper)}}} "
+            f"(\\cdot)\\, d{sp.latex(self._var)}$"
+        )
+
+
 class ZetaTransform(Operation):
     """Transform vertical coordinate: z = ζ·h + b, dz = h·dζ.
 
