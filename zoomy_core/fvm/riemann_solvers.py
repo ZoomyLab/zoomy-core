@@ -23,11 +23,7 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
     #   "hinv": {"container": "qaux", "index": 0},  # optional
     # }
     field_map = param.Dict(
-        default={
-            "h": {"container": "q", "index": 1},
-            "b": {"container": "q", "index": 0},
-            "hinv": {"container": "qaux", "index": 0},
-        }
+        default=None, allow_None=True,
     )
     scaled_q_indices = param.List(default=None, allow_None=True)
 
@@ -50,7 +46,10 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         self.flux_plus = self._create_v("flux_plus", self.model.n_variables)
         self.source_term = self._create_v("source_term", self.model.n_variables)
 
-        self._field_map = self._normalize_and_validate_field_map(self.field_map)
+        if self.field_map:
+            self._field_map = self._normalize_and_validate_field_map(self.field_map)
+        else:
+            self._field_map = {}
         self._scaled_q_indices = self._resolve_scaled_q_indices(self.scaled_q_indices)
 
         self._initialize_functions()
@@ -101,9 +100,10 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
 
         excluded = set()
         for key in ("h", "b"):
-            spec = self._field_map[key]
-            if spec["container"] == "q":
-                excluded.add(spec["index"])
+            if key in self._field_map:
+                spec = self._field_map[key]
+                if spec["container"] == "q":
+                    excluded.add(spec["index"])
         return [i for i in range(self.model.n_variables) if i not in excluded]
 
     def _field_value(self, field_name, q_state, qaux_state):
@@ -384,11 +384,12 @@ class NonconservativeRusanov(Rusanov):
         for i in range(n):
             Id[i, i] = 1
         # Preserve stationary bed variable when b is part of conservative state.
-        b_spec = self._field_map["b"]
-        if b_spec["container"] == "q":
-            b_idx = b_spec["index"]
-            if 0 <= b_idx < self.model.n_variables:
-                Id[b_idx, b_idx] = 0
+        if "b" in self._field_map:
+            b_spec = self._field_map["b"]
+            if b_spec["container"] == "q":
+                b_idx = b_spec["index"]
+                if 0 <= b_idx < self.model.n_variables:
+                    Id[b_idx, b_idx] = 0
         return Id
 
     def numerical_fluctuations(self):
