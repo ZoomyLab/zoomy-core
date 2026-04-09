@@ -928,30 +928,35 @@ class Operation(SymbolicBase):
 
 
 class DepthIntegrate(Operation):
-    """Depth-integrate all equations with kinematic BCs (Leibniz rule)."""
+    """Depth-integrate all equations over [b, b+h] w.r.t. z.
+
+    Applies Leibniz rule and fundamental theorem term-by-term.
+    Does NOT apply kinematic BCs — boundary values (u at z=b, w at z=b+h, etc.)
+    remain in the result.  Apply BCs separately via ``self.apply(KinematicBCBottom(state))``
+    etc.
+    """
 
     def __init__(self, state):
         super().__init__(
             name="depth_integrate",
-            description="Depth integration (Leibniz rule) with kinematic BCs",
+            description="Depth integration over [b, b+h] (Leibniz rule)",
         )
         self._state = state
-        self._kbc_b = KinematicBCBottom(state)
-        self._kbc_s = KinematicBCSurface(state)
 
     def apply_to_equation(self, eq, state):
         z, b, eta = state.z, state.b, state.eta
+        # map_with_bcs with empty BCs: collects boundary terms but does not substitute
         return eq.map_with_bcs(
             lambda t: t.depth_integrate(b, eta, z),
-            bcs=[self._kbc_s, self._kbc_b],
+            bcs=[],
         )
 
     def _repr_latex_(self):
-        """Show the kinematic BC equations."""
-        parts = []
-        parts.append(self._kbc_s._repr_latex_())
-        parts.append(self._kbc_b._repr_latex_())
-        return " \\\\ ".join(p for p in parts if p)
+        s = self._state
+        return (
+            f"$\\int_{{{sp.latex(s.b)}}}^{{{sp.latex(s.eta)}}} "
+            f"(\\cdot)\\, d{sp.latex(s.z)}$"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1149,11 +1154,20 @@ class HydrostaticPressure(Assumption):
         super().__init__({s.p: p_hydro}, name="hydrostatic_pressure")
 
 
+class ZeroAtmosphericPressure(Assumption):
+    """p_atm = 0 (no atmospheric pressure)."""
+
+    def __init__(self, state: StateSpace):
+        p_atm = Function("p_atm", real=True)(state.t, *state.coords_h)
+        super().__init__({p_atm: S.Zero}, name="p_atm=0")
+
+
 class assumptions:
     """Assumptions library. Usage: assumptions.kinematic_bc_bottom(state)"""
     kinematic_bc_bottom = KinematicBCBottom
     kinematic_bc_surface = KinematicBCSurface
     hydrostatic_pressure = HydrostaticPressure
+    zero_atmospheric_pressure = ZeroAtmosphericPressure
 
 
 # ---------------------------------------------------------------------------

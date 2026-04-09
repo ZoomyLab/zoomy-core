@@ -3,7 +3,12 @@
 Derivation graph::
 
     INSModel
-      |  apply(hydrostatic), apply(Newtonian), apply(DepthIntegrate)
+      |  apply(hydrostatic)
+      |  apply(Newtonian)
+      |  apply(DepthIntegrate)     — Leibniz rule, leaves boundary values
+      |  apply(KinematicBCSurface) — w|_surface = ...
+      |  apply(KinematicBCBottom)  — w|_bottom = ...
+      |  apply(ZeroAtmosphericPressure)
       v
     SMEModel  (solver-ready)
 
@@ -37,11 +42,16 @@ class SMEModel(INSModel):
     def derive_model(self):
         from zoomy_core.model.models.ins_generator import (
             HydrostaticPressure, Newtonian, DepthIntegrate,
+            KinematicBCBottom, KinematicBCSurface,
+            ZeroAtmosphericPressure,
         )
         super().derive_model()
         self.apply(HydrostaticPressure(self.state))
         self.apply(Newtonian(self.state))
         self.apply(DepthIntegrate(self.state))
+        self.apply(KinematicBCSurface(self.state))
+        self.apply(KinematicBCBottom(self.state))
+        self.apply(ZeroAtmosphericPressure(self.state))
 
     def source(self):
         return self.newtonian_viscosity() + self.navier_slip()
@@ -55,8 +65,13 @@ class SMEInviscid(INSModel):
     def derive_model(self):
         from zoomy_core.model.models.ins_generator import (
             HydrostaticPressure, Inviscid, DepthIntegrate,
+            KinematicBCBottom, KinematicBCSurface,
+            ZeroAtmosphericPressure,
         )
         super().derive_model()
         self.apply(HydrostaticPressure(self.state))
         self.apply(Inviscid(self.state))
         self.apply(DepthIntegrate(self.state))
+        self.apply(KinematicBCSurface(self.state))
+        self.apply(KinematicBCBottom(self.state))
+        self.apply(ZeroAtmosphericPressure(self.state))
