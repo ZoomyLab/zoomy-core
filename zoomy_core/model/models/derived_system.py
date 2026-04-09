@@ -23,13 +23,78 @@ Usage:
 """
 
 import pickle
+import warnings
 from typing import Dict, Optional, List
+
+import sympy as sp
 
 from zoomy_core.model.models.ins_generator import (
     StateSpace, FullINS, Expression,
     KinematicBCBottom, KinematicBCSurface, HydrostaticPressure,
     Newtonian, Inviscid,
 )
+
+
+class _EquationProxy:
+    """Proxy for in-place operations on a single equation in a DerivedSystem.
+
+    ``system.z_momentum`` returns this proxy. Calling ``.apply()`` on it
+    mutates the equation inside the system. All other attribute access
+    (e.g. ``.expr``, ``.latex()``, ``.terms``) delegates to the underlying
+    Expression.
+    """
+
+    def __init__(self, system, eq_name):
+        object.__setattr__(self, '_system', system)
+        object.__setattr__(self, '_name', eq_name)
+
+    @property
+    def _expr(self):
+        return self._system.equations[self._name]
+
+    def apply(self, *args, **kwargs):
+        """Apply operation in place — mutates the equation in the system."""
+        self._system.equations[self._name] = self._expr.apply(*args, **kwargs)
+
+    def apply_to_term(self, index, *operations):
+        """Apply operation to a specific term in place."""
+        self._system.equations[self._name] = self._expr.apply_to_term(index, *operations)
+
+    def simplify(self):
+        """Simplify in place."""
+        self._system.equations[self._name] = self._expr.simplify()
+
+    def solve_for(self, variable):
+        """Solve this equation (= 0) for the given variable.
+
+        Returns an Expression representing ``variable = solution``.
+        If multiple solutions, uses the first and warns.
+        """
+        solutions = sp.solve(self._expr.expr, variable)
+        if not solutions:
+            raise ValueError(f"Cannot solve {self._name} for {variable}")
+        if len(solutions) > 1:
+            warnings.warn(
+                f"Multiple solutions for {variable} in {self._name}, using first: {solutions[0]}"
+            )
+        return Expression(solutions[0], f"{variable}")
+
+    def delete(self):
+        """Remove this equation from the system."""
+        del self._system.equations[self._name]
+
+    def __getattr__(self, name):
+        # Delegate everything else to the underlying Expression
+        return getattr(self._expr, name)
+
+    def __repr__(self):
+        return repr(self._expr)
+
+    def _repr_latex_(self):
+        return self._expr._repr_latex_()
+
+    def __len__(self):
+        return len(self._expr)
 
 
 class DerivedSystem:
@@ -55,6 +120,14 @@ class DerivedSystem:
         self.equations = equations
         self.state = state
         self.assumptions = assumptions or []
+
+    def __getattr__(self, name):
+        # Dot access to equations: system.x_momentum, system.continuity, etc.
+        if name.startswith("_") or name in ("name", "equations", "state", "assumptions"):
+            raise AttributeError(name)
+        if name in self.equations:
+            return _EquationProxy(self, name)
+        raise AttributeError(f"No equation '{name}' in system. Available: {list(self.equations.keys())}")
 
     def apply(self, operation):
         """Apply an operation or relation to all equations in place."""
