@@ -152,6 +152,20 @@ class Expression(SymbolicBase):
             return Expression(combined, self.name)
         return self.terms[i]
 
+    def apply_to_term(self, index, *operations):
+        """Apply operations to a specific term and return the full expression.
+
+        Usage::
+
+            xmom.apply_to_term(5, ProductRule())
+            xmom.apply_to_term(5, {old: new})
+        """
+        terms = self.terms
+        modified = terms[index].apply(*operations)
+        new_terms = [t.expr if i != index else modified.expr
+                     for i, t in enumerate(terms)]
+        return Expression(sum(new_terms, S.Zero), self.name)
+
     def __len__(self):
         return len(Add.make_args(sp.expand(self.expr)))
 
