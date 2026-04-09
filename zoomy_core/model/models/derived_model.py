@@ -228,9 +228,15 @@ class DerivedModel(Model):
             self._system.state,
             self._system.assumptions + [a_name],
         )
+        # Use description if available (user-friendly), fall back to name
+        display_name = getattr(operation, 'description', None) or a_name
+        latex = operation._repr_latex_() if hasattr(operation, '_repr_latex_') else None
+        # Don't store empty latex strings
+        if latex is not None and not latex.strip():
+            latex = None
         self._applied.append({
-            "name": a_name,
-            "latex": operation._repr_latex_() if hasattr(operation, '_repr_latex_') else None,
+            "name": display_name,
+            "latex": latex,
         })
 
     # ── public API ────────────────────────────────────────────────────
@@ -306,13 +312,13 @@ class DerivedModel(Model):
             if derivation == "mermaid":
 
                 def _mermaid_node(sys, cls_name, strip):
-                    """Build a mermaid node label with class name + equations."""
+                    """Build a mermaid node label with class name + multiline equations."""
                     lines = [f"**{cls_name}**"]
                     if sys:
                         for eq_name, eq in sys.equations.items():
-                            # Use single-line ordered rendering for mermaid
-                            # (multiline \begin{aligned} breaks mermaid node syntax)
-                            tex = eq.latex(strip_args=strip, multiline=False)
+                            tex = eq.latex(strip_args=strip, multiline=True)
+                            # Mermaid needs single-line strings — collapse newlines
+                            tex = tex.replace("\n", " ")
                             lines.append(f"*{eq_name}*: $${tex} = 0$$")
                     return "<br/>".join(lines)
 
