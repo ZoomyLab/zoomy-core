@@ -981,45 +981,123 @@ class DepthIntegrate(Operation):
     """Depth-integrate all equations over [b, b+h] w.r.t. z.
 
     Applies Leibniz rule and fundamental theorem term-by-term.
-    Kinematic BCs at top and bottom are applied to the combined
-    boundary terms so that cancellations happen properly
-    (e.g., Leibniz boundary terms cancel with kinematic w terms).
-
-    The result contains only volume integrals and the clean
-    depth-integrated equation (e.g., ∂h/∂t + ∂/∂x ∫u dz = 0
-    for continuity).
+    Boundary values (w at z=b, u at z=b+h, etc.) remain as ``Subs``
+    objects.  Apply ``KinematicBCSurface`` and ``KinematicBCBottom``
+    separately to see the cancellations happen.
     """
 
     def __init__(self, state):
         super().__init__(
             name="depth_integrate",
-            description="Depth integration [b, b+h] with Leibniz rule + kinematic BCs",
+            description="Depth integration over [b, b+h] (Leibniz rule)",
+        )
+        self._state = state
+
+    def apply_to_equation(self, eq, state):
+        z, b, eta = state.z, state.b, state.eta
+        return eq.map(lambda t: t.depth_integrate(b, eta, z))
+
+    def _repr_latex_(self):
+        s = self._state
+        return (
+            f"$\\int_{{{sp.latex(s.b)}}}^{{{sp.latex(s.eta)}}} "
+            f"(\\cdot)\\, d{sp.latex(s.z)}$"
+        )
+
+
+class ApplyKinematicBCs(Operation):
+    """Apply kinematic BCs globally to combined boundary terms.
+
+    Collects all boundary terms from the expression, applies
+    kinematic BCs at surface and bottom, and simplifies.
+    This causes the Leibniz boundary u-terms to cancel with the
+    fundamental theorem w-terms.
+
+    Must be applied immediately after ``DepthIntegrate``.
+    """
+
+    def __init__(self, state):
+        super().__init__(
+            name="kinematic_bcs",
+            description="Kinematic BCs (surface + bottom): w = u·∂b/∂x + ∂b/∂t",
         )
         self._state = state
         self._kbc_s = KinematicBCSurface(state)
         self._kbc_b = KinematicBCBottom(state)
 
     def apply_to_equation(self, eq, state):
-        z, b, eta = state.z, state.b, state.eta
-        return eq.map_with_bcs(
-            lambda t: t.depth_integrate(b, eta, z),
-            bcs=[self._kbc_s, self._kbc_b],
-        )
+        """Apply kinematic BCs: evaluate only Subs, then substitute w patterns."""
+        expr = eq.expr
+        # Evaluate only Subs objects (NOT Derivative(Integral) etc.)
+        if expr.has(sp.Subs):
+            subs_map = {}
+            for s in expr.atoms(sp.Subs):
+                subs_map[s] = s.doit()
+            expr = expr.subs(subs_map)
+        # Apply both BCs
+        for bc in [self._kbc_s, self._kbc_b]:
+            expr = bc.apply_to(expr)
+        # Simplify (cancels d(b+h)/dt - db/dt → dh/dt etc.)
+        expr = _simplify_preserve_integrals(expr)
+        return Expression(expr, eq.name)
 
     def _repr_latex_(self):
-        s = self._state
-        parts = [
-            f"$\\int_{{{sp.latex(s.b)}}}^{{{sp.latex(s.eta)}}} "
-            f"(\\cdot)\\, d{sp.latex(s.z)}$",
-        ]
-        parts.append(self._kbc_s._repr_latex_())
-        parts.append(self._kbc_b._repr_latex_())
+        parts = [self._kbc_s._repr_latex_(), self._kbc_b._repr_latex_()]
         return " \\\\ ".join(p for p in parts if p)
 
 
 # ---------------------------------------------------------------------------
 # FullINS: 3D INS equations built from a StateSpace
 # ---------------------------------------------------------------------------
+
+class SimplifyIntegrals(Operation):
+    """Evaluate integrals with constant integrand and remove zero integrals.
+
+    - ``∫ 0 dz → 0``
+    - ``∫ c dz → c·h`` (if integrand has no z-dependence)
+    - ``∂/∂x ∫ 0 dz → 0``
+    """
+
+    def __init__(self, state):
+        super().__init__(
+            name="simplify_integrals",
+            description="Evaluate constant/zero integrals",
+        )
+        self._z = state.z
+
+    def apply_to_equation(self, eq, state):
+        from sympy import Integral, Derivative
+        expr = eq.expr
+
+        def _simplify_int(e):
+            if isinstance(e, Integral):
+                integrand = e.args[0]
+                limits = e.args[1]  # (z, lower, upper)
+                var = limits[0]
+                lower, upper = limits[1], limits[2]
+                # Zero integrand
+                if integrand == S.Zero:
+                    return S.Zero
+                # Constant integrand (no z dependence)
+                if not integrand.has(var):
+                    return integrand * (upper - lower)
+                return e
+            if isinstance(e, Derivative):
+                # d/dx ∫ 0 dz → 0
+                inner = _simplify_int(e.args[0])
+                if inner == S.Zero:
+                    return S.Zero
+                if inner != e.args[0]:
+                    return Derivative(inner, *e.args[1:])
+                return e
+            if e.args:
+                new_args = [_simplify_int(a) for a in e.args]
+                if any(n != o for n, o in zip(new_args, e.args)):
+                    return e.func(*new_args)
+            return e
+
+        return Expression(_simplify_int(expr), eq.name)
+
 
 class FullINS:
     """
