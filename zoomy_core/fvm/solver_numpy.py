@@ -383,21 +383,19 @@ class HyperbolicSolver(Solver):
         return run(Q, Qaux, parameters, model)
 
 
-# ── Shallow water variant ─────────────────────────────────────────────────────
+# ── Free-surface mixin ────────────────────────────────────────────────────────
 
-class FreeSurfaceFlowSolver(HyperbolicSolver):
-    """HyperbolicSolver with positive (hydrostatic reconstruction) Rusanov.
+class _FreeSurfaceMixin:
+    """Mixin: overrides Riemann solver to use positive (hydrostatic) Rusanov.
 
-    For free-surface flow models (SWE, SME, VAM) that have 'b' (bathymetry)
-    and 'h' (water depth) variables.  Adds hydrostatic reconstruction at
-    faces and wet/dry handling.
+    Requires model to have 'b' (bathymetry) and 'h' (depth) variables.
     """
 
     def _build_numerics(self, symbolic_model):
         keys = list(symbolic_model.variables.keys())
         if "h" not in keys or "b" not in keys:
             raise ValueError(
-                f"ShallowWaterSolver requires 'h' and 'b' in model variables, "
+                f"Free-surface solver requires 'h' and 'b' in model variables, "
                 f"got {keys}. Use HyperbolicSolver for general models."
             )
         field_map = _detect_field_map(symbolic_model)
@@ -407,3 +405,12 @@ class FreeSurfaceFlowSolver(HyperbolicSolver):
             field_map=field_map,
             scaled_q_indices=scaled_q_indices,
         )
+
+
+class FreeSurfaceFlowSolver(_FreeSurfaceMixin, HyperbolicSolver):
+    """Explicit FVM for free-surface flows (SWE, SME, VAM).
+
+    Uses positive (hydrostatic reconstruction) Rusanov with wet/dry handling.
+    Requires model variables 'b' and 'h'.
+    """
+    pass

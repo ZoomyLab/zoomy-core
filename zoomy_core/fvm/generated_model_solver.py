@@ -1,20 +1,14 @@
-"""Solver for free-surface flow models with derivative-aware auxiliary variables.
+"""Backward-compatible aliases for the solver hierarchy.
 
-``GeneratedModelSolver`` = ``FreeSurfaceFlowSolver`` + ``DerivativeAwareSolverMixin``.
-
-The mixin computes spatial derivatives (from ``model.derivative_specs``)
-at each timestep and fills the ``Qaux`` array.  This enables models whose
-source terms reference ``self.D.dx(self.Q.h)`` etc.
+New code should use the solvers directly:
+- ``HyperbolicSolver`` — general explicit FVM
+- ``FreeSurfaceFlowSolver`` — explicit FVM for h/b models
+- ``IMEXSolver`` — explicit flux + implicit source
+- ``FSFIMEXSolver`` — IMEX for h/b models (replaces GeneratedModelSolver)
 """
 
-from zoomy_core.fvm.solver_numpy import FreeSurfaceFlowSolver
-from zoomy_core.model.derivative_workflow import DerivativeAwareSolverMixin
+from zoomy_core.fvm.solver_imex_numpy import FSFIMEXSolver
 
 
-class GeneratedModelSolver(DerivativeAwareSolverMixin, FreeSurfaceFlowSolver):
-    """FreeSurfaceFlowSolver with derivative-aware Qaux updates.
-
-    This is the standard solver for SWE / SME models.  For models without
-    derivative-dependent source terms, ``FreeSurfaceFlowSolver`` is sufficient.
-    """
-    pass
+# Backward-compatible alias
+GeneratedModelSolver = FSFIMEXSolver
