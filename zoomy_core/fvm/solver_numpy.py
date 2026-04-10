@@ -197,9 +197,10 @@ class HyperbolicSolver(Solver):
         n_aux = symbolic_model.n_aux_variables
         n_params = symbolic_model.n_parameters
         dim = symbolic_model.dimension
+        kernel = getattr(self, '_kernel', None)
 
         if eig_mode != "numerical":
-            rt = NumpyRuntimeModel(symbolic_model)
+            rt = NumpyRuntimeModel(symbolic_model, kernel=kernel)
             compiled_eig = rt.eigenvalues
             def max_ws(*args):
                 Q = np.array(args[:n_vars])
@@ -210,7 +211,7 @@ class HyperbolicSolver(Solver):
                 return float(np.max(np.abs(evs)))
             return max_ws
 
-        rt = NumpyRuntimeModel(symbolic_model)
+        rt = NumpyRuntimeModel(symbolic_model, kernel=kernel)
         ql_fn = rt.quasilinear_matrix
         keys = list(symbolic_model.variables.keys())
         fi_h = keys.index("h") if "h" in keys else None

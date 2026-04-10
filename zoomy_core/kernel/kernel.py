@@ -122,37 +122,52 @@ class Kernel(param.Parameterized, SymbolicRegistrar):
         """conditional(c, t, f) → t if c else f."""
         return sp.Piecewise((self._t, self._c), (self._f, True))
 
-    # ── automatic expression regularization ───────────────────────────
+    # ── singularity detection + targeted regularization ───────────────
 
-    def regularize(self, model):
-        """Walk model expressions and regularize denominators involving
-        positive variables (like h) that can reach zero.
+    def positive_variables(self):
+        """Return list of model variable symbols declared positive."""
+        return [sym for sym in self._var_map.values()
+                if getattr(sym, 'is_positive', False)]
 
-        Finds variables declared with ``positive=True`` in the model,
-        substitutes them to zero in each expression, and where the result
-        is singular replaces ``1/v`` with ``1/(v + eps)`` in the original.
+    @staticmethod
+    def find_singular_denominators(expr, positive_vars):
+        """Find Pow(v, negative_exp) subexpressions for positive variables.
 
-        This is called automatically by the solver at compilation time.
-        The model itself stays analytical — regularization is a Kernel concern.
+        Walks the expression tree and collects every ``Pow(v, e)`` where
+        ``v`` is a positive variable and ``e < 0``.  These are the terms
+        that produce NaN when ``v → 0`` (e.g. at dry cells).
+
+        This is the detection function — swap this out to try different
+        strategies (e.g. numerical probing, limit analysis).
+
+        Returns
+        -------
+        list of (Pow_subexpr, variable) pairs
+        """
+        if not isinstance(expr, sp.Basic):
+            return []
+        hits = []
+        for sub in sp.preorder_traversal(expr):
+            if (isinstance(sub, sp.Pow)
+                    and sub.base in positive_vars
+                    and sub.exp.is_negative):
+                hits.append((sub, sub.base))
+        return hits
+
+    def regularize(self, obj):
+        """Regularize function definitions in-place (targeted).
+
+        Works on any object with a ``functions`` Zstruct (Model, Numerics).
+        For each function definition, finds ``Pow(v, -n)`` where ``v`` is a
+        positive variable and replaces ``v → v + eps`` in that denominator only.
+        Other occurrences of ``v`` (e.g. in ``g*h``) are untouched.
         """
         eps = self._eps
-
-        # Find positive variables from the Kernel's variable map
-        # (works for both Model and Numerics objects)
-        positive_vars = []
-        var_source = self._var_map if self._var_map else {}
-        if not var_source and hasattr(model, 'variables'):
-            vs = model.variables
-            var_source = vs if isinstance(vs, dict) else {str(v): v for v in vs}
-        for name, sym in var_source.items():
-            if getattr(sym, 'is_positive', False):
-                positive_vars.append(sym)
-
+        positive_vars = self.positive_variables()
         if not positive_vars:
-            return  # nothing to regularize
+            return
 
-        # Walk each model function and regularize
-        for fn_name, fn_obj in model.functions.items():
+        for fn_name, fn_obj in obj.functions.items():
             expr = fn_obj.definition
             if expr is None:
                 continue
@@ -160,24 +175,28 @@ class Kernel(param.Parameterized, SymbolicRegistrar):
 
     @staticmethod
     def _regularize_expr(expr, positive_vars, eps):
-        """Replace 1/v with 1/(v+eps) for positive vars where v=0 causes singularity."""
-        from zoomy_core.misc.misc import ZArray
+        """Replace Pow(v, -n) → Pow(v+eps, -n) for positive vars."""
 
         # ZArray / NDimArray — process element-wise, return same type
         if isinstance(expr, (ZArray, sp.tensor.array.NDimArray)):
-            flat = [Kernel._regularize_expr(e, positive_vars, eps) for e in sp.flatten(expr)]
-            return ZArray(flat, expr.shape) if isinstance(expr, ZArray) else sp.Array(flat).reshape(*expr.shape)
+            flat = [Kernel._regularize_expr(e, positive_vars, eps)
+                    for e in sp.flatten(expr)]
+            if isinstance(expr, ZArray):
+                return ZArray(flat, expr.shape)
+            return sp.Array(flat).reshape(*expr.shape)
 
         if isinstance(expr, (list, tuple)):
-            return type(expr)(Kernel._regularize_expr(e, positive_vars, eps) for e in expr)
+            return type(expr)(
+                Kernel._regularize_expr(e, positive_vars, eps) for e in expr)
 
         if not isinstance(expr, sp.Basic):
             return expr
 
-        # For each positive variable, replace v → v+eps in denominators
+        # Targeted: only replace v → v+eps inside Pow(v, negative_exponent)
         for v in positive_vars:
             expr = expr.replace(
-                lambda sub: (isinstance(sub, sp.Pow) and sub.base == v
+                lambda sub: (isinstance(sub, sp.Pow)
+                             and sub.base == v
                              and sub.exp.is_negative),
                 lambda sub: sp.Pow(v + eps, sub.exp)
             )
