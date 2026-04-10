@@ -107,7 +107,8 @@ class DerivedModel(Model):
         # Infer dimension from system state if not given
         if dimension is None and self._system is not None:
             state = self._system.state
-            dimension = getattr(state, "dimension", 2) - 1
+            state_dim = getattr(state, "dim", getattr(state, "dimension", 2))
+            dimension = state_dim - 1  # depth-average removes z
             if dimension < 1:
                 dimension = 1
 
