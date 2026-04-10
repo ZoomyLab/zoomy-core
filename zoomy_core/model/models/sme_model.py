@@ -24,7 +24,14 @@ def hydrostatic_scaling(state):
 
 
 class INSModel(DerivedModel):
-    """Root: the full 2D incompressible Navier-Stokes (all equations)."""
+    """Root: the full 2D incompressible Navier-Stokes (all equations).
+
+    Uses numerical eigenvalues (np.linalg.eigvals on quasilinear matrix)
+    because the symbolic Cardano formula produces complex intermediates
+    for higher-moment models (casus irreducibilis).
+    """
+
+    eigenvalue_mode = "numerical"
 
     def derive_model(self):
         from zoomy_core.model.models.ins_generator import StateSpace, FullINS
