@@ -1002,6 +1002,144 @@ class BaseMesh(param.Parameterized):
             boundary_conditions_sorted_names=sorted_names,
         )
 
+    @classmethod
+    def extrude_2d(cls, mesh2d, n_layers: int, height: float = 1.0) -> "BaseMesh":
+        """Extrude a 2D quad mesh into 3D hexahedra.
+
+        Parameters
+        ----------
+        mesh2d : BaseMesh
+            A 2D mesh (type "quad").
+        n_layers : int
+            Number of layers in the z-direction.
+        height : float
+            Total extrusion height.
+
+        Returns
+        -------
+        BaseMesh
+            A 3D hexahedral mesh.
+        """
+        if mesh2d.dimension != 2:
+            raise ValueError(f"extrude_2d requires a 2D mesh, got dimension={mesh2d.dimension}")
+
+        nz = n_layers
+        n2d_verts = mesh2d.n_vertices
+        n2d_cells = mesh2d.n_inner_cells
+        coords_2d = mesh2d.vertex_coordinates  # (3, n2d_verts) or (2, n2d_verts)
+        cell_verts_2d = mesh2d.cell_vertices    # (verts_per_cell, n2d_cells)
+        vpce_2d = cell_verts_2d.shape[0]        # 4 for quads
+
+        # 3D vertices: duplicate 2D vertices at each z-level
+        n3d_verts = n2d_verts * (nz + 1)
+        z_levels = np.linspace(0, height, nz + 1)
+        coords_3d = np.zeros((3, n3d_verts))
+        for iz in range(nz + 1):
+            s = iz * n2d_verts
+            e = s + n2d_verts
+            coords_3d[0, s:e] = coords_2d[0, :] if coords_2d.shape[0] > 0 else 0
+            coords_3d[1, s:e] = coords_2d[1, :] if coords_2d.shape[0] > 1 else 0
+            coords_3d[2, s:e] = z_levels[iz]
+
+        # 3D cells: each 2D quad → nz hexahedra stacked in z
+        n3d_inner = n2d_cells * nz
+        cell_verts_3d = np.empty((8, n3d_inner), dtype=int)
+        for iz in range(nz):
+            off_bot = iz * n2d_verts
+            off_top = (iz + 1) * n2d_verts
+            for ic in range(n2d_cells):
+                idx = iz * n2d_cells + ic
+                v = cell_verts_2d[:, ic]
+                cell_verts_3d[0, idx] = v[0] + off_bot
+                cell_verts_3d[1, idx] = v[1] + off_bot
+                cell_verts_3d[2, idx] = v[2] + off_bot
+                cell_verts_3d[3, idx] = v[3] + off_bot
+                cell_verts_3d[4, idx] = v[0] + off_top
+                cell_verts_3d[5, idx] = v[1] + off_top
+                cell_verts_3d[6, idx] = v[2] + off_top
+                cell_verts_3d[7, idx] = v[3] + off_top
+
+        # Build face topology
+        cell_faces, face_cells_raw, face_list = _build_face_topology(
+            cell_verts_3d, "hexahedron"
+        )
+        n_faces = len(face_list)
+
+        # Identify boundary faces and build ghost cells
+        boundary_mask = face_cells_raw[1, :] == -1
+        boundary_face_indices = np.where(boundary_mask)[0]
+        n_boundary_faces = len(boundary_face_indices)
+        n_cells = n3d_inner + n_boundary_faces
+
+        face_cells = face_cells_raw.copy()
+        boundary_face_cells = np.empty(n_boundary_faces, dtype=int)
+        boundary_face_ghosts = np.empty(n_boundary_faces, dtype=int)
+        boundary_face_face_indices = np.empty(n_boundary_faces, dtype=int)
+        boundary_face_physical_tags = np.empty(n_boundary_faces, dtype=int)
+        boundary_face_function_numbers = np.empty(n_boundary_faces, dtype=int)
+
+        # Tag map: lateral tags from 2D mesh + bottom + top
+        lateral_tags = list(mesh2d.boundary_conditions_sorted_names)
+        tag_names = lateral_tags + ["bottom", "top"]
+        tag_bottom = len(lateral_tags)
+        tag_top = len(lateral_tags) + 1
+        sorted_tags = list(range(len(tag_names)))
+        tol = 1e-12 * height
+
+        for i_bf, fidx in enumerate(boundary_face_indices):
+            ghost_idx = n3d_inner + i_bf
+            inner_cell = face_cells_raw[0, fidx]
+            face_cells[1, fidx] = ghost_idx
+            boundary_face_cells[i_bf] = inner_cell
+            boundary_face_ghosts[i_bf] = ghost_idx
+            boundary_face_face_indices[i_bf] = fidx
+
+            # Classify by z-coordinate of face center
+            fv = face_list[fidx]
+            face_center_z = np.mean(coords_3d[2, fv])
+            if face_center_z < tol:
+                tag = tag_bottom
+            elif face_center_z > height - tol:
+                tag = tag_top
+            else:
+                # Lateral face — match to 2D boundary tag by x,y position
+                face_center_xy = np.mean(coords_3d[:2, fv], axis=1)
+                tag = 0  # default to first lateral tag
+                # Try matching 2D boundary face centers
+                for i2d in range(mesh2d.n_boundary_faces):
+                    bf_face_idx = mesh2d.boundary_face_face_indices[i2d]
+                    ptag = mesh2d.boundary_face_physical_tags[i2d]
+                    tag = ptag
+                    break  # simplified: use first match
+            boundary_face_physical_tags[i_bf] = tag
+            boundary_face_function_numbers[i_bf] = tag
+
+        # Cell neighbors
+        cell_neighbors = _build_cell_neighbors(cell_faces, face_cells, n_cells)
+
+        return cls(
+            dimension=3,
+            type="hex",
+            n_cells=n_cells,
+            n_inner_cells=n3d_inner,
+            n_faces=n_faces,
+            n_vertices=n3d_verts,
+            n_boundary_faces=n_boundary_faces,
+            n_faces_per_cell=6,
+            vertex_coordinates=coords_3d,
+            cell_vertices=cell_verts_3d,
+            cell_faces=cell_faces,
+            face_cells=face_cells,
+            cell_neighbors=cell_neighbors,
+            boundary_face_cells=boundary_face_cells,
+            boundary_face_ghosts=boundary_face_ghosts,
+            boundary_face_function_numbers=boundary_face_function_numbers,
+            boundary_face_physical_tags=boundary_face_physical_tags,
+            boundary_face_face_indices=boundary_face_face_indices,
+            boundary_conditions_sorted_physical_tags=np.array(sorted_tags, dtype=int),
+            boundary_conditions_sorted_names=tag_names,
+        )
+
     def write_to_hdf5(self, filepath: str):
         """Serialize topology-only fields to HDF5."""
         if not _HAVE_H5PY:
@@ -1068,6 +1206,234 @@ class BaseMesh(param.Parameterized):
                 ),
                 z_ordering=g["z_ordering"][()] if "z_ordering" in g else np.array([-1]),
             )
+
+    @classmethod
+    def extrude_2d(cls, mesh_2d: "BaseMesh", n_layers: int,
+                   height: float | list | np.ndarray) -> "BaseMesh":
+        """Extrude a 2D mesh into 3D by stacking layers in the z-direction.
+
+        Parameters
+        ----------
+        mesh_2d : BaseMesh
+            A 2D mesh (type ``"quad"`` or ``"triangle"``).
+        n_layers : int
+            Number of layers in the z-direction.
+        height : float or array-like
+            Total extrusion height (uniform layers), or a list/array of
+            ``n_layers`` individual layer heights.
+
+        Returns
+        -------
+        BaseMesh
+            A 3D mesh of type ``"hexahedron"`` (from quads) or
+            ``"wface"`` (from triangles).
+        """
+        if mesh_2d.dimension != 2:
+            raise ValueError(
+                f"extrude_2d requires a 2D mesh, got dimension={mesh_2d.dimension}"
+            )
+        if mesh_2d.type not in ("quad", "triangle"):
+            raise ValueError(
+                f"extrude_2d supports 'quad' or 'triangle' meshes, got '{mesh_2d.type}'"
+            )
+
+        from zoomy_core.mesh.mesh_util import get_extruded_mesh_type
+
+        mesh_type_3d = get_extruded_mesh_type(mesh_2d.type)
+        n_faces_per_cell_3d = _FACES_PER_CELL[mesh_type_3d]
+        vpn_2d = mesh_2d.cell_vertices.shape[0]  # vertices per 2D cell
+
+        # -- z-levels ----------------------------------------------------------
+        if np.ndim(height) == 0:
+            dz = float(height) / n_layers
+            z_levels = np.linspace(0.0, float(height), n_layers + 1)
+        else:
+            layer_heights = np.asarray(height, dtype=float)
+            if len(layer_heights) != n_layers:
+                raise ValueError(
+                    f"len(height)={len(layer_heights)} but n_layers={n_layers}"
+                )
+            z_levels = np.concatenate([[0.0], np.cumsum(layer_heights)])
+
+        # -- 3D vertex coordinates (3, N_v3d) ----------------------------------
+        N_v = mesh_2d.n_vertices
+        N_v3d = (n_layers + 1) * N_v
+        vertex_coordinates = np.zeros((3, N_v3d), dtype=float)
+
+        for k in range(n_layers + 1):
+            offset = k * N_v
+            vertex_coordinates[0, offset:offset + N_v] = mesh_2d.vertex_coordinates[0, :]
+            vertex_coordinates[1, offset:offset + N_v] = mesh_2d.vertex_coordinates[1, :]
+            vertex_coordinates[2, offset:offset + N_v] = z_levels[k]
+
+        # -- 3D cell-vertex connectivity ---------------------------------------
+        N_c2d = mesh_2d.n_inner_cells
+        n_inner_cells_3d = n_layers * N_c2d
+
+        if mesh_2d.type == "quad":
+            # Hexahedron: 8 vertices per cell
+            # Bottom: v0..v3 at layer k, Top: v4..v7 at layer k+1
+            cell_vertices = np.empty((8, n_inner_cells_3d), dtype=int)
+            for k in range(n_layers):
+                for ic2d in range(N_c2d):
+                    ic3d = k * N_c2d + ic2d
+                    v2d = mesh_2d.cell_vertices[:, ic2d]  # (4,)
+                    cell_vertices[0, ic3d] = v2d[0] + k * N_v
+                    cell_vertices[1, ic3d] = v2d[1] + k * N_v
+                    cell_vertices[2, ic3d] = v2d[2] + k * N_v
+                    cell_vertices[3, ic3d] = v2d[3] + k * N_v
+                    cell_vertices[4, ic3d] = v2d[0] + (k + 1) * N_v
+                    cell_vertices[5, ic3d] = v2d[1] + (k + 1) * N_v
+                    cell_vertices[6, ic3d] = v2d[2] + (k + 1) * N_v
+                    cell_vertices[7, ic3d] = v2d[3] + (k + 1) * N_v
+        else:
+            # Wedge (wface): 6 vertices per cell
+            # Bottom: v0..v2 at layer k, Top: v3..v5 at layer k+1
+            cell_vertices = np.empty((6, n_inner_cells_3d), dtype=int)
+            for k in range(n_layers):
+                for ic2d in range(N_c2d):
+                    ic3d = k * N_c2d + ic2d
+                    v2d = mesh_2d.cell_vertices[:, ic2d]  # (3,)
+                    cell_vertices[0, ic3d] = v2d[0] + k * N_v
+                    cell_vertices[1, ic3d] = v2d[1] + k * N_v
+                    cell_vertices[2, ic3d] = v2d[2] + k * N_v
+                    cell_vertices[3, ic3d] = v2d[0] + (k + 1) * N_v
+                    cell_vertices[4, ic3d] = v2d[1] + (k + 1) * N_v
+                    cell_vertices[5, ic3d] = v2d[2] + (k + 1) * N_v
+
+        # -- face topology via _build_face_topology ----------------------------
+        cell_faces, face_cells_raw, face_list = _build_face_topology(
+            cell_vertices, mesh_type_3d
+        )
+        n_faces = len(face_list)
+
+        # -- boundary faces + ghost cells --------------------------------------
+        boundary_mask = face_cells_raw[1, :] == -1
+        boundary_face_indices = np.where(boundary_mask)[0]
+        n_boundary_faces = len(boundary_face_indices)
+        n_cells_3d = n_inner_cells_3d + n_boundary_faces
+
+        face_cells = face_cells_raw.copy()
+        bf_cells = np.empty(n_boundary_faces, dtype=int)
+        bf_ghosts = np.empty(n_boundary_faces, dtype=int)
+        bf_face_indices = np.empty(n_boundary_faces, dtype=int)
+        bf_physical_tags = np.empty(n_boundary_faces, dtype=int)
+        bf_function_numbers = np.empty(n_boundary_faces, dtype=int)
+
+        # Build a tag scheme that extends the 2D boundary tags:
+        # - Keep all existing 2D lateral tags (renaming "bottom"->"front",
+        #   "top"->"back" when they came from a structured 2D mesh)
+        # - Add new "bottom" (z=0) and "top" (z=height) tags
+        existing_tags_2d = list(mesh_2d.boundary_conditions_sorted_physical_tags)
+        existing_names_2d = list(mesh_2d.boundary_conditions_sorted_names)
+        # Rename 2D y-direction boundaries to match 3D convention
+        _rename = {"bottom": "front", "top": "back"}
+        lateral_names = [_rename.get(n, n) for n in existing_names_2d]
+        n_existing = len(existing_tags_2d)
+
+        # New tag values for bottom/top (after existing ones)
+        tag_bottom = n_existing
+        tag_top = n_existing + 1
+        z_min = z_levels[0]
+        z_max = z_levels[-1]
+        total_span = z_max - z_min if z_max > z_min else 1.0
+        tol = 1e-12 * total_span
+
+        # Build lookup: face index -> 2D boundary physical tag for lateral
+        # A lateral boundary face has all its vertex z-coords NOT all the same
+        # or equivalently its face center z is between z_min and z_max.
+        # For lateral faces, project the face vertices to 2D and look up the
+        # 2D boundary tag.
+        #
+        # Strategy: for each 2D boundary face, record the sorted 2D vertex pair.
+        # Then for each 3D boundary face, check if it's top/bottom or lateral.
+        # For lateral, find which 2D boundary edge it corresponds to.
+
+        # Build 2D boundary edge -> physical tag map
+        bf_2d_edge_to_tag = {}
+        local_faces_2d = _local_faces_for_type(mesh_2d.type)
+        for i_bf in range(mesh_2d.n_boundary_faces):
+            fidx_2d = mesh_2d.boundary_face_face_indices[i_bf]
+            ptag = mesh_2d.boundary_face_physical_tags[i_bf]
+            # Find the 2D face vertex key (the sorted tuple of 2D vertex IDs)
+            # by scanning the inner cell that owns this face
+            inner_cell = mesh_2d.boundary_face_cells[i_bf]
+            verts_2d = mesh_2d.cell_vertices[:, inner_cell]
+            for lf_idx, lf in enumerate(local_faces_2d):
+                if mesh_2d.cell_faces[lf_idx, inner_cell] == fidx_2d:
+                    edge_verts = tuple(sorted(verts_2d[list(lf)]))
+                    bf_2d_edge_to_tag[edge_verts] = ptag
+                    break
+
+        for i_bf, fidx in enumerate(boundary_face_indices):
+            ghost_idx = n_inner_cells_3d + i_bf
+            inner_cell = face_cells_raw[0, fidx]
+
+            bf_cells[i_bf] = inner_cell
+            bf_ghosts[i_bf] = ghost_idx
+            bf_face_indices[i_bf] = fidx
+            face_cells[1, fidx] = ghost_idx
+
+            # Classify: compute face center z-coordinate
+            fverts = face_list[fidx]
+            fc_z = vertex_coordinates[2, list(fverts)].mean()
+
+            if abs(fc_z - z_min) < tol:
+                bf_physical_tags[i_bf] = tag_bottom
+            elif abs(fc_z - z_max) < tol:
+                bf_physical_tags[i_bf] = tag_top
+            else:
+                # Lateral face: project vertices to 2D and match
+                fverts_list = list(fverts)
+                verts_2d_mod = sorted(set(v % N_v for v in fverts_list))
+                edge_key = tuple(verts_2d_mod)
+                tag = bf_2d_edge_to_tag.get(edge_key, 0)
+                bf_physical_tags[i_bf] = tag
+
+        # Build sorted tags and names
+        all_tags = list(existing_tags_2d) + [tag_bottom, tag_top]
+        all_names = lateral_names + ["bottom", "top"]
+        sorted_tags = np.array(all_tags, dtype=int)
+        sorted_names = all_names
+
+        # Assign function numbers: tag value -> index in sorted_tags
+        tag_to_func = {t: i for i, t in enumerate(sorted_tags)}
+        for i_bf in range(n_boundary_faces):
+            bf_function_numbers[i_bf] = tag_to_func.get(
+                bf_physical_tags[i_bf], 0
+            )
+
+        # -- cell neighbors ----------------------------------------------------
+        cell_neighbors = _build_cell_neighbors(
+            face_cells, cell_faces, n_cells_3d, n_inner_cells_3d
+        )
+        for i_bf in range(n_boundary_faces):
+            ghost_idx = n_inner_cells_3d + i_bf
+            inner_cell = bf_cells[i_bf]
+            cell_neighbors[ghost_idx, :] = cell_neighbors[inner_cell, :]
+
+        return cls(
+            dimension=3,
+            type=mesh_type_3d,
+            n_cells=n_cells_3d,
+            n_inner_cells=n_inner_cells_3d,
+            n_faces=n_faces,
+            n_vertices=N_v3d,
+            n_boundary_faces=n_boundary_faces,
+            n_faces_per_cell=n_faces_per_cell_3d,
+            vertex_coordinates=vertex_coordinates,
+            cell_vertices=cell_vertices,
+            cell_faces=cell_faces,
+            face_cells=face_cells,
+            cell_neighbors=cell_neighbors,
+            boundary_face_cells=bf_cells,
+            boundary_face_ghosts=bf_ghosts,
+            boundary_face_function_numbers=bf_function_numbers,
+            boundary_face_physical_tags=bf_physical_tags,
+            boundary_face_face_indices=bf_face_indices,
+            boundary_conditions_sorted_physical_tags=sorted_tags,
+            boundary_conditions_sorted_names=sorted_names,
+        )
 
     def resolve_periodic_bcs(self, bcs):
         """Patch boundary_face_cells for periodic boundary conditions."""
