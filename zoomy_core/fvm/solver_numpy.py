@@ -107,13 +107,14 @@ class Solver(param.Parameterized):
         return Q, Qaux, parameters, mesh, runtime_model
 
     def get_apply_boundary_conditions(self, mesh, model):
+        dim = model.dimension
         def apply_boundary_conditions(time, Q, Qaux, parameters):
             for i in range(mesh.n_boundary_faces):
                 i_face = mesh.boundary_face_face_indices[i]
                 i_bc_func = mesh.boundary_face_function_numbers[i]
                 q_cell = Q[:, mesh.boundary_face_cells[i]]
                 qaux_cell = Qaux[:, mesh.boundary_face_cells[i]]
-                normal = mesh.face_normals[:, i_face]
+                normal = mesh.face_normals[:dim, i_face]
                 position = mesh.face_centers[i_face, :]
                 position_ghost = mesh.cell_centers[:, mesh.boundary_face_ghosts[i]]
                 distance = np.linalg.norm(position - position_ghost)

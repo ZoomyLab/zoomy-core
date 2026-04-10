@@ -388,15 +388,18 @@ class DiffusionOperator:
         return self.L @ u[:self.nc]
 
     def implicit_solve(self, u_star, dt, tol=1e-8, maxiter=100):
-        """Solve (I - dt * L) @ u = u_star via GMRES."""
+        """Crank-Nicolson: (I - dt/2 * L) u^{n+1} = (I + dt/2 * L) u*.
+
+        Second-order in time for diffusion (backward Euler was first-order).
+        """
         nc = self.nc
-        rhs = u_star[:nc]
+        rhs = u_star[:nc] + 0.5 * dt * (self.L @ u_star[:nc])
 
         def matvec(x):
-            return x - dt * (self.L @ x)
+            return x - 0.5 * dt * (self.L @ x)
 
         A = LinearOperator((nc, nc), matvec=matvec, dtype=float)
-        sol, info = gmres(A, rhs, x0=rhs, atol=0.0, rtol=tol, maxiter=maxiter)
+        sol, info = gmres(A, rhs, x0=u_star[:nc], atol=0.0, rtol=tol, maxiter=maxiter)
 
         result = np.zeros(self.n_cells)
         result[:nc] = sol

@@ -165,8 +165,8 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
         self._imex_reconstruction_order = self.reconstruction_order
         # Temporarily force RK1 in parent setup
         super().setup_simulation(mesh, model, write_output=write_output)
-        # Override ODE step: IMEX always uses RK1 for explicit stage
-        self._sim_ode_step = ode.RK1
+        # ODE step matches reconstruction order: RK2 for O2, RK1 for O1
+        self._sim_ode_step = ode.RK2 if self.reconstruction_order >= 2 else ode.RK1
 
         # Resolve source mode
         self._sim_source_mode = self._resolve_source_mode(self._sim_model)
