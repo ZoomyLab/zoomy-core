@@ -602,6 +602,7 @@ class GenericCppModel(GenericCppBase):
         # Detect whether the model has non-trivial diffusion
         n_dof_gradQ = self.model.gradient_variables.length()
         has_diffusion = self._detect_has_diffusion()
+        has_free_surface = self._detect_has_free_surface()
 
         lines.extend(
             [
@@ -613,6 +614,18 @@ class GenericCppModel(GenericCppBase):
                 f"    static constexpr int dimension  = {self.model.dimension};",
                 f"    static constexpr int n_dof_gradQ = {n_dof_gradQ};",
                 f"    static constexpr bool has_diffusion = {'true' if has_diffusion else 'false'};",
+                f"    static constexpr bool has_free_surface = {'true' if has_free_surface else 'false'};",
+            ]
+        )
+        if has_free_surface:
+            lines.extend(
+                [
+                    f"    static constexpr int idx_b = {self._var_index('b')};",
+                    f"    static constexpr int idx_h = {self._var_index('h')};",
+                ]
+            )
+        lines.extend(
+            [
                 f"    static constexpr int n_boundary_tags = {len(bc_names)};",
                 f"    static const std::vector<std::string> get_boundary_tags() {{ return {{ {bc_str} }}; }}",
                 f"    static const std::vector<std::string> parameter_names() {{ return {{ {p_names_str} }}; }}",
@@ -630,6 +643,23 @@ class GenericCppModel(GenericCppBase):
         if hasattr(expr, "__iter__"):
             return not all(sp.simplify(e) == 0 for e in sp.flatten(expr))
         return sp.simplify(expr) != 0
+
+    def _var_index(self, name):
+        """Return the index of a variable by name, or -1 if not found."""
+        keys = list(self.model.variables.keys())
+        return keys.index(name) if name in keys else -1
+
+    def _detect_has_free_surface(self):
+        """Check whether the model has free-surface variables (h and b).
+
+        Free-surface models (SWE, SME, etc.) are identified by the presence
+        of both 'h' (water depth) and 'b' (bathymetry) in either the
+        conserved or auxiliary variable sets.
+        """
+        all_vars = set(self.model.variables.keys())
+        if hasattr(self.model, "aux_variables"):
+            all_vars |= set(self.model.aux_variables.keys())
+        return "h" in all_vars and "b" in all_vars
 
     def get_file_footer(self):
         """Get file footer."""
