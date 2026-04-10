@@ -16,7 +16,8 @@ def _ufl_conditional(condition, true_val, false_val):
 
 class UFLRuntimeModel(NumpyRuntimeModel):
     """UFLRuntimeModel. (class)."""
-    printer=None
+    printer = None
+    use_cse = False  # CSE can fail with UFL-mapped modules on some SymPy versions
     
     module = {
         'ones_like': lambda x: 0*x + 1,
