@@ -92,10 +92,14 @@ class DerivedModel(Model):
     )
 
     def __init__(self, level=0, n_layers=1, basis_type=Legendre_shifted,
-                 eigenvalue_mode="symbolic", dimension=None, **kwargs):
+                 eigenvalue_mode=None, dimension=None, **kwargs):
 
         self._system: Optional[DerivedSystem] = None
         self._applied: List[dict] = []  # auto-filled by apply()
+
+        # Resolve eigenvalue_mode: explicit arg > class attribute > "symbolic"
+        if eigenvalue_mode is None:
+            eigenvalue_mode = getattr(type(self), "eigenvalue_mode", "symbolic")
 
         # Run the derivation graph (calls super().derive_model() + apply()s)
         self.derive_model()
