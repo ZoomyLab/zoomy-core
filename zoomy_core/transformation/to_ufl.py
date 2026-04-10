@@ -3,6 +3,7 @@
 import ufl
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
 
+
 def _ufl_conditional(condition, true_val, false_val):
     """Internal helper `_ufl_conditional`."""
     if condition is True:
@@ -14,10 +15,72 @@ def _ufl_conditional(condition, true_val, false_val):
     else:
         return ufl.conditional(condition, true_val, false_val)
 
+
+def _ufl_from_nested_list(data):
+    """Convert a nested list (from lambdify's ImmutableDenseMatrix) to UFL.
+
+    - 2D list-of-lists -> ``ufl.as_tensor``
+    - 1D list          -> ``ufl.as_vector``
+    - scalar           -> pass-through
+    """
+    if isinstance(data, (list, tuple)):
+        if data and isinstance(data[0], (list, tuple)):
+            return ufl.as_tensor(data)
+        return ufl.as_vector(data)
+    return data
+
+
 class UFLRuntimeModel(NumpyRuntimeModel):
     """UFLRuntimeModel. (class)."""
     printer = None
     use_cse = False  # Firedrake's SymPy can't CSE ImmutableDenseNDimArray
+
+    # -----------------------------------------------------------------
+    # Array -> Matrix conversion so that lambdify can serialise the expr
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def _array_to_matrix(expr):
+        """Convert ``ImmutableDenseNDimArray`` to ``ImmutableDenseMatrix``.
+
+        SymPy's ``lambdify`` (without a code printer) cannot serialise
+        ``ImmutableDenseNDimArray`` but *can* handle ``ImmutableDenseMatrix``.
+
+        * 0-D  -> bare scalar symbol
+        * 1-D  -> column vector  (n, 1)
+        * 2-D  -> matrix         (r, c)
+        * 3-D+ -> reshaped to 2-D (product-of-leading-dims, last-dim)
+        """
+        import sympy as sp
+        from sympy.tensor.array.dense_ndim_array import ImmutableDenseNDimArray
+
+        if not isinstance(expr, (ImmutableDenseNDimArray, sp.Array)):
+            return expr
+
+        shape = tuple(int(s) for s in expr.shape)
+        flat = list(expr._array)  # always a flat list of SymPy exprs
+
+        if len(shape) == 0:
+            return flat[0] if flat else expr
+        elif len(shape) == 1:
+            return sp.ImmutableDenseMatrix([[e] for e in flat])
+        elif len(shape) == 2:
+            return sp.ImmutableDenseMatrix(shape[0], shape[1], flat)
+        else:
+            import functools, operator
+            nrows = functools.reduce(operator.mul, shape[:-1], 1)
+            ncols = shape[-1]
+            return sp.ImmutableDenseMatrix(nrows, ncols, flat)
+
+    def _vectorize_expression(self, expr, signature):
+        """Override: vectorise, then convert Array -> Matrix for lambdify."""
+        result = super()._vectorize_expression(expr, signature)
+
+        from sympy.tensor.array.dense_ndim_array import ImmutableDenseNDimArray
+        import sympy as sp
+        if isinstance(result, (ImmutableDenseNDimArray, sp.Array)):
+            return self._array_to_matrix(result)
+        return result
 
     def _lambdify_function(self, function_obj, modules):
         """Skip functions with zero-size output (e.g. Jacobian when n_aux=0)."""
@@ -85,5 +148,5 @@ class UFLRuntimeModel(NumpyRuntimeModel):
         "max": ufl.max_value,
         "sqrt": ufl.sqrt,
         "sum": lambda x: ufl.Constant(sum(x)) if isinstance(x, (list, tuple)) else x,
-        "ImmutableDenseMatrix": lambda x: x,
+        "ImmutableDenseMatrix": _ufl_from_nested_list,
     }
