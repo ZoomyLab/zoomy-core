@@ -386,14 +386,21 @@ class MeshCatalog:
         size: str = "medium",
         folder: Optional[str | Path] = None,
     ):
-        """Download (if needed) and return a ``Mesh`` object.
+        """Download (if needed) and return an ``LSQMesh``.
 
-        Requires ``zoomy_core.mesh.mesh.Mesh`` to be importable.
+        Tries HDF5 first. Falls back to .msh if HDF5 is unavailable.
         """
-        path = self.download(name, size=size, filetype="h5", folder=folder)
-        from zoomy_core.mesh.lsq_mesh import LSQMesh as Mesh
+        from zoomy_core.mesh.lsq_mesh import LSQMesh
+        from zoomy_core.mesh.base_mesh import BaseMesh
+        from zoomy_core.mesh.fvm_mesh import FVMMesh
 
-        return Mesh.from_hdf5(str(path))
+        try:
+            path = self.download(name, size=size, filetype="h5", folder=folder)
+            return LSQMesh.from_hdf5(str(path))
+        except Exception:
+            path = self.download(name, size=size, filetype="msh", folder=folder)
+            base = BaseMesh.from_msh(str(path))
+            return LSQMesh.from_fvm(FVMMesh.from_base(base))
 
     async def load_async(
         self,
