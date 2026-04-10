@@ -36,6 +36,7 @@ except ImportError:
 # ── helpers: meshio cell-type → zoomy type ──────────────────────────────────
 
 _MESHIO_TO_ZOOMY = {
+    "vertex": "vertex",
     "line": "line",
     "triangle": "triangle",
     "quad": "quad",
@@ -52,7 +53,7 @@ _FACES_PER_CELL = {
 }
 
 _DIM_OF_TYPE = {
-    "line": 1, "triangle": 2, "quad": 2,
+    "vertex": 0, "line": 1, "triangle": 2, "quad": 2,
     "tetra": 3, "hexahedron": 3, "wface": 3,
 }
 
