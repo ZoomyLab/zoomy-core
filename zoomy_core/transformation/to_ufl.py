@@ -31,7 +31,7 @@ class _ZoomyVector(sp.Function):
 class UFLRuntimeModel(NumpyRuntimeModel):
     """UFLRuntimeModel. (class)."""
     printer = None
-    use_cse = False  # Firedrake's SymPy can't CSE ImmutableDenseNDimArray
+    use_cse = True
 
     # -----------------------------------------------------------------
     # Array -> Matrix conversion so that lambdify can serialise the expr

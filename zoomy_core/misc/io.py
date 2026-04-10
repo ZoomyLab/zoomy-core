@@ -291,7 +291,7 @@ def save_fields_test(a):
 
 
 def load_mesh_from_hdf5(filepath):
-    """Load a :class:`~zoomy_core.mesh.mesh.Mesh` from disk via ``Mesh.from_hdf5``."""
+    """Load a :class:`~zoomy_core.mesh.lsq_mesh.LSQMesh` from disk via ``Mesh.from_hdf5``."""
     mesh = Mesh.from_hdf5(filepath)
     return mesh
 
