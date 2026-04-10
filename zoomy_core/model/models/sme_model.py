@@ -19,12 +19,24 @@ from zoomy_core.model.models.derived_model import DerivedModel
 
 
 def hydrostatic_scaling(state):
-    """Dict that drops w, τ_zz, τ_zx from an equation (hydrostatic assumption)."""
-    return {state.w: S.Zero, state.tau["zz"]: S.Zero, state.tau["zx"]: S.Zero}
+    """Dict that drops w and all z-row/z-column stresses (hydrostatic assumption).
+
+    Dimension-agnostic: works for 2D (x-z) and 3D (x-y-z).
+    """
+    scaling = {state.w: S.Zero}
+    for key in state.tau.keys():
+        if "z" in key:
+            scaling[state.tau[key]] = S.Zero
+    return scaling
 
 
 class INSModel(DerivedModel):
-    """Root: the full 2D incompressible Navier-Stokes (all equations).
+    """Root: the full incompressible Navier-Stokes (all equations).
+
+    Dimension-agnostic: works for 2D (x-z) and 3D (x-y-z).
+    The ``ins_dimension`` parameter controls the INS state space:
+      - 2: u, w (standard 2D vertical slice)
+      - 3: u, v, w (full 3D)
 
     Uses numerical eigenvalues (np.linalg.eigvals on quasilinear matrix)
     because the symbolic Cardano formula produces complex intermediates
@@ -32,10 +44,11 @@ class INSModel(DerivedModel):
     """
 
     eigenvalue_mode = "numerical"
+    ins_dimension = 2  # override to 3 for 3D derivation
 
     def derive_model(self):
         from zoomy_core.model.models.ins_generator import StateSpace, FullINS
-        self._system = FullINS(StateSpace(dimension=2))
+        self._system = FullINS(StateSpace(dimension=self.ins_dimension))
 
 
 class SMEModel(INSModel):

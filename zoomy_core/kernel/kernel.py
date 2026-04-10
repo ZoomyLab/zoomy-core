@@ -121,3 +121,59 @@ class Kernel(param.Parameterized, SymbolicRegistrar):
     def conditional(self):
         """conditional(c, t, f) → t if c else f."""
         return sp.Piecewise((self._t, self._c), (self._f, True))
+
+    # ── automatic expression regularization ───────────────────────────
+
+    def regularize(self, model):
+        """Walk model expressions and regularize denominators involving
+        positive variables (like h) that can reach zero.
+
+        Finds variables declared with ``positive=True`` in the model,
+        substitutes them to zero in each expression, and where the result
+        is singular replaces ``1/v`` with ``1/(v + eps)`` in the original.
+
+        This is called automatically by the solver at compilation time.
+        The model itself stays analytical — regularization is a Kernel concern.
+        """
+        eps = self._eps
+
+        # Find positive variables (candidates for zero-singularity)
+        positive_vars = []
+        for name, sym in model.variables.items():
+            if getattr(sym, 'is_positive', False):
+                positive_vars.append(sym)
+
+        if not positive_vars:
+            return  # nothing to regularize
+
+        # Walk each model function and regularize
+        for fn_name, fn_obj in model.functions.items():
+            expr = fn_obj.definition
+            if expr is None:
+                continue
+            fn_obj.definition = self._regularize_expr(expr, positive_vars, eps)
+
+    @staticmethod
+    def _regularize_expr(expr, positive_vars, eps):
+        """Replace 1/v with 1/(v+eps) for positive vars where v=0 causes singularity."""
+        from zoomy_core.misc.misc import ZArray
+
+        # ZArray / NDimArray — process element-wise, return same type
+        if isinstance(expr, (ZArray, sp.tensor.array.NDimArray)):
+            flat = [Kernel._regularize_expr(e, positive_vars, eps) for e in sp.flatten(expr)]
+            return ZArray(flat, expr.shape) if isinstance(expr, ZArray) else sp.Array(flat).reshape(*expr.shape)
+
+        if isinstance(expr, (list, tuple)):
+            return type(expr)(Kernel._regularize_expr(e, positive_vars, eps) for e in expr)
+
+        if not isinstance(expr, sp.Basic):
+            return expr
+
+        # For each positive variable, replace v → v+eps in denominators
+        for v in positive_vars:
+            expr = expr.replace(
+                lambda sub: (isinstance(sub, sp.Pow) and sub.base == v
+                             and sub.exp.is_negative),
+                lambda sub: sp.Pow(v + eps, sub.exp)
+            )
+        return expr

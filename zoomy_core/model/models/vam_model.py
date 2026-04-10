@@ -111,7 +111,8 @@ class VAMModel(INSModel):
         # Infer dimension from system state
         if dimension is None and self._system is not None:
             state = self._system.state
-            dimension = getattr(state, "dimension", 2) - 1
+            state_dim = getattr(state, "dim", getattr(state, "dimension", 2))
+            dimension = state_dim - 1
             if dimension < 1:
                 dimension = 1
 
