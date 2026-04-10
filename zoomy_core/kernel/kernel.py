@@ -137,9 +137,14 @@ class Kernel(param.Parameterized, SymbolicRegistrar):
         """
         eps = self._eps
 
-        # Find positive variables (candidates for zero-singularity)
+        # Find positive variables from the Kernel's variable map
+        # (works for both Model and Numerics objects)
         positive_vars = []
-        for name, sym in model.variables.items():
+        var_source = self._var_map if self._var_map else {}
+        if not var_source and hasattr(model, 'variables'):
+            vs = model.variables
+            var_source = vs if isinstance(vs, dict) else {str(v): v for v in vs}
+        for name, sym in var_source.items():
             if getattr(sym, 'is_positive', False):
                 positive_vars.append(sym)
 
