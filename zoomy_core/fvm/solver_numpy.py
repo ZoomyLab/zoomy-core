@@ -106,6 +106,7 @@ class Solver(param.Parameterized):
         from zoomy_core.kernel import Kernel
         kernel = Kernel(model)
         kernel.regularize(model)
+        self._kernel = kernel  # store for numerics regularization
         runtime_model = NumpyRuntimeModel(model, kernel=kernel)
         return Q, Qaux, parameters, mesh, runtime_model
 
