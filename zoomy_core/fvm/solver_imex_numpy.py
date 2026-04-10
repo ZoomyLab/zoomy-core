@@ -49,6 +49,7 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
     """
 
     source_mode = "auto"
+    _diffusion_in_flux = False  # diffusion handled implicitly, not in flux operator
     implicit_tol = 1e-8
     implicit_maxiter = 8
     gmres_tol = 1e-7
@@ -191,15 +192,24 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
             Qold, Qauxold = Qnew, Qauxnew
             dt = self.compute_dt(Qold, Qauxold, parameters, cell_inradius_face,
                                  compute_max_abs_eigenvalue)
-            dt = min(float(dt), float(self.time_end - time_now))
+            remaining = float(self.time_end - time_now)
+            if remaining < 1e-10 * max(self.time_end, 1.0):
+                break  # close enough to end time
+            dt = min(float(dt), remaining)
             if not np.isfinite(dt) or dt <= 0.0:
-                raise RuntimeError(f"Invalid IMEX dt={dt}")
+                break
             if dt < self.min_dt:
                 raise RuntimeError(f"IMEX dt={dt:.3e} < min_dt={self.min_dt:.3e}")
 
-            # Explicit flux step
+            # Explicit flux step (convection — diffusion handled implicitly below)
             Qexp = ode.RK1(flux_operator, Qold, Qauxold, parameters, dt)
             Qexp = boundary_operator(time_now, Qexp, Qauxold, parameters)
+
+            # Implicit diffusion step (if DiffusionOperator was built)
+            if hasattr(self, '_diffusion_ops') and self._diffusion_ops is not None:
+                for v, diff_op in self._diffusion_ops.items():
+                    Qexp[v, :] = diff_op.implicit_solve(Qexp[v, :], dt)
+                Qexp = boundary_operator(time_now, Qexp, Qauxold, parameters)
 
             # Implicit source step
             t_imp0 = time.time()

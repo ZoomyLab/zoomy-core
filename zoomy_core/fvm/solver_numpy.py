@@ -147,7 +147,13 @@ class HyperbolicSolver(Solver):
     time_end = param.Number(default=0.1, bounds=(0, None), doc="Simulation end time")
     min_dt = param.Number(default=1e-6, bounds=(0, None), doc="Minimum allowed timestep")
     compute_dt = param.Parameter(default=None, doc="Time-stepping strategy (callable)")
+    reconstruction_order = param.Integer(default=1, bounds=(1, 2),
+        doc="Spatial reconstruction order: 1=piecewise-constant, 2=MUSCL")
+    limiter = param.Selector(default="venkatakrishnan",
+        objects=["venkatakrishnan", "barth_jespersen", "minmod"],
+        doc="Slope limiter for MUSCL reconstruction")
     eigenvalue_regularization = 1e-8
+    _diffusion_in_flux = True  # explicit diffusion in flux operator
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -250,6 +256,31 @@ class HyperbolicSolver(Solver):
         """Build the symbolic Riemann solver. Override for SWE-specific variants."""
         return NonconservativeRusanov(symbolic_model)
 
+    def _build_diffusion_operators(self, mesh, symbolic_model, dim, n_vars):
+        """Build DiffusionOperator for each variable (if model has diffusion)."""
+        if not hasattr(symbolic_model, 'diffusive_flux'):
+            return None
+        sym_dflux = symbolic_model.diffusive_flux()
+        is_zero = hasattr(sym_dflux, 'tolist') and all(
+            e == 0 for row in sym_dflux.tolist()
+            for e in (row if isinstance(row, list) else [row])
+        )
+        if is_zero:
+            return None
+        from zoomy_core.fvm.reconstruction import DiffusionOperator
+        nu_val = _param_value(symbolic_model, "nu", default=0.0)
+        if nu_val <= 0:
+            return None
+        return {v: DiffusionOperator(mesh, dim, nu=nu_val) for v in range(n_vars)}
+
+    def _build_reconstruction(self, mesh, symbolic_model):
+        """Build the face reconstruction. Override for free-surface variants."""
+        from zoomy_core.fvm.reconstruction import ConstantReconstruction, MUSCLReconstruction
+        dim = symbolic_model.dimension
+        if self.reconstruction_order >= 2:
+            return MUSCLReconstruction(mesh, dim, limiter=self.limiter)
+        return ConstantReconstruction(mesh, dim)
+
     def get_flux_operator(self, mesh, model):
         symbolic_model = self._get_symbolic_model(model)
         max_wavespeed_fn = self._build_max_wavespeed(symbolic_model)
@@ -271,44 +302,22 @@ class HyperbolicSolver(Solver):
         n_vars = symbolic_model.n_variables
         has_aux = symbolic_model.n_aux_variables > 0
 
-        # Check if model has non-trivial diffusive flux
-        # Detect at compile time: check symbolic definition for zero
-        compiled_diff = None
-        if hasattr(symbolic_model, 'diffusive_flux'):
-            sym_dflux = symbolic_model.diffusive_flux()
-            is_zero = hasattr(sym_dflux, 'tolist') and all(
-                e == 0 for row in sym_dflux.tolist() for e in (row if isinstance(row, list) else [row])
-            )
-            if not is_zero:
-                compiled_diff = model.diffusive_flux
+        # Build reconstruction (resolved at setup, not per-step)
+        reconstruct = self._build_reconstruction(mesh, symbolic_model)
 
-        cell_centers = mesh.cell_centers[:dim, :]
+        # Build diffusion operators (explicit in HyperbolicSolver, implicit in IMEX)
+        self._diffusion_ops = self._build_diffusion_operators(mesh, symbolic_model, dim, n_vars)
 
         def flux_operator(dt, Q, Qaux, parameters, dQ):
             dQ = np.zeros_like(dQ)
-
-            # Compute cell-center gradients via Green-Gauss (for diffusion)
-            gradQ_cells = None
-            if compiled_diff is not None:
-                gradQ_cells = np.zeros((n_vars * dim, mesh.n_cells))
-                for f in range(mesh.n_faces):
-                    a, b = iA[f], iB[f]
-                    n = normals_arr[:, f]
-                    for v in range(n_vars):
-                        u_face = 0.5 * (Q[v, a] + Q[v, b])
-                        for d in range(dim):
-                            contrib = u_face * n[d] * face_volumes[f]
-                            gradQ_cells[v * dim + d, a] += contrib / cell_volumesA[f]
-                            gradQ_cells[v * dim + d, b] -= contrib / cell_volumesB[f]
-
+            Q_L, Q_R = reconstruct(Q)
             for f in range(mesh.n_faces):
-                qA = Q[:, iA[f]]
-                qB = Q[:, iB[f]]
+                qA = Q_L[:, f]
+                qB = Q_R[:, f]
                 qauxA = Qaux[:, iA[f]] if has_aux else _EMPTY_AUX
                 qauxB = Qaux[:, iB[f]] if has_aux else _EMPTY_AUX
                 n = normals_arr[:, f]
 
-                # Convective flux (Riemann solver)
                 fluct = np.asarray(
                     runtime_numerics.numerical_fluctuations(
                         qA, qB, qauxA, qauxB, parameters, n
@@ -324,19 +333,11 @@ class HyperbolicSolver(Solver):
                 dQ[:, iA[f]] -= (num_flux + Dm) * face_volumes[f] / cell_volumesA[f]
                 dQ[:, iB[f]] -= (-num_flux + Dp) * face_volumes[f] / cell_volumesB[f]
 
-                # Diffusive flux (central, no upwinding)
-                if compiled_diff is not None:
-                    q_face = 0.5 * (qA + qB)
-                    qaux_face = 0.5 * (qauxA + qauxB) if has_aux else _EMPTY_AUX
-                    gradQ_face = 0.5 * (gradQ_cells[:, iA[f]] + gradQ_cells[:, iB[f]])
-                    F_diff = np.asarray(
-                        compiled_diff(q_face, qaux_face, gradQ_face, parameters),
-                        dtype=float,
-                    ).reshape(n_vars, dim)
-                    # Diffusive flux contribution: F_diff · n * face_area
-                    diff_flux_n = F_diff @ n
-                    dQ[:, iA[f]] -= diff_flux_n * face_volumes[f] / cell_volumesA[f]
-                    dQ[:, iB[f]] += diff_flux_n * face_volumes[f] / cell_volumesB[f]
+            # Explicit diffusion (skipped when IMEX handles it implicitly)
+            if self._diffusion_ops is not None and self._diffusion_in_flux:
+                for v, diff_op in self._diffusion_ops.items():
+                    Lu = diff_op.explicit(Q[v, :])
+                    dQ[v, :mesh.n_inner_cells] += Lu
 
             return dQ
         return flux_operator
@@ -400,8 +401,8 @@ class HyperbolicSolver(Solver):
                 if not np.isfinite(dt) or dt <= 0.0:
                     break
 
-                Q1 = ode.RK1(flux_operator, Q, Qaux, parameters, dt)
-                Qnew = Q1
+                ode_step = ode.RK2 if self.reconstruction_order >= 2 else ode.RK1
+                Qnew = ode_step(flux_operator, Q, Qaux, parameters, dt)
                 Qnew = boundary_operator(time_now, Qnew, Qaux, parameters)
                 Qnew = self.update_q(Qnew, Qaux, mesh, model, parameters)
                 Qauxnew = self.update_qaux(Qnew, Qaux, Q, Qaux, mesh, model,
@@ -456,3 +457,13 @@ class FreeSurfaceFlowSolver(HyperbolicSolver):
 
     def _build_numerics(self, symbolic_model):
         return _build_free_surface_numerics(symbolic_model)
+
+    def _build_reconstruction(self, mesh, symbolic_model):
+        dim = symbolic_model.dimension
+        if self.reconstruction_order >= 2:
+            from zoomy_core.fvm.reconstruction import FreeSurfaceMUSCL
+            h_idx = _var_index(symbolic_model, "h")
+            eps_wet = self._get_dry_threshold(symbolic_model)
+            return FreeSurfaceMUSCL(mesh, dim, h_index=h_idx,
+                                    eps_wet=eps_wet, limiter=self.limiter)
+        return super()._build_reconstruction(mesh, symbolic_model)
