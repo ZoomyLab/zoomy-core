@@ -64,6 +64,7 @@ class GenericCppBase(CXX11CodePrinter):
     ARG_MAPPING = {
         "variables": "Q",
         "aux_variables": "Qaux",
+        "gradient_variables": "gradQ",
         "p": "p",
         "normal": "n",
         "position": "X",
@@ -88,6 +89,15 @@ class GenericCppBase(CXX11CodePrinter):
         "Min": lambda p, *args: p._print_min_max("min", args),
         "Max": lambda p, *args: p._print_min_max("max", args),
         "Abs": lambda p, a: f"{p.math_namespace}abs({p.doprint(a)})",
+        "clamp_positive": lambda p, x: f"{p.math_namespace}max({p.doprint(x)}, ({p.real_type})0.0)",
+        "clamp_momentum": lambda p, hu, h, u_max: (
+            f"{p.math_namespace}min({p.math_namespace}max({p.doprint(hu)}, "
+            f"-{p.doprint(h)}*{p.doprint(u_max)}), "
+            f"{p.doprint(h)}*{p.doprint(u_max)})"
+        ),
+        "max_wavespeed": lambda p, *args: p._print_nested_max(
+            [f"{p.math_namespace}abs({p.doprint(a)})" for a in args]
+        ),
     }
 
     def __init__(self, *args, **kwargs):
@@ -135,6 +145,14 @@ class GenericCppBase(CXX11CodePrinter):
         arg0 = self._print(args[0])
         rest = self._print_min_max(func_name, args[1:])
         return f"{self.math_namespace}{func_name}({arg0}, {rest})"
+
+    def _print_nested_max(self, str_args):
+        """Nest std::max calls for >2 arguments: max(a, max(b, max(c, d)))."""
+        if len(str_args) == 1:
+            return str_args[0]
+        if len(str_args) == 2:
+            return f"{self.math_namespace}max({str_args[0]}, {str_args[1]})"
+        return f"{self.math_namespace}max({str_args[0]}, {self._print_nested_max(str_args[1:])})"
 
     def _expand_vector_conditionals(self, expr):
         """Internal helper `_expand_vector_conditionals`."""
@@ -231,7 +249,12 @@ class GenericCppBase(CXX11CodePrinter):
 
     def get_array_declaration(self, target_name, shape, init_zero=False):
         """Returns the C++ declaration string for the array."""
+        total_size = 1
+        for s in shape:
+            total_size *= s
         arr_type = self.get_array_type(shape)
+        if total_size == 0:
+            return f"{arr_type} {target_name};"  # zero-size: no initializer
         if init_zero:
             return f"{arr_type} {target_name} = {{0}};"
         return f"{arr_type} {target_name};"
@@ -357,6 +380,7 @@ class GenericCppBase(CXX11CodePrinter):
             if key in [
                 "variables",
                 "aux_variables",
+                "gradient_variables",
                 "p",
                 "normal",
                 "position",
@@ -492,6 +516,8 @@ class GenericCppModel(GenericCppBase):
         self.n_parameters = model.n_parameters
         self.register_map("Q", model.variables.values())
         self.register_map("Qaux", model.aux_variables.values())
+        if hasattr(model, "gradient_variables") and model.gradient_variables.length() > 0:
+            self.register_map("gradQ", model.gradient_variables.values())
         self.register_map("n", model.normal.values())
         if hasattr(model, "position"):
             self.register_map("X", model.position.values())
@@ -573,6 +599,10 @@ class GenericCppModel(GenericCppBase):
             )
         else:
             lines.append("#define PORTABLE_FN")
+        # Detect whether the model has non-trivial diffusion
+        n_dof_gradQ = self.model.gradient_variables.length()
+        has_diffusion = self._detect_has_diffusion()
+
         lines.extend(
             [
                 tpl,
@@ -581,6 +611,8 @@ class GenericCppModel(GenericCppBase):
                 f"    static constexpr int n_dof_qaux = {self.n_dof_qaux};",
                 f"    static constexpr int n_parameters = {self.n_parameters};",
                 f"    static constexpr int dimension  = {self.model.dimension};",
+                f"    static constexpr int n_dof_gradQ = {n_dof_gradQ};",
+                f"    static constexpr bool has_diffusion = {'true' if has_diffusion else 'false'};",
                 f"    static constexpr int n_boundary_tags = {len(bc_names)};",
                 f"    static const std::vector<std::string> get_boundary_tags() {{ return {{ {bc_str} }}; }}",
                 f"    static const std::vector<std::string> parameter_names() {{ return {{ {p_names_str} }}; }}",
@@ -588,6 +620,16 @@ class GenericCppModel(GenericCppBase):
             ]
         )
         return "\n".join(lines)
+
+    def _detect_has_diffusion(self):
+        """Check whether the model's diffusive_flux is non-trivial (not all zeros)."""
+        if "diffusive_flux" not in self.model.functions.keys():
+            return False
+        expr = self.model.functions.diffusive_flux.definition
+        # Flatten the expression and check if every element is zero
+        if hasattr(expr, "__iter__"):
+            return not all(sp.simplify(e) == 0 for e in sp.flatten(expr))
+        return sp.simplify(expr) != 0
 
     def get_file_footer(self):
         """Get file footer."""

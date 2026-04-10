@@ -52,11 +52,18 @@ class NumpyRuntimeModel:
         args = self._flatten_signature_args(function_obj.args)
         expr = self._vectorize_expression(function_obj.definition, function_obj.args)
 
+        use_cse = getattr(self, 'use_cse', True)
         try:
-            compiled = sp.lambdify(args, expr, modules=modules, cse=True)
-        except TypeError:
-            # Fallback for SymPy versions without cse kwarg in lambdify.
-            compiled = sp.lambdify(args, expr, modules=modules)
+            compiled = sp.lambdify(args, expr, modules=modules, cse=use_cse)
+        except (TypeError, Exception):
+            # Fallback: try without CSE, then try converting NDimArray to list
+            try:
+                compiled = sp.lambdify(args, expr, modules=modules)
+            except Exception:
+                if hasattr(expr, 'tolist'):
+                    compiled = sp.lambdify(args, expr.tolist(), modules=modules)
+                else:
+                    raise
 
         fast_flatten = self._compile_flattener(function_obj.args)
 

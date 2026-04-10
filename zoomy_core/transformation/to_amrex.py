@@ -149,6 +149,10 @@ class AmrexCore:
                 p_len = self.model.parameters.length()
                 t_val = self.get_array_type((p_len,))
                 decls.append(f"{t_val} const& {cpp_name}")
+            elif cpp_name == "gradQ":
+                n_grad = self.model.gradient_variables.length()
+                t_val = self.get_array_type((n_grad,))
+                decls.append(f"{t_val} const& {cpp_name}")
             elif cpp_name in ["time", "dX", "dt", "dx", "bc_idx"]:
                 type_prefix = (
                     "const int" if cpp_name == "bc_idx" else f"{self.real_type} const"
