@@ -3,6 +3,12 @@
 Extends ``HyperbolicSolver`` with:
 - Derivative-aware auxiliary variable updates (``DerivativeAwareSolverMixin``)
 - Implicit source stepping: local (cell-wise Newton) or global (Newton-GMRES)
+
+Solver hierarchy:
+    IMEXSolver(HyperbolicSolver)
+      -> step(dt):
+            apply_bcs -> reconstruct -> flux -> ode_step
+            -> implicit_diffusion -> implicit_source -> update_state
 """
 
 import os
@@ -69,6 +75,8 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
             symbolic_model.derivative_specs
         )
         return "global" if has_derivatives else "local"
+
+    # -- Implicit source solvers ---------------------------------------
 
     def _implicit_source_local(self, Qe, Qaux, model, parameters, dt):
         Q = np.array(Qe, copy=True)
@@ -148,105 +156,145 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
         Rp = residual(Q + self.fd_eps * V)
         return (Rp - base_residual) / self.fd_eps
 
-    def solve(self, mesh, model, write_output=False):
-        t0 = time.time()
-        mesh = ensure_lsq_mesh(mesh, model)
-        Q, Qaux = self.initialize(mesh, model)
-        Q, Qaux, parameters, mesh, model = self.create_runtime(Q, Qaux, mesh, model)
-        Qaux = self.update_qaux(Q, Qaux, Q, Qaux, mesh, model, parameters, 0.0, 1.0)
+    # -- Setup / Step / Run / Solve ------------------------------------
 
-        compute_max_abs_eigenvalue = self.get_compute_max_abs_eigenvalue(mesh, model)
-        flux_operator = self.get_flux_operator(mesh, model)
-        boundary_operator = self.get_apply_boundary_conditions(mesh, model)
-        source_mode = self._resolve_source_mode(model)
-        object.__setattr__(self, "last_stats", IMEXStats(source_mode=source_mode))
+    def setup_simulation(self, mesh, model, write_output=False):
+        """Build all operators. Extends HyperbolicSolver.setup_simulation."""
+        t0 = time.time()
+        # Use RK1 always for IMEX (explicit flux stage)
+        self._imex_reconstruction_order = self.reconstruction_order
+        # Temporarily force RK1 in parent setup
+        super().setup_simulation(mesh, model, write_output=write_output)
+        # Override ODE step: IMEX always uses RK1 for explicit stage
+        self._sim_ode_step = ode.RK1
+
+        # Resolve source mode
+        self._sim_source_mode = self._resolve_source_mode(self._sim_model)
+        object.__setattr__(self, "last_stats", IMEXStats(source_mode=self._sim_source_mode))
         self.last_stats.init_time_s = time.time() - t0
 
+        # Output setup for IMEX (override parent's to add HDF5 init)
         if write_output:
             output_hdf5_path = os.path.join(
                 self.settings.output.directory, f"{self.settings.output.filename}.h5"
             )
-            save_fields = io.get_save_fields(output_hdf5_path, write_all=False)
+            self._sim_save_fields = io.get_save_fields(output_hdf5_path, write_all=False)
             io.init_output_directory(
                 self.settings.output.directory, self.settings.output.clean_directory
             )
-            mesh.write_to_hdf5(output_hdf5_path)
+            self._sim_mesh.write_to_hdf5(output_hdf5_path)
             io.save_settings(self.settings)
-            dt_snapshot = self.time_end / max(self.settings.output.snapshots - 1, 1)
-            i_snapshot = save_fields(0.0, 0.0, 0.0, Q, Qaux)
-        else:
-            def save_fields(t, ts, i, Q, Qaux): return i
-            dt_snapshot = self.time_end
-            i_snapshot = 0.0
 
-        Qnew = boundary_operator(0.0, Q, Qaux, parameters)
-        Qauxnew = Qaux
+    def step(self, dt):
+        """One IMEX timestep: explicit flux -> implicit diffusion -> implicit source.
+
+        Each line is one physics operation. No if-clauses.
+        """
+        Q = self._sim_Q
+        Qaux = self._sim_Qaux
+        parameters = self._sim_parameters
+        time_now = self._sim_time
+        mesh = self._sim_mesh
+        model = self._sim_model
+
+        # Explicit flux step (convection)
+        Qexp = self._sim_ode_step(self._sim_flux_operator, Q, Qaux, parameters, dt)
+        Qexp = self._sim_boundary_operator(time_now, Qexp, Qaux, parameters)
+
+        # Implicit diffusion step
+        Qexp = self._apply_implicit_diffusion(Qexp, Qaux, dt, time_now)
+
+        # Implicit source step
+        Qimp = self._apply_implicit_source(Qexp, Q, Qaux, mesh, model, parameters, time_now, dt)
+
+        # Final boundary conditions and auxiliary update
+        Qnew = self._sim_boundary_operator(time_now + dt, Qimp, Qaux, parameters)
+        Qauxnew = self.update_qaux(
+            Qnew, Qaux, Q, Qaux, mesh, model, parameters, time_now + dt, dt,
+        )
+
+        # Commit new state
+        self._sim_Q = Qnew
+        self._sim_Qaux = Qauxnew
+
+    def _apply_implicit_diffusion(self, Qexp, Qaux, dt, time_now):
+        """Apply implicit diffusion if DiffusionOperators were built."""
+        if not hasattr(self, '_diffusion_ops') or self._diffusion_ops is None:
+            return Qexp
+        for v, diff_op in self._diffusion_ops.items():
+            Qexp[v, :] = diff_op.implicit_solve(Qexp[v, :], dt)
+        Qexp = self._sim_boundary_operator(time_now, Qexp, self._sim_Qaux, self._sim_parameters)
+        return Qexp
+
+    def _apply_implicit_source(self, Qexp, Qold, Qauxold, mesh, model, parameters, time_now, dt):
+        """Apply implicit source stepping (local or global Newton)."""
+        t_imp0 = time.time()
+        source_mode = self._sim_source_mode
+
+        if source_mode == "local":
+            Qaux_imp = self.update_qaux(
+                Qexp, Qauxold, Qold, Qauxold, mesh, model, parameters, time_now, dt,
+            )
+            Qimp = self._implicit_source_local(Qexp, Qaux_imp, model, parameters, dt)
+        else:
+            Qimp = self._implicit_source_global(
+                Qexp, Qauxold, Qold, Qauxold, mesh, model, parameters,
+                time_now, dt, self._sim_boundary_operator,
+            )
+
+        self.last_stats.implicit_time_s += time.time() - t_imp0
+        self.last_stats.implicit_calls += 1
+        return Qimp
+
+    def run_simulation(self):
+        """Time loop for IMEX solver."""
         time_now = 0.0
-        cell_inradius_face = np.minimum(
-            mesh.cell_inradius[mesh.face_cells[0, :]],
-            mesh.cell_inradius[mesh.face_cells[1, :]],
-        ).min()
+        dt_snapshot = self.time_end / max(self.settings.output.snapshots - 1, 1)
+        i_snapshot = 0.0
         t_run0 = time.time()
 
         while time_now < self.time_end:
-            Qold, Qauxold = Qnew, Qauxnew
-            dt = self.compute_dt(Qold, Qauxold, parameters, cell_inradius_face,
-                                 compute_max_abs_eigenvalue)
+            dt = self.compute_dt(
+                self._sim_Q, self._sim_Qaux, self._sim_parameters,
+                self._sim_cell_inradius_face, self._sim_compute_max_abs_eigenvalue,
+            )
             remaining = float(self.time_end - time_now)
             if remaining < 1e-10 * max(self.time_end, 1.0):
-                break  # close enough to end time
+                break
             dt = min(float(dt), remaining)
             if not np.isfinite(dt) or dt <= 0.0:
                 break
             if dt < self.min_dt:
                 raise RuntimeError(f"IMEX dt={dt:.3e} < min_dt={self.min_dt:.3e}")
 
-            # Explicit flux step (convection — diffusion handled implicitly below)
-            Qexp = ode.RK1(flux_operator, Qold, Qauxold, parameters, dt)
-            Qexp = boundary_operator(time_now, Qexp, Qauxold, parameters)
-
-            # Implicit diffusion step (if DiffusionOperator was built)
-            if hasattr(self, '_diffusion_ops') and self._diffusion_ops is not None:
-                for v, diff_op in self._diffusion_ops.items():
-                    Qexp[v, :] = diff_op.implicit_solve(Qexp[v, :], dt)
-                Qexp = boundary_operator(time_now, Qexp, Qauxold, parameters)
-
-            # Implicit source step
-            t_imp0 = time.time()
-            if source_mode == "local":
-                Qaux_imp = self.update_qaux(
-                    Qexp, Qauxold, Qold, Qauxold, mesh, model, parameters, time_now, dt
-                )
-                Qimp = self._implicit_source_local(Qexp, Qaux_imp, model, parameters, dt)
-            else:
-                Qimp = self._implicit_source_global(
-                    Qexp, Qauxold, Qold, Qauxold, mesh, model, parameters,
-                    time_now, dt, boundary_operator
-                )
-            self.last_stats.implicit_time_s += time.time() - t_imp0
-            self.last_stats.implicit_calls += 1
-
-            Qnew = boundary_operator(time_now + dt, Qimp, Qauxold, parameters)
-            Qauxnew = self.update_qaux(
-                Qnew, Qauxold, Qold, Qauxold, mesh, model, parameters, time_now + dt, dt
-            )
+            self._sim_time = time_now
+            self.step(dt)
 
             time_now += dt
             self.last_stats.n_steps += 1
-            i_snapshot = save_fields(time_now, i_snapshot * dt_snapshot, i_snapshot, Qnew, Qauxnew)
+            i_snapshot = self._sim_save_fields(
+                time_now, i_snapshot * dt_snapshot, i_snapshot,
+                self._sim_Q, self._sim_Qaux,
+            )
 
             if self.last_stats.n_steps % 10 == 0:
                 logger.info(
                     f"imex it={self.last_stats.n_steps}, t={time_now:.6f}, "
-                    f"dt={dt:.6f}, mode={source_mode}"
+                    f"dt={dt:.6f}, mode={self._sim_source_mode}"
                 )
 
+        self._sim_time = time_now
         self.last_stats.runtime_only_s = time.time() - t_run0
-        self.last_stats.total_time_s = time.time() - t0
-        return Qnew, Qauxnew
+        self.last_stats.total_time_s = self.last_stats.init_time_s + self.last_stats.runtime_only_s
+        return self._sim_Q, self._sim_Qaux
+
+    def solve(self, mesh, model, write_output=False):
+        """Convenience: setup_simulation + run_simulation."""
+        self.setup_simulation(mesh, model, write_output=write_output)
+        return self.run_simulation()
 
 
-# ── Free-surface IMEX variant ─────────────────────────────────────────────────
+# -- Free-surface IMEX variant -------------------------------------------------
 
 from zoomy_core.fvm.solver_numpy import _build_free_surface_numerics
 

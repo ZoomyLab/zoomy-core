@@ -5,7 +5,10 @@ No dependency on legacy flux.py or nonconservative_flux.py.
 
 Solver hierarchy:
     Solver (base: init, create_runtime, BCs)
-      └→ HyperbolicSolver (explicit time stepping + symbolic Riemann flux)
+      -> HyperbolicSolver (explicit time stepping + symbolic Riemann flux)
+           -> setup_simulation(mesh, model)
+           -> run_simulation() -> Q, Qaux
+           -> step(dt): apply_bcs -> reconstruct -> flux -> ode_step -> update_state
 """
 
 import os
@@ -30,7 +33,7 @@ from zoomy_core.fvm.riemann_solvers import (
 _EMPTY_AUX = np.array([])
 
 
-# ── Field detection helpers ───────────────────────────────────────────────────
+# -- Field detection helpers ---------------------------------------------------
 
 def _var_index(model, name, fallback=None):
     keys = list(model.variables.keys())
@@ -71,7 +74,7 @@ def _detect_scaled_q_indices(model):
     return [i for i in range(model.n_variables) if i not in excluded]
 
 
-# ── Base Solver ───────────────────────────────────────────────────────────────
+# -- Base Solver ---------------------------------------------------------------
 
 class Solver(param.Parameterized):
     """Base solver class: initialization, runtime creation, boundary conditions."""
@@ -135,13 +138,16 @@ class Solver(param.Parameterized):
         return Qaux
 
 
-# ── HyperbolicSolver ──────────────────────────────────────────────────────────
+# -- HyperbolicSolver ----------------------------------------------------------
 
 class HyperbolicSolver(Solver):
     """Explicit time-stepping solver using the symbolic Riemann solver.
 
-    Uses PositiveNonconservativeRusanov from riemann_solvers.py.
-    No dependency on legacy flux.py or nonconservative_flux.py.
+    Core methods:
+        setup_simulation(mesh, model) -- build all operators once
+        run_simulation()              -- time loop: compute_dt -> step -> output
+        step(dt)                      -- one timestep (readable, no if-clauses)
+        solve(mesh, model)            -- convenience: setup + run
     """
 
     time_end = param.Number(default=0.1, bounds=(0, None), doc="Simulation end time")
@@ -170,7 +176,7 @@ class HyperbolicSolver(Solver):
         Qaux = model.aux_initial_conditions.apply(mesh.cell_centers, Qaux)
         return Q, Qaux
 
-    # ── Symbolic model helpers ────────────────────────────────────────
+    # -- Symbolic model helpers ----------------------------------------
 
     def _get_symbolic_model(self, model):
         return model.model if hasattr(model, "model") else model
@@ -178,7 +184,7 @@ class HyperbolicSolver(Solver):
     def _get_dry_threshold(self, symbolic_model):
         return _param_value(symbolic_model, "eps_wet", default=1e-3)
 
-    # ── Max wavespeed (for CFL + Rusanov dissipation) ─────────────────
+    # -- Max wavespeed (for CFL + Rusanov dissipation) -----------------
 
     def _build_max_wavespeed(self, symbolic_model):
         eig_mode = getattr(symbolic_model, "eigenvalue_mode", "symbolic")
@@ -250,7 +256,7 @@ class HyperbolicSolver(Solver):
             return max_ev
         return compute_max_eigenvalue
 
-    # ── Flux operator (symbolic Riemann solver) ───────────────────────
+    # -- Flux operator (symbolic Riemann solver) -----------------------
 
     def _build_numerics(self, symbolic_model):
         """Build the symbolic Riemann solver. Override for SWE-specific variants."""
@@ -342,7 +348,7 @@ class HyperbolicSolver(Solver):
             return dQ
         return flux_operator
 
-    # ── Source operator ───────────────────────────────────────────────
+    # -- Source operator -----------------------------------------------
 
     def get_compute_source(self, mesh, model):
         def compute_source(dt, Q, Qaux, parameters, dQ):
@@ -357,79 +363,124 @@ class HyperbolicSolver(Solver):
             )
         return compute
 
-    # ── Solve loop ────────────────────────────────────────────────────
+    # -- Setup / Step / Run / Solve ------------------------------------
 
-    def solve(self, mesh, model, write_output=True):
+    def setup_simulation(self, mesh, model, write_output=True):
+        """Build all operators once. Stores simulation state on self."""
         mesh = ensure_lsq_mesh(mesh, model)
         Q, Qaux = self.initialize(mesh, model)
         Q, Qaux, parameters, mesh, model = self.create_runtime(Q, Qaux, mesh, model)
         Qaux = self.update_qaux(Q, Qaux, Q, Qaux, mesh, model, parameters, 0.0, 1.0)
 
+        # Store simulation state
+        self._sim_mesh = mesh
+        self._sim_model = model
+        self._sim_parameters = parameters
+        self._sim_Q = Q
+        self._sim_Qaux = Qaux
+        self._sim_time = 0.0
+
+        # Build operators (once)
+        self._sim_compute_max_abs_eigenvalue = self.get_compute_max_abs_eigenvalue(mesh, model)
+        self._sim_boundary_operator = self.get_apply_boundary_conditions(mesh, model)
+        self._sim_flux_operator = self.get_flux_operator(mesh, model)
+        self._sim_ode_step = ode.RK2 if self.reconstruction_order >= 2 else ode.RK1
+
+        # Apply initial BCs and update
+        self._sim_Q = self._sim_boundary_operator(0.0, Q, Qaux, parameters)
+        self._sim_Q = self.update_q(self._sim_Q, Qaux, mesh, model, parameters)
+
+        # Precompute mesh constant
+        self._sim_cell_inradius_face = np.minimum(
+            mesh.cell_inradius[mesh.face_cells[0, :]],
+            mesh.cell_inradius[mesh.face_cells[1, :]],
+        ).min()
+
+        # Output setup
         if write_output:
             output_hdf5_path = os.path.join(
                 self.settings.output.directory, f"{self.settings.output.filename}.h5"
             )
-            save_fields = io.get_save_fields(output_hdf5_path, write_all=False)
+            self._sim_save_fields = io.get_save_fields(output_hdf5_path, write_all=False)
         else:
-            def save_fields(time, time_stamp, i_snapshot, Q, Qaux):
-                return i_snapshot
+            self._sim_save_fields = lambda time, time_stamp, i_snapshot, Q, Qaux: i_snapshot
 
-        def run(Q, Qaux, parameters, model):
-            t_start = gettime()
-            compute_max_abs_eigenvalue = self.get_compute_max_abs_eigenvalue(mesh, model)
-            boundary_operator = self.get_apply_boundary_conditions(mesh, model)
-            Q = boundary_operator(0.0, Q, Qaux, parameters)
-            Q = self.update_q(Q, Qaux, mesh, model, parameters)
+    def step(self, dt):
+        """One explicit timestep: flux -> ODE step -> BCs -> update state.
 
-            time_now = 0.0
-            next_write_at = 0.0
-            i_snapshot = 0.0
-            dt_snapshot = self.time_end / max(self.settings.output.snapshots - 1, 1)
-            iteration = 0
+        Each line is one physics operation. No if-clauses.
+        """
+        Q = self._sim_Q
+        Qaux = self._sim_Qaux
+        parameters = self._sim_parameters
+        time_now = self._sim_time
+        mesh = self._sim_mesh
+        model = self._sim_model
 
-            cell_inradius_face = np.minimum(
-                mesh.cell_inradius[mesh.face_cells[0, :]],
-                mesh.cell_inradius[mesh.face_cells[1, :]],
-            ).min()
+        # Explicit flux + ODE integration
+        Qnew = self._sim_ode_step(self._sim_flux_operator, Q, Qaux, parameters, dt)
 
-            flux_operator = self.get_flux_operator(mesh, model)
+        # Boundary conditions
+        Qnew = self._sim_boundary_operator(time_now, Qnew, Qaux, parameters)
 
-            while time_now < self.time_end:
-                dt = self.compute_dt(Q, Qaux, parameters, cell_inradius_face,
-                                     compute_max_abs_eigenvalue)
-                dt = min(float(dt), float(self.time_end - time_now))
-                if not np.isfinite(dt) or dt <= 0.0:
-                    break
+        # Variable updates (h clamp, momentum ramp)
+        Qnew = self.update_q(Qnew, Qaux, mesh, model, parameters)
 
-                ode_step = ode.RK2 if self.reconstruction_order >= 2 else ode.RK1
-                Qnew = ode_step(flux_operator, Q, Qaux, parameters, dt)
-                Qnew = boundary_operator(time_now, Qnew, Qaux, parameters)
-                Qnew = self.update_q(Qnew, Qaux, mesh, model, parameters)
-                Qauxnew = self.update_qaux(Qnew, Qaux, Q, Qaux, mesh, model,
-                                           parameters, time_now, dt)
-                Q = Qnew
-                Qaux = Qauxnew
+        # Auxiliary variable updates
+        Qauxnew = self.update_qaux(Qnew, Qaux, Q, Qaux, mesh, model,
+                                    parameters, time_now, dt)
 
-                time_now += dt
-                iteration += 1
+        # Commit new state
+        self._sim_Q = Qnew
+        self._sim_Qaux = Qauxnew
 
-                if time_now >= next_write_at:
-                    i_snapshot = save_fields(time_now, next_write_at, i_snapshot, Q, Qaux)
-                    next_write_at += dt_snapshot
+    def run_simulation(self):
+        """Time loop: compute_dt -> step -> post_step -> output."""
+        t_start = gettime()
+        time_now = 0.0
+        next_write_at = 0.0
+        i_snapshot = 0.0
+        dt_snapshot = self.time_end / max(self.settings.output.snapshots - 1, 1)
+        iteration = 0
 
-                if iteration % 10 == 0:
-                    logger.info(
-                        f"iteration: {iteration}, time: {time_now:.6f}, "
-                        f"dt: {dt:.6f}, next write at time: {next_write_at:.6f}"
-                    )
+        while time_now < self.time_end:
+            dt = self.compute_dt(
+                self._sim_Q, self._sim_Qaux, self._sim_parameters,
+                self._sim_cell_inradius_face, self._sim_compute_max_abs_eigenvalue,
+            )
+            dt = min(float(dt), float(self.time_end - time_now))
+            if not np.isfinite(dt) or dt <= 0.0:
+                break
 
-            logger.info(f"Finished simulation with in {gettime() - t_start:.3f} seconds")
-            return Q, Qaux
+            self._sim_time = time_now
+            self.step(dt)
 
-        return run(Q, Qaux, parameters, model)
+            time_now += dt
+            iteration += 1
+
+            if time_now >= next_write_at:
+                i_snapshot = self._sim_save_fields(
+                    time_now, next_write_at, i_snapshot, self._sim_Q, self._sim_Qaux,
+                )
+                next_write_at += dt_snapshot
+
+            if iteration % 10 == 0:
+                logger.info(
+                    f"iteration: {iteration}, time: {time_now:.6f}, "
+                    f"dt: {dt:.6f}, next write at time: {next_write_at:.6f}"
+                )
+
+        self._sim_time = time_now
+        logger.info(f"Finished simulation with in {gettime() - t_start:.3f} seconds")
+        return self._sim_Q, self._sim_Qaux
+
+    def solve(self, mesh, model, write_output=True):
+        """Convenience: setup_simulation + run_simulation."""
+        self.setup_simulation(mesh, model, write_output=write_output)
+        return self.run_simulation()
 
 
-# ── Free-surface variant ──────────────────────────────────────────────────────
+# -- Free-surface variant ------------------------------------------------------
 
 def _build_free_surface_numerics(symbolic_model):
     """Build positive Rusanov for free-surface models (requires h/b)."""

@@ -17,7 +17,17 @@ def _ufl_conditional(condition, true_val, false_val):
 class UFLRuntimeModel(NumpyRuntimeModel):
     """UFLRuntimeModel. (class)."""
     printer = None
-    use_cse = False  # CSE can fail with UFL-mapped modules on some SymPy versions
+    use_cse = False  # Firedrake's SymPy can't CSE ImmutableDenseNDimArray
+
+    def _lambdify_function(self, function_obj, modules):
+        """Skip functions with zero-size output (e.g. Jacobian when n_aux=0)."""
+        import sympy as sp
+        expr = function_obj.definition
+        if hasattr(expr, 'shape') and any(int(s) == 0 for s in expr.shape):
+            import numpy as np
+            shape = tuple(int(s) for s in expr.shape)
+            return lambda *a, _s=shape: np.empty(_s)
+        return super()._lambdify_function(function_obj, modules)
     
     module = {
         'ones_like': lambda x: 0*x + 1,

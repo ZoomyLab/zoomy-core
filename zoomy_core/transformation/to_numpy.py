@@ -56,14 +56,7 @@ class NumpyRuntimeModel:
         try:
             compiled = sp.lambdify(args, expr, modules=modules, cse=use_cse)
         except (TypeError, Exception):
-            # Fallback: try without CSE, then try converting NDimArray to list
-            try:
-                compiled = sp.lambdify(args, expr, modules=modules)
-            except Exception:
-                if hasattr(expr, 'tolist'):
-                    compiled = sp.lambdify(args, expr.tolist(), modules=modules)
-                else:
-                    raise
+            compiled = sp.lambdify(args, expr, modules=modules)
 
         fast_flatten = self._compile_flattener(function_obj.args)
 
