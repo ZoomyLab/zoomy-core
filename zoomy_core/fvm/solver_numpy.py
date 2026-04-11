@@ -129,6 +129,99 @@ class Solver(param.Parameterized):
             return Q
         return apply_boundary_conditions
 
+    def _build_gradient_operator(self, mesh, model):
+        """Build a gradient function for all variables.  Returns callable(Q) → gradQ.
+
+        gradQ shape: (n_vars, dim, n_cells).
+        Method determined by ``self.gradient_method``.
+        """
+        dim = model.dimension
+        method = getattr(self, 'gradient_method', 'green_gauss')
+
+        if method == "lsq":
+            from zoomy_core.mesh.lsq_reconstruction import compute_derivatives
+            # LSQ first derivatives: multi_index [[1,0]] for dx, [[0,1]] for dy, etc.
+            dim_indices = []
+            for d in range(dim):
+                idx = [0] * dim
+                idx[d] = 1
+                dim_indices.append(idx)
+
+            def lsq_gradients(Q):
+                n_vars = Q.shape[0]
+                grad = np.zeros((n_vars, dim, mesh.n_cells))
+                for v in range(n_vars):
+                    derivs = compute_derivatives(Q[v, :], mesh,
+                                                 derivatives_multi_index=dim_indices)
+                    for d in range(dim):
+                        grad[v, d, :] = derivs[:, d]
+                return grad
+            return lsq_gradients
+
+        # Default: Green-Gauss
+        iA = mesh.face_cells[0]
+        iB = mesh.face_cells[1]
+        fn = mesh.face_normals[:dim, :]
+        fv = mesh.face_volumes
+        cv = mesh.cell_volumes
+
+        def gg_gradients(Q):
+            n_vars = Q.shape[0]
+            grad = np.zeros((n_vars, dim, mesh.n_cells))
+            for v in range(n_vars):
+                u = Q[v, :]
+                u_face = 0.5 * (u[iA] + u[iB])
+                for d in range(dim):
+                    contrib = u_face * fn[d, :] * fv
+                    np.add.at(grad[v, d], iA, contrib / cv[iA])
+                    np.subtract.at(grad[v, d], iB, contrib / cv[iB])
+            return grad
+        return gg_gradients
+
+    def _build_bc_with_gradient(self, mesh, model):
+        """Build BC application that uses gradient for 2nd-order ghost extrapolation.
+
+        Returns callable(time, Q, Qaux, parameters, gradQ) → Q.
+        """
+        dim = model.dimension
+        bf_faces = mesh.boundary_face_face_indices
+        bf_cells = mesh.boundary_face_cells
+        bf_ghosts = mesh.boundary_face_ghosts
+        bf_funcs = mesh.boundary_face_function_numbers
+        normals = mesh.face_normals
+        fc = mesh.face_centers
+        cc = mesh.cell_centers
+        n_bf = mesh.n_boundary_faces
+
+        def apply_bc_with_grad(time, Q, Qaux, parameters, gradQ):
+            for i in range(n_bf):
+                i_face = bf_faces[i]
+                i_inner = bf_cells[i]
+                i_ghost = bf_ghosts[i]
+
+                q_cell = Q[:, i_inner]
+                qaux_cell = Qaux[:, i_inner]
+                normal = normals[:dim, i_face]
+                position = fc[i_face, :]
+                position_ghost = cc[:, i_ghost]
+                distance = np.linalg.norm(position - position_ghost)
+
+                # 1st-order BC: get wall/extrapolation state at face
+                q_ghost = model.boundary_conditions(
+                    bf_funcs[i], time, position, distance,
+                    q_cell, qaux_cell, parameters, normal,
+                )
+
+                # 2nd-order: extrapolate from face to ghost using gradient
+                if gradQ is not None:
+                    dx = position_ghost[:dim] - position[:dim]
+                    q_ghost = np.asarray(q_ghost, dtype=float)
+                    q_ghost += gradQ[:, :, i_inner] @ dx
+
+                Q[:, i_ghost] = q_ghost
+            return Q
+        return apply_bc_with_grad
+
     def update_q(self, Q, Qaux, mesh, model, parameters):
         """Apply model.update_variables (h clamp, momentum ramp) at each cell."""
         n_vars = Q.shape[0]
@@ -163,6 +256,9 @@ class HyperbolicSolver(Solver):
     limiter = param.Selector(default="venkatakrishnan",
         objects=["venkatakrishnan", "barth_jespersen", "minmod"],
         doc="Slope limiter for MUSCL reconstruction")
+    gradient_method = param.Selector(default="green_gauss",
+        objects=["green_gauss", "lsq"],
+        doc="Gradient reconstruction method for the whole mesh")
     eigenvalue_regularization = 1e-8
     _diffusion_in_flux = True  # explicit diffusion in flux operator
 
@@ -392,6 +488,13 @@ class HyperbolicSolver(Solver):
         self._sim_flux_operator = self.get_flux_operator(mesh, model)
         self._sim_ode_step = ode.RK2 if self.reconstruction_order >= 2 else ode.RK1
 
+        # Gradient operator + gradient-aware BC (for O2 boundary accuracy)
+        self._sim_use_gradient_bc = self.reconstruction_order >= 2
+        if self._sim_use_gradient_bc:
+            symbolic_model = self._get_symbolic_model(model)
+            self._sim_compute_gradients = self._build_gradient_operator(mesh, symbolic_model)
+            self._sim_bc_with_gradient = self._build_bc_with_gradient(mesh, model)
+
         # Apply initial BCs and update
         self._sim_Q = self._sim_boundary_operator(0.0, Q, Qaux, parameters)
         self._sim_Q = self.update_q(self._sim_Q, Qaux, mesh, model, parameters)
@@ -411,10 +514,16 @@ class HyperbolicSolver(Solver):
         else:
             self._sim_save_fields = lambda time, time_stamp, i_snapshot, Q, Qaux: i_snapshot
 
-    def step(self, dt):
-        """One explicit timestep: flux -> ODE step -> BCs -> update state.
+    def _apply_bcs(self, time, Q, Qaux, parameters):
+        """Apply BCs — base uses the standard operator without gradient."""
+        Q = self._sim_boundary_operator(time, Q, Qaux, parameters)
+        return Q
 
-        Each line is one physics operation. No if-clauses.
+    def step(self, dt):
+        """One explicit timestep with per-stage BC application.
+
+        O1 (RK1): BCs → flux → advance
+        O2 (RK2/Heun): BCs → flux → advance → BCs → flux → average
         """
         Q = self._sim_Q
         Qaux = self._sim_Qaux
@@ -422,14 +531,34 @@ class HyperbolicSolver(Solver):
         time_now = self._sim_time
         mesh = self._sim_mesh
         model = self._sim_model
+        flux = self._sim_flux_operator
 
-        # Explicit flux + ODE integration
-        Qnew = self._sim_ode_step(self._sim_flux_operator, Q, Qaux, parameters, dt)
+        if self.reconstruction_order >= 2:
+            # SSP-RK2 (Heun) with BCs applied per stage
+            Q0 = np.array(Q)
 
-        # Boundary conditions
-        Qnew = self._sim_boundary_operator(time_now, Qnew, Qaux, parameters)
+            # Stage 1: BCs → reconstruct → flux → advance
+            Q = self._apply_bcs(time_now, Q, Qaux, parameters)
+            dQ = np.zeros_like(Q)
+            dQ = flux(dt, Q, Qaux, parameters, dQ)
+            Q1 = Q + dt * dQ
 
-        # Variable updates (h clamp, momentum ramp)
+            # Stage 2: BCs → reconstruct → flux → advance
+            Q1 = self._apply_bcs(time_now + dt, Q1, Qaux, parameters)
+            dQ = flux(dt, Q1, Qaux, parameters, dQ)
+            Q2 = Q1 + dt * dQ
+
+            # Average
+            Qnew = 0.5 * (Q0 + Q2)
+        else:
+            # RK1: BCs → flux → advance
+            Q = self._apply_bcs(time_now, Q, Qaux, parameters)
+            dQ = np.zeros_like(Q)
+            dQ = flux(dt, Q, Qaux, parameters, dQ)
+            Qnew = Q + dt * dQ
+
+        # Final BC application + variable updates
+        Qnew = self._apply_bcs(time_now, Qnew, Qaux, parameters)
         Qnew = self.update_q(Qnew, Qaux, mesh, model, parameters)
 
         # Auxiliary variable updates
