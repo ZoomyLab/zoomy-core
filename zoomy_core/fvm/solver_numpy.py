@@ -409,6 +409,31 @@ class HyperbolicSolver(Solver):
             return MUSCLReconstruction(mesh, dim, limiter=self.limiter)
         return ConstantReconstruction(mesh, dim)
 
+    def _detect_wall_faces(self, mesh, model):
+        """Detect wall boundary faces and their momentum indices.
+
+        Returns (wall_face_set, momentum_indices_list) where:
+        - wall_face_set: set of face indices that are wall boundaries
+        - momentum_indices_list: list of index lists for normal/tangential decomposition
+        """
+        symbolic_model = self._get_symbolic_model(model) if not hasattr(model, 'variables') else model
+        bcs = getattr(symbolic_model, 'boundary_conditions', None)
+        if bcs is None:
+            return set(), []
+
+        from zoomy_core.model.boundary_conditions import Wall
+        wall_faces = set()
+        momentum_indices = []
+        for bc in bcs.boundary_conditions_list:
+            if isinstance(bc, Wall):
+                tag = bc.tag
+                momentum_indices = bc.momentum_field_indices
+                # Find faces with this tag
+                for i in range(mesh.n_boundary_faces):
+                    if mesh.boundary_face_function_numbers[i] == bcs._boundary_tags.index(tag):
+                        wall_faces.add(mesh.boundary_face_face_indices[i])
+        return wall_faces, momentum_indices
+
     def get_flux_operator(self, mesh, model):
         symbolic_model = self._get_symbolic_model(model)
         max_wavespeed_fn = self._build_max_wavespeed(symbolic_model)
@@ -436,12 +461,31 @@ class HyperbolicSolver(Solver):
         # Build diffusion operators (explicit in HyperbolicSolver, implicit in IMEX)
         self._diffusion_ops = self._build_diffusion_operators(mesh, symbolic_model, dim, n_vars)
 
+        # Detect wall faces for O2 face-state mirroring
+        wall_faces, wall_mom_idx = self._detect_wall_faces(mesh, symbolic_model)
+        use_wall_mirror = len(wall_faces) > 0 and self.reconstruction_order >= 2
+
+        def _mirror_wall_state(qL, normal):
+            """Mirror reconstructed left state for wall: reflect normal momentum."""
+            qR = qL.copy()
+            for indices in wall_mom_idx:
+                mom = np.array([qL[k] for k in indices])
+                n_vec = normal[:len(indices)]
+                normal_component = np.dot(mom, n_vec)
+                for i, k in enumerate(indices):
+                    qR[k] = mom[i] - 2.0 * normal_component * n_vec[i]
+            return qR
+
         def flux_operator(dt, Q, Qaux, parameters, dQ):
             dQ = np.zeros_like(dQ)
             Q_L, Q_R = reconstruct(Q)
             for f in range(mesh.n_faces):
                 qA = Q_L[:, f]
-                qB = Q_R[:, f]
+                # At wall faces: mirror the reconstructed left state
+                if use_wall_mirror and f in wall_faces:
+                    qB = _mirror_wall_state(qA, normals_arr[:, f])
+                else:
+                    qB = Q_R[:, f]
                 qauxA = Qaux[:, iA[f]] if has_aux else _EMPTY_AUX
                 qauxB = Qaux[:, iB[f]] if has_aux else _EMPTY_AUX
                 n = normals_arr[:, f]
