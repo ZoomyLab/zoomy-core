@@ -112,67 +112,20 @@ class Solver(param.Parameterized):
 
     def get_apply_boundary_conditions(self, mesh, model):
         dim = model.dimension
-        extrapolate = getattr(self, 'reconstruction_order', 1) >= 2
-
-        # Pre-extract boundary topology for the inner loop
-        bf_faces = mesh.boundary_face_face_indices
-        bf_cells = mesh.boundary_face_cells
-        bf_ghosts = mesh.boundary_face_ghosts
-        bf_funcs = mesh.boundary_face_function_numbers
-        normals = mesh.face_normals
-        fc = mesh.face_centers
-        cc = mesh.cell_centers
-        n_bf = mesh.n_boundary_faces
-
-        # Green-Gauss gradient operator (reuse MUSCL machinery)
-        if extrapolate:
-            iA = mesh.face_cells[0]
-            iB = mesh.face_cells[1]
-            fv = mesh.face_volumes
-            fn = normals[:dim, :]
-            cv = mesh.cell_volumes
-
-        def _green_gauss_gradients(Q):
-            """Green-Gauss gradient for each variable. Returns (n_vars, dim, n_cells)."""
-            n_vars = Q.shape[0]
-            grad = np.zeros((n_vars, dim, mesh.n_cells))
-            for v in range(n_vars):
-                u = Q[v, :]
-                u_face = 0.5 * (u[iA] + u[iB])
-                for d in range(dim):
-                    contrib = u_face * fn[d, :] * fv
-                    np.add.at(grad[v, d], iA, contrib / cv[iA])
-                    np.subtract.at(grad[v, d], iB, contrib / cv[iB])
-            return grad
-
         def apply_boundary_conditions(time, Q, Qaux, parameters):
-            # Compute gradients for 2nd-order ghost extrapolation
-            gradQ = _green_gauss_gradients(Q) if extrapolate else None
-
-            for i in range(n_bf):
-                i_face = bf_faces[i]
-                i_inner = bf_cells[i]
-                i_ghost = bf_ghosts[i]
-
-                q_cell = Q[:, i_inner]
-                qaux_cell = Qaux[:, i_inner]
-                normal = normals[:dim, i_face]
-                position = fc[i_face, :]
-                position_ghost = cc[:, i_ghost]
+            for i in range(mesh.n_boundary_faces):
+                i_face = mesh.boundary_face_face_indices[i]
+                i_bc_func = mesh.boundary_face_function_numbers[i]
+                q_cell = Q[:, mesh.boundary_face_cells[i]]
+                qaux_cell = Qaux[:, mesh.boundary_face_cells[i]]
+                normal = mesh.face_normals[:dim, i_face]
+                position = mesh.face_centers[i_face, :]
+                position_ghost = mesh.cell_centers[:, mesh.boundary_face_ghosts[i]]
                 distance = np.linalg.norm(position - position_ghost)
-
                 q_ghost = model.boundary_conditions(
-                    bf_funcs[i], time, position, distance,
-                    q_cell, qaux_cell, parameters, normal,
+                    i_bc_func, time, position, distance, q_cell, qaux_cell, parameters, normal
                 )
-
-                # 2nd-order: extrapolate from face center to ghost center
-                if gradQ is not None:
-                    dx = position_ghost[:dim] - position[:dim]
-                    q_ghost = np.asarray(q_ghost, dtype=float)
-                    q_ghost += gradQ[:, :, i_inner] @ dx
-
-                Q[:, i_ghost] = q_ghost
+                Q[:, mesh.boundary_face_ghosts[i]] = q_ghost
             return Q
         return apply_boundary_conditions
 
