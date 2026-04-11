@@ -186,6 +186,206 @@ class Periodic(BoundaryCondition):
         return ZArray(Q)
 
 
+# --- System-Aware Boundary Conditions ---
+#
+# These are applied via system.boundary_conditions.apply(SystemWall(), tag="right").
+# They dispatch per equation type: scalar → Extrapolation, momentum → reflection.
+
+
+class SystemExtrapolation:
+    """Apply Extrapolation to all equations in the system."""
+
+    def __init__(self, tag=None):
+        self.tag = tag
+
+    def apply_to_system_bcs(self, system_bcs, tag=None):
+        t = tag or self.tag
+        for eq_name in system_bcs.equation_names:
+            system_bcs.set(eq_name, Extrapolation(tag=t), tag=t)
+
+
+class SystemPeriodic:
+    """Apply Periodic to all equations in the system."""
+
+    def __init__(self, tag=None, periodic_to_physical_tag=""):
+        self.tag = tag
+        self.periodic_to_physical_tag = periodic_to_physical_tag
+
+    def apply_to_system_bcs(self, system_bcs, tag=None):
+        t = tag or self.tag
+        for eq_name in system_bcs.equation_names:
+            system_bcs.set(
+                eq_name,
+                Periodic(tag=t, periodic_to_physical_tag=self.periodic_to_physical_tag),
+                tag=t,
+            )
+
+
+class SystemWall:
+    """System-aware wall BC: Extrapolation for scalars, reflection for momentum.
+
+    Applied via ``system.boundary_conditions.apply(SystemWall(), tag="right")``.
+    The Wall BC holds a reference to the system and reads its equations
+    to determine scalar vs momentum fields automatically.
+
+    Parameters
+    ----------
+    tag : str
+        Boundary tag (e.g. "right", "bottom").
+    permeability : float
+        0 = impermeable (default), 1 = fully permeable.
+    wall_slip : float
+        1 = free-slip (default), 0 = no-slip.
+    """
+
+    def __init__(self, tag=None, permeability=0.0, wall_slip=1.0):
+        self.tag = tag
+        self.permeability = permeability
+        self.wall_slip = wall_slip
+
+    def apply_to_system_bcs(self, system_bcs, tag=None, system=None):
+        t = tag or self.tag
+        momentum_eqs = [n for n in system_bcs.equation_names if "momentum" in n]
+        scalar_eqs = [n for n in system_bcs.equation_names if n not in momentum_eqs]
+
+        for eq_name in scalar_eqs:
+            system_bcs.set(eq_name, Extrapolation(tag=t), tag=t)
+
+        # Create a single WallMomentumBC that holds the system reference.
+        # All momentum equations share it — the compiler reads the system
+        # to determine the vector grouping.
+        wall_bc = WallMomentumBC(
+            tag=t,
+            system_bcs=system_bcs,
+            permeability=self.permeability,
+            wall_slip=self.wall_slip,
+        )
+        for eq_name in momentum_eqs:
+            system_bcs.set(eq_name, wall_bc, tag=t)
+
+
+class WallMomentumBC:
+    """Wall BC for momentum equations — reads the system to build reflection.
+
+    Holds a reference to the ``SystemBoundaryConditions`` (and thus knows
+    which equations exist).  At compile time, determines the momentum
+    vector grouping automatically from the equation names.
+
+    The normal/tangential decomposition works for any system derived from
+    INS: SWE (hu), SME (hu0, hu1, ...), VAM (hu, hv, hw moments), full INS.
+    """
+
+    def __init__(self, tag, system_bcs, permeability=0.0, wall_slip=1.0):
+        self.tag = tag
+        self._system_bcs = system_bcs
+        self.permeability = permeability
+        self.wall_slip = wall_slip
+
+    @property
+    def momentum_equations(self):
+        """Momentum equations in the current system."""
+        return [n for n in self._system_bcs.equation_names if "momentum" in n]
+
+    def __repr__(self):
+        return (f"WallMomentumBC(eqs={self.momentum_equations}, "
+                f"perm={self.permeability}, slip={self.wall_slip})")
+
+
+# --- Compiler: System BCs → legacy BoundaryConditions ---
+
+
+def compile_system_bcs(system_bcs, equation_variable_map, dimension):
+    """Translate system-aware BCs into the legacy BoundaryConditions container.
+
+    Reads per-equation, per-tag BCs from ``system_bcs`` and produces
+    a ``BoundaryConditions`` with one entry per tag. The
+    ``equation_variable_map`` maps equation names to variable indices
+    so the Wall BC knows which indices form the momentum vector.
+
+    Parameters
+    ----------
+    system_bcs : SystemBoundaryConditions
+    equation_variable_map : dict
+        ``{equation_name: [var_index, ...]}``
+    dimension : int
+        Model dimension (1 or 2 for horizontal).
+
+    Returns
+    -------
+    BoundaryConditions
+    """
+    bc_list = []
+    for tag in system_bcs.tags:
+        bcs_for_tag = system_bcs.get_all(tag)
+        if not bcs_for_tag:
+            continue
+
+        # Check if any equation has a WallMomentumBC for this tag
+        wall_bc = None
+        all_extrap = True
+        all_periodic = True
+        for eq_name, bc in bcs_for_tag.items():
+            if isinstance(bc, WallMomentumBC):
+                wall_bc = bc
+                all_extrap = False
+                all_periodic = False
+            elif isinstance(bc, Periodic):
+                all_extrap = False
+            elif isinstance(bc, Extrapolation):
+                all_periodic = False
+            else:
+                all_extrap = False
+                all_periodic = False
+
+        if all_periodic:
+            bc_obj = next(iter(bcs_for_tag.values()))
+            bc_list.append(Periodic(
+                tag=tag,
+                periodic_to_physical_tag=getattr(bc_obj, 'periodic_to_physical_tag', ''),
+            ))
+        elif wall_bc is not None:
+            # Build momentum_field_indices from equation_variable_map.
+            # Group momentum equation indices by moment index:
+            # For level=1, 1D: x_momentum = [2, 3] → [[2], [3]]
+            # For level=1, 2D: x_momentum = [2, 3], y_momentum = [4, 5]
+            #   → [[2, 4], [3, 5]]  (pairs for normal/tangential)
+            mom_eqs = wall_bc.momentum_equations
+            mom_indices_per_eq = [equation_variable_map.get(eq, []) for eq in mom_eqs]
+
+            if len(mom_eqs) == 0:
+                # No momentum equations — just extrapolation
+                bc_list.append(Extrapolation(tag=tag))
+            elif len(mom_eqs) == 1:
+                # 1D: each variable is its own "vector" (scalar momentum)
+                bc_list.append(Wall(
+                    tag=tag,
+                    momentum_field_indices=[[idx] for idx in mom_indices_per_eq[0]],
+                    permeability=wall_bc.permeability,
+                    wall_slip=wall_bc.wall_slip,
+                ))
+            else:
+                # 2D+: group by moment index across equations
+                n_per_eq = len(mom_indices_per_eq[0])
+                groups = []
+                for k in range(n_per_eq):
+                    group = [indices[k] for indices in mom_indices_per_eq
+                             if k < len(indices)]
+                    groups.append(group)
+                bc_list.append(Wall(
+                    tag=tag,
+                    momentum_field_indices=groups,
+                    permeability=wall_bc.permeability,
+                    wall_slip=wall_bc.wall_slip,
+                ))
+        elif all_extrap:
+            bc_list.append(Extrapolation(tag=tag))
+        else:
+            # Mixed — default to extrapolation
+            bc_list.append(Extrapolation(tag=tag))
+
+    return BoundaryConditions(bc_list)
+
+
 # --- Container Class ---
 
 

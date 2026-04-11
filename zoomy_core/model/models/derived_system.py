@@ -35,6 +35,106 @@ from zoomy_core.model.models.ins_generator import (
 )
 
 
+class SystemBoundaryConditions:
+    """Boundary conditions for a PDE system, per equation and per tag.
+
+    Each equation has a dict of ``{tag: BoundaryConditionSpec}``.
+    Apply shortcuts set BCs for all equations at once::
+
+        system.boundary_conditions.apply(Periodic(), tag="left")
+        system.x_momentum.boundary_conditions.apply(Wall(), tag="right")
+
+    The ``Wall`` BC is system-aware: when applied at the system level,
+    it automatically assigns Extrapolation to scalar equations and
+    normal/tangential momentum reflection to vector (momentum) equations.
+    """
+
+    def __init__(self, equation_names):
+        # {equation_name: {tag: BoundaryConditionSpec}}
+        self._bcs = {name: {} for name in equation_names}
+
+    def apply(self, bc, tag=None):
+        """Apply a BC to all equations.
+
+        If ``bc`` is a system-level BC like ``Wall``, it dispatches
+        appropriately per equation type. Otherwise it applies uniformly.
+        """
+        if hasattr(bc, 'apply_to_system_bcs'):
+            bc.apply_to_system_bcs(self, tag=tag)
+        else:
+            for eq_name in self._bcs:
+                self.set(eq_name, bc, tag=tag)
+
+    def set(self, equation_name, bc, tag=None):
+        """Set a BC for a specific equation and tag."""
+        t = tag or getattr(bc, 'tag', 'default')
+        if equation_name not in self._bcs:
+            self._bcs[equation_name] = {}
+        self._bcs[equation_name][t] = bc
+
+    def get(self, equation_name, tag):
+        """Get the BC for a specific equation and tag."""
+        return self._bcs.get(equation_name, {}).get(tag)
+
+    def get_all(self, tag):
+        """Get all equation BCs for a given tag. Returns {eq_name: bc}."""
+        return {eq: bcs.get(tag) for eq, bcs in self._bcs.items() if tag in bcs}
+
+    @property
+    def tags(self):
+        """All unique tags across all equations."""
+        tags = set()
+        for bcs in self._bcs.values():
+            tags.update(bcs.keys())
+        return sorted(tags)
+
+    @property
+    def equation_names(self):
+        return list(self._bcs.keys())
+
+    def remove_equation(self, equation_name):
+        """Remove BCs for a deleted equation."""
+        self._bcs.pop(equation_name, None)
+
+    def add_equation(self, equation_name):
+        """Add BC slots for a new equation."""
+        if equation_name not in self._bcs:
+            self._bcs[equation_name] = {}
+
+    def __repr__(self):
+        parts = []
+        for eq, bcs in self._bcs.items():
+            if bcs:
+                tags = ", ".join(f"{t}: {type(bc).__name__}" for t, bc in bcs.items())
+                parts.append(f"  {eq}: {{{tags}}}")
+        return "SystemBoundaryConditions(\n" + "\n".join(parts) + "\n)" if parts else "SystemBoundaryConditions(empty)"
+
+
+class _EquationBCProxy:
+    """Proxy for per-equation boundary condition access.
+
+    Usage: ``system.x_momentum.boundary_conditions.apply(Wall(), tag="right")``
+    """
+
+    def __init__(self, system_bcs, equation_name):
+        self._system_bcs = system_bcs
+        self._equation_name = equation_name
+
+    def apply(self, bc, tag=None):
+        t = tag or getattr(bc, 'tag', 'default')
+        self._system_bcs.set(self._equation_name, bc, tag=t)
+
+    def get(self, tag):
+        return self._system_bcs.get(self._equation_name, tag)
+
+    def __repr__(self):
+        bcs = self._system_bcs._bcs.get(self._equation_name, {})
+        if bcs:
+            tags = ", ".join(f"{t}: {type(bc).__name__}" for t, bc in bcs.items())
+            return f"BCs({self._equation_name}: {{{tags}}})"
+        return f"BCs({self._equation_name}: empty)"
+
+
 class _EquationProxy:
     """Proxy for in-place operations on a single equation in a DerivedSystem.
 
@@ -51,6 +151,11 @@ class _EquationProxy:
     @property
     def _expr(self):
         return self._system.equations[self._name]
+
+    @property
+    def boundary_conditions(self):
+        """Per-equation BC access."""
+        return _EquationBCProxy(self._system.boundary_conditions, self._name)
 
     def apply(self, *args, **kwargs):
         """Apply operation in place — mutates the equation in the system."""
@@ -129,6 +234,7 @@ class System:
         self.state = state
         self.equations = dict(equations) if equations else {}
         self.assumptions = assumptions or []
+        self.boundary_conditions = SystemBoundaryConditions(list(self.equations.keys()))
 
     def add_equation(self, name, expr, term_groups=None):
         """Add an equation to the system.
@@ -146,10 +252,17 @@ class System:
             self.equations[name] = expr
         else:
             self.equations[name] = Expression(expr, name, term_groups=term_groups)
+        self.boundary_conditions.add_equation(name)
+
+    def remove_equation(self, name):
+        """Remove an equation and its boundary conditions."""
+        self.equations.pop(name, None)
+        self.boundary_conditions.remove_equation(name)
 
     def __getattr__(self, name):
         # Dot access to equations: system.x_momentum, system.continuity, etc.
-        if name.startswith("_") or name in ("name", "equations", "state", "assumptions"):
+        if name.startswith("_") or name in ("name", "equations", "state",
+                                             "assumptions", "boundary_conditions"):
             raise AttributeError(name)
         if name in self.equations:
             return _EquationProxy(self, name)
