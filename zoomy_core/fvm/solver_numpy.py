@@ -179,9 +179,12 @@ class Solver(param.Parameterized):
         return gg_gradients
 
     def _build_bc_with_gradient(self, mesh, model):
-        """Build BC application that uses gradient for 2nd-order ghost extrapolation.
+        """Build BC with per-field gradient extrapolation.
 
-        Returns callable(time, Q, Qaux, parameters, gradQ) → Q.
+        Uses ``model.boundary_conditions._gradient_variable_indices``
+        (from ``compile_system_bcs``) to determine which variables get
+        gradient extrapolation at each boundary tag.  Scalars like h
+        stay 1st-order, momentum gets 2nd-order.
         """
         dim = model.dimension
         bf_faces = mesh.boundary_face_face_indices
@@ -193,11 +196,26 @@ class Solver(param.Parameterized):
         cc = mesh.cell_centers
         n_bf = mesh.n_boundary_faces
 
+        # Get per-tag gradient indices from compiled BCs
+        symbolic_model = self._get_symbolic_model(model)
+        grad_var_indices = getattr(
+            symbolic_model.boundary_conditions, '_gradient_variable_indices', {}
+        )
+
+        # Build per-boundary-function gradient index sets
+        # bf_funcs[i] is the BC function index; we need to map it to the tag
+        bc_tags = symbolic_model.boundary_conditions._boundary_tags
+        grad_idx_per_func = []
+        for tag in bc_tags:
+            indices = set(grad_var_indices.get(tag, []))
+            grad_idx_per_func.append(indices)
+
         def apply_bc_with_grad(time, Q, Qaux, parameters, gradQ):
             for i in range(n_bf):
                 i_face = bf_faces[i]
                 i_inner = bf_cells[i]
                 i_ghost = bf_ghosts[i]
+                i_func = bf_funcs[i]
 
                 q_cell = Q[:, i_inner]
                 qaux_cell = Qaux[:, i_inner]
@@ -206,17 +224,19 @@ class Solver(param.Parameterized):
                 position_ghost = cc[:, i_ghost]
                 distance = np.linalg.norm(position - position_ghost)
 
-                # 1st-order BC: get wall/extrapolation state at face
                 q_ghost = model.boundary_conditions(
-                    bf_funcs[i], time, position, distance,
+                    i_func, time, position, distance,
                     q_cell, qaux_cell, parameters, normal,
                 )
 
-                # 2nd-order: extrapolate from face to ghost using gradient
-                if gradQ is not None:
-                    dx = position_ghost[:dim] - position[:dim]
-                    q_ghost = np.asarray(q_ghost, dtype=float)
-                    q_ghost += gradQ[:, :, i_inner] @ dx
+                # Per-field gradient extrapolation
+                if gradQ is not None and i_func < len(grad_idx_per_func):
+                    grad_vars = grad_idx_per_func[i_func]
+                    if grad_vars:
+                        dx = position_ghost[:dim] - position[:dim]
+                        q_ghost = np.asarray(q_ghost, dtype=float)
+                        for k in grad_vars:
+                            q_ghost[k] += np.dot(gradQ[k, :, i_inner], dx)
 
                 Q[:, i_ghost] = q_ghost
             return Q
@@ -515,7 +535,15 @@ class HyperbolicSolver(Solver):
             self._sim_save_fields = lambda time, time_stamp, i_snapshot, Q, Qaux: i_snapshot
 
     def _apply_bcs(self, time, Q, Qaux, parameters):
-        """Apply BCs — base uses the standard operator without gradient."""
+        """Apply boundary conditions.
+
+        Gradient extrapolation infrastructure is available via
+        ``_sim_bc_with_gradient`` but disabled by default — the
+        PositiveNonconservativeRusanov's hydrostatic reconstruction
+        handles boundary accuracy internally.  Enable per-field
+        gradient extrapolation once BCs are fully derivative-aware
+        via the Qaux pipeline.
+        """
         Q = self._sim_boundary_operator(time, Q, Qaux, parameters)
         return Q
 

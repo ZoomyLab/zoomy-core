@@ -49,6 +49,9 @@ class BoundaryCondition(param.Parameterized):
 
 class Extrapolation(BoundaryCondition):
     """Extrapolation. (class)."""
+    use_gradient = param.Boolean(default=True,
+        doc="Use gradient for 2nd-order ghost extrapolation when available")
+
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
         """Compute boundary condition."""
         return ZArray(Q)
@@ -131,6 +134,8 @@ class Wall(BoundaryCondition):
     permeability = param.Number(default=0.0)
     wall_slip = param.Number(default=1.0)
     blending = param.Number(default=0.0)
+    use_gradient = param.Boolean(default=True,
+        doc="Use gradient for 2nd-order ghost extrapolation when available")
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
         """Compute boundary condition."""
@@ -248,17 +253,17 @@ class SystemWall:
         momentum_eqs = [n for n in system_bcs.equation_names if "momentum" in n]
         scalar_eqs = [n for n in system_bcs.equation_names if n not in momentum_eqs]
 
+        # Scalars: extrapolation WITHOUT gradient (preserves hydrostatic balance)
         for eq_name in scalar_eqs:
-            system_bcs.set(eq_name, Extrapolation(tag=t), tag=t)
+            system_bcs.set(eq_name, Extrapolation(tag=t, use_gradient=False), tag=t)
 
-        # Create a single WallMomentumBC that holds the system reference.
-        # All momentum equations share it — the compiler reads the system
-        # to determine the vector grouping.
+        # Momentum: wall reflection WITH gradient (for O2 boundary accuracy)
         wall_bc = WallMomentumBC(
             tag=t,
             system_bcs=system_bcs,
             permeability=self.permeability,
             wall_slip=self.wall_slip,
+            use_gradient=True,
         )
         for eq_name in momentum_eqs:
             system_bcs.set(eq_name, wall_bc, tag=t)
@@ -275,11 +280,13 @@ class WallMomentumBC:
     INS: SWE (hu), SME (hu0, hu1, ...), VAM (hu, hv, hw moments), full INS.
     """
 
-    def __init__(self, tag, system_bcs, permeability=0.0, wall_slip=1.0):
+    def __init__(self, tag, system_bcs, permeability=0.0, wall_slip=1.0,
+                 use_gradient=True):
         self.tag = tag
         self._system_bcs = system_bcs
         self.permeability = permeability
         self.wall_slip = wall_slip
+        self.use_gradient = use_gradient
 
     @property
     def momentum_equations(self):
@@ -383,7 +390,20 @@ def compile_system_bcs(system_bcs, equation_variable_map, dimension):
             # Mixed — default to extrapolation
             bc_list.append(Extrapolation(tag=tag))
 
-    return BoundaryConditions(bc_list)
+    result = BoundaryConditions(bc_list)
+
+    # Build per-tag gradient variable indices: which variables should get
+    # gradient extrapolation at each boundary tag.
+    grad_indices = {}
+    for tag in system_bcs.tags:
+        indices = []
+        for eq_name, bc in system_bcs.get_all(tag).items():
+            if getattr(bc, 'use_gradient', True):
+                indices.extend(equation_variable_map.get(eq_name, []))
+        grad_indices[tag] = sorted(set(indices))
+    result._gradient_variable_indices = grad_indices
+
+    return result
 
 
 # --- Container Class ---
