@@ -129,6 +129,17 @@ class DerivedModel(Model):
                 "lamda": (0.1, "positive"),
                 "nu": (1e-6, "positive"),
             }
+
+            # Build equation → variable index mapping for BC compilation.
+            # Layout: [b, h, x_mom_0..x_mom_{n-1}, y_mom_0..y_mom_{n-1}]
+            eq_var_map = {"continuity": [0, 1]}  # b, h are scalar
+            eq_names = [n for n in self._system.equations if "momentum" in n]
+            idx = 2
+            for eq_name in eq_names:
+                eq_var_map[eq_name] = list(range(idx, idx + n_layers * n_mom))
+                idx += n_layers * n_mom
+            self._equation_variable_map = eq_var_map
+
             super().__init__(
                 init_functions=False,
                 dimension=hdim,

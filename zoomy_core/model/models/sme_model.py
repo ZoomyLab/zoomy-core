@@ -72,7 +72,7 @@ class SMEModel(INSModel):
             .simplify()
         )
         self.apply(HydrostaticPressure(s))
-        del self._system.equations["z_momentum"]
+        self._system.remove_equation("z_momentum")
 
         # Depth integrate + closures
         self.apply(DepthIntegrate(s))
@@ -106,7 +106,7 @@ class SMEInviscid(INSModel):
             .simplify()
         )
         self.apply(HydrostaticPressure(s))
-        del self._system.equations["z_momentum"]
+        self._system.remove_equation("z_momentum")
 
         self.apply(DepthIntegrate(s))
         self.apply(ApplyKinematicBCs(s))
