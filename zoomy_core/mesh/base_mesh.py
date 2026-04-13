@@ -130,17 +130,22 @@ def _build_cell_neighbors(face_cells: np.ndarray, cell_faces: np.ndarray,
                           n_cells: int, n_inner_cells: int):
     """Build cell_neighbors from face_cells.
 
-    For boundary faces (face_cells[1] == -1), the neighbor is the ghost cell.
-    Ghost cells are indexed starting at n_inner_cells.
+    Boundary cells get sentinel (n_cells+1) instead of ghost indices,
+    so the LSQ stencil grows inward from interior data only.
+    Ghost cells are NOT included as neighbors.
     """
+    sentinel = n_cells + 1
     n_faces_per_cell = cell_faces.shape[0]
-    cell_neighbors = (n_cells + 1) * np.ones((n_cells, n_faces_per_cell), dtype=int)
+    cell_neighbors = sentinel * np.ones((n_cells, n_faces_per_cell), dtype=int)
 
     for ic in range(n_inner_cells):
         for lf in range(n_faces_per_cell):
             fidx = cell_faces[lf, ic]
             c0, c1 = face_cells[0, fidx], face_cells[1, fidx]
             neighbor = c1 if c0 == ic else c0
+            # Ghost cells (>= n_inner_cells) → sentinel (no neighbor)
+            if neighbor >= n_inner_cells:
+                neighbor = sentinel
             cell_neighbors[ic, lf] = neighbor
 
     return cell_neighbors
@@ -540,6 +545,7 @@ class BaseMesh(param.Parameterized):
             least_squares_reconstruction_local(
                 self.n_cells, dim, self.cell_neighbors,
                 centers[:dim, :].T, degree,
+                n_inner_cells=self.n_inner_cells,
             )
         )
         lsq_scale_factors = scale_lsq_derivative(lsq_monomial_multi_index)
@@ -708,15 +714,16 @@ class BaseMesh(param.Parameterized):
         face_cells[0, -1] = n_inner_cells - 1
         face_cells[1, -1] = n_inner_cells + 1  # ghost right
 
-        cell_neighbors = (n_cells + 1) * np.ones((n_cells, 2), dtype=int)
-        for ic in range(n_cells):
+        sentinel = n_cells + 1
+        cell_neighbors = sentinel * np.ones((n_cells, 2), dtype=int)
+        for ic in range(n_inner_cells):
             cell_neighbors[ic, :] = [ic - 1, ic + 1]
-        cell_neighbors[0, 0] = n_inner_cells
-        cell_neighbors[n_inner_cells - 1, 1] = n_inner_cells + 1
-        cell_neighbors[n_inner_cells, 0] = 1
-        cell_neighbors[n_inner_cells, 1] = 0
-        cell_neighbors[n_inner_cells + 1, 0] = n_inner_cells - 1
-        cell_neighbors[n_inner_cells + 1, 1] = n_inner_cells - 2
+        # Boundary cells: sentinel instead of ghost
+        cell_neighbors[0, 0] = sentinel
+        cell_neighbors[n_inner_cells - 1, 1] = sentinel
+        # Ghost cell neighbors (kept for now, not used by LSQ)
+        cell_neighbors[n_inner_cells, :] = [1, 0]
+        cell_neighbors[n_inner_cells + 1, :] = [n_inner_cells - 1, n_inner_cells - 2]
 
         boundary_face_cells = np.array([0, n_inner_cells - 1], dtype=int)
         boundary_face_ghosts = np.array([n_inner_cells, n_inner_cells + 1], dtype=int)

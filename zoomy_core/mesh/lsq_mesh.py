@@ -134,6 +134,7 @@ class LSQMesh(FVMMesh):
             least_squares_reconstruction_local(
                 fvm.n_cells, dim, fvm.cell_neighbors,
                 centers[:dim, :].T, lsq_degree,
+                n_inner_cells=fvm.n_inner_cells,
             )
         )
         lsq._lsq_scale_factors = scale_lsq_derivative(lsq._lsq_monomial_multi_index)

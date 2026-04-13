@@ -65,10 +65,17 @@ def build_vandermonde(cell_diffs, mon_indices):
     return V
 
 
-def expand_neighbors(neighbors_list, initial_neighbors):
+def expand_neighbors(neighbors_list, initial_neighbors, n_valid=None):
+    """Expand neighbor set by one ring.  Skips sentinel/invalid indices."""
     expanded = set(initial_neighbors)
     for n in initial_neighbors:
-        expanded.update(neighbors_list[n])
+        if n_valid is not None and n >= n_valid:
+            continue
+        if n < len(neighbors_list):
+            nbrs = neighbors_list[n]
+            for nb in nbrs:
+                if n_valid is None or nb < n_valid:
+                    expanded.add(nb)
     return list(expanded)
 
 
@@ -80,9 +87,13 @@ def compute_gaussian_weights(dX, sigma=1.0):
 # ── Core LSQ reconstruction ──────────────────────────────────────────────────
 
 def least_squares_reconstruction_local(
-    n_cells, dim, neighbors_list, cell_centers, lsq_degree
+    n_cells, dim, neighbors_list, cell_centers, lsq_degree,
+    n_inner_cells=None,
 ):
     """Build per-cell LSQ gradient operators.
+
+    Only interior cells (index < n_inner_cells) are used as neighbors.
+    Boundary cells grow their stencil inward automatically.
 
     Returns
     -------
@@ -90,16 +101,22 @@ def least_squares_reconstruction_local(
     neighbors_array : (n_cells, max_neighbors) int
     mon_indices : list of tuples
     """
+    if n_inner_cells is None:
+        n_inner_cells = n_cells
     mon_indices = build_monomial_indices(lsq_degree, dim)
     degree = get_polynomial_degree(mon_indices)
     required_neighbors = get_required_monomials_count(degree, dim)
 
     neighbors_all = []
     for i_c in range(n_cells):
-        current_neighbors = list(neighbors_list[i_c])
+        # Start with valid (interior) neighbors only
+        current_neighbors = [n for n in neighbors_list[i_c] if n < n_inner_cells]
         while len(current_neighbors) < required_neighbors:
-            new_neighbors = expand_neighbors(neighbors_list, current_neighbors)
+            new_neighbors = expand_neighbors(
+                neighbors_list, current_neighbors, n_valid=n_inner_cells)
             current_neighbors = list(set(new_neighbors) - {i_c})
+            if len(current_neighbors) == 0:
+                break
         neighbors_all.append(current_neighbors)
 
     max_neighbors = max(len(nbrs) for nbrs in neighbors_all)
@@ -111,9 +128,11 @@ def least_squares_reconstruction_local(
         n_nbr = len(current_neighbors)
 
         while n_nbr < max_neighbors:
-            extended_neighbors = expand_neighbors(neighbors_list, current_neighbors)
+            extended_neighbors = expand_neighbors(
+                neighbors_list, current_neighbors, n_valid=n_inner_cells)
             extended_neighbors = list(set(extended_neighbors) - {i_c})
-            new_neighbors = [n for n in extended_neighbors if n not in current_neighbors]
+            new_neighbors = [n for n in extended_neighbors
+                             if n not in current_neighbors and n < n_inner_cells]
             current_neighbors.extend(new_neighbors)
             n_nbr = len(current_neighbors)
             if n_nbr >= max_neighbors:
