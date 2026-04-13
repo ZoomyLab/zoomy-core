@@ -38,10 +38,21 @@ class BoundaryCondition(param.Parameterized):
     tag = param.String(default="bc")
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
-        """Compute boundary condition."""
+        """Compute ghost cell value (legacy interface)."""
         raise NotImplementedError(
             "BoundaryCondition is a virtual class. Use one of its derived classes!"
         )
+
+    def face_state(self, Q_face, Qaux_face, normal, parameters):
+        """Compute the boundary-side Riemann state from the reconstructed face value.
+
+        Called at boundary faces inside the flux operator.
+        ``Q_face`` is the MUSCL-reconstructed interior state at the face.
+        Returns the state that the Riemann solver sees on the boundary side.
+
+        Default: same as Q_face (Neumann / zero-flux).
+        """
+        return Q_face.copy()
 
 
 # --- Derived Boundary Conditions (Unchanged) ---
@@ -55,6 +66,10 @@ class Extrapolation(BoundaryCondition):
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
         """Compute boundary condition."""
         return ZArray(Q)
+
+    def face_state(self, Q_face, Qaux_face, normal, parameters):
+        """Extrapolation: boundary state = interior face state (zero flux)."""
+        return Q_face.copy()
 
 
 class InflowOutflow(BoundaryCondition):
@@ -161,6 +176,19 @@ class Wall(BoundaryCondition):
                     idx
                 ]
         return out
+
+    def face_state(self, Q_face, Qaux_face, normal, parameters):
+        """Wall: reflect normal momentum component of the reconstructed face value."""
+        Q_wall = Q_face.copy()
+        for indices in self.momentum_field_indices:
+            dim = len(indices)
+            n_vec = normal[:dim]
+            mom = np.array([Q_face[k] for k in indices], dtype=float)
+            normal_component = np.dot(mom, n_vec)
+            for i, k in enumerate(indices):
+                Q_wall[k] = (self.wall_slip * (mom[i] - normal_component * n_vec[i])
+                             - (1 - self.permeability) * normal_component * n_vec[i])
+        return Q_wall
 
 
 class RoughWall(Wall):
