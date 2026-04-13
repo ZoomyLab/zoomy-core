@@ -129,119 +129,6 @@ class Solver(param.Parameterized):
             return Q
         return apply_boundary_conditions
 
-    def _build_gradient_operator(self, mesh, model):
-        """Build a gradient function for all variables.  Returns callable(Q) → gradQ.
-
-        gradQ shape: (n_vars, dim, n_cells).
-        Method determined by ``self.gradient_method``.
-        """
-        dim = model.dimension
-        method = getattr(self, 'gradient_method', 'green_gauss')
-
-        if method == "lsq":
-            from zoomy_core.mesh.lsq_reconstruction import compute_derivatives
-            # LSQ first derivatives: multi_index [[1,0]] for dx, [[0,1]] for dy, etc.
-            dim_indices = []
-            for d in range(dim):
-                idx = [0] * dim
-                idx[d] = 1
-                dim_indices.append(idx)
-
-            def lsq_gradients(Q):
-                n_vars = Q.shape[0]
-                grad = np.zeros((n_vars, dim, mesh.n_cells))
-                for v in range(n_vars):
-                    derivs = compute_derivatives(Q[v, :], mesh,
-                                                 derivatives_multi_index=dim_indices)
-                    for d in range(dim):
-                        grad[v, d, :] = derivs[:, d]
-                return grad
-            return lsq_gradients
-
-        # Default: Green-Gauss
-        iA = mesh.face_cells[0]
-        iB = mesh.face_cells[1]
-        fn = mesh.face_normals[:dim, :]
-        fv = mesh.face_volumes
-        cv = mesh.cell_volumes
-
-        def gg_gradients(Q):
-            n_vars = Q.shape[0]
-            grad = np.zeros((n_vars, dim, mesh.n_cells))
-            for v in range(n_vars):
-                u = Q[v, :]
-                u_face = 0.5 * (u[iA] + u[iB])
-                for d in range(dim):
-                    contrib = u_face * fn[d, :] * fv
-                    np.add.at(grad[v, d], iA, contrib / cv[iA])
-                    np.subtract.at(grad[v, d], iB, contrib / cv[iB])
-            return grad
-        return gg_gradients
-
-    def _build_bc_with_gradient(self, mesh, model):
-        """Build BC with per-field gradient extrapolation.
-
-        Uses ``model.boundary_conditions._gradient_variable_indices``
-        (from ``compile_system_bcs``) to determine which variables get
-        gradient extrapolation at each boundary tag.  Scalars like h
-        stay 1st-order, momentum gets 2nd-order.
-        """
-        dim = model.dimension
-        bf_faces = mesh.boundary_face_face_indices
-        bf_cells = mesh.boundary_face_cells
-        bf_ghosts = mesh.boundary_face_ghosts
-        bf_funcs = mesh.boundary_face_function_numbers
-        normals = mesh.face_normals
-        fc = mesh.face_centers
-        cc = mesh.cell_centers
-        n_bf = mesh.n_boundary_faces
-
-        # Get per-tag gradient indices from compiled BCs
-        symbolic_model = self._get_symbolic_model(model)
-        grad_var_indices = getattr(
-            symbolic_model.boundary_conditions, '_gradient_variable_indices', {}
-        )
-
-        # Build per-boundary-function gradient index sets
-        # bf_funcs[i] is the BC function index; we need to map it to the tag
-        bc_tags = symbolic_model.boundary_conditions._boundary_tags
-        grad_idx_per_func = []
-        for tag in bc_tags:
-            indices = set(grad_var_indices.get(tag, []))
-            grad_idx_per_func.append(indices)
-
-        def apply_bc_with_grad(time, Q, Qaux, parameters, gradQ):
-            for i in range(n_bf):
-                i_face = bf_faces[i]
-                i_inner = bf_cells[i]
-                i_ghost = bf_ghosts[i]
-                i_func = bf_funcs[i]
-
-                q_cell = Q[:, i_inner]
-                qaux_cell = Qaux[:, i_inner]
-                normal = normals[:dim, i_face]
-                position = fc[i_face, :]
-                position_ghost = cc[:, i_ghost]
-                distance = np.linalg.norm(position - position_ghost)
-
-                q_ghost = model.boundary_conditions(
-                    i_func, time, position, distance,
-                    q_cell, qaux_cell, parameters, normal,
-                )
-
-                # Per-field gradient extrapolation
-                if gradQ is not None and i_func < len(grad_idx_per_func):
-                    grad_vars = grad_idx_per_func[i_func]
-                    if grad_vars:
-                        dx = position_ghost[:dim] - position[:dim]
-                        q_ghost = np.asarray(q_ghost, dtype=float)
-                        for k in grad_vars:
-                            q_ghost[k] += np.dot(gradQ[k, :, i_inner], dx)
-
-                Q[:, i_ghost] = q_ghost
-            return Q
-        return apply_bc_with_grad
-
     def update_q(self, Q, Qaux, mesh, model, parameters):
         """Apply model.update_variables (h clamp, momentum ramp) at each cell."""
         n_vars = Q.shape[0]
@@ -276,9 +163,6 @@ class HyperbolicSolver(Solver):
     limiter = param.Selector(default="venkatakrishnan",
         objects=["venkatakrishnan", "barth_jespersen", "minmod"],
         doc="Slope limiter for MUSCL reconstruction")
-    gradient_method = param.Selector(default="green_gauss",
-        objects=["green_gauss", "lsq"],
-        doc="Gradient reconstruction method for the whole mesh")
     eigenvalue_regularization = 1e-8
     _diffusion_in_flux = True  # explicit diffusion in flux operator
 
@@ -421,31 +305,6 @@ class HyperbolicSolver(Solver):
             return MUSCLReconstruction(mesh, dim, limiter=self.limiter)
         return ConstantReconstruction(mesh, dim)
 
-    def _detect_wall_faces(self, mesh, model):
-        """Detect wall boundary faces and their momentum indices.
-
-        Returns (wall_face_set, momentum_indices_list) where:
-        - wall_face_set: set of face indices that are wall boundaries
-        - momentum_indices_list: list of index lists for normal/tangential decomposition
-        """
-        symbolic_model = self._get_symbolic_model(model) if not hasattr(model, 'variables') else model
-        bcs = getattr(symbolic_model, 'boundary_conditions', None)
-        if bcs is None:
-            return set(), []
-
-        from zoomy_core.model.boundary_conditions import Wall
-        wall_faces = set()
-        momentum_indices = []
-        for bc in bcs.boundary_conditions_list:
-            if isinstance(bc, Wall):
-                tag = bc.tag
-                momentum_indices = bc.momentum_field_indices
-                # Find faces with this tag
-                for i in range(mesh.n_boundary_faces):
-                    if mesh.boundary_face_function_numbers[i] == bcs._boundary_tags.index(tag):
-                        wall_faces.add(mesh.boundary_face_face_indices[i])
-        return wall_faces, momentum_indices
-
     def get_flux_operator(self, mesh, model):
         symbolic_model = self._get_symbolic_model(model)
         max_wavespeed_fn = self._build_max_wavespeed(symbolic_model)
@@ -579,13 +438,6 @@ class HyperbolicSolver(Solver):
         self._sim_flux_operator = self.get_flux_operator(mesh, model)
         self._sim_ode_step = ode.RK2 if self.reconstruction_order >= 2 else ode.RK1
 
-        # Gradient operator + gradient-aware BC (for O2 boundary accuracy)
-        self._sim_use_gradient_bc = self.reconstruction_order >= 2
-        if self._sim_use_gradient_bc:
-            symbolic_model = self._get_symbolic_model(model)
-            self._sim_compute_gradients = self._build_gradient_operator(mesh, symbolic_model)
-            self._sim_bc_with_gradient = self._build_bc_with_gradient(mesh, model)
-
         # Apply initial BCs and update
         self._sim_Q = self._sim_boundary_operator(0.0, Q, Qaux, parameters)
         self._sim_Q = self.update_q(self._sim_Q, Qaux, mesh, model, parameters)
@@ -606,12 +458,7 @@ class HyperbolicSolver(Solver):
             self._sim_save_fields = lambda time, time_stamp, i_snapshot, Q, Qaux: i_snapshot
 
     def _apply_bcs(self, time, Q, Qaux, parameters):
-        """Fill ghost cells for gradient computation.
-
-        Ghost cells are used by the MUSCL Green-Gauss gradient and
-        limiter neighbor bounds.  The actual Riemann boundary state
-        is computed by ``bc.face_state(Q_L)`` inside the flux operator.
-        """
+        """Fill ghost cells for MUSCL gradient computation and limiter bounds."""
         Q = self._sim_boundary_operator(time, Q, Qaux, parameters)
         return Q
 
