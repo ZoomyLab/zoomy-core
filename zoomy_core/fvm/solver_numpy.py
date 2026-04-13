@@ -364,13 +364,25 @@ class HyperbolicSolver(Solver):
         normals = mesh.face_normals[:dim, :]
         has_aux = symbolic_model.n_aux_variables > 0
 
+        n_inner = mesh.n_inner_cells
+
         def compute_max_eigenvalue(Q, Qaux, parameters):
             max_ev = np.zeros(mesh.n_faces)
             for f in range(mesh.n_faces):
-                if fi_h is not None and Q[fi_h, iA[f]] < dry_thr and Q[fi_h, iB[f]] < dry_thr:
+                cA, cB = iA[f], iB[f]
+                # Skip faces where both sides are dry or ghost
+                if cA >= n_inner and cB >= n_inner:
                     continue
+                if fi_h is not None:
+                    hA = Q[fi_h, cA] if cA < n_inner else 0.0
+                    hB = Q[fi_h, cB] if cB < n_inner else 0.0
+                    if hA < dry_thr and hB < dry_thr:
+                        continue
                 n = normals[:, f]
-                for i_cell in [iA[f], iB[f]]:
+                # Only evaluate at interior cells (skip ghost cells)
+                for i_cell in [cA, cB]:
+                    if i_cell >= n_inner:
+                        continue
                     q = Q[:, i_cell]
                     qaux = Qaux[:, i_cell] if has_aux else _EMPTY_AUX
                     ev = max_ws(*q, *qaux, *parameters, *n)
@@ -461,29 +473,44 @@ class HyperbolicSolver(Solver):
         # Build diffusion operators (explicit in HyperbolicSolver, implicit in IMEX)
         self._diffusion_ops = self._build_diffusion_operators(mesh, symbolic_model, dim, n_vars)
 
-        # Detect wall faces for O2 face-state mirroring
-        wall_faces, wall_mom_idx = self._detect_wall_faces(mesh, symbolic_model)
-        use_wall_mirror = len(wall_faces) > 0 and self.reconstruction_order >= 2
+        # Build per-boundary-face BC dispatchers for face_state
+        boundary_face_set = set()
+        boundary_face_bc = {}  # face_index → BoundaryCondition object
+        bcs_obj = getattr(symbolic_model, 'boundary_conditions', None)
+        if bcs_obj is not None and hasattr(bcs_obj, 'boundary_conditions_list'):
+            for i_bf in range(mesh.n_boundary_faces):
+                fidx = mesh.boundary_face_face_indices[i_bf]
+                bc_func_idx = mesh.boundary_face_function_numbers[i_bf]
+                if bc_func_idx < len(bcs_obj.boundary_conditions_list):
+                    boundary_face_set.add(fidx)
+                    boundary_face_bc[fidx] = bcs_obj.boundary_conditions_list[bc_func_idx]
 
-        def _mirror_wall_state(qL, normal):
-            """Mirror reconstructed left state for wall: reflect normal momentum."""
-            qR = qL.copy()
-            for indices in wall_mom_idx:
-                mom = np.array([qL[k] for k in indices])
-                n_vec = normal[:len(indices)]
-                normal_component = np.dot(mom, n_vec)
-                for i, k in enumerate(indices):
-                    qR[k] = mom[i] - 2.0 * normal_component * n_vec[i]
-            return qR
+        # Build wall face mirroring for O2 boundary accuracy
+        from zoomy_core.model.boundary_conditions import Wall as _WallBC
+        _wall_faces = set()
+        _wall_mom_idx = []
+        if bcs_obj is not None and hasattr(bcs_obj, 'boundary_conditions_list'):
+            for bc in bcs_obj.boundary_conditions_list:
+                if isinstance(bc, _WallBC):
+                    _wall_mom_idx = bc.momentum_field_indices
+                    for i_bf in range(mesh.n_boundary_faces):
+                        if mesh.boundary_face_function_numbers[i_bf] == bcs_obj._boundary_tags.index(bc.tag):
+                            _wall_faces.add(mesh.boundary_face_face_indices[i_bf])
+        _use_wall_mirror = len(_wall_faces) > 0 and self.reconstruction_order >= 2
 
         def flux_operator(dt, Q, Qaux, parameters, dQ):
             dQ = np.zeros_like(dQ)
             Q_L, Q_R = reconstruct(Q)
             for f in range(mesh.n_faces):
                 qA = Q_L[:, f]
-                # At wall faces: mirror the reconstructed left state
-                if use_wall_mirror and f in wall_faces:
-                    qB = _mirror_wall_state(qA, normals_arr[:, f])
+                if _use_wall_mirror and f in _wall_faces:
+                    qB = qA.copy()
+                    for indices in _wall_mom_idx:
+                        n_vec = normals_arr[:len(indices), f]
+                        mom = np.array([qA[k] for k in indices])
+                        nc = np.dot(mom, n_vec)
+                        for i, k in enumerate(indices):
+                            qB[k] = mom[i] - 2.0 * nc * n_vec[i]
                 else:
                     qB = Q_R[:, f]
                 qauxA = Qaux[:, iA[f]] if has_aux else _EMPTY_AUX
@@ -579,14 +606,11 @@ class HyperbolicSolver(Solver):
             self._sim_save_fields = lambda time, time_stamp, i_snapshot, Q, Qaux: i_snapshot
 
     def _apply_bcs(self, time, Q, Qaux, parameters):
-        """Apply boundary conditions.
+        """Fill ghost cells for gradient computation.
 
-        Gradient extrapolation infrastructure is available via
-        ``_sim_bc_with_gradient`` but disabled by default — the
-        PositiveNonconservativeRusanov's hydrostatic reconstruction
-        handles boundary accuracy internally.  Enable per-field
-        gradient extrapolation once BCs are fully derivative-aware
-        via the Qaux pipeline.
+        Ghost cells are used by the MUSCL Green-Gauss gradient and
+        limiter neighbor bounds.  The actual Riemann boundary state
+        is computed by ``bc.face_state(Q_L)`` inside the flux operator.
         """
         Q = self._sim_boundary_operator(time, Q, Qaux, parameters)
         return Q
