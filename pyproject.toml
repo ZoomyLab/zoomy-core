@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zoomy_core"
-version = "0.1.19"
+version = "0.2.0"
 description = "zoomy_core is the pure Python core of Zoomy: A simulation software for dimensionally-reduced free surface flows."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,20 +22,19 @@ classifiers = [
 ]
 
 dependencies = [
-  "attrs",
-  "sympy>=1.14",
+  "sympy>=1.13",
   "numpy",
   "scipy",
-  "loguru",
-  "h5py",
-  "matplotlib",
-  "meshio",
-  "pytest",
   "param",
 ]
 
-
 [project.optional-dependencies]
+full = [
+  "h5py",
+  "matplotlib",
+  "meshio",
+  "loguru",
+]
 gui = [
   "pyvista",
   "trame",
@@ -49,16 +48,18 @@ coupling = [
 testing = [
   "swashes",
   "pyswashes",
+  "pytest",
 ]
 mesh = [
   "gmsh",
   "python-gmsh",
-  "rasterio"
+  "rasterio",
+  "meshio",
 ]
 dev = [
   "watchfiles",
   "Cython",
-  "pytest-html"
+  "pytest-html",
 ]
 server = [
   "zoomy-server",
@@ -74,10 +75,8 @@ Source = "https://github.com/mbd-rwth/Zoomy"
 Issues = "https://github.com/mbd-rwth/Zoomy/issues"
 
 
-[project.scripts]
-zoomy-serve = "zoomy_server.cli:main"
-
 [tool.setuptools.packages.find]
-include = ["*"]
+include = ["zoomy_core*"]
+exclude = ["zoomy_core.model.legacy*", "zoomy_core.model.models.legacy*", "zoomy_core.fvm.legacy*"]
 
 
