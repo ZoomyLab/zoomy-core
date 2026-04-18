@@ -671,3 +671,158 @@ class VAMNewtonian(VAMModel):
             out[row_base_u + k] = self._apply_Minv(raw_slip, k)
 
         return out
+
+
+# =============================================================================
+# Tag-driven VAM: analogous to SMEModelTagged. Uses the hand-coded VAMModel
+# operators as the source of truth, builds one tagged scalar equation per
+# output row (continuity + x-momentum moments + optional y-momentum + z-
+# momentum moments). Pressure splitting (``source_implicit``) is inherited
+# from VAMModel; it is not routed through solver tags for now.
+# =============================================================================
+
+
+class VAMModelTagged(VAMModel):
+    """Tag-driven VAM: flux/source/NC/hydrostatic_pressure read off
+    ``solver_tag`` declarations on per-mode scalar equations.
+
+    Numerically identical to :class:`VAMModel`. Pressure splitting
+    (``source_implicit``) is untouched and still lives in the hand-coded
+    base class.
+    """
+
+    untagged_policy = "strict"
+
+    def _initialize_derived_properties(self):
+        super()._initialize_derived_properties()
+        self._build_operator_system()
+
+    def _build_operator_system(self):
+        from zoomy_core.model.models.ins_generator import Expression
+        from zoomy_core.model.models.derived_system import System
+
+        t = sp.Symbol("t", real=True)
+        x = sp.Symbol("x", real=True)
+        y = sp.Symbol("y", real=True)
+        dim = self.dimension
+        coords = [x] if dim == 1 else [x, y]
+
+        q = list(self.variables)
+        n_vars = self.n_variables
+        n_u = self._n_u
+        n_w = self._n_w
+        hdim = self._hdim
+
+        # Pull reference operators from the hand-coded parent.
+        F_ref  = VAMModel.flux(self)                         # (n_vars, dim)
+        Hp_ref = VAMModel.hydrostatic_pressure(self)         # (n_vars, dim)
+        B_ref  = VAMModel.nonconservative_matrix(self)       # (n_vars, n_vars, dim)
+        S_ref_rhs = VAMModel.source(self)                    # (n_vars,)
+
+        equations = {}
+        variable_map = {}
+
+        def _build_row(row, name):
+            time_sp = sp.Derivative(q[row], t)
+            flux_sp = sum(
+                (sp.Derivative(F_ref[row, i], coords[i]) for i in range(dim)),
+                sp.S.Zero,
+            )
+            hp_sp = sum(
+                (sp.Derivative(Hp_ref[row, i], coords[i]) for i in range(dim)),
+                sp.S.Zero,
+            )
+            nc_sp = sum(
+                (B_ref[row, j, i] * sp.Derivative(q[j], coords[i])
+                 for i in range(dim) for j in range(n_vars)),
+                sp.S.Zero,
+            )
+            source_lhs = -S_ref_rhs[row]
+            full = time_sp + flux_sp + hp_sp + nc_sp + source_lhs
+            return Expression(full, name=name).solver_tag(
+                time_derivative=time_sp,
+                flux=flux_sp,
+                hydrostatic_pressure=hp_sp,
+                nonconservative_flux=nc_sp,
+                source=source_lhs,
+            )
+
+        # continuity (h): row 1
+        equations["continuity"] = _build_row(1, "continuity")
+        variable_map["continuity"] = [1]
+
+        # x-momentum: rows 2..2+n_u-1
+        for k in range(n_u):
+            r = 2 + k
+            ename = f"x_momentum_{k}"
+            equations[ename] = _build_row(r, ename)
+            variable_map[ename] = [r]
+
+        # y-momentum (2D only): rows 2+n_u..2+2*n_u-1
+        if hdim == 2:
+            for k in range(n_u):
+                r = 2 + n_u + k
+                ename = f"y_momentum_{k}"
+                equations[ename] = _build_row(r, ename)
+                variable_map[ename] = [r]
+
+        # z-momentum: rows w_start..w_start+n_w-1
+        w_start = 2 + hdim * n_u
+        for k in range(n_w):
+            r = w_start + k
+            ename = f"z_momentum_{k}"
+            equations[ename] = _build_row(r, ename)
+            variable_map[ename] = [r]
+
+        self._operator_system = System(
+            "VAMModelTagged_ops",
+            state=(self._system.state if self._system is not None else None),
+            equations=equations,
+        )
+        self._operator_variable_map = variable_map
+        self._operator_coords = coords
+        self._operator_state_vars = list(self.variables)
+
+    # ---- Tag-driven numerical operators ----------------------------------
+
+    def _collect(self, tag, *, shape_dirs=0):
+        from zoomy_core.model.models.tag_extraction import collect_solver_tag
+        kwargs = dict(
+            variable_map=self._operator_variable_map,
+            n_variables=self.n_variables,
+            policy=self.untagged_policy,
+        )
+        if shape_dirs:
+            kwargs.update(
+                n_directions=self.dimension,
+                coords=self._operator_coords,
+                state_variables=self._operator_state_vars,
+            )
+        return collect_solver_tag(self._operator_system, tag, **kwargs)
+
+    def flux(self):
+        return ZArray(self._collect("flux", shape_dirs=1))
+
+    def hydrostatic_pressure(self):
+        return ZArray(self._collect("hydrostatic_pressure", shape_dirs=1))
+
+    def nonconservative_matrix(self):
+        return ZArray(self._collect("nonconservative_flux", shape_dirs=1))
+
+    def source(self):
+        """RHS-convention source = -sum(source tags).
+
+        Tags store the LHS piece so ``sum(tags) == equation_expression``;
+        the solver consumes ``dq/dt = ... + source`` (RHS), hence the flip.
+        """
+        raw = self._collect("source", shape_dirs=0)
+        out = ZArray.zeros(self.n_variables)
+        for i, s in enumerate(raw):
+            out[i] = -s
+        return out
+
+
+## (VAMNewtonianTagged deferred: would need a non-cyclic path to the
+##  hand-coded VAMNewtonian.source, since VAMNewtonian.source uses
+##  super().source() and that resolves back through the tagged override.
+##  Track separately if viscous-VAM via tags becomes a priority.)
