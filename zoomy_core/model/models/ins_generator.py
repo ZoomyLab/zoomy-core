@@ -131,15 +131,19 @@ class Expression(SymbolicBase):
     - Notebook: _repr_latex_
     """
 
-    def __init__(self, expr, name="", term_groups=None):
+    def __init__(self, expr, name="", term_groups=None, solver_groups=None):
         super().__init__(name)
         if isinstance(expr, Expression):
             expr = expr.expr
         self.expr = sp.sympify(expr) if not isinstance(expr, sp.Basic) else expr
-        # Optional ordered term groups for display:
+        # Physical term groups for display (drive \underbrace in latex()).
         # {"temporal": sp.Expr, "convection": sp.Expr, ...}
-        # When set, latex() renders groups in this order.
+        # Survive apply() by design — intended for provenance/rendering.
         self._term_groups = term_groups
+        # Solver tag groups for operator routing (flux, source, NC, ...).
+        # {canonical_tag: sp.Expr}. Dropped per-tag whenever apply/simplify
+        # changes the tagged sub-expression (structural equality check).
+        self._solver_groups = dict(solver_groups) if solver_groups else None
 
     @property
     def terms(self):
@@ -195,6 +199,81 @@ class Expression(SymbolicBase):
         if not kept:
             return Expression(S.Zero, self.name)
         return Expression(sum(kept.values(), S.Zero), self.name, term_groups=kept)
+
+    # ------------------------------------------------------------------
+    # Tagging: physical (display) and solver (operator routing)
+    # ------------------------------------------------------------------
+
+    def tag(self, **named_groups):
+        """Attach/replace physical term groups for display.
+
+        Physical tags survive ``apply()`` (substituted through), and drive
+        the ``\\underbrace{...}_{<name>}`` rendering in ``latex(multiline=True)``.
+
+        Usage::
+
+            xmom = xmom.tag(pressure=grad_p, stress=div_tau)
+        """
+        merged = dict(self._term_groups or {})
+        for k, v in named_groups.items():
+            merged[k] = v.expr if isinstance(v, Expression) else sp.sympify(v)
+        return Expression(self.expr, self.name,
+                          term_groups=merged, solver_groups=self._solver_groups)
+
+    @property
+    def tags(self):
+        """Dict of physical tags, or empty dict if none set."""
+        return dict(self._term_groups) if self._term_groups else {}
+
+    def solver_tag(self, **named_groups):
+        """Attach/replace solver tag groups for operator routing.
+
+        Tag names are normalized via the solver-tag alias catalog, so
+        ``.solver_tag(convection=...)`` and ``.solver_tag(flux=...)`` both
+        write to the canonical ``flux`` slot.
+
+        Solver tags are dropped per-tag whenever ``apply()`` / ``simplify()``
+        changes the tagged sub-expression (structural equality check).
+
+        Usage::
+
+            xmom = xmom.solver_tag(flux=F_x, source=g * h * dbdx)
+        """
+        from zoomy_core.model.models.tag_catalog import canonical_solver_tag
+
+        merged = dict(self._solver_groups or {})
+        for k, v in named_groups.items():
+            canonical = canonical_solver_tag(k)
+            merged[canonical] = v.expr if isinstance(v, Expression) else sp.sympify(v)
+        return Expression(self.expr, self.name,
+                          term_groups=self._term_groups, solver_groups=merged)
+
+    @property
+    def solver_tags(self):
+        """Dict of solver tags (canonical names), or empty dict if none set."""
+        return dict(self._solver_groups) if self._solver_groups else {}
+
+    def get_solver_tag(self, name):
+        """Return the sp.Expr for a solver tag, or None if not set.
+
+        ``name`` can be any alias; it is normalized to canonical form.
+        """
+        from zoomy_core.model.models.tag_catalog import canonical_solver_tag
+
+        if not self._solver_groups:
+            return None
+        return self._solver_groups.get(canonical_solver_tag(name))
+
+    def untagged_remainder(self):
+        """Return ``self.expr - sum(solver_tags.values())``, simplified.
+
+        Zero means every term has been routed to a solver tag; a non-zero
+        remainder is what drives the model's ``untagged_policy`` (warn/error).
+        """
+        if not self._solver_groups:
+            return self.expr
+        tagged_sum = sum(self._solver_groups.values(), S.Zero)
+        return sp.expand(self.expr - tagged_sum)
 
     def __len__(self):
         return len(Add.make_args(sp.expand(self.expr)))
@@ -305,7 +384,7 @@ class Expression(SymbolicBase):
         for cond in conditions:
             result = _apply_one(result, cond)
 
-        # Propagate term groups
+        # Propagate physical term groups (they always survive apply).
         new_groups = None
         if self._term_groups:
             new_groups = {}
@@ -315,10 +394,24 @@ class Expression(SymbolicBase):
                     g = _apply_one(g, cond)
                 new_groups[role] = g
 
+        # Propagate solver tags only for groups whose sub-expression is
+        # structurally unchanged by the conditions. Any tag whose expression
+        # was touched is dropped — the user must re-tag.
+        new_solver_groups = None
+        if self._solver_groups:
+            new_solver_groups = {}
+            for tag, group_expr in self._solver_groups.items():
+                g = group_expr
+                for cond in conditions:
+                    g = _apply_one(g, cond)
+                if g == group_expr:
+                    new_solver_groups[tag] = group_expr
+
         # Simplify for Relation applies (not Operations — they handle their own)
         if not any(isinstance(c, Operation) for c in conditions):
             result = _simplify_preserve_integrals(result)
-        return Expression(result, self.name, term_groups=new_groups)
+        return Expression(result, self.name,
+                          term_groups=new_groups, solver_groups=new_solver_groups)
 
     def simplify(self):
         """Return a new Expression with sympy simplification applied."""
@@ -326,7 +419,13 @@ class Expression(SymbolicBase):
         new_groups = None
         if self._term_groups:
             new_groups = {role: sp.simplify(g) for role, g in self._term_groups.items()}
-        return Expression(simplified, self.name, term_groups=new_groups)
+        # Solver tags: keep only those whose expression is unchanged.
+        new_solver_groups = None
+        if self._solver_groups:
+            new_solver_groups = {t: g for t, g in self._solver_groups.items()
+                                 if sp.simplify(g) == g}
+        return Expression(simplified, self.name,
+                          term_groups=new_groups, solver_groups=new_solver_groups)
 
     def expand(self):
         """Return a new Expression with sympy expand applied."""
@@ -334,7 +433,13 @@ class Expression(SymbolicBase):
         new_groups = None
         if self._term_groups:
             new_groups = {role: sp.expand(g) for role, g in self._term_groups.items()}
-        return Expression(expanded, self.name, term_groups=new_groups)
+        # Solver tags: keep only those whose expression is unchanged.
+        new_solver_groups = None
+        if self._solver_groups:
+            new_solver_groups = {t: g for t, g in self._solver_groups.items()
+                                 if sp.expand(g) == g}
+        return Expression(expanded, self.name,
+                          term_groups=new_groups, solver_groups=new_solver_groups)
 
     def depth_integrate(self, lower, upper, var, method="auto"):
         """
@@ -427,20 +532,42 @@ class Expression(SymbolicBase):
             )
 
     def subs(self, *args, **kwargs):
-        return Expression(self.expr.subs(*args, **kwargs), self.name)
+        new_expr = self.expr.subs(*args, **kwargs)
+        # Physical tags survive: propagate substitution through each group.
+        new_groups = None
+        if self._term_groups:
+            new_groups = {role: g.subs(*args, **kwargs)
+                          for role, g in self._term_groups.items()}
+        # Solver tags: keep only those whose expression is unchanged.
+        new_solver_groups = None
+        if self._solver_groups:
+            new_solver_groups = {t: g for t, g in self._solver_groups.items()
+                                 if g.subs(*args, **kwargs) == g}
+        return Expression(new_expr, self.name,
+                          term_groups=new_groups, solver_groups=new_solver_groups)
 
     def simplify(self):
         """Simplify: expand + cancel, preserving Integral and Derivative(Integral) terms."""
+        new_groups = ({role: _simplify_preserve_integrals(g)
+                       for role, g in self._term_groups.items()}
+                      if self._term_groups else None)
+        new_solver_groups = None
+        if self._solver_groups:
+            new_solver_groups = {t: g for t, g in self._solver_groups.items()
+                                 if _simplify_preserve_integrals(g) == g}
         return Expression(_simplify_preserve_integrals(self.expr), self.name,
-                          term_groups=({role: _simplify_preserve_integrals(g)
-                                        for role, g in self._term_groups.items()}
-                                       if self._term_groups else None))
+                          term_groups=new_groups, solver_groups=new_solver_groups)
 
     def expand(self):
+        new_groups = ({role: sp.expand(g)
+                       for role, g in self._term_groups.items()}
+                      if self._term_groups else None)
+        new_solver_groups = None
+        if self._solver_groups:
+            new_solver_groups = {t: g for t, g in self._solver_groups.items()
+                                 if sp.expand(g) == g}
         return Expression(sp.expand(self.expr), self.name,
-                          term_groups=({role: sp.expand(g)
-                                        for role, g in self._term_groups.items()}
-                                       if self._term_groups else None))
+                          term_groups=new_groups, solver_groups=new_solver_groups)
 
     def doit(self):
         return Expression(self.expr.doit(), self.name)
