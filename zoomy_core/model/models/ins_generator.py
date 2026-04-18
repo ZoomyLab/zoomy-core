@@ -1307,6 +1307,76 @@ class Integrate(Operation):
         )
 
 
+class PartialIntegrate(Operation):
+    """Rewrite a matching ``Integral(f, (var, lo, hi))`` to a running integral
+    with variable upper bound: ``Integral(f, (var, lo, upper))``.
+
+    The result is left symbolic — no evaluation. Downstream, the expression
+    can be promoted to a ``Qaux`` variable via ``DerivedModel.promote_to_qaux``
+    and rewritten into a runtime primitive (e.g. ``column_partial_integrate``).
+
+    Matching
+    --------
+    Every ``Integral`` whose integration variable equals ``var`` is inspected.
+    Additional matchers ``lo_match`` / ``hi_match`` restrict the rewrite to
+    Integrals whose lower/upper bounds also match (structural equality); pass
+    ``None`` (default) to leave them unrestricted.
+
+    The new upper bound is ``upper_symbol`` (default: ``var`` itself, producing
+    the classic running integral ``∫_lo^{var} f dvar``).
+
+    Usage::
+
+        # depth integral [b, b+h] → running integral [b, z]
+        eq.apply(PartialIntegrate(state.z, lo_match=state.b, hi_match=state.eta))
+
+        # unrestricted: rewrite every ∫ dz to ∫_·^z dz
+        eq.apply(PartialIntegrate(z))
+    """
+
+    def __init__(self, var, upper_symbol=None, lo_match=None, hi_match=None,
+                 name="partial_integrate"):
+        super().__init__(
+            name=name,
+            description=(f"partial integrate w.r.t. {var} "
+                         f"(upper → {upper_symbol if upper_symbol is not None else var})"),
+        )
+        self._var = var
+        self._upper = upper_symbol if upper_symbol is not None else var
+        self._lo_match = lo_match
+        self._hi_match = hi_match
+
+    def apply_to(self, expr):
+        v = self._var
+        new_upper = self._upper
+        lo_m = self._lo_match
+        hi_m = self._hi_match
+
+        def _walk(e):
+            if isinstance(e, Integral):
+                # sympy stores limits as sp.Tuple, not Python tuple.
+                limits = e.args[1] if len(e.args) >= 2 else None
+                if limits is not None and len(limits) == 3:
+                    int_var, lo, hi = limits[0], limits[1], limits[2]
+                    if int_var == v:
+                        if (lo_m is None or lo_m == lo) and (hi_m is None or hi_m == hi):
+                            new_integrand = _walk(e.args[0])
+                            tail = e.args[2:]
+                            return Integral(new_integrand, (int_var, lo, new_upper), *tail)
+            if hasattr(e, "args") and e.args:
+                try:
+                    return e.func(*(_walk(a) for a in e.args))
+                except (TypeError, ValueError):
+                    return e
+            return e
+
+        return _walk(expr)
+
+    def _repr_latex_(self):
+        return (f"$\\int_{{\\cdot}}^{{{sp.latex(self._upper)}}} "
+                f"(\\cdot)\\, d{sp.latex(self._var)}$")
+
+
 class ZetaTransform(Operation):
     """Transform vertical coordinate: z = ζ·h + b, dz = h·dζ.
 
