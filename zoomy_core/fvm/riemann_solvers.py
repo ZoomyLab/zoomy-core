@@ -34,7 +34,8 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
 
         self.variables = ZArray(self.model.variables.get_list())
         self.aux_variables = ZArray(self.model.aux_variables.get_list())
-        self.parameters = ZArray(self.model.parameters.get_list())
+        # Use symbols for symbolic derivation (not the numeric values in model.parameters)
+        self.parameters = ZArray(self.model._parameter_symbols.get_list())
         self.normal = ZArray(self.model.normal.get_list())
 
         self.variables_minus = self._create_v("Q_minus", self.model.n_variables)
@@ -122,8 +123,9 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
 
     def _eps_symbol(self):
         """Internal helper `_eps_symbol`."""
-        if hasattr(self.model.parameters, "contains") and self.model.parameters.contains("eps"):
-            return self.model.parameters.eps
+        # Use the symbolic eps from _parameter_symbols (not the numeric value)
+        if hasattr(self.model._parameter_symbols, "contains") and self.model._parameter_symbols.contains("eps"):
+            return self.model._parameter_symbols.eps
         return sp.Float(1e-12)
 
     def _initialize_functions(self):
@@ -176,7 +178,7 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
             sub_map[sym] = val
         for sym, val in zip(self.model.aux_variables.get_list(), list(Qaux)):
             sub_map[sym] = val
-        for sym, val in zip(self.model.parameters.get_list(), list(p)):
+        for sym, val in zip(self.model._parameter_symbols.get_list(), list(p)):
             sub_map[sym] = val
         if n is not None:
             for sym, val in zip(self.model.normal.get_list(), list(n)):

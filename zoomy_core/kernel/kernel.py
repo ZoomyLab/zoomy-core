@@ -44,7 +44,10 @@ class Kernel(param.Parameterized, SymbolicRegistrar):
         # Build convenient name → symbol maps from model
         if model is not None:
             self._var_map = {str(k): v for k, v in model.variables.items()}
-            self._param_map = {str(k): v for k, v in model.parameters.items()}
+            # Kernel needs symbolic parameters (not numeric values)
+            self._param_map = {
+                str(k): v for k, v in model._parameter_symbols.items()
+            }
         else:
             self._var_map = {}
             self._param_map = {}

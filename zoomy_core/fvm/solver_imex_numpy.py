@@ -100,7 +100,7 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
         return Q
 
     def _implicit_source_global(self, Qe, Qaux, Qold, Qauxold, mesh,
-                                model, parameters, time_now, dt, boundary_operator):
+                                model, parameters, time_now, dt):
         Q = np.array(Qe, copy=True)
         runtime_model = model
         symbolic_model = model.model if hasattr(model, "model") else None
@@ -109,9 +109,8 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
             Qaux_state = self.update_qaux(
                 Qstate, Qaux, Qold, Qauxold, mesh, runtime_model, parameters, time_now, dt
             )
-            Qstate_bc = boundary_operator(time_now, Qstate, Qaux_state, parameters)
-            S = runtime_model.source(Qstate_bc, Qaux_state, parameters)
-            return Qstate_bc - Qe - dt * S
+            S = runtime_model.source(Qstate, Qaux_state, parameters)
+            return Qstate - Qe - dt * S
 
         for _ in range(self.implicit_maxiter):
             R = residual(Q)
@@ -136,7 +135,6 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
             if info != 0:
                 delta_flat = (-R).reshape(-1)
             Q += delta_flat.reshape(q_shape)
-            Q = boundary_operator(time_now, Q, Qaux, parameters)
         return Q
 
     def _compute_source_jvp_global(self, runtime_model, symbolic_model, residual,
@@ -161,12 +159,8 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
     def setup_simulation(self, mesh, model, write_output=False):
         """Build all operators. Extends HyperbolicSolver.setup_simulation."""
         t0 = time.time()
-        # Use RK1 always for IMEX (explicit flux stage)
         self._imex_reconstruction_order = self.reconstruction_order
-        # Temporarily force RK1 in parent setup
         super().setup_simulation(mesh, model, write_output=write_output)
-        # ODE step matches reconstruction order: RK2 for O2, RK1 for O1
-        self._sim_ode_step = ode.RK2 if self.reconstruction_order >= 2 else ode.RK1
 
         # Resolve source mode
         self._sim_source_mode = self._resolve_source_mode(self._sim_model)
@@ -188,7 +182,7 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
     def step(self, dt):
         """One IMEX timestep: explicit flux -> implicit diffusion -> implicit source.
 
-        Each line is one physics operation. No if-clauses.
+        Ghost-cell-free: BCs are evaluated inside flux_operator.
         """
         Q = self._sim_Q
         Qaux = self._sim_Qaux
@@ -197,18 +191,26 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
         mesh = self._sim_mesh
         model = self._sim_model
 
-        # Explicit flux step (convection)
-        Qexp = self._sim_ode_step(self._sim_flux_operator, Q, Qaux, parameters, dt)
-        Qexp = self._sim_boundary_operator(time_now, Qexp, Qaux, parameters)
+        # Explicit flux step (convection) — BCs inside flux_operator
+        if self.reconstruction_order >= 2:
+            Q0 = np.array(Q)
+            dQ = self._sim_flux_operator(dt, time_now, Q, Qaux, parameters, np.zeros_like(Q))
+            Q1 = Q + dt * dQ
+            dQ = self._sim_flux_operator(dt, time_now + dt, Q1, Qaux, parameters, np.zeros_like(Q))
+            Q2 = Q1 + dt * dQ
+            Qexp = 0.5 * (Q0 + Q2)
+        else:
+            dQ = self._sim_flux_operator(dt, time_now, Q, Qaux, parameters, np.zeros_like(Q))
+            Qexp = Q + dt * dQ
 
-        # Implicit diffusion step
+        # Implicit diffusion step (with boundary face gradients)
         Qexp = self._apply_implicit_diffusion(Qexp, Qaux, dt, time_now)
 
         # Implicit source step
         Qimp = self._apply_implicit_source(Qexp, Q, Qaux, mesh, model, parameters, time_now, dt)
 
-        # Final boundary conditions and auxiliary update
-        Qnew = self._sim_boundary_operator(time_now + dt, Qimp, Qaux, parameters)
+        # Variable + auxiliary updates
+        Qnew = self.update_q(Qimp, Qaux, mesh, model, parameters)
         Qauxnew = self.update_qaux(
             Qnew, Qaux, Q, Qaux, mesh, model, parameters, time_now + dt, dt,
         )
@@ -218,12 +220,35 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
         self._sim_Qaux = Qauxnew
 
     def _apply_implicit_diffusion(self, Qexp, Qaux, dt, time_now):
-        """Apply implicit diffusion if DiffusionOperators were built."""
+        """Apply implicit diffusion with boundary face gradients."""
         if not hasattr(self, '_diffusion_ops') or self._diffusion_ops is None:
             return Qexp
+
+        # Compute boundary face gradients from BC objects
+        from zoomy_core.fvm.solver_numpy import _compute_bf_face_gradients
+        n_vars = Qexp.shape[0]
+        has_aux = Qaux.shape[0] > 0
+        normals_arr = self._sim_mesh.face_normals[:self._sim_mesh.dimension, :]
+
+        # Compute face values for face_gradient
+        bf_values = np.zeros((n_vars, self._n_bf))
+        for i_bf in range(self._n_bf):
+            q_inner = Qexp[:, self._bf_cells[i_bf]]
+            qaux_inner = Qaux[:, self._bf_cells[i_bf]] if has_aux else np.array([])
+            normal = normals_arr[:, self._bf_fidx[i_bf]]
+            bf_values[:, i_bf] = self._bc_objects[i_bf].face_value(
+                q_inner, qaux_inner, normal, self._d_face[i_bf],
+                time_now, self._sim_parameters,
+            )
+
+        bf_grads = _compute_bf_face_gradients(
+            Qexp, Qaux, bf_values, self._bc_objects, self._bf_cells,
+            self._bf_fidx, self._d_face, normals_arr, self._n_bf,
+            n_vars, has_aux, time_now, self._sim_parameters,
+        )
+
         for v, diff_op in self._diffusion_ops.items():
-            Qexp[v, :] = diff_op.implicit_solve(Qexp[v, :], dt)
-        Qexp = self._sim_boundary_operator(time_now, Qexp, self._sim_Qaux, self._sim_parameters)
+            Qexp[v, :] = diff_op.implicit_solve_with_bc(Qexp[v, :], dt, bf_grads[v])
         return Qexp
 
     def _apply_implicit_source(self, Qexp, Qold, Qauxold, mesh, model, parameters, time_now, dt):
@@ -239,7 +264,7 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
         else:
             Qimp = self._implicit_source_global(
                 Qexp, Qauxold, Qold, Qauxold, mesh, model, parameters,
-                time_now, dt, self._sim_boundary_operator,
+                time_now, dt,
             )
 
         self.last_stats.implicit_time_s += time.time() - t_imp0

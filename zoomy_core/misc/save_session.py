@@ -23,14 +23,11 @@ def _extract_model(model, session_folder):
         if isinstance(val, (int, float, str, bool)):
             init[pname] = val
 
-    params = {}
-    if hasattr(model, "parameter_defaults_map"):
-        params = dict(model.parameter_defaults_map)
-    if hasattr(model, "parameter_values"):
-        keys = list(model.parameters.keys()) if hasattr(model.parameters, "keys") else []
-        for i, k in enumerate(keys):
-            if i < len(model.parameter_values):
-                params[k] = float(model.parameter_values[i])
+    # Parameter values live directly in model.parameters (a Zstruct of floats)
+    if hasattr(model, "parameters") and hasattr(model.parameters, "as_dict"):
+        params = {k: float(v) for k, v in model.parameters.as_dict(recursive=False).items()}
+    else:
+        params = {}
 
     base_module = cls.__module__.rsplit(".", 1)[0] if "." in cls.__module__ else cls.__module__
     code = "from {} import {}\n\nclass UserModel({}):\n    pass".format(

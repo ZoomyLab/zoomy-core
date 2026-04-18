@@ -569,7 +569,7 @@ class GenericCppModel(GenericCppBase):
         )
         bc_str = ", ".join(f'"{item}"' for item in bc_names)
         param_keys = list(self.model.parameters.keys())
-        param_vals = list(self.model.parameter_values)
+        param_vals = list(self.model.parameters.values())
         if len(param_keys) != len(param_vals):
             raise ValueError(
                 f"Parameter keys {param_keys} and values values {param_vals} do not match"
