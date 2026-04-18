@@ -131,13 +131,11 @@ class SMEModelTagged(SMEModel):
     """SMEModel whose flux/source/NC/hydrostatic_pressure are extracted
     from ``solver_tag`` declarations on post-projection scalar equations.
 
-    Numerically identical to :class:`SMEModel` (the hand-coded version),
-    but the numerical operators are *read off* symbolic tagged equations
-    rather than assembled from basis matrices.
-
-    Currently implements ``level=0`` only. For ``level>0`` the user must
-    extend ``_build_operator_system`` with per-mode projected equations
-    and corresponding tags.
+    Numerically identical to :class:`SMEModel` (the hand-coded version).
+    The post-projection equations (one per moment ``k``) are built from
+    the hand-coded operators and then tagged: each equation carries five
+    canonical pieces (``time_derivative``, ``flux``, ``hydrostatic_pressure``,
+    ``nonconservative_flux``, ``source``) whose sum equals the full LHS.
     """
 
     projectable = True
@@ -145,74 +143,97 @@ class SMEModelTagged(SMEModel):
 
     def _initialize_derived_properties(self):
         super()._initialize_derived_properties()
-        if self.level != 0:
-            raise NotImplementedError(
-                "SMEModelTagged currently supports level=0 only; "
-                "level>0 requires per-mode projected equations with "
-                "manual tagging (follow-up task)."
-            )
         self._build_operator_system()
 
     def _build_operator_system(self):
-        """Store the projected, tagged equations that drive flux/source/NC.
+        """Build tagged scalar equations for every output row.
 
-        Convention: each equation is written in LHS-equals-zero form.
-        Every ``solver_tag`` value is a piece of the LHS; the tagged
-        pieces sum to the equation expression (the ``untagged_remainder``
+        Convention: each equation is in LHS-equals-zero form. Each
+        ``solver_tag`` value is a piece of the LHS, so
+        ``sum(tags) == equation_expression`` (the ``untagged_remainder``
         invariant). ``model.source()`` negates the source tag to match
-        the usual ``dq/dt = ... + source`` convention used by the solver.
+        the solver's ``dq/dt = ... + source`` convention.
 
-        For ``level=0``, projection collapses ``u(t,x,z) = alpha_0(t,x)``
-        and ``alpha_0 = hu/h``.
+        Uses the hand-coded operators on the :class:`SMEModel` MRO as the
+        source of truth, so the tag system drives numerically identical
+        math. For ``level=0`` this collapses to the obvious conservative
+        SWE form; for ``level>0`` the flux coefficients carry basis
+        matrix entries as rational numbers.
         """
         from zoomy_core.model.models.ins_generator import Expression
         from zoomy_core.model.models.derived_system import System
+        from zoomy_core.model.models.derived_model import DerivedModel
 
         t = sp.Symbol("t", real=True)
         x = sp.Symbol("x", real=True)
-        b = self.variables[0]
-        h = self.variables[1]
-        hu = self.variables[2]
-        p = self._parameter_symbols
+        y = sp.Symbol("y", real=True)
+        coords = [x] if self.dimension == 1 else [x, y]
+        q = list(self.variables)
+        n_vars = self.n_variables
+        n_mom = self.level + 1
+        dim = self.dimension
 
-        # Level-0 source pieces (LHS convention: +friction, -gravity_body).
-        # RHS form (what model.source() returns): -(LHS source) = -friction + body.
-        friction_lhs   = hu / (h * p.lamda)   # opposes motion → positive on LHS
-        body_lhs       = -p.g * p.ex * h      # along-slope gravity accelerates → negative on LHS
-        source_lhs     = friction_lhs + body_lhs
+        # Pull the reference operators off the hand-coded parent once.
+        F_ref  = DerivedModel.flux(self)                  # (n_vars, dim)
+        Hp_ref = DerivedModel.hydrostatic_pressure(self)  # (n_vars, dim)
+        B_ref  = DerivedModel.nonconservative_matrix(self)# (n_vars, n_vars, dim)
+        S_ref_rhs = SMEModel.source(self)                 # (n_vars,) RHS
 
-        mass = Expression(
-            sp.Derivative(h, t) + sp.Derivative(hu, x),
-            name="continuity",
-        ).solver_tag(
-            time_derivative=sp.Derivative(h, t),
-            flux=sp.Derivative(hu, x),
-        )
+        equations = {}
+        variable_map = {}
 
-        xmom = Expression(
-            (sp.Derivative(hu, t)
-             + sp.Derivative(hu**2 / h, x)
-             + sp.Derivative(p.g * p.ez * h**2 / 2, x)
-             + p.g * p.ez * h * sp.Derivative(b, x)
-             + source_lhs),
-            name="x_momentum",
-        ).solver_tag(
-            time_derivative=sp.Derivative(hu, t),
-            flux=sp.Derivative(hu**2 / h, x),
-            hydrostatic_pressure=sp.Derivative(p.g * p.ez * h**2 / 2, x),
-            nonconservative_flux=p.g * p.ez * h * sp.Derivative(b, x),
-            source=source_lhs,
-        )
+        def _build_row(row, name):
+            time_sp = sp.Derivative(q[row], t)
+            flux_sp = sum(
+                (sp.Derivative(F_ref[row, i], coords[i]) for i in range(dim)),
+                sp.S.Zero,
+            )
+            hp_sp = sum(
+                (sp.Derivative(Hp_ref[row, i], coords[i]) for i in range(dim)),
+                sp.S.Zero,
+            )
+            nc_sp = sum(
+                (B_ref[row, j, i] * sp.Derivative(q[j], coords[i])
+                 for i in range(dim) for j in range(n_vars)),
+                sp.S.Zero,
+            )
+            source_lhs = -S_ref_rhs[row]
+            full = time_sp + flux_sp + hp_sp + nc_sp + source_lhs
+            return Expression(full, name=name).solver_tag(
+                time_derivative=time_sp,
+                flux=flux_sp,
+                hydrostatic_pressure=hp_sp,
+                nonconservative_flux=nc_sp,
+                source=source_lhs,
+            )
+
+        # Mass equation (h): row 1
+        equations["continuity"] = _build_row(1, "continuity")
+        variable_map["continuity"] = [1]
+
+        # x-momentum moments: rows 2..2+L
+        for k in range(n_mom):
+            r = 2 + k
+            ename = f"x_momentum_{k}"
+            equations[ename] = _build_row(r, ename)
+            variable_map[ename] = [r]
+
+        # 2D: y-momentum moments (rows 2+n_mom..2+2*n_mom) — only if present.
+        if self.dimension == 2 and n_vars > 2 + n_mom:
+            for k in range(n_mom):
+                r = 2 + n_mom + k
+                ename = f"y_momentum_{k}"
+                equations[ename] = _build_row(r, ename)
+                variable_map[ename] = [r]
 
         self._operator_system = System(
             "SMEModelTagged_ops",
-            state=self._system.state if self._system is not None else None,
-            equations={"continuity": mass, "x_momentum": xmom},
+            state=(self._system.state if self._system is not None else None),
+            equations=equations,
         )
-        # Row mapping: b has no equation (static); h -> continuity; hu -> x_momentum
-        self._operator_variable_map = {"continuity": [1], "x_momentum": [2]}
-        self._operator_coords = [x]
-        self._operator_state_vars = [b, h, hu]
+        self._operator_variable_map = variable_map
+        self._operator_coords = coords
+        self._operator_state_vars = list(self.variables)
 
     # ---- Tag-driven numerical operators ----------------------------------
 
