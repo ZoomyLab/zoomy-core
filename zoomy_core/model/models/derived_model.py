@@ -96,6 +96,11 @@ class DerivedModel(Model):
 
         self._system: Optional[DerivedSystem] = None
         self._applied: List[dict] = []  # auto-filled by apply()
+        # Symbolic expressions for auxiliary variables. Populated by
+        # PromoteToQaux (model-level op) or user hand-set via
+        # set_aux_equation(). Consumed by the solver's update_qaux step
+        # when non-empty.
+        self._aux_equations: dict = {}
 
         # Resolve eigenvalue_mode: explicit arg > class attribute > "symbolic"
         if eigenvalue_mode is None:
@@ -455,6 +460,92 @@ class DerivedModel(Model):
 
     def mass_matrix_inverse(self):
         return self._Minv
+
+    # ── aux_equations storage ─────────────────────────────────────────
+
+    def _ensure_aux_equations(self):
+        """Lazy-init for subclasses that bypass ``DerivedModel.__init__``
+        (notably ``VAMModel``, which calls ``Model.__init__`` directly).
+        """
+        if not hasattr(self, "_aux_equations") or self._aux_equations is None:
+            self._aux_equations = {}
+        return self._aux_equations
+
+    @property
+    def aux_equations(self):
+        """Dict ``{aux_variable_name: sympy expression}``.
+
+        Populated by :meth:`promote_to_qaux` or :meth:`set_aux_equation`.
+        The solver's per-step aux-update step evaluates each expression
+        cell-wise; empty by default.
+        """
+        return dict(self._ensure_aux_equations())
+
+    def set_aux_equation(self, name, expr):
+        """Register a symbolic equation for an auxiliary variable.
+
+        ``name`` must be the name of an already-declared aux variable on
+        the model (see ``aux_variables``). ``expr`` is any sympy expression
+        over the state symbols, aux symbols, and parameters.
+
+        Raises ``KeyError`` if ``name`` is not a declared aux variable.
+        """
+        import sympy as sp
+        # Validate the name against declared aux variables.
+        aux_names = [str(v) for v in getattr(self, "aux_variables", [])]
+        if aux_names and name not in aux_names:
+            raise KeyError(
+                f"Aux variable {name!r} not declared on this model. "
+                f"Known aux variables: {aux_names}"
+            )
+        self._ensure_aux_equations()[name] = sp.sympify(expr)
+
+    def clear_aux_equation(self, name):
+        """Remove an aux_equation entry. Silent if absent."""
+        self._ensure_aux_equations().pop(name, None)
+
+    def promote_to_qaux(self, pattern, name):
+        """Promote a symbolic pattern to an auxiliary (Qaux) variable.
+
+        Side effects (all synchronous):
+
+        1. Substitutes ``pattern`` with ``Symbol(name)`` in every equation
+           of ``self._system`` (main system) and in every aux equation
+           already registered. Solver tags on touched sub-expressions are
+           dropped per-tag (the usual ``.apply``/``.subs`` rule).
+        2. Registers ``self._aux_equations[name] = pattern`` — the solver's
+           aux-update step will (re)compute the pattern from current state
+           and write the result to the ``name`` slot of Qaux.
+
+        ``name`` must be a name of an aux variable that is **already
+        declared** on this model (via the ``aux_variables`` model parameter).
+        Mutating ``aux_variables`` at runtime is not attempted — declare all
+        Qaux slots upfront and promote into them.
+
+        Returns the ``Symbol(name)`` that was substituted in.
+        """
+        aux_names = [str(v) for v in getattr(self, "aux_variables", [])]
+        if name not in aux_names:
+            raise KeyError(
+                f"promote_to_qaux: aux variable {name!r} is not declared on this "
+                f"model. Declare it in aux_variables and retry. Known aux "
+                f"variables: {aux_names}."
+            )
+        qaux_sym = Symbol(name)
+        pattern_sp = sp.sympify(pattern)
+        aux_store = self._ensure_aux_equations()
+        # 1. Substitute in main-system equations (Expression.subs handles
+        #    tag propagation).
+        if self._system is not None:
+            for eq_name, eq in list(self._system.equations.items()):
+                self._system.equations[eq_name] = eq.subs(pattern_sp, qaux_sym)
+        # 2. Substitute in any existing aux_equations (so a later aux can
+        #    reference an earlier promoted Qaux).
+        for a_name, a_expr in list(aux_store.items()):
+            aux_store[a_name] = a_expr.subs(pattern_sp, qaux_sym)
+        # 3. Register the aux equation.
+        aux_store[name] = pattern_sp
+        return qaux_sym
 
     # ── Model interface (flux, source, NC, etc.) ──────────────────────
 
