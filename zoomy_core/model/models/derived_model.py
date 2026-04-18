@@ -124,7 +124,8 @@ class DerivedModel(Model):
             param_dict = {
                 "g": (9.81, "positive"),
                 "eps": (1e-6, "positive"),
-                "ez": (1.0, "positive"),
+                "ex": (0.0, "real"),   # along-slope gravity component (body force)
+                "ez": (1.0, "positive"),  # normal-to-bed gravity component (hydrostatic)
                 "rho": (1000.0, "positive"),
                 "lamda": (0.1, "positive"),
                 "nu": (1e-6, "positive"),
@@ -472,11 +473,15 @@ class DerivedModel(Model):
             beta = moments_v[lk]
             F[1, 0] += h * sum(c_mean[k] * alpha[k] for k in range(n_mom)) * w_k
             row_base_u = 2 + lk * n_mom
+            # Per-layer advective flux: NO w_k factor here.
+            # The Galerkin projection gives w_k * A, but _apply_Minv uses the
+            # GLOBAL M_inv (not per-layer), so w_k would NOT cancel. Since
+            # M_inv_layer = M_inv_global / w_k, the correct raw_adv omits w_k.
             raw_adv = [S.Zero] * n_mom
             for l in range(n_mom):
                 for i in range(n_mom):
                     for j in range(n_mom):
-                        raw_adv[l] += h * w_k * alpha[i] * alpha[j] * A[l, i, j]
+                        raw_adv[l] += h * alpha[i] * alpha[j] * A[l, i, j]
             for k in range(n_mom):
                 F[row_base_u + k, 0] += self._apply_Minv(raw_adv, k)
             if dim == 2:
@@ -488,9 +493,9 @@ class DerivedModel(Model):
                 for l in range(n_mom):
                     for i in range(n_mom):
                         for j in range(n_mom):
-                            raw_vv[l] += h * w_k * beta[i] * beta[j] * A[l, i, j]
-                            raw_vu[l] += h * w_k * beta[i] * alpha[j] * A[l, i, j]
-                            raw_uv[l] += h * w_k * alpha[i] * beta[j] * A[l, i, j]
+                            raw_vv[l] += h * beta[i] * beta[j] * A[l, i, j]
+                            raw_vu[l] += h * beta[i] * alpha[j] * A[l, i, j]
+                            raw_uv[l] += h * alpha[i] * beta[j] * A[l, i, j]
                 for k in range(n_mom):
                     F[row_base_v + k, 1] += self._apply_Minv(raw_vv, k)
                     F[row_base_v + k, 0] += self._apply_Minv(raw_vu, k)
@@ -502,7 +507,7 @@ class DerivedModel(Model):
         n_vars = self.n_variables
         n_mom = self.level + 1
         n_layers = self.n_layers
-        p = self.parameters
+        p = self._parameter_symbols
         b, h, moments_u, moments_v, hinv = self.get_primitives()
         F = Matrix.zeros(n_vars, dim)
         phi_int = self._phi_int
@@ -520,7 +525,7 @@ class DerivedModel(Model):
         n_vars = self.n_variables
         n_mom = self.level + 1
         n_layers = self.n_layers
-        p = self.parameters
+        p = self._parameter_symbols
         B_mat = self._B
         b, h, moments_u, moments_v, hinv = self.get_primitives()
         nc_x = Matrix.zeros(n_vars, n_vars)
@@ -564,52 +569,72 @@ class DerivedModel(Model):
     def source(self):
         return ZArray.zeros(self.n_variables)
 
+    def gravity_body_force(self):
+        """Along-slope gravity body force: g * ex * h on each layer's mean momentum.
+
+        Enables the inclined-plane test case via a vector-valued gravity
+        (ex, ez) without needing bathymetry. The horizontal component ``ex``
+        drives the flow; the vertical component ``ez`` enters the hydrostatic
+        pressure as usual.
+        """
+        p = self._parameter_symbols
+        n_vars = self.n_variables
+        n_mom = self.level + 1
+        n_layers = self.n_layers
+        out = ZArray.zeros(n_vars)
+        _, h, _, _, _ = self.get_primitives()
+        for lk in range(n_layers):
+            out[2 + lk * n_mom] = p.g * p.ex * h
+        return out
+
     def newtonian_viscosity(self):
-        p = self.parameters
+        p = self._parameter_symbols
         n_vars = self.n_variables
         n_mom = self.level + 1
         n_layers = self.n_layers
         D = self._D
         out = ZArray.zeros(n_vars)
         b, h, moments_u, moments_v, hinv = self.get_primitives()
+        # Per-layer viscous source — NO w_k factor (see flux() comment).
         for lk in range(n_layers):
-            w_k = Rational(1, n_layers)
             alpha = moments_u[lk]
             row_base_u = 2 + lk * n_mom
-            raw_u = [sum(-p.nu * alpha[i] * hinv * D[i, l] / w_k
+            raw_u = [sum(-p.nu * alpha[i] * hinv * D[i, l]
                          for i in range(n_mom)) for l in range(n_mom)]
             for k in range(n_mom):
                 out[row_base_u + k] += self._apply_Minv(raw_u, k)
             if self.dimension == 2:
                 beta = moments_v[lk]
                 row_base_v = 2 + n_layers * n_mom + lk * n_mom
-                raw_v = [sum(-p.nu * beta[i] * hinv * D[i, l] / w_k
+                raw_v = [sum(-p.nu * beta[i] * hinv * D[i, l]
                              for i in range(n_mom)) for l in range(n_mom)]
                 for k in range(n_mom):
                     out[row_base_v + k] += self._apply_Minv(raw_v, k)
         return out
 
     def navier_slip(self):
-        p = self.parameters
+        p = self._parameter_symbols
         n_vars = self.n_variables
         n_mom = self.level + 1
         n_layers = self.n_layers
         phib = self._phib
         out = ZArray.zeros(n_vars)
         b, h, moments_u, moments_v, hinv = self.get_primitives()
+        # Per-layer Navier slip — NO w_k factor (see flux() comment).
+        # NOTE: physically slip acts only at the BOTTOM; this applies it per
+        # layer. Correct for n_layers=1, approximate for n_layers>1.
         for lk in range(n_layers):
-            w_k = Rational(1, n_layers)
             alpha = moments_u[lk]
             row_base_u = 2 + lk * n_mom
             u_bottom = sum(alpha[i] * phib[i] for i in range(n_mom))
-            raw_slip = [-u_bottom * phib[l] / (p.lamda * w_k) for l in range(n_mom)]
+            raw_slip = [-u_bottom * phib[l] / p.lamda for l in range(n_mom)]
             for k in range(n_mom):
                 out[row_base_u + k] += self._apply_Minv(raw_slip, k)
             if self.dimension == 2:
                 beta = moments_v[lk]
                 row_base_v = 2 + n_layers * n_mom + lk * n_mom
                 v_bottom = sum(beta[i] * phib[i] for i in range(n_mom))
-                raw_slip_v = [-v_bottom * phib[l] / (p.lamda * w_k)
+                raw_slip_v = [-v_bottom * phib[l] / p.lamda
                               for l in range(n_mom)]
                 for k in range(n_mom):
                     out[row_base_v + k] += self._apply_Minv(raw_slip_v, k)

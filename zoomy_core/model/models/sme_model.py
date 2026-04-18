@@ -83,7 +83,8 @@ class SMEModel(INSModel):
         self.apply(Newtonian(s))
 
     def source(self):
-        return self.newtonian_viscosity() + self.navier_slip()
+        return (self.newtonian_viscosity() + self.navier_slip()
+                + self.gravity_body_force())
 
 
 class SMEInviscid(INSModel):
@@ -114,3 +115,6 @@ class SMEInviscid(INSModel):
         self.apply(ZeroAtmosphericPressure(s))
         self.apply(SimplifyIntegrals(s))
         self.apply(Inviscid(s))
+
+    def source(self):
+        return self.gravity_body_force()

@@ -357,7 +357,7 @@ class VAMModel(INSModel):
         dim = self.dimension
         n_vars = self.n_variables
         n_u = self._n_u
-        p = self.parameters
+        p = self._parameter_symbols
         b, h, alpha, beta, gamma, hinv = self.get_primitives()
 
         F = Matrix.zeros(n_vars, dim)
@@ -387,7 +387,7 @@ class VAMModel(INSModel):
         dim = self.dimension
         n_vars = self.n_variables
         n_u, n_w = self._n_u, self._n_w
-        p = self.parameters
+        p = self._parameter_symbols
         B_mat = self._B
 
         b, h, alpha, beta, gamma, hinv = self.get_primitives()
@@ -459,7 +459,7 @@ class VAMModel(INSModel):
         """
         n_vars = self.n_variables
         n_w = self._n_w
-        p = self.parameters
+        p = self._parameter_symbols
         phi_int = self._phi_int
         w_start = 2 + self._hdim * self._n_u
 
@@ -537,7 +537,7 @@ class VAMModel(INSModel):
         """
         n_vars = self.n_variables
         n_u = self._n_u
-        p = self.parameters
+        p = self._parameter_symbols
         b, h, alpha, beta, gamma, hinv = self.get_primitives()
 
         ev = ZArray.zeros(n_vars)
@@ -630,7 +630,7 @@ class VAMNewtonian(VAMModel):
 
     def _newtonian_viscosity(self):
         """Newtonian viscous source for u and w moments."""
-        p = self.parameters
+        p = self._parameter_symbols
         n_vars = self.n_variables
         n_u, n_w = self._n_u, self._n_w
         D = self._D
@@ -656,7 +656,7 @@ class VAMNewtonian(VAMModel):
 
     def _navier_slip(self):
         """Navier-slip friction for u moments at the bottom."""
-        p = self.parameters
+        p = self._parameter_symbols
         n_vars = self.n_variables
         n_u = self._n_u
         phib = self._phib

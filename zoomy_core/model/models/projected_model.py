@@ -231,7 +231,7 @@ class ProjectedModel(Model):
         n_layers = self.n_layers
 
         b, h, moments_u, moments_v, hinv = self.get_primitives()
-        p = self.parameters
+        p = self._parameter_symbols
         A = self._A
         c_mean = self._c_mean
 
@@ -289,7 +289,7 @@ class ProjectedModel(Model):
         n_vars = self.n_variables
         n_mom = self.level + 1
         n_layers = self.n_layers
-        p = self.parameters
+        p = self._parameter_symbols
         c_mean = self._c_mean
 
         b, h, moments_u, moments_v, hinv = self.get_primitives()
@@ -319,7 +319,7 @@ class ProjectedModel(Model):
         n_vars = self.n_variables
         n_mom = self.level + 1
         n_layers = self.n_layers
-        p = self.parameters
+        p = self._parameter_symbols
         B_mat = self._B
 
         b, h, moments_u, moments_v, hinv = self.get_primitives()
@@ -386,7 +386,7 @@ class ProjectedModel(Model):
         Raw: S_l = -nu/h * Σ_i α_i * D[i,l]
         Resolved: S_k = Σ_l Minv[k,l] * S_l
         """
-        p = self.parameters
+        p = self._parameter_symbols
         n_vars = self.n_variables
         n_mom = self.level + 1
         n_layers = self.n_layers
@@ -423,7 +423,7 @@ class ProjectedModel(Model):
         where u_b = Σ_i α_i * φ_i(0)
         Resolved: S_k = Σ_l Minv[k,l] * S_l
         """
-        p = self.parameters
+        p = self._parameter_symbols
         n_vars = self.n_variables
         n_mom = self.level + 1
         n_layers = self.n_layers
