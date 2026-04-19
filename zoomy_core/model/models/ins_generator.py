@@ -275,6 +275,98 @@ class Expression(SymbolicBase):
         tagged_sum = sum(self._solver_groups.values(), S.Zero)
         return sp.expand(self.expr - tagged_sum)
 
+    def auto_solver_tag(self, *, state_vars, time_var, coords):
+        """Algorithmically assign solver tags by structural matching.
+
+        Each additive term of ``self.expr`` is classified:
+
+        * ``coeff * Derivative(q, t)`` with ``q`` a state variable →
+          ``time_derivative``.
+        * ``coeff * Derivative(F, x_i)`` where ``coeff`` is state-variable-
+          free → ``flux`` (conservative form, regardless of whether ``F``
+          is pure advection or hydrostatic pressure — they're lumped here;
+          well-balanced separation is a follow-up).
+        * ``coeff * Derivative(q_j, x_i)`` where ``q_j`` is a state variable
+          → ``nonconservative_flux``.
+        * No derivatives and no un-substituted Function-call atoms (purely
+          algebraic in state-symbol space) → ``source``.
+        * Anything else (un-substituted ``f(t,x,z)`` evaluations, unmatched
+          Derivatives) stays in the untagged remainder.
+
+        Returns a new Expression with ``solver_groups`` populated. Physical
+        tags are preserved.
+        """
+        state_set = set(state_vars)
+        coords_list = list(coords)
+        tags = {
+            "time_derivative": S.Zero,
+            "flux": S.Zero,
+            "nonconservative_flux": S.Zero,
+            "source": S.Zero,
+        }
+
+        def _is_un_subbed_function(term):
+            """True iff term contains a Function call (e.g. u(t, x, b))."""
+            return any(a.args for a in term.atoms(Function))
+
+        for term in Add.make_args(sp.expand(self.expr)):
+            if term == S.Zero:
+                continue
+
+            # Un-substituted Function calls cannot be evaluated in state-
+            # symbol space → leave untagged.
+            if _is_un_subbed_function(term):
+                continue
+
+            # Try to split as `coeff * Derivative(...)`.
+            coeff = S.One
+            deriv = None
+            if isinstance(term, Derivative):
+                deriv = term
+            elif isinstance(term, Mul):
+                ds = [a for a in term.args if isinstance(a, Derivative)]
+                if len(ds) == 1:
+                    deriv = ds[0]
+                    coeff = Mul(*[a for a in term.args if a is not deriv])
+
+            if deriv is not None and len(deriv.variables) == 1:
+                v = deriv.variables[0]
+                inner = deriv.args[0]
+
+                # time_derivative: coeff * ∂_t(state_var)
+                if v == time_var and inner in state_set:
+                    tags["time_derivative"] = tags["time_derivative"] + term
+                    continue
+
+                # spatial derivative
+                if v in coords_list:
+                    coeff_state_refs = state_set & coeff.free_symbols
+                    if not coeff_state_refs:
+                        # Conservative form (no state vars in coefficient).
+                        tags["flux"] = tags["flux"] + term
+                        continue
+                    if inner in state_set:
+                        # NCP: coeff * ∂(state)/∂x_i
+                        tags["nonconservative_flux"] = tags["nonconservative_flux"] + term
+                        continue
+
+            # Anything with no Derivative at all AND no Function call
+            # (filtered above) is pure algebraic in state space → source.
+            has_derivative = any(
+                isinstance(a, Derivative) for a in term.atoms(Derivative)
+            )
+            if not has_derivative:
+                tags["source"] = tags["source"] + term
+                continue
+
+            # Unmatched Derivative shape → untagged (caller sees via remainder).
+
+        # Drop empty tag groups.
+        nonempty = {t: v for t, v in tags.items() if v != 0}
+        return Expression(self.expr, self.name,
+                          term_groups=self._term_groups,
+                          solver_groups=nonempty)
+
     def __len__(self):
         return len(Add.make_args(sp.expand(self.expr)))
 
@@ -1692,6 +1784,31 @@ class KinematicBCSurface(Assumption):
             v_at_s = s.v.subs(s.z, s.eta)
             rhs += v_at_s * Derivative(s.eta, s.y)
         super().__init__({w_at_s: rhs}, name="kinematic_bc_surface")
+
+
+class NoTangentialBoundaryStress(Assumption):
+    """Zero tangential normal stress at both surface and bottom.
+
+    Closes the Leibniz boundary terms ``tau_xx(z=b)``, ``tau_xx(z=eta)``
+    (and y-components in 3D) that remain after depth-integrating
+    ``∂_x tau_xx``.  Uses a Newtonian-style "no flow variation" closure
+    at the vertical boundaries.
+    """
+
+    def __init__(self, state: StateSpace):
+        s = state
+        subs = {}
+        if "xx" in s.tau:
+            subs[s.tau["xx"].subs(s.z, s.b)] = S.Zero
+            subs[s.tau["xx"].subs(s.z, s.eta)] = S.Zero
+        if s.has_y and "yy" in s.tau:
+            subs[s.tau["yy"].subs(s.z, s.b)] = S.Zero
+            subs[s.tau["yy"].subs(s.z, s.eta)] = S.Zero
+            subs[s.tau["xy"].subs(s.z, s.b)] = S.Zero
+            subs[s.tau["xy"].subs(s.z, s.eta)] = S.Zero
+            subs[s.tau["yx"].subs(s.z, s.b)] = S.Zero
+            subs[s.tau["yx"].subs(s.z, s.eta)] = S.Zero
+        super().__init__(subs, name="no_tangential_boundary_stress")
 
 
 class HydrostaticPressure(Assumption):
