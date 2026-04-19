@@ -188,16 +188,21 @@ class _EquationProxy:
         return self
 
     def solve_for(self, variable):
-        """Solve this equation (= 0) for the given variable.
+        """Solve this equation for ``variable``, isolate it, return self.
 
-        Returns a substitution-ready :class:`Expression` — the returned
-        object carries an ``_as_relation`` attribute ``{variable: solution}``
-        that ``Expression.apply`` consumes directly.  Example::
+        Rewrites the stored equation to the canonical form
+        ``variable - solution = 0`` (so ``describe()`` shows the
+        cleanly isolated equation) AND attaches an
+        ``_as_relation = {variable: solution}`` marker on the new
+        expression that ``Expression.apply`` consumes as a substitution.
 
+        Chains as a proxy, so both
+            model.z_momentum.apply({BC}).solve_for(state.p).simplify()
+        and
             model.x_momentum.apply(model.z_momentum.solve_for(state.p))
-
-        (solves z_momentum for p and substitutes the solution into
-         x_momentum in a single step).
+        work directly — in the second case, the proxy is passed in and
+        ``Expression.apply`` finds ``_as_relation`` via attribute
+        delegation on the underlying Expression.
 
         If multiple solutions exist, the first is used with a warning.
         """
@@ -210,11 +215,14 @@ class _EquationProxy:
                 f"using first: {solutions[0]}"
             )
         solution = solutions[0]
-        result = Expression(solution, f"{variable}")
-        # Attach substitution metadata so Expression.apply can use this
-        # directly as ``{variable: solution}``.
-        result._as_relation = {variable: solution}
-        return result
+        isolated = Expression(variable - solution, self._name,
+                              term_groups=self._expr._term_groups,
+                              solver_groups=self._expr._solver_groups)
+        # ``_as_relation`` on the Expression so Expression.simplify /
+        # .expand (which create new Expressions) preserve it.
+        isolated._as_relation = {variable: solution}
+        self._system.equations[self._name] = isolated
+        return self
 
     def remove(self):
         """Remove this equation from the system.
