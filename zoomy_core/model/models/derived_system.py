@@ -158,35 +158,74 @@ class _EquationProxy:
         return _EquationBCProxy(self._system.boundary_conditions, self._name)
 
     def apply(self, *args, **kwargs):
-        """Apply operation in place — mutates the equation in the system."""
+        """Apply operation in place — mutates the equation in the system.
+
+        Returns ``self`` so calls chain: ``model.z_momentum.apply(X).simplify()``.
+        """
         self._system.equations[self._name] = self._expr.apply(*args, **kwargs)
+        return self
 
     def apply_to_term(self, index, *operations):
-        """Apply operation to a specific term in place."""
-        self._system.equations[self._name] = self._expr.apply_to_term(index, *operations)
+        """Apply operation to a specific term in place. Returns ``self``."""
+        self._system.equations[self._name] = self._expr.apply_to_term(
+            index, *operations
+        )
+        return self
 
     def simplify(self):
-        """Simplify in place."""
+        """Simplify in place. Returns ``self``."""
         self._system.equations[self._name] = self._expr.simplify()
+        return self
+
+    def expand(self):
+        """Expand in place. Returns ``self``."""
+        self._system.equations[self._name] = self._expr.expand()
+        return self
+
+    def subs(self, *args, **kwargs):
+        """Substitute in place. Returns ``self``."""
+        self._system.equations[self._name] = self._expr.subs(*args, **kwargs)
+        return self
 
     def solve_for(self, variable):
         """Solve this equation (= 0) for the given variable.
 
-        Returns an Expression representing ``variable = solution``.
-        If multiple solutions, uses the first and warns.
+        Returns a substitution-ready :class:`Expression` — the returned
+        object carries an ``_as_relation`` attribute ``{variable: solution}``
+        that ``Expression.apply`` consumes directly.  Example::
+
+            model.x_momentum.apply(model.z_momentum.solve_for(state.p))
+
+        (solves z_momentum for p and substitutes the solution into
+         x_momentum in a single step).
+
+        If multiple solutions exist, the first is used with a warning.
         """
         solutions = sp.solve(self._expr.expr, variable)
         if not solutions:
             raise ValueError(f"Cannot solve {self._name} for {variable}")
         if len(solutions) > 1:
             warnings.warn(
-                f"Multiple solutions for {variable} in {self._name}, using first: {solutions[0]}"
+                f"Multiple solutions for {variable} in {self._name}, "
+                f"using first: {solutions[0]}"
             )
-        return Expression(solutions[0], f"{variable}")
+        solution = solutions[0]
+        result = Expression(solution, f"{variable}")
+        # Attach substitution metadata so Expression.apply can use this
+        # directly as ``{variable: solution}``.
+        result._as_relation = {variable: solution}
+        return result
 
-    def delete(self):
-        """Remove this equation from the system."""
-        del self._system.equations[self._name]
+    def remove(self):
+        """Remove this equation from the system.
+
+        Uses :meth:`System.remove_equation` so both ``equations`` and
+        ``boundary_conditions`` stay consistent.
+        """
+        self._system.remove_equation(self._name)
+
+    # Back-compat alias — older code may call .delete().
+    delete = remove
 
     def __getattr__(self, name):
         # Delegate everything else to the underlying Expression
@@ -369,9 +408,14 @@ class System:
 
         if final_equation:
             for eq_name, eq in self.equations.items():
-                # Use multiline if term groups are available
-                tex = eq.latex(strip_args=strip_args, multiline=bool(eq._term_groups))
-                parts.append(f"**{eq_name}:**\n$$\n{tex} = 0\n$$\n")
+                use_multiline = bool(eq._term_groups)
+                tex = eq.latex(strip_args=strip_args, multiline=use_multiline)
+                # latex(multiline=True) emits a trailing "&= 0" inside the
+                # aligned block; don't append a second "= 0".
+                if use_multiline:
+                    parts.append(f"**{eq_name}:**\n$$\n{tex}\n$$\n")
+                else:
+                    parts.append(f"**{eq_name}:**\n$$\n{tex} = 0\n$$\n")
 
         if parameters:
             all_syms = set()

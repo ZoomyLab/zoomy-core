@@ -452,6 +452,13 @@ class Expression(SymbolicBase):
                     except NotImplementedError:
                         pass
                 return cond.apply_to(expr)
+            # Expression returned by ``proxy.solve_for(var)`` carries an
+            # ``_as_relation`` attribute ``{var: solution}``. Treat it as
+            # a substitution dict so
+            #     model.x_momentum.apply(model.z_momentum.solve_for(state.p))
+            # works directly.
+            if isinstance(cond, Expression) and getattr(cond, "_as_relation", None):
+                return expr.subs(cond._as_relation)
             if isinstance(cond, Relation) or hasattr(cond, 'apply_to'):
                 # Evaluate Subs first so BC patterns match
                 if expr.has(sp.Subs):
@@ -1027,8 +1034,17 @@ class Expression(SymbolicBase):
             parts.append(f"**{self.name}** ({len(self)} terms)")
 
         if final_equation:
-            tex = self.latex(strip_args=strip_args)
-            parts.append(f"\n$$\n{tex} = 0\n$$")
+            # Match System.describe: use multiline underbrace rendering when
+            # term_groups are populated (otherwise model.describe and
+            # model.<eq>.describe show the same equation differently).
+            tex = self.latex(strip_args=strip_args,
+                             multiline=bool(self._term_groups))
+            # latex(multiline=True) already emits a trailing "&= 0" inside the
+            # aligned block, so in that case we don't append another "= 0".
+            if self._term_groups:
+                parts.append(f"\n$$\n{tex}\n$$")
+            else:
+                parts.append(f"\n$$\n{tex} = 0\n$$")
 
         if parameters:
             from sympy import Symbol
@@ -1364,33 +1380,76 @@ class SimplifyIntegrals(Operation):
 
 
 class Integrate(Operation):
-    """Integrate the expression w.r.t. a variable over given bounds.
+    """Integrate each additive term of an equation w.r.t. ``var`` over [lower, upper].
 
-    Sympy performs the integration analytically. For an equation like
-    ``∂p/∂z/ρ + g = 0``, integrating from ``η`` to ``z`` gives
-    ``p(z)/ρ - p(η)/ρ + g(z - η) = 0``, i.e. the hydrostatic pressure.
+    Per-term strategy is driven by ``method``:
+
+    * ``"auto"`` (default) — detect the outermost derivative direction
+      per term and pick Leibniz / fundamental theorem / direct accordingly.
+    * ``"leibniz"`` — force the Leibniz rule (for terms containing
+      ``∂/∂x_i`` where ``x_i != var``):
+      ``∫ ∂_x f dvar = ∂_x [∫ f dvar]  − f|_upper · ∂_x upper  + f|_lower · ∂_x lower``.
+    * ``"fundamental_theorem"`` — for terms containing ``∂/∂var`` as the
+      outermost derivative: ``∫ ∂_var f dvar = f|_upper − f|_lower``.
+    * ``"direct"`` — keep as an unevaluated ``Integral(expr, (var, lower, upper))``.
+    * ``"analytical"`` — run ``sympy.integrate`` on the whole expression
+      (what the original small ``Integrate`` did; useful for z-momentum
+      analytic integration when the integrand has no horizontal derivatives).
+
+    Boundary terms produced by Leibniz / fundamental-theorem are kept as
+    ``Subs(f, var, bound)`` expressions — no kinematic BCs are applied here.
+    Resolve them later via an explicit ``.apply({Subs-pattern: value})`` or
+    a convenience Relation (``ApplyKinematicBCs``, ``StressFreeSurface``, ...).
+
+    Partial integration (``upper == var``) is supported by the ``"direct"``
+    and ``"analytical"`` methods — sympy will produce a running integral.
 
     Usage::
 
-        zmom.apply(Integrate(z, lower=eta, upper=z))
+        zmom.apply(Integrate(state.z, state.b, state.z))             # partial
+        zmom.apply(Integrate(state.z, state.b, state.eta))           # full depth
+        zmom.apply(Integrate(state.z, state.b, state.b + state.H,
+                             method="analytical"))                    # sympy.integrate
     """
 
-    def __init__(self, var, lower, upper):
+    def __init__(self, var, lower, upper, method="auto"):
         super().__init__(
             name="integrate",
-            description=f"Integrate w.r.t. {var} from {lower} to {upper}",
+            description=(f"Integrate w.r.t. {var} from {lower} to {upper} "
+                         f"(method={method})"),
         )
         self._var = var
         self._lower = lower
         self._upper = upper
+        self._method = method
+
+    def apply_to_expression(self, expression):
+        if self._method == "analytical":
+            # Whole-expression analytic integration, with Dummy substitution
+            # to avoid clashes when upper == var (partial / running integral).
+            dummy = sp.Dummy("_int_dummy")
+            integrand = expression.expr.subs(self._var, dummy)
+            result = sp.integrate(integrand, (dummy, self._lower, self._upper))
+            return Expression(result, expression.name)
+
+        # Per-term dispatch through Expression.depth_integrate.
+        total = Expression(S.Zero)
+        for term in expression.terms:
+            r = term.depth_integrate(self._lower, self._upper, self._var,
+                                     method=self._method)
+            if isinstance(r, DepthIntegralResult):
+                # DepthIntegralResult's components already carry their signs;
+                # assemble = volume + boundary_upper + boundary_lower.
+                total = total + r.assemble()
+            elif isinstance(r, Expression):
+                total = total + r
+            else:
+                total = total + Expression(r)
+        return total
 
     def apply_to(self, expr):
-        # Use a dummy variable to avoid z appearing as both integration
-        # variable and limit
-        dummy = sp.Dummy("_z_int")
-        integrand = expr.subs(self._var, dummy)
-        result = sp.integrate(integrand, (dummy, self._lower, self._upper))
-        return result
+        # Fall-back for older direct-subs call sites that skip apply_to_expression.
+        return self.apply_to_expression(Expression(expr, "")).expr
 
     def _repr_latex_(self):
         return (
