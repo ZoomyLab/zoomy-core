@@ -452,13 +452,21 @@ class Expression(SymbolicBase):
                     except NotImplementedError:
                         pass
                 return cond.apply_to(expr)
-            # Expression returned by ``proxy.solve_for(var)`` carries an
-            # ``_as_relation`` attribute ``{var: solution}``. Treat it as
-            # a substitution dict so
-            #     model.x_momentum.apply(model.z_momentum.solve_for(state.p))
-            # works directly.
-            if isinstance(cond, Expression) and getattr(cond, "_as_relation", None):
-                return expr.subs(cond._as_relation)
+            # Any object carrying an ``_as_relation`` attribute
+            # (Expression from ``solve_for`` or a proxy that delegates to
+            # it) is treated as a substitution dict so both
+            #     model.x_momentum.apply(model.z_momentum.solve_for(p))
+            # and, after solve_for has mutated z_momentum,
+            #     model.x_momentum.apply(model.z_momentum)
+            # work directly.  Evaluate ``Subs`` atoms first so BC-shaped
+            # patterns written with ``f.subs(var, bound)`` match the
+            # ``Subs(f, var, bound)`` shapes that ``Integrate`` emits.
+            rel = getattr(cond, "_as_relation", None)
+            if isinstance(rel, dict) and rel:
+                if expr.has(sp.Subs):
+                    subs_map = {s: s.doit() for s in expr.atoms(sp.Subs)}
+                    expr = expr.subs(subs_map)
+                return expr.subs(rel)
             if isinstance(cond, Relation) or hasattr(cond, 'apply_to'):
                 # Evaluate Subs first so BC patterns match
                 if expr.has(sp.Subs):
@@ -466,6 +474,12 @@ class Expression(SymbolicBase):
                     expr = expr.subs(subs_map)
                 return cond.apply_to(expr)
             elif isinstance(cond, dict):
+                # Evaluate Subs first so dict keys written with
+                # ``state.w.subs(state.z, state.b)`` (= ``w(t, x, b)``)
+                # match ``Subs(w, z, b)`` shapes emitted by ``Integrate``.
+                if expr.has(sp.Subs):
+                    subs_map = {s: s.doit() for s in expr.atoms(sp.Subs)}
+                    expr = expr.subs(subs_map)
                 return expr.subs(cond)
             elif isinstance(cond, (list, tuple)):
                 if len(cond) == 2 and isinstance(cond[0], sp.Basic):
@@ -654,8 +668,14 @@ class Expression(SymbolicBase):
         if self._solver_groups:
             new_solver_groups = {t: g for t, g in self._solver_groups.items()
                                  if _simplify_preserve_integrals(g) == g}
-        return Expression(_simplify_preserve_integrals(self.expr), self.name,
-                          term_groups=new_groups, solver_groups=new_solver_groups)
+        out = Expression(_simplify_preserve_integrals(self.expr), self.name,
+                         term_groups=new_groups, solver_groups=new_solver_groups)
+        # Preserve the solve_for-style substitution marker — simplification
+        # is a pure rearrangement that doesn't invalidate {variable: solution}.
+        rel = getattr(self, "_as_relation", None)
+        if rel is not None:
+            out._as_relation = rel
+        return out
 
     def expand(self):
         new_groups = ({role: sp.expand(g)
@@ -665,8 +685,12 @@ class Expression(SymbolicBase):
         if self._solver_groups:
             new_solver_groups = {t: g for t, g in self._solver_groups.items()
                                  if sp.expand(g) == g}
-        return Expression(sp.expand(self.expr), self.name,
-                          term_groups=new_groups, solver_groups=new_solver_groups)
+        out = Expression(sp.expand(self.expr), self.name,
+                         term_groups=new_groups, solver_groups=new_solver_groups)
+        rel = getattr(self, "_as_relation", None)
+        if rel is not None:
+            out._as_relation = rel
+        return out
 
     def doit(self):
         return Expression(self.expr.doit(), self.name)
@@ -1994,16 +2018,61 @@ def _simplify_preserve_integrals(expr):
         return e
 
     protected = _protect(expr)
-    # Evaluate simple derivatives like d(b+h)/dt → db/dt + dh/dt
-    # but NOT Derivative(Integral) (already protected as dummies)
-    evaled = protected.doit() if protected.has(Derivative) else protected
-    # Expand to reveal cancellations, then collect like terms
+    # Evaluate derivatives by *linearity only* — ``d(b+h)/dt → db/dt + dh/dt``
+    # — but do NOT chain-rule through ``Derivative(u², x)`` or ``Derivative(u·w, z)``.
+    # Conservative-form derivatives must survive simplification so that a
+    # later ``Integrate(..., method="auto")`` can apply the Leibniz rule /
+    # fundamental theorem cleanly.  ``Derivative(Integral(...))`` is
+    # already protected above.
+    evaled = _evaluate_linear_derivatives(protected)
+    # Expand to reveal cancellations, then collect like terms.  We pass
+    # ``mul=True, multinomial=True`` explicitly and keep Derivatives unexpanded.
     expanded = sp.expand(evaled)
     simplified = sp.powsimp(expanded, combine="all")
     return simplified.subs(integral_map)
 
 
+def _evaluate_linear_derivatives(expr):
+    """``Derivative(Add(...), var)`` → sum of per-term derivatives.
+
+    Leaves ``Derivative(Mul(...), var)``, ``Derivative(Pow(...), var)`` and
+    ``Derivative(Function(...), var)`` untouched so conservative forms like
+    ``Derivative(u**2, x)`` and ``Derivative(u*w, z)`` survive.
+    """
+    if not isinstance(expr, sp.Basic):
+        return expr
+    if isinstance(expr, Derivative):
+        inner = expr.args[0]
+        if isinstance(inner, sp.Add):
+            inner_walked = _evaluate_linear_derivatives(inner)
+            return expr.func(inner_walked, *expr.args[1:]).doit()
+        inner_walked = _evaluate_linear_derivatives(inner)
+        return expr.func(inner_walked, *expr.args[1:])
+    if expr.args:
+        return expr.func(*(_evaluate_linear_derivatives(a) for a in expr.args))
+    return expr
+
+
 def _extract_derivative(expr, var):
+    """Decompose ``expr`` as ``coeff * Derivative(inner, var)``.
+
+    Returns ``(inner, coeff)`` when the decomposition is valid,
+    ``(None, None)`` otherwise.  Validity requires that ``coeff`` is
+    independent of ``var``.
+
+    Without that check, a product-rule-expanded term like
+    ``2u · ∂_x u`` would be split as ``coeff = 2u, inner = u`` and the
+    downstream Leibniz rule ``∫ coeff · ∂_x inner dz = ∂_x[∫ coeff ·
+    inner dz] + …`` would compute ``∂_x[∫ 2u² dz]`` — **double** the
+    correct value, since the true conservative form ``∂_x(u²)`` gives
+    ``∂_x[∫ u² dz]``.
+
+    So we only succeed when the term is in genuine conservative form:
+    either a bare ``Derivative(f, var)``, or a product whose only
+    var-dependent factor is the ``Derivative``.  Expanded product-rule
+    forms fall through to "direct" integration and stay wrapped in an
+    unevaluated ``Integral``.
+    """
     expr = sp.sympify(expr)
     if isinstance(expr, Derivative):
         if expr.variables == (var,):
@@ -2019,6 +2088,10 @@ def _extract_derivative(expr, var):
     if inner is None:
         return None, None
     coeff = Mul(*coeff_factors) if coeff_factors else S.One
+    # Refuse when ``coeff`` still depends on the derivative variable —
+    # the term is product-rule expanded, not conservative.
+    if var in coeff.free_symbols:
+        return None, None
     return inner, coeff
 
 
