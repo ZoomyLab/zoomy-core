@@ -308,12 +308,41 @@ class System:
         raise AttributeError(f"No equation '{name}' in system. Available: {list(self.equations.keys())}")
 
     def apply(self, operation):
-        """Apply an operation or relation to all equations in place."""
+        """Apply an operation or relation to all equations in place.
+
+        Returns ``self`` so calls chain:
+        ``model.apply(Newtonian(s)).apply(Integrate(...)).simplify()``.
+        """
         self.equations = {
             k: eq.apply(operation) for k, eq in self.equations.items()
         }
-        a_name = getattr(operation, 'description', None) or getattr(operation, 'name', str(operation))
+        a_name = (getattr(operation, 'description', None)
+                  or getattr(operation, 'name', None)
+                  or str(operation))
         self.assumptions.append(a_name)
+        return self
+
+    def simplify(self):
+        """Simplify every equation in place.  Returns ``self``."""
+        self.equations = {k: eq.simplify() for k, eq in self.equations.items()}
+        return self
+
+    def expand(self):
+        """Expand every equation in place.  Returns ``self``."""
+        self.equations = {k: eq.expand() for k, eq in self.equations.items()}
+        return self
+
+    def subs(self, *args, **kwargs):
+        """Substitute in every equation in place.  Returns ``self``."""
+        self.equations = {
+            k: eq.subs(*args, **kwargs) for k, eq in self.equations.items()
+        }
+        return self
+
+    def remove(self, name):
+        """Remove an equation by name (alias for ``remove_equation``)."""
+        self.remove_equation(name)
+        return self
 
     def apply_to_term(self, equation_name, term_index, *operations):
         """Apply operations to a specific term of a specific equation in place.
