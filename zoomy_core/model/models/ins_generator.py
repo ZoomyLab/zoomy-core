@@ -131,19 +131,71 @@ class Expression(SymbolicBase):
     - Notebook: _repr_latex_
     """
 
-    def __init__(self, expr, name="", term_groups=None, solver_groups=None):
+    def __init__(self, expr, name="", term_groups=None, solver_groups=None,
+                 term_tags=None, tag_order=None):
         super().__init__(name)
         if isinstance(expr, Expression):
             expr = expr.expr
         self.expr = sp.sympify(expr) if not isinstance(expr, sp.Basic) else expr
-        # Physical term groups for display (drive \underbrace in latex()).
-        # {"temporal": sp.Expr, "convection": sp.Expr, ...}
-        # Survive apply() by design — intended for provenance/rendering.
-        self._term_groups = term_groups
+        # Physical tags: per-additive-term labels for the display view.
+        # ``_term_tags`` maps each tagged term (sp.Expr) to the tag name it
+        # belongs to.  Tags are propagated *follow-the-term* by ``.apply``,
+        # ``.simplify``, ``.subs``, ``.expand``: when a transformation
+        # replaces ``old_term`` with ``new_term(s)``, every new term
+        # inherits the old term's tag.  Cross-tag cancellation in the main
+        # ``self.expr`` is reflected by terms vanishing from both
+        # ``Add.make_args(self.expr)`` and ``_term_tags``.
+        self._term_tags = dict(term_tags) if term_tags else {}
+        # Display order for tags (first-seen wins).
+        self._tag_order = list(tag_order) if tag_order else []
+        # Back-compat: legacy ``term_groups`` kwarg (parallel-sum dict).
+        # Convert to per-term entries.  Summing is associative, so splitting
+        # a tag's group into Add.make_args and recording each piece gives
+        # an equivalent view.
+        if term_groups:
+            for name_, g in term_groups.items():
+                g_sp = g if isinstance(g, sp.Basic) else sp.sympify(g)
+                # ``sp.expand`` distributes scalar factors across Adds so
+                # something like ``-(∂_x τ_xx + ∂_z τ_xz)/ρ`` gets split
+                # into its atomic additive terms before we record each
+                # under the tag.
+                for term in Add.make_args(sp.expand(g_sp)):
+                    if term != S.Zero:
+                        self._term_tags[term] = name_
+                if name_ not in self._tag_order:
+                    self._tag_order.append(name_)
         # Solver tag groups for operator routing (flux, source, NC, ...).
         # {canonical_tag: sp.Expr}. Dropped per-tag whenever apply/simplify
         # changes the tagged sub-expression (structural equality check).
         self._solver_groups = dict(solver_groups) if solver_groups else None
+
+    # ``_term_groups`` is a lazy view over ``_term_tags`` filtered by the
+    # current ``self.expr`` terms.  It's always in sync with the main
+    # expression (terms that cancelled out of ``self.expr`` disappear
+    # from the groups automatically).  Kept as a property for any code
+    # that still reads ``_term_groups``.
+    @property
+    def _term_groups(self):
+        if not self._term_tags:
+            return None
+        current = set(Add.make_args(sp.expand(self.expr)))
+        groups = {name: S.Zero for name in self._tag_order}
+        for term in current:
+            tag_name = self._term_tags.get(term)
+            if tag_name is None:
+                continue
+            if tag_name not in groups:
+                groups[tag_name] = S.Zero
+            groups[tag_name] = groups[tag_name] + term
+        non_empty = {k: v for k, v in groups.items() if v != S.Zero}
+        return non_empty if non_empty else None
+
+    @_term_groups.setter
+    def _term_groups(self, value):
+        # Setter exists only so ``__init__`` could still do the legacy
+        # assignment during early-init before the dict is built.  The
+        # attribute has been fully migrated to ``_term_tags`` / ``_tag_order``.
+        pass
 
     @property
     def terms(self):
@@ -173,57 +225,95 @@ class Expression(SymbolicBase):
         return Expression(sum(new_terms, S.Zero), self.name)
 
     def keep_groups(self, *group_names):
-        """Return a new Expression keeping only the specified term groups.
-
-        Usage::
-
-            zmom.keep_groups("pressure", "source")  # drops temporal, convection, stress
-        """
-        if not self._term_groups:
-            raise ValueError("Expression has no term_groups.")
-        kept = {k: v for k, v in self._term_groups.items() if k in group_names}
-        if not kept:
+        """Return a new Expression keeping only the specified tags' terms."""
+        if not self._term_tags:
+            raise ValueError("Expression has no tags.")
+        kept_terms = {t: name for t, name in self._term_tags.items()
+                      if name in group_names}
+        if not kept_terms:
             return Expression(S.Zero, self.name)
-        return Expression(sum(kept.values(), S.Zero), self.name, term_groups=kept)
+        kept_order = [n for n in self._tag_order if n in group_names]
+        new_expr = sum(kept_terms.keys(), S.Zero)
+        return Expression(new_expr, self.name,
+                          term_tags=kept_terms, tag_order=kept_order)
 
     def drop_groups(self, *group_names):
-        """Return a new Expression dropping the specified term groups.
-
-        Usage::
-
-            zmom.drop_groups("temporal", "convection", "stress")
-        """
-        if not self._term_groups:
-            raise ValueError("Expression has no term_groups.")
-        kept = {k: v for k, v in self._term_groups.items() if k not in group_names}
-        if not kept:
+        """Return a new Expression dropping the specified tags' terms."""
+        if not self._term_tags:
+            raise ValueError("Expression has no tags.")
+        kept_terms = {t: name for t, name in self._term_tags.items()
+                      if name not in group_names}
+        if not kept_terms:
             return Expression(S.Zero, self.name)
-        return Expression(sum(kept.values(), S.Zero), self.name, term_groups=kept)
+        kept_order = [n for n in self._tag_order if n not in group_names]
+        new_expr = sum(kept_terms.keys(), S.Zero)
+        return Expression(new_expr, self.name,
+                          term_tags=kept_terms, tag_order=kept_order)
 
     # ------------------------------------------------------------------
     # Tagging: physical (display) and solver (operator routing)
     # ------------------------------------------------------------------
 
     def tag(self, **named_groups):
-        """Attach/replace physical term groups for display.
+        """Attach physical tags to terms for display.
 
-        Physical tags survive ``apply()`` (substituted through), and drive
-        the ``\\underbrace{...}_{<name>}`` rendering in ``latex(multiline=True)``.
+        Each ``name=value`` kwarg is split into additive terms and each
+        term is recorded as belonging to ``name`` in the per-term tag map.
+
+        Tags follow the terms through ``.apply`` / ``.subs`` / ``.simplify``:
+        when a transformation replaces a tagged term, the new term(s)
+        inherit the tag.  Terms that cancel (via ``simplify``) silently
+        disappear from the view — no parallel-sum math, no cross-tag
+        contamination.
 
         Usage::
 
             xmom = xmom.tag(pressure=grad_p, stress=div_tau)
         """
-        merged = dict(self._term_groups or {})
-        for k, v in named_groups.items():
-            merged[k] = v.expr if isinstance(v, Expression) else sp.sympify(v)
+        new_tags = dict(self._term_tags)
+        new_order = list(self._tag_order)
+        for name_, v in named_groups.items():
+            v_sp = v.expr if isinstance(v, Expression) else sp.sympify(v)
+            for term in Add.make_args(sp.expand(v_sp)):
+                if term != S.Zero:
+                    new_tags[term] = name_
+            if name_ not in new_order:
+                new_order.append(name_)
         return Expression(self.expr, self.name,
-                          term_groups=merged, solver_groups=self._solver_groups)
+                          term_tags=new_tags, tag_order=new_order,
+                          solver_groups=self._solver_groups)
 
     @property
     def tags(self):
-        """Dict of physical tags, or empty dict if none set."""
-        return dict(self._term_groups) if self._term_groups else {}
+        """Dict of current-expr terms grouped by physical tag.
+
+        Computed on demand by walking ``Add.make_args(self.expr)`` and
+        assigning each term to the tag recorded in ``_term_tags``.  Terms
+        not in the main expression (cancelled by simplify, etc.) do not
+        appear — the view stays in sync with the single source of truth.
+        """
+        if not self._term_tags:
+            return {}
+        # Group current expression terms by tag, preserving tag order.
+        groups = {name: S.Zero for name in self._tag_order}
+        for term in Add.make_args(sp.expand(self.expr)):
+            tag_name = self._term_tags.get(term)
+            if tag_name is None:
+                continue
+            if tag_name not in groups:
+                groups[tag_name] = S.Zero
+            groups[tag_name] = groups[tag_name] + term
+        # Drop empty tags (their terms all cancelled).
+        return {k: v for k, v in groups.items() if v != S.Zero}
+
+    @property
+    def untagged(self):
+        """Sum of current-expr terms that have no physical tag."""
+        tagged_terms = set(self._term_tags)
+        return sum(
+            (t for t in Add.make_args(sp.expand(self.expr)) if t not in tagged_terms),
+            S.Zero,
+        )
 
     def solver_tag(self, **named_groups):
         """Attach/replace solver tag groups for operator routing.
@@ -437,30 +527,32 @@ class Expression(SymbolicBase):
         )
 
     def apply(self, *conditions):
-        """
-        Apply conditions: dicts, (old, new) tuples, or Relation objects.
-        Relation objects use their .apply_to() method.
-        Preserves term_groups if present.
+        """Apply substitutions / Relations / Operations — per term.
+
+        The transformation is applied to every additive term of
+        ``self.expr`` individually.  Each output term inherits the tag of
+        its parent term (follow-the-term), so the per-term tag dict stays
+        in sync with the evolving main expression automatically.
+
+        After Relation/dict-style applies the result is lightly simplified
+        via ``_simplify_preserve_integrals`` (linearity-only derivatives,
+        cancellations across the full expr).  Terms that cancel vanish
+        from both ``self.expr`` and the tag dict.
+
+        Operations that carry their own ``apply_to_expression`` are
+        dispatched per term too; when the operation produces multiple
+        output pieces per input term (``DepthIntegrate`` etc.) all pieces
+        inherit the parent tag.
         """
         def _apply_one(expr, cond):
             if isinstance(cond, Operation):
-                # Operations may need the Expression (for .map, .terms etc.)
                 if hasattr(cond, 'apply_to_expression'):
                     try:
-                        eq = Expression(expr, self.name, term_groups=self._term_groups)
+                        eq = Expression(expr, self.name)
                         return cond.apply_to_expression(eq).expr
                     except NotImplementedError:
                         pass
                 return cond.apply_to(expr)
-            # Any object carrying an ``_as_relation`` attribute
-            # (Expression from ``solve_for`` or a proxy that delegates to
-            # it) is treated as a substitution dict so both
-            #     model.x_momentum.apply(model.z_momentum.solve_for(p))
-            # and, after solve_for has mutated z_momentum,
-            #     model.x_momentum.apply(model.z_momentum)
-            # work directly.  Evaluate ``Subs`` atoms first so BC-shaped
-            # patterns written with ``f.subs(var, bound)`` match the
-            # ``Subs(f, var, bound)`` shapes that ``Integrate`` emits.
             rel = getattr(cond, "_as_relation", None)
             if isinstance(rel, dict) and rel:
                 if expr.has(sp.Subs):
@@ -468,15 +560,11 @@ class Expression(SymbolicBase):
                     expr = expr.subs(subs_map)
                 return expr.subs(rel)
             if isinstance(cond, Relation) or hasattr(cond, 'apply_to'):
-                # Evaluate Subs first so BC patterns match
                 if expr.has(sp.Subs):
                     subs_map = {s: s.doit() for s in expr.atoms(sp.Subs)}
                     expr = expr.subs(subs_map)
                 return cond.apply_to(expr)
             elif isinstance(cond, dict):
-                # Evaluate Subs first so dict keys written with
-                # ``state.w.subs(state.z, state.b)`` (= ``w(t, x, b)``)
-                # match ``Subs(w, z, b)`` shapes emitted by ``Integrate``.
                 if expr.has(sp.Subs):
                     subs_map = {s: s.doit() for s in expr.atoms(sp.Subs)}
                     expr = expr.subs(subs_map)
@@ -484,32 +572,55 @@ class Expression(SymbolicBase):
             elif isinstance(cond, (list, tuple)):
                 if len(cond) == 2 and isinstance(cond[0], sp.Basic):
                     return expr.subs(cond[0], cond[1])
-                else:
-                    for pair in cond:
-                        if isinstance(pair, (list, tuple)) and len(pair) == 2:
-                            expr = expr.subs(pair[0], pair[1])
-                    return expr
+                for pair in cond:
+                    if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                        expr = expr.subs(pair[0], pair[1])
+                return expr
             elif hasattr(cond, 'apply_to'):
                 return cond.apply_to(expr)
             return expr
 
-        result = self.expr
-        for cond in conditions:
-            result = _apply_one(result, cond)
+        # Per-term iteration with tag inheritance.
+        #
+        # For non-Operation conditions we run the lightweight simplify
+        # (``_simplify_preserve_integrals``, linearity-only on
+        # Derivatives) **per term** before splitting into sub-pieces.
+        # This fragments things like ``Derivative(g*ρ*(η − z), x) / ρ``
+        # into ``g·∂_x b + g·∂_x h`` before we record each piece under
+        # the parent tag — otherwise the unfragmented form becomes an
+        # orphan key when a later global simplify fragments it.
+        simplifying = not any(isinstance(c, Operation) for c in conditions)
+        new_tags = {}
+        pieces = []
+        for term in Add.make_args(sp.expand(self.expr)):
+            if term == S.Zero:
+                continue
+            parent_tag = self._term_tags.get(term)
+            result = term
+            for cond in conditions:
+                result = _apply_one(result, cond)
+            if simplifying:
+                result = _simplify_preserve_integrals(result)
+            for sub in Add.make_args(sp.expand(result)):
+                if sub == S.Zero:
+                    continue
+                pieces.append(sub)
+                if parent_tag is not None:
+                    new_tags[sub] = parent_tag
 
-        # Propagate physical term groups (they always survive apply).
-        new_groups = None
-        if self._term_groups:
-            new_groups = {}
-            for role, group_expr in self._term_groups.items():
-                g = group_expr
-                for cond in conditions:
-                    g = _apply_one(g, cond)
-                new_groups[role] = g
+        new_expr = sum(pieces, S.Zero)
 
-        # Propagate solver tags only for groups whose sub-expression is
-        # structurally unchanged by the conditions. Any tag whose expression
-        # was touched is dropped — the user must re-tag.
+        # Global simplify catches cross-term cancellations (e.g. the
+        # ``u|_η · ∂_t b`` pieces from two different tags that sum to
+        # zero after kinematic BCs).  Surviving terms keep their tags;
+        # cancelled ones silently disappear.
+        if simplifying:
+            new_expr = _simplify_preserve_integrals(new_expr)
+            current = set(Add.make_args(sp.expand(new_expr)))
+            new_tags = {t: name for t, name in new_tags.items() if t in current}
+
+        # Solver tags: drop any whose stored expression was touched by
+        # this transformation.
         new_solver_groups = None
         if self._solver_groups:
             new_solver_groups = {}
@@ -520,39 +631,37 @@ class Expression(SymbolicBase):
                 if g == group_expr:
                     new_solver_groups[tag] = group_expr
 
-        # Simplify for Relation applies (not Operations — they handle their own)
-        if not any(isinstance(c, Operation) for c in conditions):
-            result = _simplify_preserve_integrals(result)
-        return Expression(result, self.name,
-                          term_groups=new_groups, solver_groups=new_solver_groups)
+        return Expression(new_expr, self.name,
+                          term_tags=new_tags, tag_order=self._tag_order,
+                          solver_groups=new_solver_groups)
 
     def simplify(self):
         """Return a new Expression with sympy simplification applied."""
         simplified = sp.simplify(self.expr)
         new_groups = None
-        if self._term_groups:
-            new_groups = {role: sp.simplify(g) for role, g in self._term_groups.items()}
-        # Solver tags: keep only those whose expression is unchanged.
+        # Cleanup: keep only tags whose term is still present post-simplify.
+        current = set(Add.make_args(sp.expand(simplified)))
+        new_tags = {t: name for t, name in self._term_tags.items() if t in current}
         new_solver_groups = None
         if self._solver_groups:
             new_solver_groups = {t: g for t, g in self._solver_groups.items()
                                  if sp.simplify(g) == g}
         return Expression(simplified, self.name,
-                          term_groups=new_groups, solver_groups=new_solver_groups)
+                          term_tags=new_tags, tag_order=self._tag_order,
+                          solver_groups=new_solver_groups)
 
     def expand(self):
         """Return a new Expression with sympy expand applied."""
         expanded = sp.expand(self.expr)
-        new_groups = None
-        if self._term_groups:
-            new_groups = {role: sp.expand(g) for role, g in self._term_groups.items()}
-        # Solver tags: keep only those whose expression is unchanged.
+        current = set(Add.make_args(expanded))
+        new_tags = {t: name for t, name in self._term_tags.items() if t in current}
         new_solver_groups = None
         if self._solver_groups:
             new_solver_groups = {t: g for t, g in self._solver_groups.items()
                                  if sp.expand(g) == g}
         return Expression(expanded, self.name,
-                          term_groups=new_groups, solver_groups=new_solver_groups)
+                          term_tags=new_tags, tag_order=self._tag_order,
+                          solver_groups=new_solver_groups)
 
     def depth_integrate(self, lower, upper, var, method="auto"):
         """
@@ -645,48 +754,59 @@ class Expression(SymbolicBase):
             )
 
     def subs(self, *args, **kwargs):
-        new_expr = self.expr.subs(*args, **kwargs)
-        # Physical tags survive: propagate substitution through each group.
-        new_groups = None
-        if self._term_groups:
-            new_groups = {role: g.subs(*args, **kwargs)
-                          for role, g in self._term_groups.items()}
-        # Solver tags: keep only those whose expression is unchanged.
+        # Per-term substitution with tag inheritance, then cleanup.
+        new_tags = {}
+        pieces = []
+        for term in Add.make_args(sp.expand(self.expr)):
+            if term == S.Zero:
+                continue
+            parent_tag = self._term_tags.get(term)
+            sub = term.subs(*args, **kwargs)
+            for piece in Add.make_args(sp.expand(sub)):
+                if piece == S.Zero:
+                    continue
+                pieces.append(piece)
+                if parent_tag is not None:
+                    new_tags[piece] = parent_tag
+        new_expr = sum(pieces, S.Zero)
+        current = set(Add.make_args(sp.expand(new_expr)))
+        new_tags = {t: name for t, name in new_tags.items() if t in current}
         new_solver_groups = None
         if self._solver_groups:
             new_solver_groups = {t: g for t, g in self._solver_groups.items()
                                  if g.subs(*args, **kwargs) == g}
         return Expression(new_expr, self.name,
-                          term_groups=new_groups, solver_groups=new_solver_groups)
+                          term_tags=new_tags, tag_order=self._tag_order,
+                          solver_groups=new_solver_groups)
 
     def simplify(self):
         """Simplify: expand + cancel, preserving Integral and Derivative(Integral) terms."""
-        new_groups = ({role: _simplify_preserve_integrals(g)
-                       for role, g in self._term_groups.items()}
-                      if self._term_groups else None)
+        simplified = _simplify_preserve_integrals(self.expr)
+        current = set(Add.make_args(sp.expand(simplified)))
+        new_tags = {t: name for t, name in self._term_tags.items() if t in current}
         new_solver_groups = None
         if self._solver_groups:
             new_solver_groups = {t: g for t, g in self._solver_groups.items()
                                  if _simplify_preserve_integrals(g) == g}
-        out = Expression(_simplify_preserve_integrals(self.expr), self.name,
-                         term_groups=new_groups, solver_groups=new_solver_groups)
-        # Preserve the solve_for-style substitution marker — simplification
-        # is a pure rearrangement that doesn't invalidate {variable: solution}.
+        out = Expression(simplified, self.name,
+                         term_tags=new_tags, tag_order=self._tag_order,
+                         solver_groups=new_solver_groups)
         rel = getattr(self, "_as_relation", None)
         if rel is not None:
             out._as_relation = rel
         return out
 
     def expand(self):
-        new_groups = ({role: sp.expand(g)
-                       for role, g in self._term_groups.items()}
-                      if self._term_groups else None)
+        expanded = sp.expand(self.expr)
+        current = set(Add.make_args(expanded))
+        new_tags = {t: name for t, name in self._term_tags.items() if t in current}
         new_solver_groups = None
         if self._solver_groups:
             new_solver_groups = {t: g for t, g in self._solver_groups.items()
                                  if sp.expand(g) == g}
-        out = Expression(sp.expand(self.expr), self.name,
-                         term_groups=new_groups, solver_groups=new_solver_groups)
+        out = Expression(expanded, self.name,
+                         term_tags=new_tags, tag_order=self._tag_order,
+                         solver_groups=new_solver_groups)
         rel = getattr(self, "_as_relation", None)
         if rel is not None:
             out._as_relation = rel
@@ -987,10 +1107,24 @@ class Expression(SymbolicBase):
         def _tex(expr):
             return printer.doprint(expr) if printer else sp.latex(expr)
 
-        if multiline and self._term_groups:
+        if multiline and self._term_tags:
+            # Group current-expression terms by their tag.
+            current_terms = list(Add.make_args(sp.expand(self.expr)))
+            by_tag = {name: [] for name in self._tag_order}
+            untagged = []
+            for term in current_terms:
+                name = self._term_tags.get(term)
+                if name is None:
+                    untagged.append(term)
+                else:
+                    by_tag.setdefault(name, []).append(term)
             lines = []
             first = True
-            for role, g in self._term_groups.items():
+            for role in list(by_tag.keys()):
+                terms = by_tag.get(role, [])
+                if not terms:
+                    continue
+                g = sum(terms, S.Zero)
                 if g == S.Zero:
                     continue
                 tex = _tex(g)
@@ -1001,11 +1135,16 @@ class Expression(SymbolicBase):
                     lines.append(f"  & \\underbrace{{{tex}}}_{{{role}}}")
                 else:
                     lines.append(f"  & + \\underbrace{{{tex}}}_{{{role}}}")
+            if untagged:
+                g = sum(untagged, S.Zero)
+                if g != S.Zero:
+                    tex = _tex(g)
+                    prefix = "" if first or tex.startswith("-") else "+ "
+                    lines.append(f"  & {prefix}\\underbrace{{{tex}}}_{{untagged}}")
             return "\\begin{aligned}\n" + " \\\\\n".join(lines) + "\n  &= 0\n\\end{aligned}"
 
         if multiline and not self._term_groups:
             # No term groups — split by additive terms for multiline rendering
-            from sympy import Add
             terms = Add.make_args(self.expr)
             if len(terms) > 1:
                 lines = []
@@ -2033,18 +2172,29 @@ def _simplify_preserve_integrals(expr):
 
 
 def _evaluate_linear_derivatives(expr):
-    """``Derivative(Add(...), var)`` → sum of per-term derivatives.
+    """``Derivative(Add(...) | expandable-to-Add, var)`` → sum of per-term derivatives.
 
-    Leaves ``Derivative(Mul(...), var)``, ``Derivative(Pow(...), var)`` and
-    ``Derivative(Function(...), var)`` untouched so conservative forms like
+    Evaluates the Derivative only when it can be resolved by linearity.
+    Concretely: if ``sp.expand(inner)`` is an ``Add``, distribute the
+    Derivative across the summands (``.doit()`` on the Add-inner form).
+    Otherwise leave the Derivative intact so conservative forms like
     ``Derivative(u**2, x)`` and ``Derivative(u*w, z)`` survive.
+
+    We expand the inner first so that factored forms like
+    ``Derivative(g*ρ*(η − z), x)`` — which are algebraically
+    ``Derivative(−g*ρ*z + g*ρ*b + g*ρ*h, x)`` — also get linearly
+    distributed, producing ``g*ρ*∂_x b + g*ρ*∂_x h`` (and 0 for the
+    z-independent-of-x part).  Without the expand-first step, the
+    factored form stays as a single opaque Derivative and its tag
+    cannot be follow-the-term propagated during ``.apply``.
     """
     if not isinstance(expr, sp.Basic):
         return expr
     if isinstance(expr, Derivative):
         inner = expr.args[0]
-        if isinstance(inner, sp.Add):
-            inner_walked = _evaluate_linear_derivatives(inner)
+        inner_expanded = sp.expand(inner) if isinstance(inner, sp.Basic) else inner
+        if isinstance(inner_expanded, sp.Add):
+            inner_walked = _evaluate_linear_derivatives(inner_expanded)
             return expr.func(inner_walked, *expr.args[1:]).doit()
         inner_walked = _evaluate_linear_derivatives(inner)
         return expr.func(inner_walked, *expr.args[1:])
