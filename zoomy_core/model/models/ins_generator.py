@@ -1890,39 +1890,53 @@ class _INSBuilder:
 
 
 def FullINS(state, equations=None):
-    """Build the incompressible Navier-Stokes as a ``System``.
+    """Build the incompressible Navier-Stokes as a ``System`` tree.
 
-    Returns a mutable system with ``.apply()`` for in-place transformations.
+    Tree shape::
+
+        system
+        ├── continuity   (scalar leaf)
+        └── momentum     (intermediate Zstruct)
+            ├── x        (leaf)
+            ├── y        (leaf, only in 3D)
+            └── z        (leaf)
+
+    Access::
+
+        ins = FullINS(state)
+        ins.continuity                  # scalar proxy
+        ins.momentum                    # intermediate proxy
+        ins.momentum.x.apply(op)        # mutate one component leaf
+        ins.momentum.apply(op)          # mutate every component leaf
 
     Parameters
     ----------
     state : StateSpace
     equations : list of str, optional
-        Which equations to include.  Default: all.
-        Options: "continuity", "x_momentum", "y_momentum", "z_momentum".
-
-    Usage::
-
-        ins = FullINS(state)
-        ins.z_momentum.apply({state.w: 0})
-        ins.x_momentum.apply(HydrostaticPressure(state))
-        ins.describe()
+        Components to include.  Options: ``"continuity"``, ``"momentum.x"``,
+        ``"momentum.y"``, ``"momentum.z"``.  Top-level ``"momentum"`` means
+        all momentum components.  Default: everything.
     """
     from zoomy_core.model.models.derived_system import System
+
     builder = _INSBuilder(state)
     system = System("INS", state)
 
-    eq_builders = {
-        "continuity": lambda: builder.continuity,
-        "x_momentum": lambda: builder.x_momentum,
-        "z_momentum": lambda: builder.z_momentum,
-    }
-    if state.has_y:
-        eq_builders["y_momentum"] = lambda: builder.y_momentum
+    want_continuity = (equations is None) or ("continuity" in equations)
+    want_all_momentum = (equations is None) or ("momentum" in equations)
+    momentum_components = []
+    for axis in ("x", "y", "z"):
+        if axis == "y" and not state.has_y:
+            continue
+        if want_all_momentum or f"momentum.{axis}" in (equations or ()):
+            momentum_components.append(axis)
 
-    for name, build_fn in eq_builders.items():
-        if equations is None or name in equations:
-            system.add_equation(name, build_fn())
+    if want_continuity:
+        system.add_equation("continuity", builder.continuity)
+
+    for axis in momentum_components:
+        expr = getattr(builder, f"{axis}_momentum")
+        system.add_equation(("momentum", axis), expr)
 
     return system
 

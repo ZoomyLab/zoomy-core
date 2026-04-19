@@ -1,33 +1,38 @@
 """
 Reusable derived equation systems.
 
-A ``DerivedSystem`` holds a set of depth-integrated equations that
-are basis-independent.  You derive it once from the INS, then reuse it
-with different bases, materials, or levels without re-deriving.
+Equations live in a **tree**, not a flat dict.  A ``System`` owns a
+``Zstruct`` whose leaves are ``Expression`` objects.  Intermediate
+``Zstruct`` nodes group related equations: the ``continuity`` scalar
+lives as a leaf directly under the root, while ``momentum`` is an
+intermediate ``Zstruct(x=Expression, y=Expression, z=Expression)``.
 
-Usage:
-    from zoomy_core.model.models.derived_system import DerivedSystem, sme, vam
+Attribute access walks the tree::
 
-    # Pre-derived SME (hydrostatic, basis-independent)
-    system = sme()
+    system.continuity            # → Expression (leaf)
+    system.momentum              # → _NodeProxy over the momentum Zstruct
+    system.momentum.x            # → _NodeProxy over x_momentum Expression
+    system.momentum.x.apply(op)  # mutate that leaf in place
 
-    # Try different bases
-    leg_eqs = system.with_basis(Legendre_shifted, level=2, field_map={"u": alphas})
-    spl_eqs = system.with_basis(SplineBasis, level=3, field_map={"u": alphas})
+``apply`` / ``simplify`` / ``subs`` invoked on an intermediate node
+recurse into every leaf below it.  Rank-changing ops (``Multiply`` with
+a basis, ``outer=True``) may replace a leaf with a new ``Zstruct``
+subtree; that's just another tree edit.
 
-    # Apply material later
-    viscous = system.with_material(Newtonian(state))
-
-    # Describe
-    print(system.describe())
+Boundary-condition storage (``SystemBoundaryConditions``) is pending a
+dedicated refactor alongside the tree — it's not provided by this
+module right now.
 """
+
+from __future__ import annotations
 
 import pickle
 import warnings
-from typing import Dict, Optional, List
+from typing import Iterator, Tuple
 
 import sympy as sp
 
+from zoomy_core.misc.misc import Zstruct
 from zoomy_core.model.models.ins_generator import (
     StateSpace, FullINS, Expression,
     KinematicBCBottom, KinematicBCSurface, HydrostaticPressure,
@@ -35,553 +40,472 @@ from zoomy_core.model.models.ins_generator import (
 )
 
 
-class SystemBoundaryConditions:
-    """Boundary conditions for a PDE system, per equation and per tag.
+# ---------------------------------------------------------------------------
+# Tree helpers
+# ---------------------------------------------------------------------------
 
-    Each equation has a dict of ``{tag: BoundaryConditionSpec}``.
-    Apply shortcuts set BCs for all equations at once::
+def _is_intermediate(node) -> bool:
+    return isinstance(node, Zstruct)
 
-        system.boundary_conditions.apply(Periodic(), tag="left")
-        system.x_momentum.boundary_conditions.apply(Wall(), tag="right")
 
-    The ``Wall`` BC is system-aware: when applied at the system level,
-    it automatically assigns Extrapolation to scalar equations and
-    normal/tangential momentum reflection to vector (momentum) equations.
+def _iter_leaves(tree: Zstruct, prefix=()) -> Iterator[Tuple[tuple, Expression]]:
+    """Yield ``(path_tuple, Expression)`` for every leaf under ``tree``."""
+    for key in tree._filter_dict():
+        val = getattr(tree, key)
+        new_prefix = prefix + (key,)
+        if _is_intermediate(val):
+            yield from _iter_leaves(val, new_prefix)
+        elif isinstance(val, Expression):
+            yield (new_prefix, val)
+        # else: skip non-Expression, non-Zstruct nodes (shouldn't occur)
+
+
+def _tree_path(tree: Zstruct, path) -> Expression | Zstruct:
+    node = tree
+    for p in path:
+        node = getattr(node, p)
+    return node
+
+
+def _tree_set(tree: Zstruct, path, value) -> None:
+    """Set the node at ``path`` (must be non-empty)."""
+    if not path:
+        raise ValueError("Cannot set root via _tree_set")
+    parent = tree
+    for p in path[:-1]:
+        parent = getattr(parent, p)
+    setattr(parent, path[-1], value)
+
+
+def _tree_walk_apply(tree, op_callable) -> None:
+    """Apply ``op_callable(Expression) → Expression`` in place to every leaf."""
+    for key in list(tree._filter_dict()):
+        val = getattr(tree, key)
+        if _is_intermediate(val):
+            _tree_walk_apply(val, op_callable)
+        elif isinstance(val, Expression):
+            setattr(tree, key, op_callable(val))
+
+
+# ---------------------------------------------------------------------------
+# _NodeProxy — the uniform interface for leaves AND intermediate nodes
+# ---------------------------------------------------------------------------
+
+class _NodeProxy:
+    """Proxy into a tree position.
+
+    Resolves each access dynamically against the system's live tree, so
+    mutations (including rank-changing ones like ``Multiply(basis)``)
+    stay visible through the same proxy.
+
+    On a **leaf** (the proxy points at an ``Expression``):
+        ``.apply(op)``    → mutate the Expression in place.
+        ``.simplify()``   → same.
+        other attributes (``.expr``, ``.terms``, ``.tags``, ``.latex()``, …)
+        delegate to the underlying Expression.
+
+    On an **intermediate** (the proxy points at a ``Zstruct``):
+        ``.apply(op)``    → recurse into every child leaf.
+        ``.simplify()``   → same.
+        ``.x``, ``.y``, … → child proxies.
     """
 
-    def __init__(self, equation_names):
-        # {equation_name: {tag: BoundaryConditionSpec}}
-        self._bcs = {name: {} for name in equation_names}
+    def __init__(self, system, path):
+        object.__setattr__(self, "_system", system)
+        object.__setattr__(self, "_path", tuple(path))
 
-    def apply(self, bc, tag=None):
-        """Apply a BC to all equations.
+    # -- resolution --------------------------------------------------------
 
-        If ``bc`` is a system-level BC like ``Wall``, it dispatches
-        appropriately per equation type. Otherwise it applies uniformly.
-        """
-        if hasattr(bc, 'apply_to_system_bcs'):
-            bc.apply_to_system_bcs(self, tag=tag)
+    @property
+    def _node(self):
+        return _tree_path(self._system._tree, self._path)
+
+    def _replace(self, new_node) -> None:
+        _tree_set(self._system._tree, self._path, new_node)
+
+    # -- attribute access --------------------------------------------------
+
+    def __getattr__(self, name):
+        node = self._node
+        if _is_intermediate(node):
+            children = node._filter_dict()
+            if name in children:
+                return _NodeProxy(self._system, self._path + (name,))
+            raise AttributeError(
+                f"Node {'/'.join(self._path) or 'root'} has no child {name!r}. "
+                f"Available: {list(children)}"
+            )
+        # Leaf Expression: delegate.
+        return getattr(node, name)
+
+    def __setattr__(self, name, value):
+        raise AttributeError(
+            "Assignment on a _NodeProxy is not supported — use "
+            "``.apply(...)`` / ``.remove()`` / ``Multiply(...)`` instead."
+        )
+
+    def __repr__(self):
+        node = self._node
+        if _is_intermediate(node):
+            return f"_NodeProxy(path={'/'.join(self._path) or 'root'}, " \
+                   f"children={list(node._filter_dict())})"
+        return f"_NodeProxy({'/'.join(self._path)}): {repr(node)}"
+
+    def __len__(self):
+        node = self._node
+        if _is_intermediate(node):
+            return len(node._filter_dict())
+        return len(node)
+
+    def __iter__(self):
+        node = self._node
+        if _is_intermediate(node):
+            for key in node._filter_dict():
+                yield _NodeProxy(self._system, self._path + (key,))
         else:
-            for eq_name in self._bcs:
-                self.set(eq_name, bc, tag=tag)
+            raise TypeError("Cannot iterate a leaf node")
 
-    def set(self, equation_name, bc, tag=None):
-        """Set a BC for a specific equation and tag."""
-        t = tag or getattr(bc, 'tag', 'default')
-        if equation_name not in self._bcs:
-            self._bcs[equation_name] = {}
-        self._bcs[equation_name][t] = bc
-
-    def get(self, equation_name, tag):
-        """Get the BC for a specific equation and tag."""
-        return self._bcs.get(equation_name, {}).get(tag)
-
-    def get_all(self, tag):
-        """Get all equation BCs for a given tag. Returns {eq_name: bc}."""
-        return {eq: bcs.get(tag) for eq, bcs in self._bcs.items() if tag in bcs}
-
-    @property
-    def tags(self):
-        """All unique tags across all equations."""
-        tags = set()
-        for bcs in self._bcs.values():
-            tags.update(bcs.keys())
-        return sorted(tags)
-
-    @property
-    def equation_names(self):
-        return list(self._bcs.keys())
-
-    def remove_equation(self, equation_name):
-        """Remove BCs for a deleted equation."""
-        self._bcs.pop(equation_name, None)
-
-    def add_equation(self, equation_name):
-        """Add BC slots for a new equation."""
-        if equation_name not in self._bcs:
-            self._bcs[equation_name] = {}
-
-    def __repr__(self):
-        parts = []
-        for eq, bcs in self._bcs.items():
-            if bcs:
-                tags = ", ".join(f"{t}: {type(bc).__name__}" for t, bc in bcs.items())
-                parts.append(f"  {eq}: {{{tags}}}")
-        return "SystemBoundaryConditions(\n" + "\n".join(parts) + "\n)" if parts else "SystemBoundaryConditions(empty)"
-
-
-class _EquationBCProxy:
-    """Proxy for per-equation boundary condition access.
-
-    Usage: ``system.x_momentum.boundary_conditions.apply(Wall(), tag="right")``
-    """
-
-    def __init__(self, system_bcs, equation_name):
-        self._system_bcs = system_bcs
-        self._equation_name = equation_name
-
-    def apply(self, bc, tag=None):
-        t = tag or getattr(bc, 'tag', 'default')
-        self._system_bcs.set(self._equation_name, bc, tag=t)
-
-    def get(self, tag):
-        return self._system_bcs.get(self._equation_name, tag)
-
-    def __repr__(self):
-        bcs = self._system_bcs._bcs.get(self._equation_name, {})
-        if bcs:
-            tags = ", ".join(f"{t}: {type(bc).__name__}" for t, bc in bcs.items())
-            return f"BCs({self._equation_name}: {{{tags}}})"
-        return f"BCs({self._equation_name}: empty)"
-
-
-class _EquationProxy:
-    """Proxy for in-place operations on a single equation in a DerivedSystem.
-
-    ``system.z_momentum`` returns this proxy. Calling ``.apply()`` on it
-    mutates the equation inside the system. All other attribute access
-    (e.g. ``.expr``, ``.latex()``, ``.terms``) delegates to the underlying
-    Expression.
-    """
-
-    def __init__(self, system, eq_name):
-        object.__setattr__(self, '_system', system)
-        object.__setattr__(self, '_name', eq_name)
-
-    @property
-    def _expr(self):
-        return self._system.equations[self._name]
-
-    @property
-    def boundary_conditions(self):
-        """Per-equation BC access."""
-        return _EquationBCProxy(self._system.boundary_conditions, self._name)
+    # -- operations --------------------------------------------------------
 
     def apply(self, *args, **kwargs):
-        """Apply operation in place — mutates the equation in the system.
+        """Apply to this subtree in place.
 
-        Returns ``self`` so calls chain: ``model.z_momentum.apply(X).simplify()``.
+        Leaf: mutate the Expression.  Intermediate: recurse into every
+        leaf descendant.  Returns ``self`` for chaining.
         """
-        self._system.equations[self._name] = self._expr.apply(*args, **kwargs)
-        return self
-
-    def apply_to_term(self, index, *operations):
-        """Apply operation to a specific term in place. Returns ``self``."""
-        self._system.equations[self._name] = self._expr.apply_to_term(
-            index, *operations
-        )
+        node = self._node
+        if isinstance(node, Expression):
+            new_expr = node.apply(*args, **kwargs)
+            self._replace(new_expr)
+        elif _is_intermediate(node):
+            for key in list(node._filter_dict()):
+                _NodeProxy(self._system, self._path + (key,)).apply(*args, **kwargs)
         return self
 
     def simplify(self):
-        """Simplify in place. Returns ``self``."""
-        self._system.equations[self._name] = self._expr.simplify()
+        node = self._node
+        if isinstance(node, Expression):
+            self._replace(node.simplify())
+        elif _is_intermediate(node):
+            for key in list(node._filter_dict()):
+                _NodeProxy(self._system, self._path + (key,)).simplify()
         return self
 
     def expand(self):
-        """Expand in place. Returns ``self``."""
-        self._system.equations[self._name] = self._expr.expand()
+        node = self._node
+        if isinstance(node, Expression):
+            self._replace(node.expand())
+        elif _is_intermediate(node):
+            for key in list(node._filter_dict()):
+                _NodeProxy(self._system, self._path + (key,)).expand()
         return self
 
     def subs(self, *args, **kwargs):
-        """Substitute in place. Returns ``self``."""
-        self._system.equations[self._name] = self._expr.subs(*args, **kwargs)
+        node = self._node
+        if isinstance(node, Expression):
+            self._replace(node.subs(*args, **kwargs))
+        elif _is_intermediate(node):
+            for key in list(node._filter_dict()):
+                _NodeProxy(self._system, self._path + (key,)).subs(*args, **kwargs)
+        return self
+
+    def apply_to_term(self, index, *operations):
+        node = self._node
+        if not isinstance(node, Expression):
+            raise TypeError("apply_to_term requires a leaf Expression")
+        self._replace(node.apply_to_term(index, *operations))
         return self
 
     def solve_for(self, variable):
-        """Solve this equation for ``variable``, isolate it, return self.
+        """Solve leaf equation for ``variable``, isolate, return self.
 
-        Rewrites the stored equation to the canonical form
-        ``variable - solution = 0`` (so ``describe()`` shows the
-        cleanly isolated equation) AND attaches an
-        ``_as_relation = {variable: solution}`` marker on the new
-        expression that ``Expression.apply`` consumes as a substitution.
-
-        Chains as a proxy, so both
-            model.z_momentum.apply({BC}).solve_for(state.p).simplify()
-        and
-            model.x_momentum.apply(model.z_momentum.solve_for(state.p))
-        work directly — in the second case, the proxy is passed in and
-        ``Expression.apply`` finds ``_as_relation`` via attribute
-        delegation on the underlying Expression.
-
-        If multiple solutions exist, the first is used with a warning.
+        Only valid on leaves (an intermediate node has no single equation
+        to solve).
         """
-        solutions = sp.solve(self._expr.expr, variable)
+        node = self._node
+        if not isinstance(node, Expression):
+            raise TypeError("solve_for requires a leaf Expression")
+        solutions = sp.solve(node.expr, variable)
         if not solutions:
-            raise ValueError(f"Cannot solve {self._name} for {variable}")
+            raise ValueError(f"Cannot solve {self._path!r} for {variable}")
         if len(solutions) > 1:
             warnings.warn(
-                f"Multiple solutions for {variable} in {self._name}, "
+                f"Multiple solutions for {variable} in {self._path!r}, "
                 f"using first: {solutions[0]}"
             )
         solution = solutions[0]
-        isolated = Expression(variable - solution, self._name,
-                              term_groups=self._expr._term_groups,
-                              solver_groups=self._expr._solver_groups)
-        # ``_as_relation`` on the Expression so Expression.simplify /
-        # .expand (which create new Expressions) preserve it.
+        isolated = Expression(variable - solution, self._path[-1] if self._path else "",
+                              term_tags=dict(node._term_tags),
+                              tag_order=list(node._tag_order),
+                              solver_groups=node._solver_groups)
         isolated._as_relation = {variable: solution}
-        self._system.equations[self._name] = isolated
+        self._replace(isolated)
         return self
 
-    def remove(self):
-        """Remove this equation from the system.
+    def copy(self):
+        """Deep-copy this subtree into a detached leaf / Zstruct.
 
-        Uses :meth:`System.remove_equation` so both ``equations`` and
-        ``boundary_conditions`` stay consistent.
+        Returns a plain ``Expression`` (leaf) or ``Zstruct`` of ``Expression``
+        (intermediate) — *not* a ``_NodeProxy``.  The copy is detached
+        from the system, so edits don't propagate back.
         """
-        self._system.remove_equation(self._name)
+        return _deep_clone(self._node)
 
-    # Back-compat alias — older code may call .delete().
+    def remove(self):
+        """Remove this node from the tree.
+
+        Leaves and intermediates both supported.  Removing the last
+        child of an intermediate leaves an empty Zstruct; removing the
+        intermediate itself removes the whole subtree.
+        """
+        if not self._path:
+            raise ValueError("Cannot remove root")
+        parent = _tree_path(self._system._tree, self._path[:-1])
+        if hasattr(parent, self._path[-1]):
+            delattr(parent, self._path[-1])
+
+    # Legacy alias
     delete = remove
 
-    def __getattr__(self, name):
-        # Delegate everything else to the underlying Expression
-        return getattr(self._expr, name)
+    # -- latex / repr for notebook rendering -------------------------------
 
-    def __repr__(self):
-        return repr(self._expr)
+    def latex(self, **kwargs):
+        node = self._node
+        if isinstance(node, Expression):
+            return node.latex(**kwargs)
+        # Intermediate: concatenate children
+        parts = []
+        for key in node._filter_dict():
+            child = getattr(node, key)
+            if isinstance(child, Expression):
+                parts.append(f"\\text{{{key}}}: {child.latex(**kwargs)} = 0")
+            elif _is_intermediate(child):
+                child_proxy = _NodeProxy(self._system, self._path + (key,))
+                parts.append(f"\\text{{{key}}}: {child_proxy.latex(**kwargs)}")
+        return r"\\ ".join(parts)
 
     def _repr_latex_(self):
-        return self._expr._repr_latex_()
+        node = self._node
+        if isinstance(node, Expression):
+            return node._repr_latex_()
+        return f"${self.latex()}$"
 
-    def __len__(self):
-        return len(self._expr)
+    def describe(self, **kwargs):
+        from zoomy_core.misc.description import Description
+        node = self._node
+        if isinstance(node, Expression):
+            return node.describe(**kwargs)
+        parts = []
+        name = self._path[-1] if self._path else "system"
+        parts.append(f"**{name}**")
+        for key in node._filter_dict():
+            child_proxy = _NodeProxy(self._system, self._path + (key,))
+            parts.append(str(child_proxy.describe(**kwargs)))
+        return Description("\n\n".join(parts))
 
+    # -- tree shape --------------------------------------------------------
+
+    @property
+    def is_leaf(self) -> bool:
+        return isinstance(self._node, Expression)
+
+
+# ---------------------------------------------------------------------------
+# Deep-clone utility
+# ---------------------------------------------------------------------------
+
+def _deep_clone(node):
+    """Return an independent copy of a leaf Expression or Zstruct subtree."""
+    if isinstance(node, Expression):
+        clone = Expression(node.expr, node.name,
+                           term_tags=dict(node._term_tags),
+                           tag_order=list(node._tag_order),
+                           solver_groups=node._solver_groups)
+        rel = getattr(node, "_as_relation", None)
+        if rel is not None:
+            clone._as_relation = dict(rel)
+        return clone
+    if _is_intermediate(node):
+        new_zs = Zstruct()
+        for key in node._filter_dict():
+            setattr(new_zs, key, _deep_clone(getattr(node, key)))
+        return new_zs
+    return node
+
+
+# ---------------------------------------------------------------------------
+# System — tree-authoritative
+# ---------------------------------------------------------------------------
 
 class System:
-    """A mutable system of symbolic PDE equations.
+    """A mutable PDE equation system stored as a tree of ``Expression`` leaves.
 
-    Equations are ``Expression`` objects accessed by name via dot syntax
-    (``system.continuity``) or dict syntax (``system.equations["continuity"]``).
-
-    Operations are applied in place::
+    Construction::
 
         system = System("INS", state)
-        system.add_equation("continuity", du_dx + dw_dz)
-        system.add_equation("x_momentum", ..., term_groups={...})
-        system.apply(HydrostaticPressure(state))
-        system.x_momentum.apply_to_term(5, ProductRule())
-        system.describe()
+        system._set("continuity", Expression(du_dx + dw_dz))
+        system._set("momentum", Zstruct(
+            x=Expression(...),
+            z=Expression(...),
+        ))
 
-    Attributes
-    ----------
-    name : str
-        Human-readable name (e.g. "INS", "SME")
-    equations : dict
-        ``{name: Expression}``
-    state : StateSpace
-        The shared symbolic state
-    assumptions : list of str
-        Operations applied during derivation
+    In practice use the :func:`FullINS` builder.
+
+    Attribute access returns a :class:`_NodeProxy`, so
+    ``system.momentum.x.apply(op)`` mutates the leaf in place.
     """
 
-    def __init__(self, name, state, equations=None, assumptions=None):
+    def __init__(self, name, state, tree: Zstruct | None = None, assumptions=None):
         self.name = name
         self.state = state
-        self.equations = dict(equations) if equations else {}
-        self.assumptions = assumptions or []
-        self.boundary_conditions = SystemBoundaryConditions(list(self.equations.keys()))
+        self._tree: Zstruct = tree if tree is not None else Zstruct()
+        self.assumptions = list(assumptions) if assumptions else []
 
-    def add_equation(self, name, expr, term_groups=None):
-        """Add an equation to the system.
+    # -- structural mutators ----------------------------------------------
 
-        Parameters
-        ----------
-        name : str
-            Equation name (e.g. "continuity", "x_momentum").
-        expr : Expression or sympy expr
-            The equation (= 0).
-        term_groups : dict, optional
-            Named term groups for ordered display.
+    def _set(self, name: str, value):
+        """Attach ``value`` (Expression or Zstruct subtree) under ``name``.
+
+        Lower-level than :meth:`add_equation`; used by constructors.
         """
-        if isinstance(expr, Expression):
-            self.equations[name] = expr
-        else:
-            self.equations[name] = Expression(expr, name, term_groups=term_groups)
-        self.boundary_conditions.add_equation(name)
+        setattr(self._tree, name, value)
 
-    def remove_equation(self, name):
-        """Remove an equation and its boundary conditions."""
-        self.equations.pop(name, None)
-        self.boundary_conditions.remove_equation(name)
+    def add_equation(self, path, expr):
+        """Attach a leaf Expression at the dotted-path location.
+
+        ``path`` may be a string (top-level) or a tuple / dotted string
+        for nested locations.  Intermediate Zstructs are created on demand.
+        """
+        if isinstance(path, str):
+            parts = tuple(path.split("."))
+        else:
+            parts = tuple(path)
+        node = self._tree
+        for p in parts[:-1]:
+            if not hasattr(node, p):
+                setattr(node, p, Zstruct())
+            node = getattr(node, p)
+        if not isinstance(expr, Expression):
+            expr = Expression(expr, parts[-1])
+        setattr(node, parts[-1], expr)
+
+    def remove_equation(self, path):
+        if isinstance(path, str):
+            parts = tuple(path.split("."))
+        else:
+            parts = tuple(path)
+        parent = self._tree
+        for p in parts[:-1]:
+            if not hasattr(parent, p):
+                return
+            parent = getattr(parent, p)
+        if hasattr(parent, parts[-1]):
+            delattr(parent, parts[-1])
+
+    # -- attribute walk via proxy -----------------------------------------
 
     def __getattr__(self, name):
-        # Dot access to equations: system.x_momentum, system.continuity, etc.
-        if name.startswith("_") or name in ("name", "equations", "state",
-                                             "assumptions", "boundary_conditions"):
+        # Reserved attributes on System itself.
+        if name.startswith("_") or name in ("name", "state", "assumptions"):
             raise AttributeError(name)
-        if name in self.equations:
-            return _EquationProxy(self, name)
-        raise AttributeError(f"No equation '{name}' in system. Available: {list(self.equations.keys())}")
+        tree = self.__dict__.get("_tree")
+        if tree is None or not hasattr(tree, name):
+            raise AttributeError(
+                f"System {self.__dict__.get('name', '?')!r} has no top-level "
+                f"equation {name!r}. Available: "
+                f"{list(tree._filter_dict()) if tree else []}"
+            )
+        node = getattr(tree, name)
+        if isinstance(node, Expression) or _is_intermediate(node):
+            return _NodeProxy(self, (name,))
+        return node
 
-    def apply(self, operation):
-        """Apply an operation or relation to all equations in place.
+    # -- iteration over leaves --------------------------------------------
 
-        Returns ``self`` so calls chain:
-        ``model.apply(Newtonian(s)).apply(Integrate(...)).simplify()``.
-        """
-        self.equations = {
-            k: eq.apply(operation) for k, eq in self.equations.items()
-        }
-        a_name = (getattr(operation, 'description', None)
-                  or getattr(operation, 'name', None)
-                  or str(operation))
+    def leaves(self) -> Iterator[Tuple[tuple, Expression]]:
+        yield from _iter_leaves(self._tree)
+
+    # -- apply / simplify / subs on the whole tree ------------------------
+
+    def apply(self, *args, **kwargs):
+        """Apply to every leaf.  Returns ``self``."""
+        def _op(expr: Expression) -> Expression:
+            return expr.apply(*args, **kwargs)
+        _tree_walk_apply(self._tree, _op)
+        op = args[0] if args else None
+        a_name = (getattr(op, "description", None)
+                  or getattr(op, "name", None)
+                  or (str(op) if op is not None else "apply"))
         self.assumptions.append(a_name)
         return self
 
     def simplify(self):
-        """Simplify every equation in place.  Returns ``self``."""
-        self.equations = {k: eq.simplify() for k, eq in self.equations.items()}
+        _tree_walk_apply(self._tree, lambda e: e.simplify())
         return self
 
     def expand(self):
-        """Expand every equation in place.  Returns ``self``."""
-        self.equations = {k: eq.expand() for k, eq in self.equations.items()}
+        _tree_walk_apply(self._tree, lambda e: e.expand())
         return self
 
     def subs(self, *args, **kwargs):
-        """Substitute in every equation in place.  Returns ``self``."""
-        self.equations = {
-            k: eq.subs(*args, **kwargs) for k, eq in self.equations.items()
-        }
+        _tree_walk_apply(self._tree, lambda e: e.subs(*args, **kwargs))
         return self
 
-    def remove(self, name):
-        """Remove an equation by name (alias for ``remove_equation``)."""
-        self.remove_equation(name)
+    def remove(self, path):
+        self.remove_equation(path)
         return self
 
-    def apply_to_term(self, equation_name, term_index, *operations):
-        """Apply operations to a specific term of a specific equation in place.
-
-        Usage::
-
-            system.apply_to_term("x_momentum", 5, ProductRule())
-        """
-        self.equations[equation_name] = self.equations[equation_name].apply_to_term(
-            term_index, *operations
-        )
-        for op in operations:
-            a_name = getattr(op, 'description', None) or getattr(op, 'name', str(op))
-            self.assumptions.append(f"{a_name} on {equation_name}[{term_index}]")
-
-    def with_material(self, material):
-        """Apply a material model. Returns a new DerivedSystem (immutable)."""
-        new_eqs = {k: eq.apply(material) for k, eq in self.equations.items()}
-        return System(
-            f"{self.name}+{material.name}",
-            self.state,
-            new_eqs,
-            self.assumptions + [f"material={material.name}"],
-        )
-
-    def with_assumption(self, assumption):
-        """Apply an assumption. Returns a new System (immutable)."""
-        new_eqs = {k: eq.apply(assumption) for k, eq in self.equations.items()}
-        a_name = assumption.name if hasattr(assumption, 'name') else str(assumption)
-        return System(
-            self.name,
-            self.state,
-            new_eqs,
-            self.assumptions + [a_name],
-        )
-
-    def with_basis(self, basis, level, field_map, z_var=None, test_mode=None):
-        """Project all equations onto a basis.
-
-        Parameters
-        ----------
-        basis : Basisfunction class
-        level : int
-        field_map : dict
-            ``{field_name: [alpha_0, alpha_1, ...]}``
-        z_var : Symbol, optional
-            Vertical coordinate (default: ``self.state.z``)
-        test_mode : int or None
-            Galerkin test function mode
-
-        Returns
-        -------
-        dict of Expression
-            Projected equations with basis matrix products
-        """
-        z = z_var or self.state.z
-        return {
-            name: eq.project_onto_basis(basis, level, field_map, z, test_mode=test_mode)
-            for name, eq in self.equations.items()
-        }
+    # -- description ------------------------------------------------------
 
     def describe(self, header=True, assumptions=True, final_equation=True,
                  parameters=False, strip_args=False):
-        """Composable description of this equation system.
-
-        Returns a ``Description`` that renders as markdown in Jupyter.
-
-        Parameters
-        ----------
-        header : bool
-            System name and equation list.
-        assumptions : bool
-            List assumptions applied.
-        final_equation : bool
-            Show equations.
-        parameters : bool
-            List free symbols.
-        strip_args : bool
-            Display ``u`` instead of ``u(t, x, z)``.
-        """
         from zoomy_core.misc.description import Description
-        import sympy as sp
 
         parts = []
-
+        leaf_paths = [p for p, _ in self.leaves()]
         if header:
-            eq_names = ", ".join(self.equations.keys())
-            parts.append(f"**{self.name}** ({eq_names})\n")
-
+            leaf_names = ", ".join(".".join(p) for p in leaf_paths)
+            parts.append(f"**{self.name}** ({leaf_names})\n")
         if assumptions and self.assumptions:
             parts.append("**Assumptions:** " + ", ".join(self.assumptions) + "\n")
-
         if final_equation:
-            for eq_name, eq in self.equations.items():
-                use_multiline = bool(eq._term_groups)
+            for path, eq in self.leaves():
+                label = ".".join(path)
+                use_multiline = bool(eq._term_tags)
                 tex = eq.latex(strip_args=strip_args, multiline=use_multiline)
-                # latex(multiline=True) emits a trailing "&= 0" inside the
-                # aligned block; don't append a second "= 0".
                 if use_multiline:
-                    parts.append(f"**{eq_name}:**\n$$\n{tex}\n$$\n")
+                    parts.append(f"**{label}:**\n$$\n{tex}\n$$\n")
                 else:
-                    parts.append(f"**{eq_name}:**\n$$\n{tex} = 0\n$$\n")
-
+                    parts.append(f"**{label}:**\n$$\n{tex} = 0\n$$\n")
         if parameters:
             all_syms = set()
-            for eq in self.equations.values():
+            for _, eq in self.leaves():
                 all_syms |= eq.expr.free_symbols
             syms = sorted([s for s in all_syms if isinstance(s, sp.Symbol)], key=str)
             if syms:
                 sym_str = ", ".join(f"${sp.latex(s)}$" for s in syms)
                 parts.append(f"**Parameters:** {sym_str}")
-
         return Description("\n".join(parts))
 
     def _repr_markdown_(self):
         return self.describe()._repr_markdown_()
 
+    # -- persistence ------------------------------------------------------
+
     def save(self, path):
-        """Save to file for reuse without re-derivation."""
         with open(path, "wb") as f:
             pickle.dump(self, f)
 
     @classmethod
     def load(cls, path):
-        """Load a previously saved system."""
         with open(path, "rb") as f:
             return pickle.load(f)
 
     def __repr__(self):
-        eqs = ", ".join(f"{k}({len(v)} terms)" for k, v in self.equations.items())
-        return f"System('{self.name}', [{eqs}], assumptions={self.assumptions})"
+        leaves = list(self.leaves())
+        short = ", ".join(f"{'.'.join(p)}({len(e)} terms)" for p, e in leaves)
+        return f"System({self.name!r}, [{short}], assumptions={self.assumptions})"
 
 
-# Backward-compatible alias
+# Alias retained for name-clarity; identical to System.
 DerivedSystem = System
-
-
-# =========================================================================
-# Pre-built factory functions
-# =========================================================================
-
-def sme(state=None, material=None):
-    """Derive the depth-integrated SME (hydrostatic shallow moment equations).
-
-    Returns a ``DerivedSystem`` that is basis-independent. Apply a basis
-    later with ``.with_basis()``, or add viscosity with ``.with_material()``.
-
-    Parameters
-    ----------
-    state : StateSpace, optional
-        Default: ``StateSpace(dimension=2)`` (xz plane)
-    material : Relation, optional
-        If provided, applied before depth integration
-
-    Returns
-    -------
-    DerivedSystem
-    """
-    state = state or StateSpace(dimension=2)
-    ins = FullINS(state)
-    z = state.z
-    b, eta = state.b, state.eta
-
-    kbc_b = KinematicBCBottom(state)
-    kbc_s = KinematicBCSurface(state)
-    hydro = HydrostaticPressure(state)
-
-    assumptions = ["hydrostatic"]
-
-    # x-momentum: apply hydrostatic + optional material
-    xm = ins.x_momentum.apply(hydro)
-    if material:
-        xm = xm.apply(material)
-        assumptions.append(f"material={material.name}")
-
-    # Depth-integrate
-    mass = ins.continuity.map_with_bcs(
-        lambda t: t.depth_integrate(b, eta, z),
-        bcs=[kbc_s, kbc_b],
-    )
-    xmom = xm.map_with_bcs(
-        lambda t: t.depth_integrate(b, eta, z),
-        bcs=[kbc_s, kbc_b],
-    )
-
-    return System("SME", state, {"mass": mass, "x_momentum": xmom}, assumptions)
-
-
-def vam(state=None, material=None):
-    """Derive the depth-integrated VAM (non-hydrostatic, with z-momentum).
-
-    Returns a ``DerivedSystem`` with mass, x-momentum, and z-momentum
-    equations.  Pressure is NOT substituted — it remains as an unknown.
-
-    Parameters
-    ----------
-    state : StateSpace, optional
-    material : Relation, optional
-        Default: Inviscid
-
-    Returns
-    -------
-    DerivedSystem
-    """
-    state = state or StateSpace(dimension=2)
-    ins = FullINS(state)
-    z = state.z
-    b, eta = state.b, state.eta
-
-    kbc_b = KinematicBCBottom(state)
-    kbc_s = KinematicBCSurface(state)
-
-    material = material or Inviscid(state)
-    assumptions = ["non_hydrostatic", f"material={material.name}"]
-
-    xm = ins.x_momentum.apply(material)
-    zm = ins.z_momentum.apply(material)
-
-    mass = ins.continuity.map_with_bcs(
-        lambda t: t.depth_integrate(b, eta, z),
-        bcs=[kbc_s, kbc_b],
-    )
-    xmom = xm.map_with_bcs(
-        lambda t: t.depth_integrate(b, eta, z),
-        bcs=[kbc_s, kbc_b],
-    )
-    zmom = zm.map_with_bcs(
-        lambda t: t.depth_integrate(b, eta, z),
-        bcs=[kbc_s, kbc_b],
-    )
-
-    return System("VAM", state,
-                  {"mass": mass, "x_momentum": xmom, "z_momentum": zmom},
-                  assumptions)
