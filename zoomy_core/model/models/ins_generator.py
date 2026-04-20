@@ -590,49 +590,7 @@ class Expression(SymbolicBase):
             lhs = conditions[0]
             lhs_sp = lhs.expr if isinstance(lhs, Expression) else lhs
             conditions = ({lhs_sp: rhs},)
-        def _resolve_subs(expr):
-            """Rewrite ``Subs(f, var, val)`` via structural xreplace when safe.
-
-            Sympy keeps ``Subs(Derivative(u(t,x,z), x), z, b(t,x))`` as
-            a ``Subs`` node because plugging ``z=b(t,x)`` into the inner
-            derivative would produce ``Derivative(u(t,x,b), x)`` — the
-            *total* ``x``-derivative, which would chain-rule through
-            ``b`` as ``(∂_x u)|_b + (∂_z u)|_b · ∂_x b``.  The original
-            Subs represents the *partial* ``(∂_x u)|_{z=b}``, so sympy
-            refuses to commit either way.
-
-            For the symbolic-projection pipeline we xreplace anyway:
-            the ``Derivative(u(t,x,b), x)`` form is replaced by the
-            basis expansion ``u(t,x,b) → Σ α_k φ_k(0)`` in the very
-            next ``apply`` step, after which the expression has no
-            ``z`` dependence and both interpretations coincide.  The
-            substitution must therefore happen *before* any ``.doit()``
-            or chain-rule-expanding simplify — which it does, as part
-            of the same per-term ``apply`` pass.
-
-            Subs whose variable is itself a differentiation variable
-            (e.g. ``Subs(∂_z u, z, b)``) are *not* rewritten — there's
-            no safe structural substitution — and are left for an
-            explicit boundary closure further down the pipeline.
-            """
-            if not expr.has(sp.Subs):
-                return expr
-            mapping = {}
-            for s in expr.atoms(sp.Subs):
-                inner = s.args[0]
-                vars_tup = s.args[1]
-                vals_tup = s.args[2]
-                deriv_vars = set()
-                for d in inner.atoms(sp.Derivative):
-                    deriv_vars.update(d.variables)
-                if any(v in deriv_vars for v in vars_tup):
-                    continue
-                mapping[s] = inner.xreplace(dict(zip(vars_tup, vals_tup)))
-            # Use xreplace (structural) so we can resolve ``Subs`` nodes
-            # that live inside an ``Integral`` whose dummy variable
-            # appears in the replacement.  ``.subs`` would refuse with
-            # "substitution cannot create dummy dependencies".
-            return expr.xreplace(mapping) if mapping else expr
+        _resolve_subs = _resolve_subs_safe  # module-level helper
 
         def _apply_one(expr, cond):
             if isinstance(cond, Operation):
@@ -659,7 +617,14 @@ class Expression(SymbolicBase):
                 # inside a zeta-integral).  All our dict keys are
                 # concrete Function applications or Subs-derived forms,
                 # both of which match exactly under structural equality.
-                return expr.xreplace(cond)
+                expr = expr.xreplace(cond)
+                # Second ``_resolve_subs`` pass: the substitution may
+                # have closed running integrals / nested Subs that
+                # previously blocked resolution (``ContinuityClosure``'s
+                # ``∫_b^z ∂_x u dz'`` becomes a polynomial in ``z``
+                # once ``u`` is basis-expanded), so Subs around them
+                # now resolve cleanly.
+                return _resolve_subs(expr)
             elif isinstance(cond, (list, tuple)):
                 if len(cond) == 2 and isinstance(cond[0], sp.Basic):
                     return expr.subs(cond[0], cond[1])
@@ -1819,7 +1784,20 @@ class EvaluateIntegrals(Operation):
                     return e.func(*new_args)
             return e
 
-        return _walk(expr)
+        # Alternate integrate / resolve-Subs until fixpoint: each
+        # integration may uncover ``Subs`` nodes whose inner just got
+        # cleaner, and each resolve may expose new ``Integral`` nodes
+        # (outer integrals whose integrand was previously a ``Subs``).
+        # The loop usually converges in 2 iterations but the bound is
+        # generous to handle deeply nested cases.
+        result = expr
+        for _ in range(6):
+            prev = result
+            result = _walk(result)
+            result = _resolve_subs_safe(result)
+            if result == prev:
+                break
+        return result
 
 
 class SimplifyIntegrals(Operation):
@@ -2765,6 +2743,78 @@ class KinematicBCSurface(Assumption):
         super().__init__({w_at_s: rhs}, name="kinematic_bc_surface")
 
 
+class ContinuityClosure(Assumption):
+    """Close the bulk ``w(t, x, z)`` via continuity + lower-interface KBC.
+
+    The pointwise continuity equation ``∂_x u + ∂_z w = 0`` integrated
+    from the lower interface ``lower(t, x)`` upward gives::
+
+        w(t, x, z) = w|_{z = lower}
+                     − ∫_{lower}^{z} ∂_x u(t, x, z') dz'
+
+    The ``w|_{z = lower}`` value is supplied by the lower-interface KBC
+    (bottom / free-surface / internal layer interface depending on the
+    context), with an optional mass-flux contribution.
+
+    The resulting substitution ``{w(t, x, z): w|_lower − ∫_{lower}^z ∂_x u dz'}``
+    closes every bulk appearance of ``w(t, x, z)`` in the expression
+    tree.  Boundary evaluations ``w(t, x, b)``, ``w(t, x, η)`` etc. are
+    handled by the corresponding :class:`InterfaceKBC` and are **not**
+    touched here (those are distinct structural forms).
+
+    Parameters
+    ----------
+    state : StateSpace
+    lower : sympy expression, optional
+        Lower integration bound — the interface that fixes ``w``.
+        Default: ``state.b`` (bottom).  For multi-layer use, pass the
+        relevant layer interface height.
+    mass_flux : sympy expression, optional
+        Mass flux through ``lower`` (mass per unit area per unit time).
+        Default: ``None`` (impermeable lower boundary).  If supplied,
+        added to the KBC value as ``mass_flux / rho``.
+
+    Typical placement
+    -----------------
+    Apply **after** :class:`Integrate` (so the depth-integration has
+    already introduced the ``Integral(f, (z, lower, upper))`` volume
+    terms) and **after** :class:`InterfaceKBC` (so the boundary
+    evaluations of ``w`` are already closed), but **before**
+    :class:`ZetaTransform` (so the running integral's ``z``-bounded
+    form is converted cleanly in the same pass).
+    """
+
+    def __init__(self, state: StateSpace, lower=None, mass_flux=None,
+                 name=None, description=None):
+        s = state
+        if lower is None:
+            lower = s.b
+        u_at_lower = s.u.subs(s.z, lower)
+        w_at_lower = Derivative(lower, s.t) + u_at_lower * Derivative(lower, s.x)
+        if s.has_y:
+            v_at_lower = s.v.subs(s.z, lower)
+            w_at_lower = w_at_lower + v_at_lower * Derivative(lower, s.y)
+        if mass_flux is not None:
+            w_at_lower = w_at_lower + mass_flux / s.rho
+        # Running integral in z — ``Integral(f, (z, lower, z))`` is sympy's
+        # standard form for an indefinite / running integral with a
+        # symbolic upper bound that happens to match the integration
+        # variable's name.  Downstream ops (``ZetaTransform``,
+        # ``EvaluateIntegrals``) treat the inner integral as an opaque
+        # sub-expression until the basis substitution closes ``u``.
+        w_of_z = w_at_lower - Integral(Derivative(s.u, s.x),
+                                       (s.z, lower, s.z))
+        if s.has_y:
+            w_of_z = w_of_z - Integral(Derivative(s.v, s.y),
+                                       (s.z, lower, s.z))
+        super().__init__({s.w: w_of_z},
+                         name=name or f"continuity_closure@{lower}")
+        self.description = description or (
+            f"w(z) = w|_{{z={lower}}} − ∫_{{{lower}}}^z ∂_x u dz' "
+            f"(continuity + lower-interface KBC)"
+        )
+
+
 class NoTangentialBoundaryStress(Assumption):
     """Zero tangential normal stress at both surface and bottom.
 
@@ -2929,21 +2979,34 @@ class Basis:
         )
 
     def expand(self, field):
-        """Substitution dict for all three evaluations of ``field``.
+        """Substitution dict for every bulk / boundary evaluation of ``field``.
 
-        The returned dict has three keys:
+        Four keys:
 
+        * ``field``                    → ``Σ α_k(t,x) · φ_k((z−b)/h)``
+          (pointwise form — matches ``field(t,x,z)`` in inner running
+          integrals produced by e.g. :class:`ContinuityClosure`).
         * ``field.subs(z, ζ·h + b)`` → ``Σ α_k(t,x) · φ_k(ζ)``
-          (the form occurring inside ζ-transformed integrals)
-        * ``field.subs(z, b)``       → ``Σ α_k · φ_k(0)`` (bottom eval)
-        * ``field.subs(z, b + h)``   → ``Σ α_k · φ_k(1)`` (surface eval)
+          (ζ-transformed form occurring inside outer ζ-integrals).
+        * ``field.subs(z, b)``         → ``Σ α_k · φ_k(0)`` (bottom eval).
+        * ``field.subs(z, b + h)``     → ``Σ α_k · φ_k(1)`` (surface eval).
+
+        Including the pointwise key is free — it only fires where the
+        expression structurally carries ``field(t, x, z)`` — and makes
+        ``ContinuityClosure``'s inner ``∫_b^z ∂_x u dz'`` close
+        cleanly once ``u`` has been expanded.
         """
         state = self._state
         z, zeta, b, h = state.z, state.zeta, state.b, state.H
         volume_key = field.subs(z, zeta * h + b)
         bottom_key = field.subs(z, b)
         surface_key = field.subs(z, state.eta)
+        # Pointwise form: ζ is a *function* of z here, so we evaluate
+        # the inner basis at (z−b)/h and let sympy carry the resulting
+        # polynomial-in-z through any outstanding z-integrals.
+        pointwise_rhs = self._sum((z - b) / h)
         return {
+            field: pointwise_rhs,
             volume_key: self._sum(zeta),
             bottom_key: self._sum(S.Zero),
             surface_key: self._sum(S.One),
@@ -3187,6 +3250,55 @@ def _simplify_preserve_integrals(expr):
     expanded = sp.expand(evaled)
     simplified = sp.powsimp(expanded, combine="all")
     return simplified.subs(integral_map)
+
+
+def _resolve_subs_safe(expr):
+    """Unwrap every ``Subs(f, var, val)`` in ``expr`` whose inner is safe
+    to ``xreplace(var → val)``.
+
+    "Safe" means **none** of the following:
+
+    * ``var`` appears as a ``Derivative`` differentiation variable in
+      ``f`` — would commit to chain-rule-through-val ambiguity sympy is
+      deliberately conservative about.
+    * ``var`` is the integration variable of an ``Integral`` nested in
+      ``f`` — a naive ``xreplace`` would overwrite the integration
+      binder's tuple and produce nonsense limits (``Integral(_,
+      (val, lo, val))``).  This protects running integrals introduced
+      by :class:`ContinuityClosure`.
+    * ``var`` is the binding variable of a nested ``Subs`` in ``f``
+      — same shadowing concern.
+
+    When all guards pass, the Subs is replaced structurally via
+    ``f.xreplace({var: val})`` — using ``xreplace`` on purpose, so
+    that running integrals / nested Subs / ``ζ`` appearances the
+    caller *did* want subbed (top-level free occurrences) are resolved
+    rather than refused by sympy's ``.subs`` "dummy dependency"
+    guard.
+    """
+    if not expr.has(sp.Subs):
+        return expr
+    mapping = {}
+    for s in expr.atoms(sp.Subs):
+        inner = s.args[0]
+        vars_tup = s.args[1]
+        vals_tup = s.args[2]
+        deriv_vars = set()
+        for d in inner.atoms(sp.Derivative):
+            deriv_vars.update(d.variables)
+        if any(v in deriv_vars for v in vars_tup):
+            continue
+        bound_vars = set()
+        for I in inner.atoms(sp.Integral):
+            for lim in I.args[1:]:
+                if hasattr(lim, "__getitem__") and len(lim) >= 1:
+                    bound_vars.add(lim[0])
+        for nested in inner.atoms(sp.Subs):
+            bound_vars.update(nested.args[1])
+        if any(v in bound_vars for v in vars_tup):
+            continue
+        mapping[s] = inner.xreplace(dict(zip(vars_tup, vals_tup)))
+    return expr.xreplace(mapping) if mapping else expr
 
 
 def _evaluate_linear_derivatives(expr):
