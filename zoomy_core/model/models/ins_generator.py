@@ -3216,18 +3216,48 @@ def _simplify_preserve_integrals(expr):
         return e
 
     protected = _protect(expr)
-    # Evaluate derivatives by *linearity only* — ``d(b+h)/dt → db/dt + dh/dt``
-    # — but do NOT chain-rule through ``Derivative(u², x)`` or ``Derivative(u·w, z)``.
-    # Conservative-form derivatives must survive simplification so that a
-    # later ``Integrate(..., method="auto")`` can apply the Leibniz rule /
-    # fundamental theorem cleanly.  ``Derivative(Integral(...))`` is
-    # already protected above.
-    evaled = _evaluate_linear_derivatives(protected)
-    # Expand to reveal cancellations, then collect like terms.  We pass
-    # ``mul=True, multinomial=True`` explicitly and keep Derivatives unexpanded.
-    expanded = sp.expand(evaled)
-    simplified = sp.powsimp(expanded, combine="all")
-    return simplified.subs(integral_map)
+    # Three-pass simplify — all internal to this one pipeline:
+    #
+    #   Pass 1 "expand": ``_evaluate_linear_derivatives`` distributes
+    #   Derivative over Add AND pulls purely-numeric scalar factors out
+    #   of Derivative inners (``Derivative(-α₁, x) → -Derivative(α₁, x)``,
+    #   ``Derivative(c·f, v) → c·Derivative(f, v)``).  This canonicalizes
+    #   signs / coefficients so structurally-equivalent forms actually
+    #   match as sympy objects.
+    #
+    #   Pass 2 "simplify": ``sp.expand + sp.powsimp``.  Cancellations
+    #   fire on the canonical form — e.g. ``(-∂α₁)² / ∂α₁`` reduces to
+    #   ``∂α₁`` because sympy's Mul canonicalization finally sees
+    #   matching bases.
+    #
+    #   Pass 3 "collect": ``_fold_numeric_coeffs_into_derivative`` is
+    #   the inverse of Pass 1 — re-absorb numeric coefficients back into
+    #   Derivative inners so fluxes read conservatively
+    #   (``Derivative(g·h²/2, x)`` rather than ``(1/2)·Derivative(g·h², x)``).
+    #   Safe because Pass 2 already collapsed the problematic rational
+    #   forms; re-absorbing ``-1`` / ``1/2`` / etc. cannot resurrect them.
+    #
+    # Linearity only: neither pass chain-rules through ``Derivative(u², x)``
+    # or ``Derivative(u·w, z)`` — conservative shapes stay intact so
+    # ``Integrate(..., method="auto")`` can still Leibniz / fund-thm.
+    # ``Derivative(Integral(...))`` is already protected above.
+    #
+    # Fixpoint loop: one expand→simplify→collect pass may expose
+    # further cancellations once Pass-3-collected conservative
+    # shapes get re-expanded on the next iteration (the collected
+    # form ``Derivative(c·f + c·g, x)`` expands to an Add inner that
+    # Pass 1 then distributes).  Bound is generous; single-layer SME
+    # reaches a fixed point in ≤ 3 iterations.
+    result = protected
+    for _ in range(6):
+        prev = result
+        evaled = _evaluate_linear_derivatives(result)
+        expanded = sp.expand(evaled)
+        simplified = sp.powsimp(expanded, combine="all")
+        result = _fold_numeric_coeffs_into_derivative(simplified)
+        if result == prev:
+            break
+    return result.subs(integral_map)
 
 
 def _resolve_subs_safe(expr):
@@ -3325,6 +3355,22 @@ def _evaluate_linear_derivatives(expr):
         # "no diff-var inside" check keeps both cases correct.
         if not any(inner.has(v) for v in expr.variables):
             return S.Zero
+        # Pass-1 "expand": pull a purely-numeric scalar factor out of the
+        # Derivative inner via ``Mul.as_coeff_Mul()`` (default behaviour —
+        # only ``Rational`` / ``Integer`` / ``Float`` come out; free
+        # symbols like ``ρ``, ``g``, ``ν`` stay inside).  Turns
+        # ``Derivative(-α₁, x)`` into ``-Derivative(α₁, x)`` so that
+        # downstream ``(-∂α₁)² / ∂α₁`` reduces structurally via sympy's
+        # Mul canonicalization.  Conservative shapes are untouched:
+        # ``Derivative(u², x)`` has a Pow inner (no Mul factor to pull),
+        # and ``Derivative(u·w, z)`` has ``as_coeff_Mul() == (1, u·w)``
+        # so nothing is pulled.
+        if isinstance(inner, sp.Mul):
+            c, rest = inner.as_coeff_Mul()
+            if c != S.One:
+                return c * _evaluate_linear_derivatives(
+                    expr.func(rest, *expr.args[1:])
+                )
         inner_expanded = sp.expand(inner) if isinstance(inner, sp.Basic) else inner
         if isinstance(inner_expanded, sp.Add):
             inner_walked = _evaluate_linear_derivatives(inner_expanded)
@@ -3346,6 +3392,47 @@ def _evaluate_linear_derivatives(expr):
         return expr.func(inner_walked, *expr.args[1:])
     if expr.args:
         return expr.func(*(_evaluate_linear_derivatives(a) for a in expr.args))
+    return expr
+
+
+def _fold_numeric_coeffs_into_derivative(expr):
+    """Pass-3 "collect": inverse of the Pass-1 numeric pull-out.
+
+    Walks ``expr`` and rewrites every ``c · Derivative(f, v, ...)`` where
+    ``c`` is a purely-numeric scalar (``Mul.as_coeff_Mul()`` default)
+    back into ``Derivative(c · f, v, ...)``.  This restores the
+    conservative-form reading of fluxes — ``Derivative(g·h²/2, x)``
+    instead of ``(1/2)·Derivative(g·h², x)`` — after Pass 2's
+    ``expand + powsimp`` has already fired every cancellation that
+    the Pass-1-canonical form exposed.
+
+    The two passes are exact inverses (``as_coeff_Mul`` is symmetric),
+    so the full expand→simplify→collect pipeline is idempotent under
+    repeated ``.simplify()`` calls.
+    """
+    if not isinstance(expr, sp.Basic):
+        return expr
+    if isinstance(expr, sp.Mul):
+        walked_args = [_fold_numeric_coeffs_into_derivative(a)
+                       for a in expr.args]
+        derivs = [a for a in walked_args if isinstance(a, Derivative)]
+        if len(derivs) == 1:
+            deriv = derivs[0]
+            coeff = sp.Mul(*[a for a in walked_args if a is not deriv])
+            # Only fold purely-numeric coefficients — matches Pass 1's
+            # ``as_coeff_Mul`` gate.  ``coeff.is_number`` is True for
+            # Rational / Integer / Float and False for any free-symbol
+            # product, so ``ν · ∂_x u`` stays as-is.
+            if coeff.is_number and coeff != S.One:
+                return Derivative(coeff * deriv.args[0], *deriv.args[1:])
+        if any(n is not o for n, o in zip(walked_args, expr.args)):
+            return expr.func(*walked_args)
+        return expr
+    if expr.args:
+        walked_args = tuple(_fold_numeric_coeffs_into_derivative(a)
+                            for a in expr.args)
+        if any(n is not o for n, o in zip(walked_args, expr.args)):
+            return expr.func(*walked_args)
     return expr
 
 
