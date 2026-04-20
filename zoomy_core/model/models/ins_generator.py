@@ -14,6 +14,8 @@ Class hierarchy:
 Design: the user drives every step. No hidden assumptions.
 """
 
+import warnings
+
 import sympy as sp
 from sympy import (
     Function, Symbol, Derivative, Integral, Add, Mul, S, Rational,
@@ -596,7 +598,10 @@ class Expression(SymbolicBase):
             if isinstance(cond, Operation):
                 result = cond(Expression(expr, self.name))
                 if isinstance(result, Expression):
-                    return result.expr
+                    # Integrate with ``upper == var`` (running integral) produces
+                    # trivial ``Subs(f, var, var)`` wrappers that downstream
+                    # solve/substitute steps treat as opaque.  Resolve them now.
+                    return _resolve_subs(result.expr)
                 raise TypeError(
                     f"{type(cond).__name__} returned {type(result).__name__} "
                     f"from per-term apply; rank-changing Operations must be "
@@ -620,7 +625,7 @@ class Expression(SymbolicBase):
                 expr = expr.xreplace(cond)
                 # Second ``_resolve_subs`` pass: the substitution may
                 # have closed running integrals / nested Subs that
-                # previously blocked resolution (``ContinuityClosure``'s
+                # previously blocked resolution (the w-closure's
                 # ``∫_b^z ∂_x u dz'`` becomes a polynomial in ``z``
                 # once ``u`` is basis-expanded), so Subs around them
                 # now resolve cleanly.
@@ -716,6 +721,41 @@ class Expression(SymbolicBase):
         return Expression(expanded, self.name,
                           term_tags=new_tags, tag_order=self._tag_order,
                           solver_groups=new_solver_groups)
+
+    def copy(self):
+        """Return an independent Expression with the same expr, tags, relation."""
+        clone = Expression(self.expr, self.name,
+                           term_tags=dict(self._term_tags),
+                           tag_order=list(self._tag_order),
+                           solver_groups=(dict(self._solver_groups)
+                                          if self._solver_groups else None))
+        rel = getattr(self, "_as_relation", None)
+        if rel is not None:
+            clone._as_relation = dict(rel)
+        return clone
+
+    def solve_for(self, variable):
+        """Return a new Expression whose ``_as_relation`` maps ``variable``
+        to the solution of ``self.expr == 0``.
+
+        Pipeline-style counterpart to ``_NodeProxy.solve_for``: does **not**
+        mutate a system tree.  Downstream ``model.apply(result)`` picks up
+        the relation and performs the substitution.
+        """
+        solutions = sp.solve(self.expr, variable)
+        if not solutions:
+            raise ValueError(f"Cannot solve {self.name or self.expr!r} for {variable}")
+        if len(solutions) > 1:
+            warnings.warn(
+                f"Multiple solutions for {variable}, using first: {solutions[0]}"
+            )
+        solution = solutions[0]
+        isolated = Expression(variable - solution, self.name,
+                              term_tags=dict(self._term_tags),
+                              tag_order=list(self._tag_order),
+                              solver_groups=self._solver_groups)
+        isolated._as_relation = {variable: solution}
+        return isolated
 
     def depth_integrate(self, lower, upper, var, method="auto"):
         """
@@ -2743,76 +2783,14 @@ class KinematicBCSurface(Assumption):
         super().__init__({w_at_s: rhs}, name="kinematic_bc_surface")
 
 
-class ContinuityClosure(Assumption):
-    """Close the bulk ``w(t, x, z)`` via continuity + lower-interface KBC.
-
-    The pointwise continuity equation ``∂_x u + ∂_z w = 0`` integrated
-    from the lower interface ``lower(t, x)`` upward gives::
-
-        w(t, x, z) = w|_{z = lower}
-                     − ∫_{lower}^{z} ∂_x u(t, x, z') dz'
-
-    The ``w|_{z = lower}`` value is supplied by the lower-interface KBC
-    (bottom / free-surface / internal layer interface depending on the
-    context), with an optional mass-flux contribution.
-
-    The resulting substitution ``{w(t, x, z): w|_lower − ∫_{lower}^z ∂_x u dz'}``
-    closes every bulk appearance of ``w(t, x, z)`` in the expression
-    tree.  Boundary evaluations ``w(t, x, b)``, ``w(t, x, η)`` etc. are
-    handled by the corresponding :class:`InterfaceKBC` and are **not**
-    touched here (those are distinct structural forms).
-
-    Parameters
-    ----------
-    state : StateSpace
-    lower : sympy expression, optional
-        Lower integration bound — the interface that fixes ``w``.
-        Default: ``state.b`` (bottom).  For multi-layer use, pass the
-        relevant layer interface height.
-    mass_flux : sympy expression, optional
-        Mass flux through ``lower`` (mass per unit area per unit time).
-        Default: ``None`` (impermeable lower boundary).  If supplied,
-        added to the KBC value as ``mass_flux / rho``.
-
-    Typical placement
-    -----------------
-    Apply **after** :class:`Integrate` (so the depth-integration has
-    already introduced the ``Integral(f, (z, lower, upper))`` volume
-    terms) and **after** :class:`InterfaceKBC` (so the boundary
-    evaluations of ``w`` are already closed), but **before**
-    :class:`ZetaTransform` (so the running integral's ``z``-bounded
-    form is converted cleanly in the same pass).
-    """
-
-    def __init__(self, state: StateSpace, lower=None, mass_flux=None,
-                 name=None, description=None):
-        s = state
-        if lower is None:
-            lower = s.b
-        u_at_lower = s.u.subs(s.z, lower)
-        w_at_lower = Derivative(lower, s.t) + u_at_lower * Derivative(lower, s.x)
-        if s.has_y:
-            v_at_lower = s.v.subs(s.z, lower)
-            w_at_lower = w_at_lower + v_at_lower * Derivative(lower, s.y)
-        if mass_flux is not None:
-            w_at_lower = w_at_lower + mass_flux / s.rho
-        # Running integral in z — ``Integral(f, (z, lower, z))`` is sympy's
-        # standard form for an indefinite / running integral with a
-        # symbolic upper bound that happens to match the integration
-        # variable's name.  Downstream ops (``ZetaTransform``,
-        # ``EvaluateIntegrals``) treat the inner integral as an opaque
-        # sub-expression until the basis substitution closes ``u``.
-        w_of_z = w_at_lower - Integral(Derivative(s.u, s.x),
-                                       (s.z, lower, s.z))
-        if s.has_y:
-            w_of_z = w_of_z - Integral(Derivative(s.v, s.y),
-                                       (s.z, lower, s.z))
-        super().__init__({s.w: w_of_z},
-                         name=name or f"continuity_closure@{lower}")
-        self.description = description or (
-            f"w(z) = w|_{{z={lower}}} − ∫_{{{lower}}}^z ∂_x u dz' "
-            f"(continuity + lower-interface KBC)"
-        )
+# ``ContinuityClosure`` removed — superseded by the composable pipeline
+# ``pointwise_continuity = model.continuity.copy()``, then
+# ``pointwise_continuity.apply(Integrate(z, lower, z, "auto")).solve_for(w)``.
+# The resulting Expression carries an ``_as_relation`` that ``model.apply``
+# substitutes.  ``w|_lower`` is left symbolic and is closed by a separate
+# ``InterfaceKBC(state, lower, mass_flux=...)`` step — the algebraic
+# identity (continuity integrated from the lower interface) is decoupled
+# from the kinematic boundary condition.
 
 
 class NoTangentialBoundaryStress(Assumption):
@@ -2985,7 +2963,7 @@ class Basis:
 
         * ``field``                    → ``Σ α_k(t,x) · φ_k((z−b)/h)``
           (pointwise form — matches ``field(t,x,z)`` in inner running
-          integrals produced by e.g. :class:`ContinuityClosure`).
+          integrals produced by the w-closure pipeline).
         * ``field.subs(z, ζ·h + b)`` → ``Σ α_k(t,x) · φ_k(ζ)``
           (ζ-transformed form occurring inside outer ζ-integrals).
         * ``field.subs(z, b)``         → ``Σ α_k · φ_k(0)`` (bottom eval).
@@ -2993,8 +2971,8 @@ class Basis:
 
         Including the pointwise key is free — it only fires where the
         expression structurally carries ``field(t, x, z)`` — and makes
-        ``ContinuityClosure``'s inner ``∫_b^z ∂_x u dz'`` close
-        cleanly once ``u`` has been expanded.
+        the w-closure's inner ``∫_b^z ∂_x u dz'`` close cleanly once
+        ``u`` has been expanded.
         """
         state = self._state
         z, zeta, b, h = state.z, state.zeta, state.b, state.H
@@ -3265,7 +3243,7 @@ def _resolve_subs_safe(expr):
       ``f`` — a naive ``xreplace`` would overwrite the integration
       binder's tuple and produce nonsense limits (``Integral(_,
       (val, lo, val))``).  This protects running integrals introduced
-      by :class:`ContinuityClosure`.
+      by the w-closure pipeline (``Integrate(z, b, z)``).
     * ``var`` is the binding variable of a nested ``Subs`` in ``f``
       — same shadowing concern.
 
