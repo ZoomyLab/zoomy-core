@@ -22,6 +22,11 @@ from sympy import (
 import numpy as np
 
 
+# Sentinel for optional kwargs that must distinguish "not passed" from
+# "passed a falsy value" (most notably ``rhs=0``).
+_UNSET = object()
+
+
 # ---------------------------------------------------------------------------
 # StateSpace: shared symbolic state
 # ---------------------------------------------------------------------------
@@ -365,7 +370,8 @@ class Expression(SymbolicBase):
         tagged_sum = sum(self._solver_groups.values(), S.Zero)
         return sp.expand(self.expr - tagged_sum)
 
-    def auto_solver_tag(self, *, state_vars, time_var, coords):
+    def auto_solver_tag(self, *, state_vars, time_var, coords,
+                        parameters=()):
         """Algorithmically assign solver tags by structural matching.
 
         Each additive term of ``self.expr`` is classified:
@@ -373,20 +379,40 @@ class Expression(SymbolicBase):
         * ``coeff * Derivative(q, t)`` with ``q`` a state variable →
           ``time_derivative``.
         * ``coeff * Derivative(F, x_i)`` where ``coeff`` is state-variable-
-          free → ``flux`` (conservative form, regardless of whether ``F``
-          is pure advection or hydrostatic pressure — they're lumped here;
-          well-balanced separation is a follow-up).
-        * ``coeff * Derivative(q_j, x_i)`` where ``q_j`` is a state variable
-          → ``nonconservative_flux``.
-        * No derivatives and no un-substituted Function-call atoms (purely
-          algebraic in state-symbol space) → ``source``.
-        * Anything else (un-substituted ``f(t,x,z)`` evaluations, unmatched
-          Derivatives) stays in the untagged remainder.
+          free → ``flux`` (conservative form).
+        * ``coeff * Derivative(q_j, x_i)`` with ``q_j`` a state variable
+          and ``coeff`` containing state vars → ``nonconservative_flux``.
+        * ``coeff * Derivative(p, x_i)`` where ``p`` is a declared
+          parameter and ``coeff`` contains state vars → also
+          ``nonconservative_flux`` (the term couples a state coefficient
+          to a parameter gradient — e.g. bathymetry-gradient forcing).
+        * No derivative and purely algebraic in ``state_vars ∪
+          parameters`` space → ``source``.
+        * Anything else (unclosed fields like ``u(t, x, z)``, unmatched
+          Derivative shapes) stays in the untagged remainder.
 
-        Returns a new Expression with ``solver_groups`` populated. Physical
-        tags are preserved.
+        Parameters
+        ----------
+        state_vars : iterable of sympy Functions / Symbols
+            The evolution variables (``α_k(t, x)``, interface heights,
+            etc.).
+        time_var : sympy Symbol
+            The time coordinate (for ``time_derivative`` detection).
+        coords : iterable of sympy Symbols
+            Spatial coordinates (``x``, ``y``, …) for flux / NCP.
+        parameters : iterable, optional
+            Known external Function/Symbol atoms (bathymetry ``b(t, x)``,
+            prescribed fluxes, etc.).  These may freely appear in any
+            term without the term being marked "unclosed", and they may
+            appear as the inner of a spatial Derivative in the NCP
+            tagging.
+
+        Returns a new Expression with ``solver_groups`` populated.
+        Physical tags are preserved.
         """
         state_set = set(state_vars)
+        parameters = set(parameters)
+        allowed_fn_set = state_set | parameters
         coords_list = list(coords)
         tags = {
             "time_derivative": S.Zero,
@@ -395,17 +421,22 @@ class Expression(SymbolicBase):
             "source": S.Zero,
         }
 
-        def _is_un_subbed_function(term):
-            """True iff term contains a Function call (e.g. u(t, x, b))."""
-            return any(a.args for a in term.atoms(Function))
+        def _has_unclosed_function(term):
+            """``True`` iff the term contains a Function call that is
+            neither a declared state variable nor a declared parameter.
+            Those are the terms the auto-tagger can't classify safely;
+            everything else (including Function atoms of state_vars /
+            parameters — they're allowed to carry ``(t, x)`` args) is
+            fair game.
+            """
+            return any(a not in allowed_fn_set and a.args
+                       for a in term.atoms(Function))
 
         for term in Add.make_args(sp.expand(self.expr)):
             if term == S.Zero:
                 continue
 
-            # Un-substituted Function calls cannot be evaluated in state-
-            # symbol space → leave untagged.
-            if _is_un_subbed_function(term):
+            if _has_unclosed_function(term):
                 continue
 
             # Try to split as `coeff * Derivative(...)`.
@@ -423,33 +454,36 @@ class Expression(SymbolicBase):
                 v = deriv.variables[0]
                 inner = deriv.args[0]
 
-                # time_derivative: coeff * ∂_t(state_var)
-                if v == time_var and inner in state_set:
+                # time_derivative: coeff * ∂_t(state_var_or_parameter).
+                # Time-derivatives of parameters (e.g. moving bathymetry)
+                # get lumped here too — solvers typically treat them as
+                # time-varying forcing alongside the genuine ∂_t q terms.
+                if v == time_var and inner in allowed_fn_set:
                     tags["time_derivative"] = tags["time_derivative"] + term
                     continue
 
-                # spatial derivative
                 if v in coords_list:
-                    coeff_state_refs = state_set & coeff.free_symbols
+                    # A coeff counts as "state-bearing" iff it contains a
+                    # state-variable atom.  Function state variables
+                    # (``α_k(t, x)``) don't show up in ``free_symbols``,
+                    # so test via ``.atoms(Function) | .free_symbols``.
+                    coeff_symbols = coeff.free_symbols | coeff.atoms(Function)
+                    coeff_state_refs = state_set & coeff_symbols
                     if not coeff_state_refs:
-                        # Conservative form (no state vars in coefficient).
                         tags["flux"] = tags["flux"] + term
                         continue
-                    if inner in state_set:
-                        # NCP: coeff * ∂(state)/∂x_i
-                        tags["nonconservative_flux"] = tags["nonconservative_flux"] + term
+                    # coeff has state; treat any ∂_xᵢ(state_or_parameter) as NCP.
+                    if inner in allowed_fn_set:
+                        tags["nonconservative_flux"] = (
+                            tags["nonconservative_flux"] + term)
                         continue
 
-            # Anything with no Derivative at all AND no Function call
-            # (filtered above) is pure algebraic in state space → source.
             has_derivative = any(
                 isinstance(a, Derivative) for a in term.atoms(Derivative)
             )
             if not has_derivative:
                 tags["source"] = tags["source"] + term
                 continue
-
-            # Unmatched Derivative shape → untagged (caller sees via remainder).
 
         # Drop empty tag groups.
         nonempty = {t: v for t, v in tags.items() if v != 0}
@@ -526,7 +560,7 @@ class Expression(SymbolicBase):
             ),
         )
 
-    def apply(self, *conditions):
+    def apply(self, *conditions, rhs=_UNSET):
         """Apply substitutions / Relations / Operations — per term.
 
         The transformation is applied to every additive term of
@@ -534,41 +568,98 @@ class Expression(SymbolicBase):
         its parent term (follow-the-term), so the per-term tag dict stays
         in sync with the evolving main expression automatically.
 
+        Shorthand: ``expr.apply(lhs, rhs=0)`` is equivalent to
+        ``expr.apply({lhs: 0})``.  Valid only with a single positional
+        argument which is a sympy expression (or :class:`Expression`).
+
         After Relation/dict-style applies the result is lightly simplified
         via ``_simplify_preserve_integrals`` (linearity-only derivatives,
         cancellations across the full expr).  Terms that cancel vanish
         from both ``self.expr`` and the tag dict.
 
-        Operations that carry their own ``apply_to_expression`` are
-        dispatched per term too; when the operation produces multiple
-        output pieces per input term (``DepthIntegrate`` etc.) all pieces
-        inherit the parent tag.
+        Operations are invoked via their unified ``__call__`` interface;
+        when the op produces multiple output pieces per input term
+        (``DepthIntegrate`` etc.) all pieces inherit the parent tag.
         """
+        if rhs is not _UNSET:
+            if len(conditions) != 1:
+                raise TypeError(
+                    "apply(lhs, rhs=...) shorthand requires exactly one "
+                    f"positional argument (got {len(conditions)})."
+                )
+            lhs = conditions[0]
+            lhs_sp = lhs.expr if isinstance(lhs, Expression) else lhs
+            conditions = ({lhs_sp: rhs},)
+        def _resolve_subs(expr):
+            """Rewrite ``Subs(f, var, val)`` via structural xreplace when safe.
+
+            Sympy keeps ``Subs(Derivative(u(t,x,z), x), z, b(t,x))`` as
+            a ``Subs`` node because plugging ``z=b(t,x)`` into the inner
+            derivative would produce ``Derivative(u(t,x,b), x)`` — the
+            *total* ``x``-derivative, which would chain-rule through
+            ``b`` as ``(∂_x u)|_b + (∂_z u)|_b · ∂_x b``.  The original
+            Subs represents the *partial* ``(∂_x u)|_{z=b}``, so sympy
+            refuses to commit either way.
+
+            For the symbolic-projection pipeline we xreplace anyway:
+            the ``Derivative(u(t,x,b), x)`` form is replaced by the
+            basis expansion ``u(t,x,b) → Σ α_k φ_k(0)`` in the very
+            next ``apply`` step, after which the expression has no
+            ``z`` dependence and both interpretations coincide.  The
+            substitution must therefore happen *before* any ``.doit()``
+            or chain-rule-expanding simplify — which it does, as part
+            of the same per-term ``apply`` pass.
+
+            Subs whose variable is itself a differentiation variable
+            (e.g. ``Subs(∂_z u, z, b)``) are *not* rewritten — there's
+            no safe structural substitution — and are left for an
+            explicit boundary closure further down the pipeline.
+            """
+            if not expr.has(sp.Subs):
+                return expr
+            mapping = {}
+            for s in expr.atoms(sp.Subs):
+                inner = s.args[0]
+                vars_tup = s.args[1]
+                vals_tup = s.args[2]
+                deriv_vars = set()
+                for d in inner.atoms(sp.Derivative):
+                    deriv_vars.update(d.variables)
+                if any(v in deriv_vars for v in vars_tup):
+                    continue
+                mapping[s] = inner.xreplace(dict(zip(vars_tup, vals_tup)))
+            # Use xreplace (structural) so we can resolve ``Subs`` nodes
+            # that live inside an ``Integral`` whose dummy variable
+            # appears in the replacement.  ``.subs`` would refuse with
+            # "substitution cannot create dummy dependencies".
+            return expr.xreplace(mapping) if mapping else expr
+
         def _apply_one(expr, cond):
             if isinstance(cond, Operation):
-                if hasattr(cond, 'apply_to_expression'):
-                    try:
-                        eq = Expression(expr, self.name)
-                        return cond.apply_to_expression(eq).expr
-                    except NotImplementedError:
-                        pass
-                return cond.apply_to(expr)
+                result = cond(Expression(expr, self.name))
+                if isinstance(result, Expression):
+                    return result.expr
+                raise TypeError(
+                    f"{type(cond).__name__} returned {type(result).__name__} "
+                    f"from per-term apply; rank-changing Operations must be "
+                    f"invoked at the tree level, not through Expression.apply."
+                )
             rel = getattr(cond, "_as_relation", None)
             if isinstance(rel, dict) and rel:
-                if expr.has(sp.Subs):
-                    subs_map = {s: s.doit() for s in expr.atoms(sp.Subs)}
-                    expr = expr.subs(subs_map)
+                expr = _resolve_subs(expr)
                 return expr.subs(rel)
             if isinstance(cond, Relation) or hasattr(cond, 'apply_to'):
-                if expr.has(sp.Subs):
-                    subs_map = {s: s.doit() for s in expr.atoms(sp.Subs)}
-                    expr = expr.subs(subs_map)
+                expr = _resolve_subs(expr)
                 return cond.apply_to(expr)
             elif isinstance(cond, dict):
-                if expr.has(sp.Subs):
-                    subs_map = {s: s.doit() for s in expr.atoms(sp.Subs)}
-                    expr = expr.subs(subs_map)
-                return expr.subs(cond)
+                expr = _resolve_subs(expr)
+                # ``xreplace`` is purely structural — no dummy-dependency
+                # safety check — so it handles the basis-expansion case
+                # where the RHS contains the integration variable (``ζ``
+                # inside a zeta-integral).  All our dict keys are
+                # concrete Function applications or Subs-derived forms,
+                # both of which match exactly under structural equality.
+                return expr.xreplace(cond)
             elif isinstance(cond, (list, tuple)):
                 if len(cond) == 2 and isinstance(cond[0], sp.Basic):
                     return expr.subs(cond[0], cond[1])
@@ -576,8 +667,6 @@ class Expression(SymbolicBase):
                     if isinstance(pair, (list, tuple)) and len(pair) == 2:
                         expr = expr.subs(pair[0], pair[1])
                 return expr
-            elif hasattr(cond, 'apply_to'):
-                return cond.apply_to(expr)
             return expr
 
         # Per-term iteration with tag inheritance.
@@ -1173,7 +1262,7 @@ class Expression(SymbolicBase):
         return _tex(self.expr)
 
     def describe(self, header=True, final_equation=True, parameters=False,
-                 strip_args=False):
+                 strip_args=True):
         """Composable description of this expression.
 
         Returns a ``Description`` that renders as markdown in Jupyter.
@@ -1400,37 +1489,180 @@ class Material(Relation):
 # ---------------------------------------------------------------------------
 
 class Operation(SymbolicBase):
-    """An operation that transforms an Expression (e.g. depth integration).
+    """A structural transformation on a tree node.
 
-    Unlike a ``Relation`` (which substitutes symbols), an ``Operation``
-    applies a structural transformation.  Works with both
-    ``Expression.apply()`` and ``DerivedModel.apply()``.
+    A node is either an :class:`Expression` (leaf) or a ``Zstruct`` of
+    nodes (intermediate).  The unified entry point is ``__call__(node)``:
 
-    Subclasses override ``apply_to(expr)`` which receives and returns
-    a sympy expression, or ``apply_to_expression(expression)`` which
-    receives and returns an ``Expression`` object.
+    - Subclasses override :meth:`_apply_leaf` to transform a leaf
+      Expression.  The default ``__call__`` dispatches over the tree,
+      recursing into intermediate Zstructs.
+    - Rank-changing Operations (``Multiply`` with ``outer=True`` on a
+      leaf, or contraction on a Zstruct) override ``__call__`` directly
+      and may return a node of different shape than they received.
+
+    Every Operation carries ``name`` + ``description`` so
+    ``System.apply`` can record what was done in the derivation history.
     """
 
     def __init__(self, name="", description=None):
         super().__init__(name)
         self.description = description or name
 
-    def apply_to(self, expr):
-        """Transform a sympy expression. Override for simple operations."""
-        # Default: wrap in Expression, call apply_to_expression, unwrap
-        eq = Expression(expr, "")
-        result = self.apply_to_expression(eq)
-        return result.expr
-
-    def apply_to_expression(self, expression):
-        """Transform an Expression object. Override for operations that
-        need access to .terms, .map(), etc."""
-        raise NotImplementedError(
-            f"{type(self).__name__} must implement apply_to or apply_to_expression"
+    def __call__(self, node):
+        """Dispatch: leaf Expression → ``_apply_leaf``; Zstruct → recurse."""
+        from zoomy_core.misc.misc import Zstruct
+        if isinstance(node, Expression):
+            return self._apply_leaf(node)
+        if isinstance(node, Zstruct):
+            out = Zstruct()
+            for key in node._filter_dict():
+                setattr(out, key, self(getattr(node, key)))
+            return out
+        raise TypeError(
+            f"{type(self).__name__} got an unsupported node type: {type(node).__name__}"
         )
+
+    def _apply_leaf(self, expression):
+        """Transform a leaf Expression → Expression (or Zstruct for rank-changers).
+
+        Default: delegate to :meth:`_leaf_sp` and re-wrap the result,
+        inheriting the leaf's name, tags, and ``_as_relation``.
+        """
+        new_sp = self._leaf_sp(expression.expr)
+        if new_sp is expression.expr:
+            return expression
+        out = Expression(
+            new_sp, expression.name,
+            term_tags=dict(expression._term_tags),
+            tag_order=list(expression._tag_order),
+            solver_groups=expression._solver_groups,
+        )
+        rel = getattr(expression, "_as_relation", None)
+        if rel is not None:
+            out._as_relation = rel
+        return out
+
+    def _leaf_sp(self, sp_expr):
+        """Transform a raw sympy expression. Override for simple ops.
+
+        Subclasses override *either* this (for per-term sympy transforms)
+        *or* :meth:`_apply_leaf` (for ops that need the Expression's
+        ``.terms`` / tags), not both.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement _leaf_sp or override _apply_leaf"
+        )
+
+    # Ops that turn a leaf Expression into an intermediate Zstruct
+    # (``Multiply(outer=True)`` etc.) set this to ``True`` so tree-level
+    # dispatchers (``_NodeProxy.apply`` / ``System.apply``) know to call
+    # ``op(node)`` directly and replace the node, instead of routing
+    # through ``Expression.apply``'s per-term loop.
+    rank_changes_leaf = False
+
+    # Ops that need to see the whole leaf at once — i.e. they look at
+    # cross-term relationships rather than acting per-additive-term —
+    # set this to ``True``.  ``Recombine`` is the canonical example: to
+    # fold ``α·∂_v f + f·∂_v α → ∂_v(α·f)`` we need to see both terms
+    # simultaneously, which the default per-term dispatch hides.
+    # Dispatchers call ``op(node)`` directly when this is set, just
+    # like ``rank_changes_leaf``, but the result must remain an
+    # Expression (not a rank-changing Zstruct).
+    whole_leaf_op = False
 
     def _repr_latex_(self):
         return ""
+
+
+class Multiply(Operation):
+    """Multiply an Expression (or tree of Expressions) by a factor.
+
+    Default behaviour (``outer=False``) — *rank-preserving*:
+      Scales every term of a leaf Expression by ``factor``.  Tags follow
+      the terms through the per-term dispatch in
+      :meth:`Expression.apply`, so ``model.apply(Multiply(1/rho))``
+      scales the whole system and keeps physical tags intact.
+
+    ``outer=True`` — *rank-changing* (leaf → Zstruct):
+      ``factor`` must be a ``Zstruct`` of scalar factors
+      (e.g. test functions ``phi_0, phi_1, ...``).  The leaf Expression
+      is promoted to a ``Zstruct`` with one child Expression per factor,
+      keyed ``test_<index>``.  Each child is ``leaf.expr * factor_k``.
+
+      Per-term tag inheritance: each parent tag is re-keyed through the
+      multiplication (same rule as :meth:`Expression.apply`), so physical
+      tags follow into every ``test_<k>`` child.
+
+    Usage::
+
+        model.apply(Multiply(1 / state.rho))                 # scalar scaling
+        phis = Zstruct(**{f"phi_{k}": ... for k in range(N)})
+        model.momentum.x.apply(Multiply(phis, outer=True))   # Galerkin test
+    """
+
+    def __init__(self, factor, outer=False, name=None, description=None):
+        from zoomy_core.misc.misc import Zstruct
+        self._outer = outer
+        if outer:
+            if not isinstance(factor, Zstruct):
+                raise TypeError(
+                    "Multiply(outer=True) requires a Zstruct of factors "
+                    f"(got {type(factor).__name__})."
+                )
+            self._factor = factor
+            default_desc = (
+                f"outer-multiply by {len(factor._filter_dict())} test function(s)"
+            )
+        else:
+            f_sp = factor.expr if isinstance(factor, Expression) else sp.sympify(factor)
+            self._factor = f_sp
+            default_desc = f"multiply by {f_sp}"
+        super().__init__(
+            name=name or "multiply",
+            description=description or default_desc,
+        )
+
+    @property
+    def rank_changes_leaf(self):
+        return self._outer
+
+    def _leaf_sp(self, sp_expr):
+        if self._outer:
+            raise NotImplementedError(
+                "Multiply(outer=True) is rank-changing; invoke via "
+                "node.apply() so the leaf can be replaced with a Zstruct."
+            )
+        return sp_expr * self._factor
+
+    def _apply_leaf(self, expression):
+        if not self._outer:
+            return super()._apply_leaf(expression)
+        from zoomy_core.misc.misc import Zstruct
+        out = Zstruct()
+        for i, key in enumerate(self._factor._filter_dict()):
+            f = getattr(self._factor, key)
+            f_sp = f.expr if isinstance(f, Expression) else sp.sympify(f)
+            # Deep-clone the parent (expr + tags + solver_groups + relation),
+            # rename to ``<parent>_<index>``, then pointwise scalar-multiply
+            # by ``f_sp``.  The scalar ``Multiply`` routes through
+            # ``Expression.apply``'s per-term loop, so tag re-keying against
+            # the new terms is handled by the existing single-source-of-truth
+            # path — no parallel logic here.
+            child_name = (f"{expression.name}_{i}" if expression.name
+                          else f"test_{i}")
+            clone = Expression(
+                expression.expr, child_name,
+                term_tags=dict(expression._term_tags),
+                tag_order=list(expression._tag_order),
+                solver_groups=expression._solver_groups,
+            )
+            rel = getattr(expression, "_as_relation", None)
+            if rel is not None:
+                clone._as_relation = dict(rel)
+            child = clone.apply(Multiply(f_sp))
+            setattr(out, f"test_{i}", child)
+        return out
 
 
 class DepthIntegrate(Operation):
@@ -1448,9 +1680,9 @@ class DepthIntegrate(Operation):
         )
         self._state = state
 
-    def apply_to_expression(self, eq):
+    def _apply_leaf(self, expression):
         s = self._state
-        return eq.map(lambda t: t.depth_integrate(s.b, s.eta, s.z))
+        return expression.map(lambda t: t.depth_integrate(s.b, s.eta, s.z))
 
     def _repr_latex_(self):
         s = self._state
@@ -1478,7 +1710,7 @@ class ApplyKinematicBCs(Operation):
         self._kbc_s = KinematicBCSurface(state)
         self._kbc_b = KinematicBCBottom(state)
 
-    def apply_to(self, expr):
+    def _leaf_sp(self, expr):
         # Evaluate only Subs objects (NOT Derivative(Integral))
         if expr.has(sp.Subs):
             subs_map = {s: s.doit() for s in expr.atoms(sp.Subs)}
@@ -1498,6 +1730,98 @@ class ApplyKinematicBCs(Operation):
 # FullINS: 3D INS equations built from a StateSpace
 # ---------------------------------------------------------------------------
 
+_integrate_cache: dict = {}
+_integrate_cache_stats = {"hits": 0, "misses": 0}
+
+
+def _cached_integrate(integrand, limits):
+    """Cached wrapper around ``sympy.integrate(integrand, limits)``.
+
+    Keyed on ``(integrand, limits)``; both are hashable sympy objects.
+    Across a full SME derivation — many leaves, many ``test_k`` clones
+    — most ``∫_0^1 polynomial(ζ) dζ`` integrands appear repeatedly, so a
+    hash cache cuts ``sympy.integrate`` work by an order of magnitude.
+
+    Returns the original (possibly-unevaluated) ``Integral`` on failure;
+    caller can detect "not evaluated" via ``isinstance(..., Integral)``.
+    """
+    key = (integrand, limits)
+    hit = _integrate_cache.get(key)
+    if hit is not None:
+        _integrate_cache_stats["hits"] += 1
+        return hit
+    _integrate_cache_stats["misses"] += 1
+    try:
+        result = sp.integrate(integrand, limits)
+    except Exception:
+        result = Integral(integrand, limits)
+    _integrate_cache[key] = result
+    return result
+
+
+def integrate_cache_stats():
+    """Return ``(hits, misses)`` for the cached-integrate helper."""
+    return _integrate_cache_stats["hits"], _integrate_cache_stats["misses"]
+
+
+def integrate_cache_clear():
+    """Drop all cached integrals and reset stats (useful between runs)."""
+    _integrate_cache.clear()
+    _integrate_cache_stats["hits"] = 0
+    _integrate_cache_stats["misses"] = 0
+
+
+class EvaluateIntegrals(Operation):
+    """Run ``sympy.integrate`` on every ``Integral`` node in the expression.
+
+    After :class:`ZetaTransform` + basis expansion the volume integrals
+    look like ``Integral(polynomial_in_zeta, (zeta, 0, 1))``.  This op
+    collapses each such integral to a scalar.
+
+    Walks ``Derivative(Integral(...), x)`` too: the inner Integral is
+    evaluated first, then the outer Derivative survives symbolically.
+
+    Uses :func:`_cached_integrate` so repeated integrands across leaves
+    (every ``test_k`` clone after ``Multiply(basis.phi, outer=True)``)
+    cost one ``sympy.integrate`` call each, not one-per-leaf.
+
+    Leaves unevaluatable Integrals untouched (e.g. non-polynomial ones
+    or ones whose result would need a closed form sympy can't find).
+    """
+
+    def __init__(self, state=None, name="evaluate_integrals",
+                 description=None):
+        super().__init__(
+            name=name,
+            description=description or "Evaluate all Integral nodes via sympy.integrate",
+        )
+
+    def _leaf_sp(self, expr):
+        from sympy import Integral, Derivative
+
+        def _walk(e):
+            if isinstance(e, Integral):
+                # Recurse into nested integrands first.
+                integrand = _walk(e.args[0])
+                limits = e.args[1]
+                evaluated = _cached_integrate(integrand, limits)
+                if not isinstance(evaluated, Integral):
+                    return evaluated
+                return Integral(integrand, limits, *e.args[2:])
+            if isinstance(e, Derivative):
+                inner = _walk(e.args[0])
+                if inner != e.args[0]:
+                    return Derivative(inner, *e.args[1:])
+                return e
+            if hasattr(e, "args") and e.args:
+                new_args = [_walk(a) for a in e.args]
+                if any(n != o for n, o in zip(new_args, e.args)):
+                    return e.func(*new_args)
+            return e
+
+        return _walk(expr)
+
+
 class SimplifyIntegrals(Operation):
     """Evaluate integrals with constant integrand and remove zero integrals.
 
@@ -1512,7 +1836,7 @@ class SimplifyIntegrals(Operation):
             description="Evaluate constant/zero integrals",
         )
 
-    def apply_to(self, expr):
+    def _leaf_sp(self, expr):
         from sympy import Integral, Derivative
 
         def _simplify_int(e):
@@ -1586,7 +1910,7 @@ class Integrate(Operation):
         self._upper = upper
         self._method = method
 
-    def apply_to_expression(self, expression):
+    def _apply_leaf(self, expression):
         if self._method == "analytical":
             # Whole-expression analytic integration, with Dummy substitution
             # to avoid clashes when upper == var (partial / running integral).
@@ -1609,10 +1933,6 @@ class Integrate(Operation):
             else:
                 total = total + Expression(r)
         return total
-
-    def apply_to(self, expr):
-        # Fall-back for older direct-subs call sites that skip apply_to_expression.
-        return self.apply_to_expression(Expression(expr, "")).expr
 
     def _repr_latex_(self):
         return (
@@ -1660,7 +1980,7 @@ class PartialIntegrate(Operation):
         self._lo_match = lo_match
         self._hi_match = hi_match
 
-    def apply_to(self, expr):
+    def _leaf_sp(self, expr):
         v = self._var
         new_upper = self._upper
         lo_m = self._lo_match
@@ -1692,32 +2012,54 @@ class PartialIntegrate(Operation):
 
 
 class ZetaTransform(Operation):
-    """Transform vertical coordinate: z = ζ·h + b, dz = h·dζ.
+    """Transform vertical coordinate: z = ζ·(upper−lower) + lower, dz = (upper−lower)·dζ.
 
-    Transforms integrals: ∫_b^{b+h} f(z) dz → h·∫_0^1 f(ζ·h+b) dζ.
+    Transforms z-integrals whose bounds match the configured
+    ``(lower, upper)``::
+
+        ∫_{lower}^{upper} f(z) dz → (upper − lower) · ∫_0^1 f(ζ·(upper−lower)+lower) dζ
+
+    With no ``lower`` / ``upper`` given, defaults to ``state.b`` /
+    ``state.eta`` — the full free-surface transform used by the
+    single-layer SME walkthrough.  Pass layer-specific bounds
+    (e.g. ``lower=state.b, upper=z_1``) in the multi-layer case so
+    each layer's integrals get mapped to their own ζ-interval.
+
+    Only ``Integral`` nodes whose bounds structurally equal the
+    configured pair are rewritten; other integrals (including
+    already-transformed ``(zeta, 0, 1)`` ones) are left untouched.
+    That makes it safe to apply multiple ZetaTransforms back-to-back
+    on a branch with several integration ranges.
     """
 
-    def __init__(self, state):
-        super().__init__(
-            name="zeta_transform",
-            description="Coordinate transform z = ζ·h + b",
-        )
+    def __init__(self, state, lower=None, upper=None, zeta=None,
+                 name=None, description=None):
         self._z = state.z
-        self._b = state.b
-        self._h = state.H
-        self._zeta = state.zeta
+        self._lower = lower if lower is not None else state.b
+        self._upper = upper if upper is not None else state.eta
+        self._h = self._upper - self._lower
+        self._zeta = zeta if zeta is not None else state.zeta
+        super().__init__(
+            name=name or "zeta_transform",
+            description=(description or
+                         f"z = ζ·({self._upper} − {self._lower}) + {self._lower}"),
+        )
 
-    def apply_to(self, expr):
+    def _leaf_sp(self, expr):
         from sympy import Integral, Derivative
-        z, b, h, zeta = self._z, self._b, self._h, self._zeta
+        z, lower, upper, h, zeta = (
+            self._z, self._lower, self._upper, self._h, self._zeta,
+        )
 
         def _transform(e):
             if isinstance(e, Integral):
                 integrand = e.args[0]
                 limits = e.args[1]
-                var = limits[0]
-                if var == z:
-                    new_integrand = integrand.subs(z, zeta * h + b) * h
+                if (len(limits) == 3
+                        and limits[0] == z
+                        and limits[1] == lower
+                        and limits[2] == upper):
+                    new_integrand = integrand.subs(z, zeta * h + lower) * h
                     return Integral(new_integrand, (zeta, S.Zero, S.One))
                 return e
             if isinstance(e, Derivative):
@@ -1734,7 +2076,358 @@ class ZetaTransform(Operation):
         return _transform(expr)
 
     def _repr_latex_(self):
-        return f"$z = \\zeta \\cdot h + b, \\quad dz = h \\, d\\zeta$"
+        return (f"$z = \\zeta \\cdot ({sp.latex(self._upper)} - "
+                f"{sp.latex(self._lower)}) + {sp.latex(self._lower)}, "
+                f"\\quad dz = ({sp.latex(self._h)}) \\, d\\zeta$")
+
+
+def _decompose_deriv_factor(term, var):
+    """Decompose ``term`` as ``(coeff, inner)`` so that ``term == coeff * Derivative(inner, var)``.
+
+    Returns ``None`` if no such decomposition exists (term is not of the
+    form ``coeff * ∂_var(inner)`` with a first-order ``var``-derivative).
+    Used by :func:`_rule_anti_product_rule` to match conjugate pairs.
+    """
+    if isinstance(term, Derivative):
+        if term.variables == (var,):
+            return S.One, term.args[0]
+        return None
+    if isinstance(term, Mul):
+        factors = list(term.args)
+        ds = [f for f in factors
+              if isinstance(f, Derivative) and f.variables == (var,)]
+        if len(ds) != 1:
+            return None
+        d = ds[0]
+        inner = d.args[0]
+        coeff = Mul(*[f for f in factors if f is not d]) if len(factors) > 1 else S.One
+        return coeff, inner
+    return None
+
+
+def _rule_anti_product_rule(expr, *, vars=(), **kwargs):
+    """Reverse the product rule: ``α·∂_v f + f·∂_v α → ∂_v(α·f)``.
+
+    Walks the additive decomposition of ``expr`` once per ``v`` in
+    ``vars`` and greedily pairs up conjugate terms (``α·∂_v f`` with
+    ``f·∂_v α``), folding each matched pair into a single conservative
+    ``Derivative(α·f, v)`` term.  Unmatched Derivative terms and
+    Derivative-free terms pass through unchanged.
+
+    The match is signed: two terms must have the same sign to combine
+    (``+α·∂_v f`` with ``+f·∂_v α`` → ``+∂_v(α f)``;
+    ``−α·∂_v f`` with ``−f·∂_v α`` → ``−∂_v(α f)``).  Numerical
+    coefficients on each side are absorbed into the coeff / inner parts
+    before matching, so ``2α·∂_v f + 2f·∂_v α`` still pairs correctly.
+    """
+    for v in vars:
+        terms = list(Add.make_args(sp.expand(expr)))
+        decomp = {}
+        for i, term in enumerate(terms):
+            d = _decompose_deriv_factor(term, v)
+            if d is not None:
+                decomp[i] = d
+        used = set()
+        for i in list(decomp):
+            if i in used:
+                continue
+            ci, ii = decomp[i]
+            for j in list(decomp):
+                if j <= i or j in used:
+                    continue
+                cj, ij = decomp[j]
+                # α·∂_v f + f·∂_v α  ⇔  ci == ij AND cj == ii
+                if ci == ij and cj == ii:
+                    terms[i] = sp.Derivative(ci * ii, v)
+                    terms[j] = S.Zero
+                    used.update([i, j])
+                    break
+        if used:
+            expr = Add(*terms)
+    return expr
+
+
+def _rule_apply_aliases(expr, *, aliases=None, **kwargs):
+    """Rewrite recognised sub-expressions with human-readable names.
+
+    ``aliases`` is a dict ``{name: value}`` — for each pair we
+    replace ``value`` with ``name`` in the expression.  A direct
+    ``.subs`` matches only if the expanded form structurally contains
+    ``value``; we first try that, and if nothing changes we run
+    ``sp.factor`` on the current expression before re-trying so that
+    multi-term values like ``z_1 - b`` fire on the factored form
+    ``α·(z_1 - b)`` rather than the expanded ``α·z_1 - α·b``.
+
+    Recurses into Derivative / Integral / Add / Mul children so that
+    aliases inside a ``Derivative(..., t)`` also get rewritten.
+    """
+    aliases = aliases or {}
+    if not aliases:
+        return expr
+
+    def _try_alias_here(e):
+        for name, value in aliases.items():
+            e2 = e.subs(value, name)
+            if e2 != e:
+                e = e2
+                continue
+            # Fall back to factoring and retrying.  ``factor`` can be
+            # slow on big expressions but fires at structural leaves
+            # like ``α·z_1 - α·b`` → ``α·(z_1 - b)`` where .subs matches.
+            try:
+                factored = sp.factor(e)
+            except Exception:
+                factored = e
+            e2 = factored.subs(value, name)
+            if e2 != factored:
+                e = e2
+        return e
+
+    def _walk(e):
+        # Apply at the current node first, then **also** recurse into
+        # sub-expressions — a partial match at the current level (e.g.
+        # ``z_1 - b`` in one Add child) shouldn't block alias
+        # substitution inside a sibling child (e.g. ``α·z_1 - α·b`` inside
+        # a Derivative), which we only see after factoring the sibling.
+        candidate = _try_alias_here(e)
+        if candidate != e:
+            e = candidate
+        if hasattr(e, "args") and e.args:
+            new_args = [_walk(a) for a in e.args]
+            if any(n is not o for n, o in zip(new_args, e.args)):
+                return e.func(*new_args)
+        return e
+
+    return _walk(expr)
+
+
+def _rule_combine_derivatives(expr, **kwargs):
+    """Combine additive ``Derivative`` terms sharing the same variables.
+
+    ``Derivative(f, v) + Derivative(g, v) → Derivative(f + g, v)`` (linearity).
+    Runs across all additive siblings; terms with other factors (e.g.
+    ``α(t,x)·Derivative(β, v)`` where the coefficient is not a pure
+    scalar) are **not** folded — that would need the product rule,
+    which is ``anti_product_rule``'s job.
+
+    In practice this picks up things the pipeline emits as two
+    adjacent conservative terms, e.g.
+    ``Derivative(α·z_1, t) + Derivative(−α·b, t)`` folds to
+    ``Derivative(α·(z_1 − b), t)`` which an ``apply_aliases`` rule can
+    then rename to ``Derivative(α·h_0, t)``.
+    """
+    terms = list(Add.make_args(sp.expand(expr)))
+    grouped: dict = {}
+    leftovers = []
+    for term in terms:
+        if isinstance(term, Derivative):
+            key = term.args[1:]
+            grouped[key] = grouped.get(key, S.Zero) + term.args[0]
+            continue
+        if isinstance(term, Mul):
+            deriv_factors = [f for f in term.args if isinstance(f, Derivative)]
+            if len(deriv_factors) == 1:
+                d = deriv_factors[0]
+                coeff = Mul(*[f for f in term.args if f is not d])
+                # Only fold when the remaining factor is a pure scalar
+                # (no free_symbols overlap with the Derivative vars).
+                deriv_vars_set = set(d.variables)
+                coeff_depends = bool(coeff.free_symbols & deriv_vars_set)
+                if not coeff_depends and not any(
+                        isinstance(a, sp.Function)
+                        and any(v in a.free_symbols for v in deriv_vars_set)
+                        for a in coeff.atoms(sp.Function)):
+                    key = d.args[1:]
+                    grouped[key] = grouped.get(key, S.Zero) + coeff * d.args[0]
+                    continue
+        leftovers.append(term)
+    new_parts = list(leftovers)
+    for key, inner in grouped.items():
+        if inner == 0:
+            continue
+        new_parts.append(sp.Derivative(inner, *key))
+    return Add(*new_parts)
+
+
+def _rule_collapse_trivial_derivative(expr, **kwargs):
+    """``Derivative(c, v) → 0`` when ``c`` doesn't depend on ``v``.
+
+    A safety-net rule — :func:`_evaluate_linear_derivatives` already
+    handles this during the lightweight simplify, so in practice
+    Recombine only hits it when a downstream op re-introduces a
+    trivial Derivative (e.g. a manual ``sp.Derivative(f, v)`` with a
+    ``v``-free ``f``).
+    """
+    def _walk(e):
+        if isinstance(e, Derivative):
+            inner = e.args[0]
+            if not any(inner.has(v) for v in e.variables):
+                return S.Zero
+            inner_new = _walk(inner)
+            if inner_new is not inner:
+                return sp.Derivative(inner_new, *e.args[1:])
+            return e
+        if hasattr(e, "args") and e.args:
+            new_args = [_walk(a) for a in e.args]
+            if any(n is not o for n, o in zip(new_args, e.args)):
+                return e.func(*new_args)
+        return e
+    return _walk(expr)
+
+
+class Recombine(Operation):
+    """Fold expanded expressions back into compact / conservative shapes.
+
+    Typically run at the end of a derivation to pretty up ``describe()``
+    output: ``h·∂_t α + α·∂_t h`` becomes ``∂_t(h α)``, cancels like
+    ``(z_1 − b)`` can be aliased to ``h_0``, and any trivially-zero
+    Derivative re-introduced downstream gets collapsed.
+
+    **Rule catalog.**  ``Recombine.RULES`` is a module-level dict
+    mapping a rule's name to a ``callable(expr, **kwargs) → expr``.
+    The default implementation ships three rules:
+
+    * ``anti_product_rule`` — the classic
+      ``α·∂_v f + f·∂_v α → ∂_v(α·f)`` fold (needs ``vars=[...]``).
+    * ``apply_aliases`` — replaces user-declared sub-expressions with
+      shorter names (needs ``aliases={...}``).
+    * ``collapse_trivial_derivative`` — ``Derivative(c, v) → 0`` if
+      ``c`` has no ``v``.
+
+    Select / order rules via the ``rules`` argument:
+
+        # Default: all rules, in catalog order.
+        eq.apply(Recombine(vars=[t, x], aliases={h_0: z_1 - b}))
+
+        # Only the anti-product-rule, for display cleanup:
+        eq.apply(Recombine(rules=["anti_product_rule"], vars=[t, x]))
+
+        # Custom rule: pass a callable directly alongside / instead
+        # of a named rule.
+        eq.apply(Recombine(rules=["anti_product_rule", my_rule],
+                           vars=[t, x]))
+
+    **Extending the catalog.**  Add a rule once — available to every
+    subsequent ``Recombine``:
+
+        Recombine.RULES["my_rule"] = my_rule_fn
+
+    A rule is any callable with signature ``fn(expr, **kwargs) → expr``.
+    It receives the full ``vars`` / ``aliases`` kwargs; unknown kwargs
+    are harmless (they get swallowed by ``**kwargs``).
+    """
+
+    RULES = {
+        "anti_product_rule": _rule_anti_product_rule,
+        "combine_derivatives": _rule_combine_derivatives,
+        "apply_aliases": _rule_apply_aliases,
+        "collapse_trivial_derivative": _rule_collapse_trivial_derivative,
+    }
+
+    # Recombine needs to see the whole leaf — pair-matching rules
+    # (``anti_product_rule``, ``combine_derivatives``) only work when
+    # multiple additive terms are visible at once.
+    whole_leaf_op = True
+
+    def __init__(self, rules=None, vars=(), aliases=None,
+                 name=None, description=None):
+        if rules is None:
+            rules = list(self.RULES)
+        # Normalise each entry to a callable.
+        self._rule_fns = []
+        rule_labels = []
+        for r in rules:
+            if isinstance(r, str):
+                if r not in self.RULES:
+                    raise KeyError(
+                        f"Unknown Recombine rule {r!r}. "
+                        f"Available: {sorted(self.RULES)}"
+                    )
+                self._rule_fns.append(self.RULES[r])
+                rule_labels.append(r)
+            elif callable(r):
+                self._rule_fns.append(r)
+                rule_labels.append(getattr(r, "__name__", repr(r)))
+            else:
+                raise TypeError(
+                    f"Recombine rules must be strings or callables "
+                    f"(got {type(r).__name__})."
+                )
+        self._vars = tuple(vars)
+        self._aliases = dict(aliases) if aliases else {}
+        super().__init__(
+            name=name or "recombine",
+            description=(description
+                         or f"recombine via {', '.join(rule_labels)}"),
+        )
+
+    def _leaf_sp(self, expr):
+        for rule in self._rule_fns:
+            expr = rule(expr, vars=self._vars, aliases=self._aliases)
+        return expr
+
+
+class ExpandProductRule(Operation):
+    """Split ``φ(…) · ∂_var(f)`` into ``∂_var(φ·f) - ∂_var(φ)·f``.
+
+    Required when a test function factor carries the same coordinate
+    that the derivative is w.r.t.  For instance, after
+    ``Multiply(basis.phi_of_z, outer=True)``, terms look like
+    ``φ_l((z-b)/h) · ∂_x(u²)``.  The coefficient depends on ``x`` via
+    ``b(t,x)``, ``h(t,x)``, so it's **not** in conservative form and
+    ``Integrate(method='auto')`` would fall back to ``direct`` —
+    leaving an un-Leibniz'd ``Integral(φ · ∂_x f, (z, b, eta))``.
+
+    Running ``ExpandProductRule([t, x, z])`` *before* ``Integrate``
+    rewrites each such term into:
+
+    * ``∂_var(φ·f)`` — now genuinely conservative in ``var``.
+      ``Integrate`` applies Leibniz or the fundamental theorem to it.
+    * ``-∂_var(φ)·f`` — the non-conservative coupling.  ``∂_var φ`` is
+      evaluated via ``.doit()`` so the explicit dependence on
+      ``∂_var b``, ``∂_var h`` shows up (this is what generates the
+      ``W_sigma``-like terms of the sigma-SME derivation).  The
+      resulting integrand is not in derivative form; ``Integrate``
+      keeps it inside a direct integral, which collapses under
+      ``EvaluateIntegrals`` after basis expansion and
+      ``ZetaTransform``.
+
+    Each term that's already conservative (``var ∉ coeff.free_symbols``)
+    is left untouched.
+    """
+
+    def __init__(self, variables, name="expand_product_rule",
+                 description=None):
+        self._vars = tuple(variables)
+        super().__init__(
+            name=name,
+            description=(description or
+                         f"Expand φ·∂_v(f) → ∂_v(φ·f) − ∂_v(φ)·f for v∈"
+                         f"{{{', '.join(str(v) for v in variables)}}}"),
+        )
+
+    def _leaf_sp(self, expr):
+        def _expand_term(term):
+            if isinstance(term, Derivative):
+                return term  # bare Derivative → already conservative
+            if not isinstance(term, Mul):
+                return term
+            factors = list(term.args)
+            derivs = [f for f in factors if isinstance(f, Derivative)]
+            if len(derivs) != 1:
+                return term
+            d = derivs[0]
+            if len(d.variables) != 1 or d.variables[0] not in self._vars:
+                return term
+            var = d.variables[0]
+            inner = d.args[0]
+            coeff = Mul(*(f for f in factors if f is not d)) if len(factors) > 1 else S.One
+            if var not in coeff.free_symbols:
+                return term  # already conservative
+            return (sp.Derivative(coeff * inner, var)
+                    - sp.Derivative(coeff, var).doit() * inner)
+
+        return sum((_expand_term(t) for t in Add.make_args(sp.expand(expr))), S.Zero)
 
 
 class ProductRule(Operation):
@@ -1753,7 +2446,7 @@ class ProductRule(Operation):
             description="Inverse product rule: coeff·∂f/∂x → ∂(F)/∂x",
         )
 
-    def apply_to(self, expr):
+    def _leaf_sp(self, expr):
         from sympy import Derivative, Mul
 
         # Find the derivative factor in the term
@@ -1865,7 +2558,7 @@ class _INSBuilder:
         eqs.append(self.z_momentum)
         return eqs
 
-    def describe(self, header=True, final_equation=True, strip_args=False,
+    def describe(self, header=True, final_equation=True, strip_args=True,
                  **kwargs):
         """Composable description of the full INS system.
 
@@ -1994,6 +2687,56 @@ class materials:
 # Assumptions library
 # ---------------------------------------------------------------------------
 
+class InterfaceKBC(Assumption):
+    """Kinematic BC at an arbitrary interface ``z = interface(t, x[, y])``.
+
+    Generalises :class:`KinematicBCBottom` / :class:`KinematicBCSurface`:
+    parameterised on the interface height and an optional mass flux
+    ``m`` (mass per unit area per unit time crossing the interface),
+    so a single class covers solid bed, free surface, and every
+    internal layer interface in a multi-layer derivation.
+
+    ``w|_{z=interface}`` is substituted with::
+
+        ∂_t interface + u|·∂_x interface [+ v|·∂_y interface] + mass_flux / rho
+
+    Pass ``mass_flux=None`` for impermeable interfaces (bottom / top);
+    pass a sympy expression (typically a freshly-minted ``Function``)
+    for internal interfaces whose flux is an unknown of the resulting
+    system.
+
+    Usage::
+
+        # Bottom (identical to KinematicBCBottom):
+        model.apply(InterfaceKBC(state, state.b))
+
+        # Free surface (identical to KinematicBCSurface):
+        model.apply(InterfaceKBC(state, state.eta))
+
+        # Internal layer interface with mass flux m_1:
+        model.apply(InterfaceKBC(state, z_1, mass_flux=m_1))
+    """
+
+    def __init__(self, state: StateSpace, interface, mass_flux=None,
+                 name=None, description=None):
+        s = state
+        w_at = s.w.subs(s.z, interface)
+        u_at = s.u.subs(s.z, interface)
+        rhs = Derivative(interface, s.t) + u_at * Derivative(interface, s.x)
+        if s.has_y:
+            v_at = s.v.subs(s.z, interface)
+            rhs += v_at * Derivative(interface, s.y)
+        if mass_flux is not None:
+            rhs = rhs + mass_flux / s.rho
+        default_name = f"kinematic_bc@{interface}"
+        super().__init__({w_at: rhs}, name=name or default_name)
+        # ``Relation.__init__`` doesn't carry a description, so attach
+        # one directly so history_mermaid labels stay readable.
+        self.description = description or (
+            f"w|_{{z={interface}}} = ∂_t + u·∂_x (+ v·∂_y) (+ m/ρ)"
+        )
+
+
 class KinematicBCBottom(Assumption):
     """w|_{z=b} = db/dt + u_b * db/dx [+ v_b * db/dy]"""
 
@@ -2099,6 +2842,267 @@ class assumptions:
 
 
 # ---------------------------------------------------------------------------
+# Basis: vertical polynomial basis + coefficient functions
+# ---------------------------------------------------------------------------
+
+class Basis:
+    """Vertical polynomial basis for the SME expansion ``u = Σ α_k φ_k(ζ)``.
+
+    Wraps a :class:`Basisfunction` class (``Legendre_shifted`` etc.) and
+    exposes symbolic pieces for the apply-based walkthrough:
+
+    * ``basis.phi`` — ``Zstruct(phi_0, …, phi_N)`` of sympy expressions in
+      ``state.zeta``.  Drop-in factor for ``Multiply(basis.phi, outer=True)``.
+    * ``basis.alpha`` — ``Zstruct(alpha_0, …, alpha_N)`` of
+      :class:`Function` coefficients ``α_k(t, x, [y])``.  Using Functions
+      (not bare Symbols) keeps downstream partial derivatives honest and
+      makes linear-stability analysis straightforward.
+    * ``basis.expand(field)`` — single substitution dict covering the
+      volume evaluation (in ζ-transformed form) and both boundary
+      evaluations at ``z=b`` / ``z=η``.  Feed it to ``model.apply(...)``.
+
+    Usage::
+
+        from zoomy_core.model.models.basisfunctions import Legendre_shifted
+        basis = Basis(state, Legendre_shifted, level=2)
+        model.momentum.x.apply(Multiply(basis.phi, outer=True))
+        model.apply(ZetaTransform(state))
+        model.apply(basis.expand(state.u))
+
+    The volume substitution uses the ζ-transformed key
+    ``field.subs(z, ζ·h + b)`` — apply it **after** :class:`ZetaTransform`
+    so it matches what's under the integrals.
+    """
+
+    def __init__(self, state: StateSpace, basisfunction_cls, level=0,
+                 alpha_name="alpha", **basis_kwargs):
+        """Wrap a :class:`Basisfunction` subclass for the apply-based pipeline.
+
+        ``basis_kwargs`` are forwarded to the ``basisfunction_cls`` constructor
+        — use them for bases that need extra structure beyond the level
+        index (e.g. ``PiecewiseConstant(interfaces=[state.b, z_1, state.eta])``).
+        When ``basis_kwargs`` is non-empty, ``level`` is ignored and
+        re-read from the instantiated basisfunction.
+        """
+        from zoomy_core.misc.misc import Zstruct
+
+        self._state = state
+        if basis_kwargs:
+            self._bf = basisfunction_cls(**basis_kwargs)
+            self.level = self._bf.level
+        else:
+            self._bf = basisfunction_cls(level=level)
+            self.level = level
+        self._alpha_name = alpha_name
+
+        zeta = state.zeta
+        self.phi = Zstruct(**{
+            f"phi_{k}": self._bf.eval(k, zeta)
+            for k in range(self.level + 1)
+        })
+        args_h = state._args_h
+        self.alpha = Zstruct(**{
+            f"{alpha_name}_{k}": Function(f"{alpha_name}_{k}", real=True)(*args_h)
+            for k in range(self.level + 1)
+        })
+        # Test functions expressed as functions of z: phi_l((z-b)/h).
+        # Use this BEFORE depth-integration so the test function
+        # participates in the Leibniz rule and produces the W_sigma-like
+        # coupling terms on ∂_t phi, ∂_x phi.  Use ``self.phi`` (in zeta)
+        # AFTER ZetaTransform, inside integrands.
+        zeta_of_z = (state.z - state.b) / state.H
+        self.phi_of_z = Zstruct(**{
+            f"phi_{k}": self._bf.eval(k, zeta_of_z)
+            for k in range(self.level + 1)
+        })
+        # Piecewise-constant bases that live in physical z-space expose
+        # their breakpoints directly — this is what the layer-wise
+        # walkthrough reads to pull z_i and u_i.
+        self.interfaces = getattr(self._bf, "interfaces", None)
+
+    def _sum(self, zeta_value):
+        """Return ``Σ α_k · φ_k(zeta_value)``."""
+        return sum(
+            getattr(self.alpha, f"{self._alpha_name}_{k}")
+            * self._bf.eval(k, zeta_value)
+            for k in range(self.level + 1)
+        )
+
+    def expand(self, field):
+        """Substitution dict for all three evaluations of ``field``.
+
+        The returned dict has three keys:
+
+        * ``field.subs(z, ζ·h + b)`` → ``Σ α_k(t,x) · φ_k(ζ)``
+          (the form occurring inside ζ-transformed integrals)
+        * ``field.subs(z, b)``       → ``Σ α_k · φ_k(0)`` (bottom eval)
+        * ``field.subs(z, b + h)``   → ``Σ α_k · φ_k(1)`` (surface eval)
+        """
+        state = self._state
+        z, zeta, b, h = state.z, state.zeta, state.b, state.H
+        volume_key = field.subs(z, zeta * h + b)
+        bottom_key = field.subs(z, b)
+        surface_key = field.subs(z, state.eta)
+        return {
+            volume_key: self._sum(zeta),
+            bottom_key: self._sum(S.Zero),
+            surface_key: self._sum(S.One),
+        }
+
+    def layer_expand(self, field, layer_idx, zeta_transformed=False):
+        """Per-layer closure substitution for a :class:`LayeredBasis`.
+
+        Inside layer ``i`` the field is closed against that layer's
+        coefficients:
+
+        .. math::
+
+            \\text{field}(t, x, z)
+            \\;\\longrightarrow\\;
+            \\sum_{k=0}^{m-1} \\alpha_{i\\,m + k}(t, x)\\,
+                              \\phi^{\\text{inner}}_{k}(\\zeta_i(z))
+
+        where ``m = inner_level + 1`` is the number of moments per
+        layer and ``ζ_i(z) = (z - z_i) / h_i``.  The returned
+        substitution dict has three entries (volume + lower interface
+        + upper interface) — the side-local convention means the two
+        interface evaluations plug in ``ζ_i = 0`` and ``ζ_i = 1`` of
+        the **current** layer's inner basis; a neighbouring layer
+        applying its own ``layer_expand`` produces its own (generally
+        different) interface value, which is exactly the jump that
+        drives the multi-layer mass-flux terms.
+
+        Parameters
+        ----------
+        field : sympy Function call
+            The variable being closed (e.g. ``state.u``).
+        layer_idx : int
+            Index into ``self._bf.interfaces`` specifying the layer.
+        zeta_transformed : bool, default ``False``
+            If ``False`` (the SWE case), the bulk key is ``field``
+            itself — substitutes ``u(t,x,z) → Σ α·φ_inner(ζ_i(z))``.
+            If ``True`` (the SME case, applied *after*
+            :class:`ZetaTransform`), the bulk key becomes
+            ``field.subs(z, ζ·h_i + z_i)`` and the substituted form
+            reduces to ``Σ α·φ_inner(ζ)`` in the shared zeta symbol,
+            ready for ``EvaluateIntegrals`` to collapse the
+            orthogonality integrals.
+
+        For the piecewise-constant case (``Monomials, inner_level=0``)
+        the sum collapses to a single coefficient per layer and you
+        recover the simple SWE closure ``u → α_i``.
+
+        Raises ``ValueError`` if the wrapped basisfunction isn't a
+        ``LayeredBasis``.
+        """
+        from zoomy_core.model.models.basisfunctions import LayeredBasis
+        if not isinstance(self._bf, LayeredBasis):
+            raise ValueError(
+                "Basis.layer_expand requires a LayeredBasis "
+                "(e.g. LayeredBasis(Monomials, interfaces=[b, z_1, eta]))."
+            )
+        if not (0 <= layer_idx < self._bf.n_layers):
+            raise IndexError(
+                f"layer_idx={layer_idx} out of range for "
+                f"{self._bf.n_layers} layer(s)."
+            )
+        state = self._state
+        lower = self._bf.interfaces[layer_idx]
+        upper = self._bf.interfaces[layer_idx + 1]
+
+        def _closure(z_value):
+            """Σ α_{i*m+k} · φ_inner_k(ζ_i(z_value))."""
+            zeta_local = self._bf.layer_zeta(layer_idx, z_value)
+            return sum(
+                getattr(self.alpha,
+                        f"{self._alpha_name}_"
+                        f"{self._bf.flat_index(layer_idx, k)}")
+                * self._bf.inner.eval(k, zeta_local)
+                for k in range(self._bf.inner_n_basis)
+            )
+
+        if zeta_transformed:
+            # After ZetaTransform the bulk form is ``field.subs(z, ζ·h_i + lower)``.
+            # ``ZetaTransform`` + the lightweight simplify path store the
+            # subbed argument in **expanded** form (``ζ·upper − ζ·lower + lower``),
+            # while a naive ``ζ·(upper−lower)+lower`` stays factored.
+            # We need the bulk key to match the expanded form produced by
+            # ZetaTransform, because ``xreplace`` is structural and
+            # ``a·(b−c)+c`` isn't the same subtree as ``a·b − a·c + c``.
+            zeta_of_z = sp.expand(state.zeta * (upper - lower) + lower)
+            bulk_key = field.subs(state.z, zeta_of_z)
+            # RHS shortcut: after ZetaTransform the bulk argument is
+            # identically ``ζ``, so we evaluate the inner basis at
+            # ``state.zeta`` directly.  Going through ``_closure`` would
+            # produce ``ζ·(upper-lower)/(upper-lower)`` which sympy
+            # doesn't cancel (it can't rule out ``upper == lower``),
+            # leaving unsimplified ratios inside integrands and
+            # blocking ``EvaluateIntegrals`` from collapsing them.
+            bulk_val = sum(
+                getattr(self.alpha,
+                        f"{self._alpha_name}_"
+                        f"{self._bf.flat_index(layer_idx, k)}")
+                * self._bf.inner.eval(k, state.zeta)
+                for k in range(self._bf.inner_n_basis)
+            )
+        else:
+            bulk_key = field
+            bulk_val = _closure(state.z)
+
+        return {
+            bulk_key: bulk_val,
+            field.subs(state.z, lower): _closure(lower),
+            field.subs(state.z, upper): _closure(upper),
+        }
+
+    def layer_phi(self, layer_idx):
+        """Zstruct of inner test functions in the shared ``ζ`` symbol.
+
+        Equivalent to ``basis.phi`` but for one layer of a
+        :class:`LayeredBasis`.  Use after ZetaTransform, inside
+        integrands, when you need ``φ_inner_k(ζ)`` multiplied into an
+        ``EvaluateIntegrals`` target.
+
+        Raises ``ValueError`` on a non-layered basis.
+        """
+        from zoomy_core.misc.misc import Zstruct
+        from zoomy_core.model.models.basisfunctions import LayeredBasis
+        if not isinstance(self._bf, LayeredBasis):
+            raise ValueError("layer_phi requires a LayeredBasis.")
+        if not (0 <= layer_idx < self._bf.n_layers):
+            raise IndexError(f"layer_idx={layer_idx} out of range.")
+        zeta = self._state.zeta
+        return Zstruct(**{
+            f"phi_{k}": self._bf.inner.eval(k, zeta)
+            for k in range(self._bf.inner_n_basis)
+        })
+
+    def layer_phi_of_z(self, layer_idx):
+        """Zstruct of inner test functions at ``ζ_i(z) = (z − z_i)/h_i``.
+
+        Equivalent to ``basis.phi_of_z`` but for one layer of a
+        :class:`LayeredBasis`.  Use **before** depth-integration —
+        ``Multiply(basis.layer_phi_of_z(i), outer=True)`` on a layer's
+        branch produces its Galerkin test equations, one per inner
+        moment, each carrying the rescaled ``φ_inner_k((z − z_i)/h_i)``
+        factor that the Leibniz rule will dismantle.
+
+        Raises ``ValueError`` on a non-layered basis.
+        """
+        from zoomy_core.misc.misc import Zstruct
+        from zoomy_core.model.models.basisfunctions import LayeredBasis
+        if not isinstance(self._bf, LayeredBasis):
+            raise ValueError("layer_phi_of_z requires a LayeredBasis.")
+        if not (0 <= layer_idx < self._bf.n_layers):
+            raise IndexError(f"layer_idx={layer_idx} out of range.")
+        zeta_i_of_z = self._bf.layer_zeta(layer_idx, self._state.z)
+        return Zstruct(**{
+            f"phi_{k}": self._bf.inner.eval(k, zeta_i_of_z)
+            for k in range(self._bf.inner_n_basis)
+        })
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -2194,6 +3198,16 @@ def _evaluate_linear_derivatives(expr):
     Otherwise leave the Derivative intact so conservative forms like
     ``Derivative(u**2, x)`` and ``Derivative(u*w, z)`` survive.
 
+    Trivial zero collapses are handled here too: ``Derivative(0, var)``
+    → ``0`` and ``Subs(0, var, val)`` → ``0``.  Without this,
+    post-``hydrostatic_scaling`` z-momentum carries leftover
+    ``∂/∂t 0``, ``∂/∂x 0``, and ``Subs(∂/∂Dummy 0, Dummy, b+h)``
+    residue from the analytical integrate (Dummies come from
+    ``sp.integrate``).  Sympy refuses to reduce these on its own —
+    ``Derivative.doit()`` only evaluates when the inner depends on the
+    diff variable, and ``Subs`` stays lazy for the same chain-rule
+    reason that keeps ``Subs(Derivative(u, x), z, b)`` frozen.
+
     We expand the inner first so that factored forms like
     ``Derivative(g*ρ*(η − z), x)`` — which are algebraically
     ``Derivative(−g*ρ*z + g*ρ*b + g*ρ*h, x)`` — also get linearly
@@ -2204,12 +3218,40 @@ def _evaluate_linear_derivatives(expr):
     """
     if not isinstance(expr, sp.Basic):
         return expr
+    if isinstance(expr, sp.Subs) and expr.args[0] == S.Zero:
+        return S.Zero
     if isinstance(expr, Derivative):
         inner = expr.args[0]
+        if inner == S.Zero:
+            return S.Zero
+        # Trivially zero: inner doesn't mention any of the diff vars.
+        # Without this shortcut, expressions like Derivative(-g·ρ·z, x)
+        # (coming out of the hydrostatic pressure solve) would survive
+        # our post-distribute pass.  ``sympy.Derivative.doit()`` would
+        # handle it, but we can't ``.doit()`` the Add-distributed form
+        # in general (it also applies the product rule, flattening
+        # conservative ``Derivative(ν·∂_z u, z)`` shapes that the
+        # fundamental theorem of calculus needs).  The targeted
+        # "no diff-var inside" check keeps both cases correct.
+        if not any(inner.has(v) for v in expr.variables):
+            return S.Zero
         inner_expanded = sp.expand(inner) if isinstance(inner, sp.Basic) else inner
         if isinstance(inner_expanded, sp.Add):
             inner_walked = _evaluate_linear_derivatives(inner_expanded)
-            return expr.func(inner_walked, *expr.args[1:]).doit()
+            # Distribute the outer Derivative over the Add via linearity
+            # **without** ``.doit()``.  ``.doit()`` at this stage applies
+            # the product rule inside each summand, turning conservative
+            # shapes like ``Derivative(ν·∂_z u, z)`` into the expanded
+            # ``∂_z ν · ∂_z u + ν · ∂²u/∂z²`` form.  The second piece
+            # then has a two-variable Derivative tuple that
+            # ``_extract_derivative`` refuses, and the fundamental
+            # theorem of calculus can no longer integrate the term.
+            # By building the distributed sum manually we keep each
+            # summand in conservative ``Derivative(coeff·f, var)`` form,
+            # where Leibniz / fund-thm apply cleanly.
+            args_rest = expr.args[1:]
+            return sp.Add(*(expr.func(t, *args_rest)
+                            for t in sp.Add.make_args(inner_walked)))
         inner_walked = _evaluate_linear_derivatives(inner)
         return expr.func(inner_walked, *expr.args[1:])
     if expr.args:
