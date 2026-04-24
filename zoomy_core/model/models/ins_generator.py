@@ -1738,17 +1738,69 @@ class ApplyKinematicBCs(Operation):
 _integrate_cache: dict = {}
 _integrate_cache_stats = {"hits": 0, "misses": 0}
 
+# Registry of Zoomy-specific integration rules.  Each rule is a callable
+# ``(integrand, limits) -> Optional[sp.Expr]``: returns the definite
+# integral if the rule applies, ``None`` otherwise.  ``_cached_integrate``
+# consults the registry before falling back to ``sympy.integrate``.
+#
+# Motivation: sympy's integration algorithm makes antiderivative choices
+# that are correct but inconvenient for our downstream simplification —
+# e.g. for ``∫ ∂_x f(z) dz`` with ``f`` linear in ``z`` it picks the
+# chain-rule form ``f(z)²/(2·∂_z f)`` over the polynomial
+# ``A·z + B·z²/2``.  The two differ by a constant, so the definite
+# integral is algebraically the same, but sympy leaves the rational
+# form unreduced and it survives all the way to the solver-tag
+# extraction as a stubborn ``1/Derivative(state_var, x)`` residue.
+# Rules in this registry give us deterministic, polynomial-shaped
+# antiderivatives where we can; anything the rules don't match falls
+# through to sympy's fully general (and very capable) integrator.
+_INTEGRATION_RULES: list = []
+
+
+def register_integration_rule(rule):
+    """Register a Zoomy integration rule.
+
+    A rule is ``(integrand, limits) -> Optional[sp.Expr]``:
+
+    * ``limits`` is the full ``(var, lower, upper)`` triple passed to
+      ``_cached_integrate`` (matching ``sympy.integrate``'s call shape).
+    * Return the **definite** integral if the pattern matches — the
+      caller does no further transformation.
+    * Return ``None`` if the rule doesn't apply.  ``_cached_integrate``
+      tries rules in registration order; the first non-``None`` wins.
+    """
+    _INTEGRATION_RULES.append(rule)
+    return rule
+
+
+def _try_integration_rules(integrand, limits):
+    """Run registered rules in order, return the first non-None result."""
+    for rule in _INTEGRATION_RULES:
+        try:
+            result = rule(integrand, limits)
+        except Exception:
+            # A rule that raises is treated as "does not apply" — never
+            # abort the integration because a rule had a bad day.  The
+            # sympy fallback catches everything the rules miss.
+            continue
+        if result is not None:
+            return result
+    return None
+
 
 def _cached_integrate(integrand, limits):
-    """Cached wrapper around ``sympy.integrate(integrand, limits)``.
+    """Cached wrapper around the Zoomy-rule + ``sympy.integrate`` pair.
 
     Keyed on ``(integrand, limits)``; both are hashable sympy objects.
     Across a full SME derivation — many leaves, many ``test_k`` clones
     — most ``∫_0^1 polynomial(ζ) dζ`` integrands appear repeatedly, so a
-    hash cache cuts ``sympy.integrate`` work by an order of magnitude.
+    hash cache cuts integration work by an order of magnitude.
 
-    Returns the original (possibly-unevaluated) ``Integral`` on failure;
-    caller can detect "not evaluated" via ``isinstance(..., Integral)``.
+    Resolution order: (1) consult ``_INTEGRATION_RULES`` — if a Zoomy
+    rule matches, use its result; (2) otherwise fall back to
+    ``sympy.integrate(integrand, limits)``.  Returns the original
+    (possibly-unevaluated) ``Integral`` on failure; caller can detect
+    "not evaluated" via ``isinstance(..., Integral)``.
     """
     key = (integrand, limits)
     hit = _integrate_cache.get(key)
@@ -1756,12 +1808,163 @@ def _cached_integrate(integrand, limits):
         _integrate_cache_stats["hits"] += 1
         return hit
     _integrate_cache_stats["misses"] += 1
-    try:
-        result = sp.integrate(integrand, limits)
-    except Exception:
-        result = Integral(integrand, limits)
+    result = _try_integration_rules(integrand, limits)
+    if result is None:
+        try:
+            result = sp.integrate(integrand, limits)
+        except Exception:
+            result = Integral(integrand, limits)
     _integrate_cache[key] = result
     return result
+
+
+# ---------------------------------------------------------------------------
+# Default Zoomy integration rules
+# ---------------------------------------------------------------------------
+#
+# Rules are deliberately narrow — each catches one well-understood
+# shape and nothing else.  Rules compose by registration order; the
+# first to match wins.
+
+
+@register_integration_rule
+def _rule_fundamental_theorem(integrand, limits):
+    """``∫_lo^hi ∂_var g dvar = g|_hi − g|_lo``.
+
+    Handles both single-order ``∂_var g`` and mixed-order
+    ``∂_var ∂_other g`` (removing one ``var`` from the outer
+    Derivative).  Higher-order-in-``var`` like ``∂²_var g`` is
+    handled too: ``∫ ∂²_var g dvar = ∂_var g|_hi − ∂_var g|_lo``.
+
+    Whenever ``var`` is one of the differentiation variables of the
+    integrand, the antiderivative is the integrand with *one*
+    occurrence of ``var`` stripped — no further computation needed.
+    """
+    if not isinstance(integrand, Derivative):
+        return None
+    var, lo, hi = limits[0], limits[1], limits[2]
+    # sympy canonicalises Derivative.args[1:] to ``(var, order)`` tuples.
+    diff_tuples = list(integrand.args[1:])
+    match_index = None
+    for i, dv in enumerate(diff_tuples):
+        if len(dv) == 2 and dv[0] == var:
+            match_index = i
+            break
+    if match_index is None:
+        return None
+    matched = diff_tuples[match_index]
+    order = matched[1]
+    if order <= 1:
+        # Remove the ``(var, 1)`` entry entirely.
+        remaining = diff_tuples[:match_index] + diff_tuples[match_index + 1:]
+    else:
+        # Reduce ``(var, n) → (var, n-1)`` — one ``var`` peels off.
+        remaining = (diff_tuples[:match_index]
+                     + [sp.Tuple(var, order - 1)]
+                     + diff_tuples[match_index + 1:])
+    inner = integrand.args[0]
+    if remaining:
+        antideriv = Derivative(inner, *remaining)
+    else:
+        antideriv = inner
+    return antideriv.subs(var, hi) - antideriv.subs(var, lo)
+
+
+def _rule_derivative_of_polynomial(integrand, limits):
+    """``∫_lo^hi ∂_y f(var) dvar`` with ``f`` polynomial in ``var``
+    and a single differentiation variable ``y ≠ var``.
+
+    Applies the Leibniz rule directly:
+
+    ``∫_lo^hi ∂_y f dvar = ∂_y[∫_lo^hi f dvar]
+                          − f(hi)·∂_y hi + f(lo)·∂_y lo.``
+
+    ``∫ f dvar`` is polynomial (sympy handles pure polynomial cases
+    cleanly), so the Leibniz-swap avoids sympy's chain-rule
+    antiderivative ``f²/(2·∂_var f)`` which introduces rational
+    forms in ``∂_y ∂_var f`` denominators — the exact trap that
+    surfaced in the SME shear-moment residual.
+
+    Not registered by default.  Sympy's rational form is
+    structurally more compact than our Leibniz expansion for the
+    rest of the SME pipeline, even though it carries the
+    ``1/Derivative(state, y)`` denominators; the polynomial form
+    produces many more atomic terms that don't re-combine under
+    the standard simplify fixpoint.  Users who want to replace
+    sympy's rational form with the polynomial Leibniz form can
+    opt in via ``register_integration_rule(
+    _rule_derivative_of_polynomial)``.
+
+    Skips higher-order ``∂²_y f`` integrands (not a product-rule
+    case) and mixed ``∂_y ∂_var f`` (delegated to
+    ``_rule_fundamental_theorem`` since ``var`` is in the diff-var
+    tuple).
+    """
+    if not isinstance(integrand, Derivative):
+        return None
+    var, lo, hi = limits[0], limits[1], limits[2]
+    diff_tuples = list(integrand.args[1:])
+    if len(diff_tuples) != 1:
+        return None
+    dv = diff_tuples[0]
+    if len(dv) != 2 or dv[1] != 1:
+        # Higher-order: ``∂²_y f`` — not this rule.
+        return None
+    y = dv[0]
+    if y == var:
+        # ``∂_var f``: fundamental theorem rule already fired.
+        return None
+    inner = integrand.args[0]
+    if not inner.has(var):
+        # ``var``-free integrand — sympy's default behaviour is fine
+        # (and the rule would accidentally treat the integrand as a
+        # zero-degree polynomial).  Let the fallback handle it.
+        return None
+    try:
+        sp.Poly(inner, var)
+    except (sp.PolynomialError, sp.CoercionFailed, sp.GeneratorsNeeded):
+        return None
+    # Narrow override: only replace sympy's result when it contains
+    # the pathology — a rational with a ``Derivative`` in the
+    # denominator.  Sympy's own antiderivative is shorter and
+    # cancels better for every other shape.
+    try:
+        sympy_result = sp.integrate(integrand, limits)
+    except Exception:
+        return None
+    if isinstance(sympy_result, Integral):
+        # Sympy couldn't integrate — fall through to the main fallback
+        # (our rule's polynomial form wouldn't help either in general).
+        return None
+    if not _has_derivative_denominator(sympy_result):
+        return sympy_result  # sympy's form is clean — take it.
+    # Pathology confirmed.  Build the Leibniz form instead:
+    #   ∫_lo^hi ∂_y f dvar  =  ∂_y[∫_lo^hi f dvar]
+    #                         − f(hi)·∂_y hi + f(lo)·∂_y lo
+    # ``∫ f dvar`` is pure polynomial (sympy handles this branch
+    # cleanly); the surface terms only fire when bounds depend on
+    # ``y``.
+    inner_integrated = sp.integrate(inner, (var, lo, hi))
+    main = Derivative(inner_integrated, y)
+    surface = S.Zero
+    if hi.has(y):
+        surface -= inner.subs(var, hi) * Derivative(hi, y)
+    if lo.has(y):
+        surface += inner.subs(var, lo) * Derivative(lo, y)
+    return main + surface
+
+
+def _has_derivative_denominator(expr):
+    """True iff ``expr`` contains ``Pow(X, negative)`` with a
+    ``Derivative`` inside ``X`` — the signature of sympy's u-sub
+    antiderivative trap."""
+    for pw in expr.atoms(sp.Pow):
+        exp = pw.args[1]
+        if not getattr(exp, "is_negative", False):
+            continue
+        if pw.args[0].atoms(Derivative):
+            return True
+    return False
 
 
 def integrate_cache_stats():
@@ -2385,121 +2588,101 @@ class Recombine(Operation):
         return expr
 
 
-class ExpandProductRule(Operation):
-    """Split ``φ(…) · ∂_var(f)`` into ``∂_var(φ·f) - ∂_var(φ)·f``.
+class ProductRule(Operation):
+    """Product rule — term-level, identity-preserving.
 
-    Required when a test function factor carries the same coordinate
-    that the derivative is w.r.t.  For instance, after
-    ``Multiply(basis.phi_of_z, outer=True)``, terms look like
-    ``φ_l((z-b)/h) · ∂_x(u²)``.  The coefficient depends on ``x`` via
-    ``b(t,x)``, ``h(t,x)``, so it's **not** in conservative form and
-    ``Integrate(method='auto')`` would fall back to ``direct`` —
-    leaving an un-Leibniz'd ``Integral(φ · ∂_x f, (z, b, eta))``.
+    Applied per term (use ``expr.terms[i].apply(ProductRule())`` or
+    ``model.<leaf>.apply(ProductRule())`` which iterates per term).
 
-    Running ``ExpandProductRule([t, x, z])`` *before* ``Integrate``
-    rewrites each such term into:
+    ``direction="inverse"`` (default) — term is a ``Mul`` with exactly
+    one ``Derivative`` factor:
 
-    * ``∂_var(φ·f)`` — now genuinely conservative in ``var``.
-      ``Integrate`` applies Leibniz or the fundamental theorem to it.
-    * ``-∂_var(φ)·f`` — the non-conservative coupling.  ``∂_var φ`` is
-      evaluated via ``.doit()`` so the explicit dependence on
-      ``∂_var b``, ``∂_var h`` shows up (this is what generates the
-      ``W_sigma``-like terms of the sigma-SME derivation).  The
-      resulting integrand is not in derivative form; ``Integrate``
-      keeps it inside a direct integral, which collapses under
-      ``EvaluateIntegrals`` after basis expansion and
-      ``ZetaTransform``.
+        ``coeff · ∂_v(f)  →  ∂_v(coeff · f)  −  ∂_v(coeff).doit() · f``
 
-    Each term that's already conservative (``var ∉ coeff.free_symbols``)
-    is left untouched.
+    The second piece is the residual that keeps the rewrite an exact
+    identity.  When ``coeff`` is constant in ``v``, the residual
+    vanishes and the result is simply ``∂_v(coeff · f)`` (trivial
+    collapse).  Bare ``Derivative`` terms are left alone so that
+    ``Integrate(method="auto")`` can Leibniz / fund-thm them.
+
+    ``direction="forward"`` — term is a bare
+    ``Derivative(Π f_i, v)`` or ``Derivative(f**n, v)``:
+
+        ``∂_v(Π f_i)   →  Σ_i (Π_{j≠i} f_j) · ∂_v(f_i)``
+        ``∂_v(f**n)    →  n · f**(n-1) · ∂_v(f)``  (integer ``n ≥ 2``)
+
+    ``direction="both"`` — forward on bare ``Derivative``, inverse on
+    ``Mul`` with one ``Derivative`` factor.  Use with care: applied
+    leaf-wide it will break apart conservative forms that
+    ``Integrate`` relies on.
+
+    The operation is strictly *local*: no cross-term recombination.
+    To turn ``h·∂_t α + α·∂_t h`` into ``∂_t(h·α)``, apply
+    :class:`ProductRule` to **one** sibling only; the residual produced
+    by the inverse rewrite cancels against the untouched sibling via
+    sympy's like-term combining in the next ``.simplify()``.
     """
 
-    def __init__(self, variables, name="expand_product_rule",
-                 description=None):
-        self._vars = tuple(variables)
+    _DIRECTIONS = ("inverse", "forward", "both")
+
+    def __init__(self, direction="inverse"):
+        if direction not in self._DIRECTIONS:
+            raise ValueError(
+                f"ProductRule direction must be one of "
+                f"{self._DIRECTIONS!r}; got {direction!r}."
+            )
+        self._direction = direction
         super().__init__(
-            name=name,
-            description=(description or
-                         f"Expand φ·∂_v(f) → ∂_v(φ·f) − ∂_v(φ)·f for v∈"
-                         f"{{{', '.join(str(v) for v in variables)}}}"),
+            name="product_rule",
+            description=f"Product rule ({direction})",
         )
 
     def _leaf_sp(self, expr):
-        def _expand_term(term):
-            if isinstance(term, Derivative):
-                return term  # bare Derivative → already conservative
-            if not isinstance(term, Mul):
-                return term
+        # Per-term dispatch even if we happen to receive a multi-term Add
+        # directly (e.g. when called without going through Expression.apply).
+        return sum(
+            (self._one_term(t) for t in Add.make_args(sp.expand(expr))),
+            S.Zero,
+        )
+
+    def _one_term(self, term):
+        # Forward: bare Derivative whose inner is a product or integer power.
+        if (self._direction in ("forward", "both")
+                and isinstance(term, Derivative)
+                and len(term.variables) == 1):
+            var = term.variables[0]
+            inner = term.args[0]
+            if isinstance(inner, Mul) and len(inner.args) >= 2:
+                factors = inner.args
+                return sum(
+                    (Mul(*(factors[j] for j in range(len(factors)) if j != i))
+                     * Derivative(factors[i], var)
+                     for i in range(len(factors))),
+                    S.Zero,
+                )
+            if isinstance(inner, sp.Pow):
+                base, exp = inner.args
+                if isinstance(exp, sp.Integer) and int(exp) >= 2:
+                    n = int(exp)
+                    return n * base**(n - 1) * Derivative(base, var)
+            return term
+        # Inverse: Mul with exactly one Derivative factor.
+        if (self._direction in ("inverse", "both")
+                and isinstance(term, Mul)):
             factors = list(term.args)
             derivs = [f for f in factors if isinstance(f, Derivative)]
             if len(derivs) != 1:
                 return term
             d = derivs[0]
-            if len(d.variables) != 1 or d.variables[0] not in self._vars:
+            if len(d.variables) != 1:
                 return term
             var = d.variables[0]
             inner = d.args[0]
-            coeff = Mul(*(f for f in factors if f is not d)) if len(factors) > 1 else S.One
-            if var not in coeff.free_symbols:
-                return term  # already conservative
-            return (sp.Derivative(coeff * inner, var)
-                    - sp.Derivative(coeff, var).doit() * inner)
-
-        return sum((_expand_term(t) for t in Add.make_args(sp.expand(expr))), S.Zero)
-
-
-class ProductRule(Operation):
-    """Inverse product rule: combine ``coeff · d(f)/dx`` into ``d(F)/dx``.
-
-    Applied to a single term (use ``expr.terms[i].apply(ProductRule())``).
-    Detects the derivative in the term, checks if the remaining coefficient
-    can be integrated w.r.t. the differentiated variable, and combines.
-
-    Example: ``g·h·∂h/∂x → ∂/∂x(g·h²/2)``
-    """
-
-    def __init__(self):
-        super().__init__(
-            name="product_rule",
-            description="Inverse product rule: coeff·∂f/∂x → ∂(F)/∂x",
-        )
-
-    def _leaf_sp(self, expr):
-        from sympy import Derivative, Mul
-
-        # Find the derivative factor in the term
-        factors = Mul.make_args(expr)
-        deriv_factor = None
-        other_factors = []
-        for f in factors:
-            if isinstance(f, Derivative) and deriv_factor is None:
-                deriv_factor = f
-            else:
-                other_factors.append(f)
-
-        if deriv_factor is None:
-            return expr  # no derivative found, nothing to do
-
-        inner = deriv_factor.args[0]
-        var = deriv_factor.variables[0]
-        coeff = sp.Mul(*other_factors) if other_factors else S.One
-
-        # Check if coeff is proportional to inner^n
-        # Common case: coeff = c * inner → term = c * inner * d(inner)/dx = c * d(inner²/2)/dx
-        if coeff.has(inner):
-            ratio = sp.simplify(coeff / inner)
-            if not ratio.has(inner):
-                flux = ratio * inner**2 / 2
-                return Derivative(flux, var)
-
-        # General case: coeff doesn't contain inner
-        # term = coeff * d(inner)/dx = d(coeff * inner)/dx - d(coeff)/dx * inner
-        # Only useful if d(coeff)/dx = 0 (coeff is constant w.r.t. var)
-        if not coeff.has(var):
-            flux = coeff * inner
-            return Derivative(flux, var)
-
-        return expr  # can't simplify
+            coeff_factors = [f for f in factors if f is not d]
+            coeff = Mul(*coeff_factors) if coeff_factors else S.One
+            return (Derivative(coeff * inner, var)
+                    - Derivative(coeff, var).doit() * inner)
+        return term
 
     def _repr_latex_(self):
         return ""
@@ -3237,7 +3420,15 @@ def _simplify_preserve_integrals(expr):
     #   Safe because Pass 2 already collapsed the problematic rational
     #   forms; re-absorbing ``-1`` / ``1/2`` / etc. cannot resurrect them.
     #
-    # Linearity only: neither pass chain-rules through ``Derivative(u², x)``
+    # Product-rule recombine (``h·∂_t α + α·∂_t h → ∂_t(h·α)``) is
+    # **not** applied automatically — it's a deliberate user step.
+    # Apply ``ProductRule()`` (default inverse) to one sibling; the
+    # residual cancels the other under the next ``.simplify()`` pass
+    # via sympy Add's combine-like-terms.  The automatic simplify
+    # deliberately stays narrow so the user decides when the collapse
+    # is the right move.
+    #
+    # Linearity only: no pass chain-rules through ``Derivative(u², x)``
     # or ``Derivative(u·w, z)`` — conservative shapes stay intact so
     # ``Integrate(..., method="auto")`` can still Leibniz / fund-thm.
     # ``Derivative(Integral(...))`` is already protected above.
