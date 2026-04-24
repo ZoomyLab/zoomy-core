@@ -924,7 +924,7 @@ class Expression(SymbolicBase):
         return f"Expression{label}: {short}"
 
     def _repr_latex_(self):
-        return f"${sp.latex(self.expr)}$"
+        return f"${self.latex(strip_args=True)}$"
 
     def _sympy_(self):
         return self.expr
