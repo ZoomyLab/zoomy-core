@@ -2600,10 +2600,11 @@ class ProductRule(Operation):
         ``coeff · ∂_v(f)  →  ∂_v(coeff · f)  −  ∂_v(coeff).doit() · f``
 
     The second piece is the residual that keeps the rewrite an exact
-    identity.  When ``coeff`` is constant in ``v``, the residual
-    vanishes and the result is simply ``∂_v(coeff · f)`` (trivial
-    collapse).  Bare ``Derivative`` terms are left alone so that
-    ``Integrate(method="auto")`` can Leibniz / fund-thm them.
+    identity.  Already-conservative terms (``coeff`` free of ``v``)
+    are left untouched — they'd produce a zero residual and churn
+    simplify needlessly.  Bare ``Derivative`` terms are also left
+    alone so that ``Integrate(method="auto")`` can Leibniz / fund-thm
+    them.
 
     ``direction="forward"`` — term is a bare
     ``Derivative(Π f_i, v)`` or ``Derivative(f**n, v)``:
@@ -2616,6 +2617,16 @@ class ProductRule(Operation):
     leaf-wide it will break apart conservative forms that
     ``Integrate`` relies on.
 
+    ``variables=None`` (default) — act on derivatives w.r.t. any
+    ``Symbol`` named ``t``, ``x``, ``y``, or ``z`` (the conventional
+    independent coordinates).  Derivatives in layer-height functions,
+    test-function indices, or other auxiliaries are left alone —
+    which keeps multi-layer derivations tractable by avoiding
+    expensive ``.doit()`` chain-rule expansions on coefficients whose
+    only dependence on the differentiation variable is through a
+    layered basis argument.  Pass ``variables=[state.t, state.x, ...]``
+    for an explicit whitelist by Symbol identity.
+
     The operation is strictly *local*: no cross-term recombination.
     To turn ``h·∂_t α + α·∂_t h`` into ``∂_t(h·α)``, apply
     :class:`ProductRule` to **one** sibling only; the residual produced
@@ -2624,18 +2635,28 @@ class ProductRule(Operation):
     """
 
     _DIRECTIONS = ("inverse", "forward", "both")
+    _DEFAULT_COORD_NAMES = frozenset({"t", "x", "y", "z"})
 
-    def __init__(self, direction="inverse"):
+    def __init__(self, variables=None, direction="inverse"):
         if direction not in self._DIRECTIONS:
             raise ValueError(
                 f"ProductRule direction must be one of "
                 f"{self._DIRECTIONS!r}; got {direction!r}."
             )
         self._direction = direction
-        super().__init__(
-            name="product_rule",
-            description=f"Product rule ({direction})",
-        )
+        self._vars = tuple(variables) if variables is not None else None
+        if variables is None:
+            desc = (f"Product rule ({direction}) on d/d{{t,x,y,z}} "
+                    "by default coord-name match")
+        else:
+            desc = (f"Product rule ({direction}) on "
+                    f"{{{', '.join(str(v) for v in variables)}}}")
+        super().__init__(name="product_rule", description=desc)
+
+    def _var_allowed(self, var):
+        if self._vars is not None:
+            return var in self._vars
+        return getattr(var, "name", None) in self._DEFAULT_COORD_NAMES
 
     def _leaf_sp(self, expr):
         # Per-term dispatch even if we happen to receive a multi-term Add
@@ -2651,6 +2672,8 @@ class ProductRule(Operation):
                 and isinstance(term, Derivative)
                 and len(term.variables) == 1):
             var = term.variables[0]
+            if not self._var_allowed(var):
+                return term
             inner = term.args[0]
             if isinstance(inner, Mul) and len(inner.args) >= 2:
                 factors = inner.args
@@ -2677,9 +2700,17 @@ class ProductRule(Operation):
             if len(d.variables) != 1:
                 return term
             var = d.variables[0]
+            if not self._var_allowed(var):
+                return term
             inner = d.args[0]
             coeff_factors = [f for f in factors if f is not d]
             coeff = Mul(*coeff_factors) if coeff_factors else S.One
+            # Already-conservative shortcut: coeff free of var means the
+            # residual ∂_v(coeff)·f vanishes, so the rewrite would just
+            # re-wrap the term with no gain — skip entirely to save the
+            # per-term .doit() + simplify churn.
+            if var not in coeff.free_symbols:
+                return term
             return (Derivative(coeff * inner, var)
                     - Derivative(coeff, var).doit() * inner)
         return term
