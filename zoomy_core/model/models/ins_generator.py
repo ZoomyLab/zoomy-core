@@ -2272,7 +2272,8 @@ class ZetaTransform(Operation):
             self._z, self._lower, self._upper, self._h, self._zeta,
         )
 
-        def _transform(e):
+        def _transform_outer(e):
+            """Pass 1: map full-layer ``∫_lower^upper f(z) dz`` → ``h·∫_0^1 f(ζ·h+lower) dζ``."""
             if isinstance(e, Integral):
                 integrand = e.args[0]
                 limits = e.args[1]
@@ -2284,17 +2285,57 @@ class ZetaTransform(Operation):
                     return Integral(new_integrand, (zeta, S.Zero, S.One))
                 return e
             if isinstance(e, Derivative):
-                inner = _transform(e.args[0])
+                inner = _transform_outer(e.args[0])
                 if inner != e.args[0]:
                     return Derivative(inner, *e.args[1:])
                 return e
             if e.args:
-                new_args = [_transform(a) for a in e.args]
+                new_args = [_transform_outer(a) for a in e.args]
                 if any(n != o for n, o in zip(new_args, e.args)):
                     return e.func(*new_args)
             return e
 
-        return _transform(expr)
+        # Pass 2 converts a *running* integral ``∫_lower^z f(z') dz'`` (produced
+        # by e.g. the w-closure) that's ended up with its upper bound
+        # substituted by Pass 1 — so it now reads ``∫_lower^{ζ·h+lower} f(z) dz``
+        # — into ζ-space ``h·∫_0^ζ f(ζ'·h+lower) dζ'``.  Without this step
+        # EvaluateIntegrals gets handed a mixed-space integral (z-integration
+        # variable, ζ-dependent upper bound) and sympy.integrate has to chew
+        # through the polynomial layer-expansion of the integrand, slowly.
+        zeta_prime = sp.Dummy(f"{zeta}_prime", positive=True)
+        running_upper = zeta * h + lower
+
+        def _transform_running(e):
+            if isinstance(e, Integral):
+                integrand = e.args[0]
+                limits = e.args[1]
+                if (len(limits) == 3
+                        and limits[0] == z
+                        and limits[1] == lower):
+                    bound_diff = limits[2] - running_upper
+                    if (bound_diff == 0
+                            or (hasattr(bound_diff, "is_zero") and bound_diff.is_zero)
+                            or sp.simplify(bound_diff) == 0):
+                        inner = _transform_running(integrand)
+                        new_integrand = inner.subs(z, zeta_prime * h + lower) * h
+                        return Integral(new_integrand,
+                                        (zeta_prime, S.Zero, zeta))
+                new_integrand = _transform_running(integrand)
+                if new_integrand is not integrand:
+                    return Integral(new_integrand, *e.args[1:])
+                return e
+            if isinstance(e, Derivative):
+                inner = _transform_running(e.args[0])
+                if inner != e.args[0]:
+                    return Derivative(inner, *e.args[1:])
+                return e
+            if e.args:
+                new_args = [_transform_running(a) for a in e.args]
+                if any(n != o for n, o in zip(new_args, e.args)):
+                    return e.func(*new_args)
+            return e
+
+        return _transform_running(_transform_outer(expr))
 
     def _repr_latex_(self):
         return (f"$z = \\zeta \\cdot ({sp.latex(self._upper)} - "
