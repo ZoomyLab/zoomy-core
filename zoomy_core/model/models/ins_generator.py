@@ -206,7 +206,7 @@ class Expression(SymbolicBase):
 
     @property
     def terms(self):
-        expanded = sp.expand(self.expr)
+        expanded = _expand_preserve_integrals(self.expr)
         raw = Add.make_args(expanded)
         return [Expression(t, f"{self.name}[{i}]") for i, t in enumerate(raw)]
 
@@ -651,7 +651,7 @@ class Expression(SymbolicBase):
         simplifying = not any(isinstance(c, Operation) for c in conditions)
         new_tags = {}
         pieces = []
-        for term in Add.make_args(sp.expand(self.expr)):
+        for term in Add.make_args(_expand_preserve_integrals(self.expr)):
             if term == S.Zero:
                 continue
             parent_tag = self._term_tags.get(term)
@@ -660,7 +660,7 @@ class Expression(SymbolicBase):
                 result = _apply_one(result, cond)
             if simplifying:
                 result = _simplify_preserve_integrals(result)
-            for sub in Add.make_args(sp.expand(result)):
+            for sub in Add.make_args(_expand_preserve_integrals(result)):
                 if sub == S.Zero:
                     continue
                 pieces.append(sub)
@@ -675,7 +675,7 @@ class Expression(SymbolicBase):
         # cancelled ones silently disappear.
         if simplifying:
             new_expr = _simplify_preserve_integrals(new_expr)
-            current = set(Add.make_args(sp.expand(new_expr)))
+            current = set(Add.make_args(_expand_preserve_integrals(new_expr)))
             new_tags = {t: name for t, name in new_tags.items() if t in current}
 
         # Solver tags: drop any whose stored expression was touched by
@@ -691,21 +691,6 @@ class Expression(SymbolicBase):
                     new_solver_groups[tag] = group_expr
 
         return Expression(new_expr, self.name,
-                          term_tags=new_tags, tag_order=self._tag_order,
-                          solver_groups=new_solver_groups)
-
-    def simplify(self):
-        """Return a new Expression with sympy simplification applied."""
-        simplified = sp.simplify(self.expr)
-        new_groups = None
-        # Cleanup: keep only tags whose term is still present post-simplify.
-        current = set(Add.make_args(sp.expand(simplified)))
-        new_tags = {t: name for t, name in self._term_tags.items() if t in current}
-        new_solver_groups = None
-        if self._solver_groups:
-            new_solver_groups = {t: g for t, g in self._solver_groups.items()
-                                 if sp.simplify(g) == g}
-        return Expression(simplified, self.name,
                           term_tags=new_tags, tag_order=self._tag_order,
                           solver_groups=new_solver_groups)
 
@@ -797,16 +782,29 @@ class Expression(SymbolicBase):
                             method = "leibniz"
                             break
 
+        # Running integrals have ``upper == var``.  In that case the outer
+        # ``var`` is also the integration variable, which sympy accepts as
+        # shadowing but which downstream tools struggle with.  Rebind the
+        # integration variable to a fresh ``\hat{<var>}`` Dummy so the
+        # integral is cleanly bound.  The outer ``var`` remains free,
+        # available for later ζ-transform / basis expansion.
+        if upper == var:
+            bound_var = sp.Dummy(rf"\hat{{{var}}}", positive=True)
+            expr_bound = expr.subs(var, bound_var)
+        else:
+            bound_var = var
+            expr_bound = expr
+
         if method == "fundamental_theorem":
             # int df/dz dz = f(upper) - f(lower)
-            inner, coeff = _extract_derivative(expr, var)
+            inner, coeff = _extract_derivative(expr_bound, bound_var)
             if inner is None:
                 raise ValueError(
                     f"No Derivative w.r.t. {var} found for fundamental theorem: {expr}"
                 )
             f = coeff * inner
-            f_upper = sp.Subs(f, var, upper)
-            f_lower = sp.Subs(f, var, lower)
+            f_upper = sp.Subs(f, bound_var, upper)
+            f_lower = sp.Subs(f, bound_var, lower)
             return DepthIntegralResult(
                 volume=Expression(S.Zero, f"ft_volume({self.name})"),
                 boundary_upper=Expression(f_upper, f"ft_upper({self.name})"),
@@ -815,23 +813,23 @@ class Expression(SymbolicBase):
 
         elif method == "leibniz":
             # int df/dx dz = d/dx[int f dz] - f(upper)*d(upper)/dx + f(lower)*d(lower)/dx
-            for s in list(expr.free_symbols) + [Symbol("x"), Symbol("t")]:
-                if s == var:
+            for s in list(expr_bound.free_symbols) + [Symbol("x"), Symbol("t")]:
+                if s == bound_var or s == var:
                     continue
-                inner, coeff = _extract_derivative(expr, s)
+                inner, coeff = _extract_derivative(expr_bound, s)
                 if inner is not None:
                     break
             else:
                 raise ValueError(f"No horizontal Derivative found for Leibniz: {expr}")
 
             # Volume: d/dx[int f dz]
-            int_f = Integral(coeff * inner, (var, lower, upper))
+            int_f = Integral(coeff * inner, (bound_var, lower, upper))
             volume = Derivative(int_f, s)
 
             # Boundary terms: use Subs to keep evaluation explicit
             f = coeff * inner
-            f_at_upper = sp.Subs(f, var, upper)
-            f_at_lower = sp.Subs(f, var, lower)
+            f_at_upper = sp.Subs(f, bound_var, upper)
+            f_at_lower = sp.Subs(f, bound_var, lower)
             bnd_upper = -f_at_upper * Derivative(upper, s)
             bnd_lower = f_at_lower * Derivative(lower, s)
 
@@ -843,7 +841,7 @@ class Expression(SymbolicBase):
 
         else:  # direct
             return Expression(
-                Integral(expr, (var, lower, upper)),
+                Integral(expr_bound, (bound_var, lower, upper)),
                 f"integral({self.name})",
             )
 
@@ -851,19 +849,19 @@ class Expression(SymbolicBase):
         # Per-term substitution with tag inheritance, then cleanup.
         new_tags = {}
         pieces = []
-        for term in Add.make_args(sp.expand(self.expr)):
+        for term in Add.make_args(_expand_preserve_integrals(self.expr)):
             if term == S.Zero:
                 continue
             parent_tag = self._term_tags.get(term)
             sub = term.subs(*args, **kwargs)
-            for piece in Add.make_args(sp.expand(sub)):
+            for piece in Add.make_args(_expand_preserve_integrals(sub)):
                 if piece == S.Zero:
                     continue
                 pieces.append(piece)
                 if parent_tag is not None:
                     new_tags[piece] = parent_tag
         new_expr = sum(pieces, S.Zero)
-        current = set(Add.make_args(sp.expand(new_expr)))
+        current = set(Add.make_args(_expand_preserve_integrals(new_expr)))
         new_tags = {t: name for t, name in new_tags.items() if t in current}
         new_solver_groups = None
         if self._solver_groups:
@@ -1319,29 +1317,97 @@ from sympy.printing.latex import LatexPrinter as _LatexPrinter
 
 
 class _StripArgsLatexPrinter(_LatexPrinter):
-    """LaTeX printer that renders function calls cleanly:
+    """LaTeX printer for function calls.
 
-    - ``u(t,x,z)`` → ``u``  (standard args stripped)
-    - ``u(t,x,b+h)`` → ``u|_{z=b+h}``  (boundary evaluation shown)
-    - ``Subs(u(t,x,z), z, b)`` → ``u|_{z=b}``  (via sympy Subs printing)
+    One unified rule.  Each function shape has a *canonical* call —
+    a tuple of "natural" arguments where the call should be displayed
+    bare (just the function name, no parentheses).  When the actual
+    call deviates in its **last** argument only, the deviation is
+    rendered as a *restriction* ``f|_{var=value}``.  Anything else
+    falls through to the full ``f(args)`` form.
 
-    Horizontal functions (b, h, p_atm with fewer args) always stripped.
+    Shapes recognised:
+
+    ===========  ============  ================================
+    arity        canonical     restriction-bar variable
+    ===========  ============  ================================
+    ``f(t,x)``   ``(t, x)``    *none — purely horizontal, strip*
+    ``f(t,x,y)`` ``(t, x, y)`` *none — 3D horizontal, strip*
+    ``f(t,x,z)`` ``(t, x, z)`` ``z``  — vertical / 2D vertical
+    ``f(t,x,y,z)`` ``(t,x,y,z)`` ``z`` — vertical / 3D vertical
+    ``f(ζ)``     ``(ζ,)``      ``ζ``  — basis test functions
+    ===========  ============  ================================
+
+    Examples (in 2D)::
+
+        u(t, x, z)         →  u
+        u(t, x, b+h)       →  u|_{z=b+h}
+        b(t, x)            →  b
+        phi_0(zeta)        →  phi_0
+        phi_0(0)           →  phi_0|_{ζ=0}
+        phi_0((z-b)/h)     →  phi_0|_{ζ=(z-b)/h}
+        Subs(u(t,x,z),z,b) →  u|_{z=b}        (via sympy's Subs printer)
     """
 
-    # The vertical coordinate symbol — functions with this as last arg are "standard"
+    _t = sp.Symbol("t", real=True)
+    _x = sp.Symbol("x", real=True)
+    _y = sp.Symbol("y", real=True)
     _z = sp.Symbol("z", real=True)
+    _zeta = sp.Symbol("zeta", real=True)
 
     def _print_Function(self, expr, exp=None):
         name = expr.func.__name__
         tex = self._deal_with_super_sub(name)
         args = expr.args
 
-        # Check if this is a 3D function (u, w, tau_xx, ...) evaluated at a boundary
-        # Heuristic: if last arg is NOT z and the function has 3+ args, it's a boundary eval
-        if len(args) >= 3 and args[-1] != self._z:
-            z_val = args[-1]
-            z_tex = self.doprint(z_val)
-            tex = r"\left. %s \right|_{\substack{ z=%s }}" % (tex, z_tex)
+        # Identify the shape: which symbols are "natural", and which
+        # symbol — if any — is the restriction-bar variable.
+        bar_var = None
+        bar_value = None
+        recognised = False
+        if (len(args) == 2
+                and args[0] == self._t and args[1] == self._x):
+            # f(t, x) — horizontal, no restriction.
+            recognised = True
+        elif (len(args) == 3
+              and args[0] == self._t and args[1] == self._x
+              and args[2] == self._y):
+            # f(t, x, y) — 3D horizontal, no restriction.
+            recognised = True
+        elif (len(args) == 3
+              and args[0] == self._t and args[1] == self._x):
+            # f(t, x, z) — 2D vertical.  Last arg is the bar variable.
+            bar_var, bar_value = self._z, args[2]
+            recognised = True
+        elif (len(args) == 4
+              and args[0] == self._t and args[1] == self._x
+              and args[2] == self._y):
+            # f(t, x, y, z) — 3D vertical.
+            bar_var, bar_value = self._z, args[3]
+            recognised = True
+        elif len(args) == 1:
+            # f(ζ) — basis-style: the single arg is the bar variable.
+            # The basis is naturally on the reference interval [0, 1]
+            # (we write ``phi_k((z − b)/h)`` for the physical column);
+            # the reference coordinate is ``ζ``, so:
+            # ``phi_k(zeta)``         → ``phi_k``
+            # ``phi_k(0)`` / ``phi_k(1)`` → ``phi_k|_{ζ=0}`` / ``|_{ζ=1}``
+            # ``phi_k((z-b)/h)``      → ``phi_k|_{ζ=(z-b)/h}``
+            bar_var, bar_value = self._zeta, args[0]
+            recognised = True
+
+        if recognised:
+            if bar_var is not None and bar_value != bar_var:
+                value_tex = self.doprint(bar_value)
+                var_tex = self.doprint(bar_var)
+                tex = r"\left. %s \right|_{\substack{ %s=%s }}" % (
+                    tex, var_tex, value_tex)
+            # else: canonical call — strip args entirely.
+        else:
+            # Unknown shape: keep the full f(args) form so nothing
+            # gets silently hidden.
+            arg_tex = ", ".join(self.doprint(a) for a in args)
+            tex = r"%s\!\left(%s\right)" % (tex, arg_tex)
 
         if exp is not None:
             tex = r"%s^{%s}" % (tex, exp)
@@ -1870,6 +1936,7 @@ def _rule_fundamental_theorem(integrand, limits):
     return antideriv.subs(var, hi) - antideriv.subs(var, lo)
 
 
+@register_integration_rule
 def _rule_derivative_of_polynomial(integrand, limits):
     """``∫_lo^hi ∂_y f(var) dvar`` with ``f`` polynomial in ``var``
     and a single differentiation variable ``y ≠ var``.
@@ -1885,15 +1952,8 @@ def _rule_derivative_of_polynomial(integrand, limits):
     forms in ``∂_y ∂_var f`` denominators — the exact trap that
     surfaced in the SME shear-moment residual.
 
-    Not registered by default.  Sympy's rational form is
-    structurally more compact than our Leibniz expansion for the
-    rest of the SME pipeline, even though it carries the
-    ``1/Derivative(state, y)`` denominators; the polynomial form
-    produces many more atomic terms that don't re-combine under
-    the standard simplify fixpoint.  Users who want to replace
-    sympy's rational form with the polynomial Leibniz form can
-    opt in via ``register_integration_rule(
-    _rule_derivative_of_polynomial)``.
+    Registered by default: the no-rationals invariant trumps the
+    slightly-less-compact Leibniz expansion.
 
     Skips higher-order ``∂²_y f`` integrands (not a product-rule
     case) and mixed ``∂_y ∂_var f`` (delegated to
@@ -1920,31 +1980,37 @@ def _rule_derivative_of_polynomial(integrand, limits):
         # (and the rule would accidentally treat the integrand as a
         # zero-degree polynomial).  Let the fallback handle it.
         return None
+    # Sympy's ``Derivative(var · g, y)`` stays unevaluated even though
+    # ``var`` is independent of ``y`` and could be pulled out as a
+    # coefficient.  ``Poly(..., var)`` fails on such Derivative atoms
+    # because they "contain a generator".  Evaluate Derivative atoms
+    # structurally (without running ``.doit()`` on nested Integrals /
+    # Subs which we want to preserve) so ``var`` factors surface.
+    def _doit_only_derivatives(e):
+        if isinstance(e, Derivative):
+            return e.doit()
+        if e.args:
+            new = tuple(_doit_only_derivatives(a) for a in e.args)
+            if any(n is not o for n, o in zip(new, e.args)):
+                return e.func(*new)
+        return e
+    inner = _doit_only_derivatives(inner)
+    inner = sp.expand(inner)
     try:
         sp.Poly(inner, var)
     except (sp.PolynomialError, sp.CoercionFailed, sp.GeneratorsNeeded):
         return None
-    # Narrow override: only replace sympy's result when it contains
-    # the pathology — a rational with a ``Derivative`` in the
-    # denominator.  Sympy's own antiderivative is shorter and
-    # cancels better for every other shape.
-    try:
-        sympy_result = sp.integrate(integrand, limits)
-    except Exception:
-        return None
-    if isinstance(sympy_result, Integral):
-        # Sympy couldn't integrate — fall through to the main fallback
-        # (our rule's polynomial form wouldn't help either in general).
-        return None
-    if not _has_derivative_denominator(sympy_result):
-        return sympy_result  # sympy's form is clean — take it.
-    # Pathology confirmed.  Build the Leibniz form instead:
+    # The polynomial-Leibniz form never builds rationals:
     #   ∫_lo^hi ∂_y f dvar  =  ∂_y[∫_lo^hi f dvar]
     #                         − f(hi)·∂_y hi + f(lo)·∂_y lo
-    # ``∫ f dvar`` is pure polynomial (sympy handles this branch
-    # cleanly); the surface terms only fire when bounds depend on
-    # ``y``.
-    inner_integrated = sp.integrate(inner, (var, lo, hi))
+    # ``∫ f dvar`` is pure polynomial (via ``sp.Poly``); the surface
+    # terms only fire when bounds depend on ``y``.  This is always
+    # the right answer when the Poly build above succeeds, so return
+    # it unconditionally — sympy's ``u-sub antiderivative`` trap is
+    # the default disease we're curing, and even when sympy's form is
+    # clean for other shapes, this form is equally valid.
+    inner_integrated = sp.Poly(inner, var).integrate().as_expr()
+    inner_integrated = inner_integrated.subs(var, hi) - inner_integrated.subs(var, lo)
     main = Derivative(inner_integrated, y)
     surface = S.Zero
     if hi.has(y):
@@ -1952,6 +2018,45 @@ def _rule_derivative_of_polynomial(integrand, limits):
     if lo.has(y):
         surface += inner.subs(var, lo) * Derivative(lo, y)
     return main + surface
+
+
+@register_integration_rule
+def _rule_polynomial_integrand(integrand, limits):
+    """``∫_lo^hi poly(var) dvar`` via ``sp.Poly.integrate`` — strictly
+    polynomial, no ``sp.integrate`` call that might invoke rational
+    routines (u-sub, together, cancel).
+
+    Applies to any integrand that, after a structural Derivative
+    evaluation pre-pass, is a polynomial in ``var`` with coefficients
+    that may contain unevaluated ``Derivative`` / ``Subs`` / other
+    symbolic atoms.  Registered *after* the Derivative-of-polynomial
+    rule so the outer-derivative shape wins when both apply.
+    """
+    var, lo, hi = limits[0], limits[1], limits[2]
+    expr = integrand
+    # Distribute linear derivatives (``Derivative(var·f, y) → var·∂_y f``)
+    # so ``var`` surfaces as a polynomial generator.  Only walk
+    # ``Derivative`` atoms — don't ``.doit()`` Integrals / Subs we
+    # want preserved.
+    def _doit_derivs(e):
+        if isinstance(e, Derivative):
+            return e.doit()
+        if e.args:
+            new = tuple(_doit_derivs(a) for a in e.args)
+            if any(n is not o for n, o in zip(new, e.args)):
+                return e.func(*new)
+        return e
+    expr = _doit_derivs(expr)
+    expr = sp.expand(expr)
+    if not expr.has(var):
+        # ``var``-free integrand → result is ``(hi − lo) · expr``.
+        return (hi - lo) * expr
+    try:
+        poly = sp.Poly(expr, var)
+    except (sp.PolynomialError, sp.CoercionFailed, sp.GeneratorsNeeded):
+        return None
+    anti = poly.integrate().as_expr()
+    return anti.subs(var, hi) - anti.subs(var, lo)
 
 
 def _has_derivative_denominator(expr):
@@ -2043,6 +2148,166 @@ class EvaluateIntegrals(Operation):
         return result
 
 
+class ProjectBasisIntegrals(Operation):
+    """Resolve every ``Integral(..., (ζ, a, b))`` via basis-aware cache lookup.
+
+    Replaces the old "expand polynomial basis + run ``sympy.integrate``"
+    chain.  Every integral whose integrand contains opaque ``phi_k(arg)``
+    nodes is mapped to a :class:`BasisIntegralCache` query, with
+    ``ζ``-independent factors pulled out first so the kernel the cache
+    sees is a clean basis-only product.
+
+    Steps, applied per leaf expression:
+
+    1. **Canonicalize Subs** — rewrite ``Subs(Derivative(phi_k(ξ), ξ), ξ, arg)``
+       (the sympy chain-rule leftover) back to
+       ``Derivative(phi_k(arg), arg)``.
+    2. **Distribute Adds** — ``Integral(Add(t1, t2), …) → Σ Integral(ti, …)``
+       so each term can be factored independently.
+    3. **Factor constants out + cache query** — for each
+       ``Integral(kernel, (var, a, b))``:
+
+       * split the Mul integrand into ``var``-independent factor ``C``
+         and ``var``-dependent kernel ``K``;
+       * if ``K`` contains any ``phi_k``, hand ``K`` to the cache and
+         multiply its result by ``C``;
+       * otherwise leave the Integral alone.
+
+    The cache returns a sympy scalar / polynomial; nested running
+    integrals inside ``K`` get evaluated via the cache too (their
+    polynomial results are substituted into the outer integrand on the
+    next pass, and the fixpoint loop below handles this).
+
+    No ``sympy.integrate`` is ever called on an opaque ``phi_k``: the
+    cache concretizes ``phi_k`` against the basis polynomial first, then
+    does polynomial integration only.
+    """
+
+    def __init__(self, basis_cache, name="project_basis_integrals",
+                 description=None):
+        super().__init__(
+            name=name,
+            description=description or (
+                "Resolve volume integrals via BasisIntegralCache lookup"),
+        )
+        self.basis_cache = basis_cache
+
+    def _leaf_sp(self, expr):
+        from sympy import Add, Derivative, Integral, Mul, Subs
+
+        # ------------------ Pass 1: canonicalize Subs of phi-derivatives
+        def _canon(e):
+            if isinstance(e, Subs):
+                inner = e.args[0]
+                subs_vars = e.args[1]
+                subs_vals = e.args[2]
+                if (isinstance(inner, Derivative)
+                        and isinstance(inner.args[0], sp.Function)
+                        and getattr(inner.args[0].func, "__name__", "")
+                        .startswith("phi_")
+                        and len(subs_vars) == 1
+                        and len(subs_vals) == 1
+                        and inner.args[0].args[0] == subs_vars[0]):
+                    fn = inner.args[0].func
+                    arg = subs_vals[0]
+                    return Derivative(fn(arg), arg)
+            if e.args:
+                new_args = tuple(_canon(a) for a in e.args)
+                if any(n is not o for n, o in zip(new_args, e.args)):
+                    return e.func(*new_args)
+            return e
+
+        # ------------------ Pass 2: distribute Integral over Add
+        def _distribute(e):
+            if isinstance(e, Integral):
+                integrand = _distribute(e.args[0])
+                limits = e.args[1:]
+                if isinstance(integrand, Add):
+                    return Add(*(Integral(t, *limits) for t in integrand.args))
+                if integrand is not e.args[0]:
+                    return Integral(integrand, *limits)
+                return e
+            if e.args:
+                new_args = tuple(_distribute(a) for a in e.args)
+                if any(n is not o for n, o in zip(new_args, e.args)):
+                    return e.func(*new_args)
+            return e
+
+        def _has_phi(e):
+            if (isinstance(e, sp.Function)
+                    and getattr(e.func, "__name__", "").startswith("phi_")):
+                return True
+            if e.args:
+                return any(_has_phi(a) for a in e.args)
+            return False
+
+        # ------------------ Pass 3: factor + query cache
+        def _map(e):
+            if isinstance(e, Integral):
+                integrand = _map(e.args[0])
+                limits = e.args[1]
+                if len(limits) != 3:
+                    if integrand is not e.args[0]:
+                        return Integral(integrand, *e.args[1:])
+                    return e
+                var, a, b = limits
+                # split integrand into var-independent const × var-dependent kernel
+                if isinstance(integrand, Mul):
+                    consts, kern_parts = [], []
+                    for f in integrand.args:
+                        (kern_parts if f.has(var) else consts).append(f)
+                    const = Mul(*consts) if consts else sp.S.One
+                    kernel = Mul(*kern_parts) if kern_parts else sp.S.One
+                elif integrand.has(var):
+                    const, kernel = sp.S.One, integrand
+                else:
+                    return integrand * (b - a)
+                if _has_phi(kernel):
+                    value = self.basis_cache.integrate(kernel, var, a, b)
+                    return const * value
+                if integrand is not e.args[0]:
+                    return Integral(integrand, *e.args[1:])
+                return e
+            if e.args:
+                new_args = tuple(_map(a) for a in e.args)
+                if any(n is not o for n, o in zip(new_args, e.args)):
+                    return e.func(*new_args)
+            return e
+
+        # Resolve leftover boundary Subs ``Subs(f(z), z, b|η)`` that came
+        # out of the Leibniz rule.  At this point in the pipeline there
+        # are no more pending chain-rule-through-val ambiguities — any
+        # inner ``Derivative(g(z), z)`` genuinely means ``g'(z)|_{z=…}``
+        # and ``Subs.doit()`` handles it correctly.
+        def _resolve_subs_doit(e):
+            if isinstance(e, sp.Subs):
+                return e.doit()
+            if e.args:
+                new_args = tuple(_resolve_subs_doit(a) for a in e.args)
+                if any(n is not o for n, o in zip(new_args, e.args)):
+                    return e.func(*new_args)
+            return e
+
+        result = _canon(expr)
+        result = _distribute(result)
+        # Alternate map / Subs-resolution until fixpoint.  Each map pass
+        # may expose fresh ``Subs(_, z, b|η)`` boundary terms whose
+        # inner has ``phi_k((z-b)/h)·…``; resolving those produces
+        # ``phi_k(0)`` / ``phi_k(1)``.  Running integrals nested inside
+        # outer integrands also resolve in inside-out order across
+        # iterations.  Any ``phi_k(arg)`` left *outside* a volume
+        # Integral after the fixpoint is a boundary evaluation
+        # (``phi_k(0)``, ``phi_k(1)``, ``phi_k|_{z=b}``, …) — those
+        # stay symbolic on purpose.
+        for _ in range(6):
+            prev = result
+            result = _map(result)
+            result = _resolve_subs_doit(result)
+            if result == prev:
+                break
+        return result
+
+
 class SimplifyIntegrals(Operation):
     """Evaluate integrals with constant integrand and remove zero integrals.
 
@@ -2120,6 +2385,14 @@ class Integrate(Operation):
                              method="analytical"))                    # sympy.integrate
     """
 
+    # See ``_apply_leaf``: volume pieces produced by different input
+    # terms are collapsed into a single ``Integral(sum_integrand,
+    # limits)`` per ``(limits, outer-derivative-variables)`` signature,
+    # so sympy's ``Add`` canonicalization can collapse like-terms inside
+    # a single integrand.  That cross-term consolidation needs the
+    # whole leaf at once — opt out of the per-additive-term dispatch.
+    whole_leaf_op = True
+
     def __init__(self, var, lower, upper, method="auto"):
         super().__init__(
             name="integrate",
@@ -2140,26 +2413,265 @@ class Integrate(Operation):
             result = sp.integrate(integrand, (dummy, self._lower, self._upper))
             return Expression(result, expression.name)
 
-        # Per-term dispatch through Expression.depth_integrate.
-        total = Expression(S.Zero)
+        # Per-term dispatch through Expression.depth_integrate.  We group
+        # the volume pieces by ``(limits, outer-derivative-variable)`` so
+        # every term that lands on the same signature contributes to the
+        # same ``Integral(sum, limits)`` (optionally wrapped in a shared
+        # ``Derivative(..., diff_var)``).  This keeps all volume
+        # cancellations available to sympy's Add canonicalization inside
+        # a single integrand, instead of fragmenting across many
+        # ``Integral`` atoms that never recombine.  Boundary pieces are
+        # not Integrals; they pass through as-is and simplify normally.
+        volumes = {}   # (limits_tuple, diff_var_or_None) -> integrand sum (sympy)
+        boundaries = []  # list[sympy.Expr]
+
+        def _collect_volume(vol_expr):
+            """Extract (limits, diff_var, integrand) from a volume piece and
+            add to ``volumes``.  ``vol_expr`` is either ``S.Zero``,
+            ``Integral(f, lim)``, or ``Derivative(Integral(f, lim), s)``.
+            Anything else is treated as a boundary-type expression."""
+            if vol_expr == S.Zero or vol_expr == 0:
+                return
+            if isinstance(vol_expr, Derivative) and isinstance(vol_expr.args[0], Integral):
+                inner = vol_expr.args[0]
+                limits = inner.args[1]
+                diff_vars = tuple(vol_expr.args[1:])
+                key = (tuple(limits), diff_vars)
+                volumes[key] = volumes.get(key, S.Zero) + inner.args[0]
+                return
+            if isinstance(vol_expr, Integral):
+                limits = vol_expr.args[1]
+                key = (tuple(limits), None)
+                volumes[key] = volumes.get(key, S.Zero) + vol_expr.args[0]
+                return
+            # Anything else — treat as a boundary-style piece.
+            boundaries.append(vol_expr)
+
         for term in expression.terms:
             r = term.depth_integrate(self._lower, self._upper, self._var,
                                      method=self._method)
             if isinstance(r, DepthIntegralResult):
-                # DepthIntegralResult's components already carry their signs;
-                # assemble = volume + boundary_upper + boundary_lower.
-                total = total + r.assemble()
+                _collect_volume(r.volume.expr)
+                boundaries.append(r.boundary_upper.expr)
+                boundaries.append(r.boundary_lower.expr)
             elif isinstance(r, Expression):
-                total = total + r
+                # ``direct`` returns ``Expression(Integral(expr, lim))``.
+                _collect_volume(r.expr)
             else:
-                total = total + Expression(r)
-        return total
+                _collect_volume(r)
+
+        pieces = []
+        for (limits_tuple, diff_vars), integrand in volumes.items():
+            integrand = sp.expand(integrand)
+            if integrand == 0:
+                continue
+            integ = Integral(integrand, limits_tuple)
+            if diff_vars is not None:
+                integ = Derivative(integ, *diff_vars)
+            pieces.append(integ)
+        pieces.extend(boundaries)
+
+        total_sp = S.Zero
+        for p in pieces:
+            total_sp = total_sp + p
+        return Expression(total_sp, expression.name)
 
     def _repr_latex_(self):
         return (
             f"$\\int_{{{sp.latex(self._lower)}}}^{{{sp.latex(self._upper)}}} "
             f"(\\cdot)\\, d{sp.latex(self._var)}$"
         )
+
+
+class IntegralTransform(Operation):
+    """Affine change of variable applied to every ``Integral`` in an
+    expression.  Maps each integration interval to a reference interval
+    (default: the unit interval ``[0, 1]``) via the affine map:
+
+        ``var = a + (b - a) · (ref - ref_lo) / (ref_hi - ref_lo)``
+
+    with Jacobian ``|dφ/dref| = (b - a) / (ref_hi - ref_lo)``.
+
+    Unlike substitution-based approaches (``expr.subs(z, ζ·h + b)``),
+    this is strictly local to each ``Integral``: only the integration
+    variable is replaced, only inside the integrand of the Integral
+    it's bound to.  Sibling occurrences of ``var`` in the expression
+    — boundary Subs terms, the outer ``z`` of a running integral after
+    an outer transform — are untouched, because those aren't bound by
+    *this* Integral.
+
+    Nested Integrals are handled naturally: the walk recurses into
+    integrands first (bottom-up), so the innermost Integral is
+    transformed before its outer host.  After the outer transform
+    replaces ``var`` throughout its own integrand, any inner Integral's
+    now-renamed limits (in the old ``var``) get rewritten in terms of
+    the outer's reference variable — so a running integral
+    ``Integral(g(ẑ), (ẑ, b, z))`` sitting inside
+    ``Integral(f(z), (z, b, b+h))`` correctly transforms to
+    ``Integral(g(…), (ẑ′, 0, 1)) · (b + h·ζ − b)`` after the outer
+    `z → b + h·ζ` step.
+
+    Parameters
+    ----------
+    ref_interval : tuple (ref_lo, ref_hi), default ``(0, 1)``
+        The target reference interval.  Always the unit interval in
+        typical use.
+    ref_name : str, optional
+        Base name for the reference-variable Dummies (rendered with
+        a hat by default).  Each transformed Integral gets its own
+        Dummy — different Dummies never collide even with the same
+        display name.
+    """
+
+    whole_leaf_op = True
+
+    def __init__(self, ref_interval=(0, 1), ref_name=r"\hat{\zeta}",
+                 name="integral_transform", description=None):
+        super().__init__(
+            name=name,
+            description=(description or
+                         f"Affine change of variable to reference "
+                         f"interval {ref_interval}"),
+        )
+        self._ref_lo, self._ref_hi = ref_interval
+        self._ref_name = ref_name
+
+    def _leaf_sp(self, expr):
+        from sympy import Integral, Derivative
+
+        # One ``Dummy`` per nesting depth, **shared across siblings**.
+        # Two top-level Integrals on the same ``Add`` live in separate
+        # scopes and can safely share the same bound variable — and
+        # *should*, otherwise sympy's structural equality keeps them as
+        # distinct atoms and ``Add`` can't merge ``∫f dζ + ∫f dζ`` into
+        # ``2·∫f dζ`` (or cancel ``+∫f dζ − ∫f dζ`` to 0).  Nested
+        # Integrals (in an outer's integrand) are processed at the next
+        # depth, so they never collide with their host.
+        dummies_by_depth: dict[int, sp.Dummy] = {}
+
+        def _ref(depth):
+            if depth not in dummies_by_depth:
+                dummies_by_depth[depth] = sp.Dummy(
+                    f"{self._ref_name}_{{{depth}}}", positive=True)
+            return dummies_by_depth[depth]
+
+        def _transform(e, depth=0):
+            if isinstance(e, Integral):
+                # Bottom-up: transform the integrand first (one level
+                # deeper) so any nested Integrals are already in
+                # reference form before we substitute the outer var.
+                integrand = _transform(e.args[0], depth=depth + 1)
+                limits = e.args[1]
+                if len(limits) != 3:
+                    # unevaluated / indefinite — pass through.
+                    if integrand is not e.args[0]:
+                        return Integral(integrand, *e.args[1:])
+                    return e
+                var, a, b = limits
+                ref = _ref(depth)
+                span = b - a
+                ref_span = self._ref_hi - self._ref_lo
+                phi = a + span * (ref - self._ref_lo) / ref_span
+                jac = span / ref_span
+                new_integrand = integrand.subs(var, phi) * jac
+                return Integral(new_integrand,
+                                (ref, self._ref_lo, self._ref_hi))
+            if isinstance(e, Derivative):
+                inner = _transform(e.args[0], depth=depth)
+                if inner is not e.args[0]:
+                    return Derivative(inner, *e.args[1:])
+                return e
+            if e.args:
+                new_args = tuple(_transform(a, depth=depth) for a in e.args)
+                if any(n is not o for n, o in zip(new_args, e.args)):
+                    return e.func(*new_args)
+            return e
+
+        return _transform(expr)
+
+
+class IsolateBasisIntegrand(Operation):
+    """Rewrite each ``Integral(integrand, (var, a, b))`` so the
+    integrand contains *only* factors that depend on ``var``.
+
+    Two passes per Integral:
+
+    1. Distribute ``Integral(Add(t1, t2, …), …) → Σ Integral(t_i, …)``,
+       so each term can be analysed independently.
+    2. For each (now single-term) Integral, split the multiplicative
+       factors of the integrand into a ``var``-independent coefficient
+       ``C`` and a ``var``-dependent kernel ``K``, and rewrite as
+       ``C · Integral(K, (var, a, b))``.
+
+    After this, every Integral has the form ``coeff · Integral(kernel, …)``
+    where ``kernel`` only contains ``var`` (and any opaque basis
+    functions / derivatives evaluated at ``var``).  This is the shape
+    a basismatrix-lookup pattern-matches against:
+    ``∫_0^1 phi_k(z)·phi_l(z) dz``, ``∫_0^1 z·phi_k(z)·phi_l(z) dz``,
+    etc.
+
+    The Op walks Integrals bottom-up so nested running integrals are
+    isolated first.  Each Integral's integration variable ``var`` is
+    read directly from its own limit tuple — there's no ambiguity, and
+    different Integrals can carry different ``var``s (e.g. ``ζ̂_0``,
+    ``ζ̂_1``, …).
+    """
+
+    whole_leaf_op = True
+
+    def __init__(self, name="isolate_basis_integrand", description=None):
+        super().__init__(
+            name=name,
+            description=(description or
+                         "split each Integral into coeff · Integral("
+                         "var-dependent kernel, …)"),
+        )
+
+    def _leaf_sp(self, expr):
+        from sympy import Add, Integral, Mul
+
+        def _isolate(e):
+            if isinstance(e, Integral):
+                # Recurse into integrand first so nested Integrals are
+                # already in isolated form.
+                integrand = _isolate(e.args[0])
+                limits = e.args[1]
+                if not (hasattr(limits, "__len__") and len(limits) == 3):
+                    return Integral(integrand, *e.args[1:])
+                var = limits[0]
+                # Distribute Add: ∫ (a + b) dvar = ∫a dvar + ∫b dvar.
+                # We do this BEFORE factoring so each term contributes
+                # its own ``coeff · Integral(kernel, lim)`` piece.
+                terms = Add.make_args(sp.expand(integrand))
+                pieces = []
+                for term in terms:
+                    if term == S.Zero:
+                        continue
+                    # Split term into var-independent / var-dependent
+                    # factors.  Single non-Mul terms are treated as
+                    # one-element products.
+                    factors = (Mul.make_args(term) if isinstance(term, Mul)
+                               else (term,))
+                    consts = [f for f in factors if not f.has(var)]
+                    kern_parts = [f for f in factors if f.has(var)]
+                    coeff = Mul(*consts) if consts else S.One
+                    kernel = Mul(*kern_parts) if kern_parts else S.One
+                    if kernel == S.One:
+                        # Integrand has no var dependence at all —
+                        # ∫ const dvar = const · (b − a).
+                        pieces.append(coeff * (limits[2] - limits[1]))
+                    else:
+                        pieces.append(
+                            coeff * Integral(kernel, *e.args[1:])
+                        )
+                return sp.Add(*pieces) if pieces else S.Zero
+            if e.args:
+                new_args = tuple(_isolate(a) for a in e.args)
+                if any(n is not o for n, o in zip(new_args, e.args)):
+                    return e.func(*new_args)
+            return e
+
+        return _isolate(expr)
 
 
 class PartialIntegrate(Operation):
@@ -2302,24 +2814,31 @@ class ZetaTransform(Operation):
         # EvaluateIntegrals gets handed a mixed-space integral (z-integration
         # variable, ζ-dependent upper bound) and sympy.integrate has to chew
         # through the polynomial layer-expansion of the integrand, slowly.
-        zeta_prime = sp.Dummy(f"{zeta}_prime", positive=True)
+        zeta_hat = sp.Dummy(rf"\hat{{{zeta}}}", positive=True)
         running_upper = zeta * h + lower
 
         def _transform_running(e):
             if isinstance(e, Integral):
                 integrand = e.args[0]
                 limits = e.args[1]
+                # Running integrals produced by ``Integrate(z, b, z)`` now
+                # carry a ``\hat{z}`` Dummy as the integration variable
+                # (see ``Expression.depth_integrate``).  Match any var as
+                # long as ``lower`` / ``upper`` match the running pattern
+                # — the integrand was built in terms of that inner var,
+                # so we substitute *that* var to go into ζ-space.
                 if (len(limits) == 3
-                        and limits[0] == z
                         and limits[1] == lower):
+                    inner_var = limits[0]
                     bound_diff = limits[2] - running_upper
                     if (bound_diff == 0
                             or (hasattr(bound_diff, "is_zero") and bound_diff.is_zero)
                             or sp.simplify(bound_diff) == 0):
                         inner = _transform_running(integrand)
-                        new_integrand = inner.subs(z, zeta_prime * h + lower) * h
+                        new_integrand = inner.subs(
+                            inner_var, zeta_hat * h + lower) * h
                         return Integral(new_integrand,
-                                        (zeta_prime, S.Zero, zeta))
+                                        (zeta_hat, S.Zero, zeta))
                 new_integrand = _transform_running(integrand)
                 if new_integrand is not integrand:
                     return Integral(new_integrand, *e.args[1:])
@@ -3115,6 +3634,31 @@ class ZeroAtmosphericPressure(Assumption):
         super().__init__({p_atm: S.Zero}, name="p_atm=0")
 
 
+class _FieldExpansion:
+    """Function-level expansion relation — replaces every call of a
+    :class:`Function` (e.g. ``u(t, x, arg)``) with a parametric RHS that
+    sees the call's argument list.
+
+    Used by :meth:`Basis.expand` to substitute the basis ansatz
+    ``u(t, x, arg) → Σ α_k · φ_k((arg − b)/h)`` **everywhere** ``u`` is
+    applied — including inside ``Derivative(u(t,x, \\hat{z}), x)``,
+    ``Integral(u(t,x, ζ̂·h+b), …)``, and the boundary evaluations
+    ``u(t,x,b)`` / ``u(t,x,η)``.  A plain ``{u(t,x,z): rhs}`` dict
+    substituted via ``xreplace`` / ``.subs`` is structural and only
+    matches the exact key, which breaks the moment the argument shape
+    changes.  ``.replace(fn, handler)`` walks the whole tree and
+    rewrites every call, so this covers all the cases uniformly.
+    """
+
+    def __init__(self, field_fn, rhs_callable, name="field_expansion"):
+        self.field_fn = field_fn
+        self.rhs_callable = rhs_callable
+        self.name = name
+
+    def apply_to(self, expr):
+        return expr.replace(self.field_fn, self.rhs_callable)
+
+
 class assumptions:
     """Assumptions library."""
     kinematic_bc_bottom = KinematicBCBottom
@@ -3231,19 +3775,24 @@ class Basis:
         """
         state = self._state
         z, zeta, b, h = state.z, state.zeta, state.b, state.H
-        volume_key = field.subs(z, zeta * h + b)
-        bottom_key = field.subs(z, b)
-        surface_key = field.subs(z, state.eta)
-        # Pointwise form: ζ is a *function* of z here, so we evaluate
-        # the inner basis at (z−b)/h and let sympy carry the resulting
-        # polynomial-in-z through any outstanding z-integrals.
-        pointwise_rhs = self._sum((z - b) / h)
-        return {
-            field: pointwise_rhs,
-            volume_key: self._sum(zeta),
-            bottom_key: self._sum(S.Zero),
-            surface_key: self._sum(S.One),
-        }
+
+        # Build a function-level rewriter.  A plain ``{u(t,x,z): rhs}``
+        # dict substituted via ``xreplace`` is structural and won't match
+        # ``u(t,x,ζ·h+b)``, ``u(t,x,\hat{z})`` or any other
+        # argument form.  ``.replace(u, lambda *args: ...)`` rewrites
+        # every call of ``u``, regardless of its third argument, so the
+        # running-integral / basis / boundary evaluations all close
+        # through a single rule.
+        field_fn = field.func  # the raw Function (e.g. ``u``)
+
+        def _field_rhs(*args):
+            arg_z = args[-1]
+            # Volume / running / boundary cases collapse into one
+            # parametric rule: φ_k((arg − b)/h).  At arg=b → φ_k(0);
+            # at arg=η → φ_k(1); at arg=ζ·h+b → φ_k(ζ).
+            return self._sum((arg_z - b) / h)
+
+        return _FieldExpansion(field_fn, _field_rhs)
 
     def layer_expand(self, field, layer_idx, zeta_transformed=False):
         """Per-layer closure substitution for a :class:`LayeredBasis`.
@@ -3436,20 +3985,103 @@ def _simplify_derivatives_only(expr):
     protected = _protect(expr)
     # Now safe to simplify — only pure Derivative(Function, var) remain
     simplified = protected.doit() if protected.has(Derivative) else protected
-    # Restore integral-containing nodes
-    return simplified.subs(integral_map)
+    # Restore integral-containing nodes via xreplace.  ``.subs`` would
+    # wrap the result in ``Subs(_, _INT0, Integral(_, …, z))`` whenever
+    # ``_INT0`` lives inside a ``Derivative(_, z)`` and the Integral has
+    # ``z`` in its limits — sympy's deliberate caution.  ``xreplace`` is
+    # purely structural, so the protected Dummy is replaced in place
+    # without the Subs wrapping.
+    return simplified.xreplace(integral_map)
 
 
-def _simplify_preserve_integrals(expr):
-    """Expand + cancel while protecting Integral and Derivative(Integral) terms.
+def _expand_preserve_integrals(expr):
+    """``sp.expand(expr)`` that does NOT fragment ``Integral(f + g, lim)``
+    into ``Integral(f, lim) + Integral(g, lim)``.
 
-    Cancels terms like u²·d(b+h)/dx - u²·db/dx → u²·dh/dx and
-    (-gρ(b+h) + gρb + gρh)·... → 0, while leaving ∫...dz terms intact.
-
-    Uses expand + powsimp (not simplify) to avoid common denominator wrapping.
+    Built-in ``sp.expand`` treats Integrals as transparent and distributes
+    Add across the integrand — which undoes the cross-term consolidation
+    that ``Integrate`` performs.  This helper protects every Integral as
+    a Dummy, runs the normal expand, then restores — so Mul still
+    distributes over Add on the outside but Integrands stay intact.
     """
     if not isinstance(expr, sp.Basic):
         return expr
+    integral_map = {}
+    counter = [0]
+
+    def _protect(e):
+        if isinstance(e, Integral):
+            key = sp.Dummy(f"_INT{counter[0]}")
+            integral_map[key] = e
+            counter[0] += 1
+            return key
+        if e.args:
+            new_args = tuple(_protect(a) for a in e.args)
+            if any(n is not o for n, o in zip(new_args, e.args)):
+                return e.func(*new_args)
+        return e
+    protected = _protect(expr)
+    return sp.expand(protected).xreplace(integral_map)
+
+
+def _kill_zero_length_integrals(expr):
+    """``Integral(_, (var, a, a)) → 0``.
+
+    Sympy doesn't auto-simplify this on construction (only via ``.doit()``).
+    Empty-interval integrals appear naturally in our pipeline whenever an
+    outer Subs evaluates a running integral's upper bound at the same
+    point as its lower bound (e.g. evaluating ``∫_b^z f dẑ`` at ``z=b``
+    leaves ``∫_b^b f dẑ = 0``).
+    """
+    if not isinstance(expr, sp.Basic):
+        return expr
+    mapping = {}
+    for I in expr.atoms(Integral):
+        limits = I.args[1]
+        if hasattr(limits, "__len__") and len(limits) == 3:
+            _, lo, hi = limits
+            if lo == hi or sp.simplify(lo - hi) == 0:
+                mapping[I] = S.Zero
+    return expr.xreplace(mapping) if mapping else expr
+
+
+def _kill_free_derivatives(expr):
+    """Replace ``Derivative(sym_a, sym_b)`` with 0 when both are plain free
+    ``Symbol`` s (not ``Function`` s).  These arise from Leibniz boundary
+    terms where the upper/lower limit is a bare coordinate symbol (e.g.
+    ``∂_x z = 0``); sympy does not auto-reduce them and they propagate
+    through the pipeline as spurious boundary residuals.
+    """
+    if not isinstance(expr, sp.Basic):
+        return expr
+    mapping = {}
+    for d in expr.atoms(Derivative):
+        inner = d.args[0]
+        if not isinstance(inner, Symbol):
+            continue
+        variables = []
+        for v in d.args[1:]:
+            variables.append(v[0] if isinstance(v, tuple) else v)
+        if all(isinstance(v, Symbol) for v in variables) and all(v != inner for v in variables):
+            mapping[d] = S.Zero
+    return expr.xreplace(mapping) if mapping else expr
+
+
+def _simplify_preserve_integrals(expr):
+    """Expand + like-term collection, protecting ``Integral`` and
+    ``Derivative(Integral)`` as atoms.
+
+    No ``cancel`` / ``together`` / ``ratsimp`` — those build common
+    denominators and turn polynomial Derivative combinations into rational
+    functions.  Just ``expand + powsimp + linearity-only derivative
+    distribution`` + a pre-pass that kills trivially-zero
+    ``Derivative(free_symbol, other_free_symbol)`` boundary residuals.
+    """
+    if not isinstance(expr, sp.Basic):
+        return expr
+
+    expr = _kill_free_derivatives(expr)
+    expr = _kill_zero_length_integrals(expr)
 
     integral_map = {}
     counter = [0]
@@ -3516,11 +4148,37 @@ def _simplify_preserve_integrals(expr):
         prev = result
         evaled = _evaluate_linear_derivatives(result)
         expanded = sp.expand(evaled)
-        simplified = sp.powsimp(expanded, combine="all")
-        result = _fold_numeric_coeffs_into_derivative(simplified)
+        # ``powsimp(combine="all")`` is too aggressive — it can build
+        # rational-function common denominators that downstream treats
+        # as unresolvable integrands (e.g. ``1/(h·∂_x α₁ − α₁·∂_x h)``
+        # appearing inside a depth integral).  Plain ``expand`` already
+        # collects like terms; skip powsimp entirely.
+        result = _fold_numeric_coeffs_into_derivative(expanded)
         if result == prev:
             break
-    return result.subs(integral_map)
+    # Recurse into the integrands we protected: the outer expand only
+    # simplified the expression OUTSIDE Integrals.  Inside each Integral,
+    # the integrand may contain its own cancellable terms (eg. the
+    # ``±u·∂_t b · φ'`` pair from the Leibniz-rule mixing).  Without this
+    # recursion, those cancellations never fire because each Integral is
+    # one atom to the outer Add canonicalisation.
+    for key, integral in list(integral_map.items()):
+        if isinstance(integral, Integral):
+            new_integrand = _simplify_preserve_integrals(integral.args[0])
+            if new_integrand is not integral.args[0]:
+                integral_map[key] = Integral(new_integrand, *integral.args[1:])
+        elif isinstance(integral, Derivative) and integral.args[0].has(Integral):
+            # Derivative(Integral(...), var) — simplify the inner Integral.
+            new_inner = _simplify_preserve_integrals(integral.args[0])
+            if new_inner is not integral.args[0]:
+                integral_map[key] = Derivative(new_inner, *integral.args[1:])
+    # ``xreplace`` (not ``.subs``) for the restore: ``.subs`` wraps the
+    # result in ``Subs(_, _INT0, Integral(_, …, z))`` whenever the
+    # protected Dummy lives inside a ``Derivative(_, z)`` and the
+    # Integral has ``z`` in its limits — sympy's deliberate caution
+    # against differentiating a z-dependent integral.  Structural
+    # ``xreplace`` skips that wrapping.
+    return result.xreplace(integral_map)
 
 
 def _resolve_subs_safe(expr):
