@@ -2674,6 +2674,96 @@ class IsolateBasisIntegrand(Operation):
         return _isolate(expr)
 
 
+class MapBasisToReference(Operation):
+    """Rewrite ``phi_k(arg) → phi_k((arg − b) / h)`` in every leaf.
+
+    With the ``phi_k(state.z)`` convention the basis is opaque on the
+    raw coordinate ``z``.  After ``IntegralTransform`` substitutes
+    ``z → ζ·h + b`` inside an integrand, integrand basis evaluations
+    read ``phi_k(ζ·h + b)`` — semantically the **physical** basis at
+    point ``ζ·h + b``.  This Op states the FEM convention that the
+    physical basis is the *reference* basis composed with the affine
+    map: ``phi_k(z) := phi_k_ref((z − b)/h)``.  After the rewrite,
+    sympy auto-simplifies arguments — ``(b − b)/h → 0``,
+    ``((b + h) − b)/h → 1``, ``((ζ h + b) − b)/h → ζ`` — so every
+    ``phi_k`` call lands on a single argument in ``[0, 1]``: the
+    canonical pattern a basismatrix lookup recognises.
+
+    Also forces the chain rule on any ``Derivative(f(t, x, arg), v)``
+    whose third argument got rewritten to a (b, h)-dependent form by
+    ``IntegralTransform`` — sympy's structural ``subs`` keeps a
+    ``Subs`` wrapper around such Derivatives instead of distributing,
+    so we explicitly ``.doit()`` them so the chain-rule metric terms
+    materialise inside the integrand.
+
+    Parameters
+    ----------
+    b, h : sympy expressions
+        The bottom topography and column height entering the affine
+        map ``z = ζ·h + b``.  Typically ``state.b`` and ``state.H``.
+    """
+
+    def __init__(self, b, h, name="map_basis_to_reference",
+                 description=None):
+        super().__init__(
+            name=name,
+            description=(description or
+                         "phi_k(arg) → phi_k((arg − b)/h)"),
+        )
+        self._b = b
+        self._h = h
+
+    def _leaf_sp(self, expr):
+        # The chain-rule contributions are already handled correctly
+        # by ``ProductRule`` (which fires ``phi_k'(z)`` from the
+        # vertical-convection ``∂_z`` and Leibniz boundary terms from
+        # the horizontal Derivatives via ``Integrate(method='auto')``).
+        # We do **not** attempt to force a second chain rule by
+        # ``.doit()``-ing Derivatives — that would double-count, since
+        # the moving-boundary metric has already been captured by
+        # those upstream operations.
+        # Step B: rewrite ``phi_k(arg) → phi_k((arg − b)/h)`` and the
+        # Subs counterpart that sympy uses for the chain-rule of an
+        # opaque function: ``Subs(Derivative(phi_k(ξ), ξ), ξ, value)
+        # → Subs(Derivative(phi_k(ξ), ξ), ξ, (value − b)/h)``.  Both
+        # forms appear after ``IntegralTransform``.  Sympy then auto-
+        # simplifies the argument when ``arg`` is one of ``b``,
+        # ``b + h``, or ``ζ·h + b``: ``(b − b)/h → 0``,
+        # ``((b + h) − b)/h → 1``, ``((ζ·h + b) − b)/h → ζ``.
+        def _is_basis_call(e):
+            return (isinstance(e, sp.Function)
+                    and not isinstance(e, sp.Derivative)
+                    and getattr(e.func, "__name__", "")
+                    .startswith("phi_"))
+
+        def _is_basis_derivative_subs(e):
+            """Detect ``Subs(Derivative(phi_k(ξ), ξ), ξ, value)`` —
+            sympy's representation of ``phi_k'(value)`` for an opaque
+            ``phi_k``."""
+            if not isinstance(e, sp.Subs):
+                return False
+            inner = e.args[0]
+            if not isinstance(inner, Derivative):
+                return False
+            head = inner.args[0]
+            return _is_basis_call(head) and len(head.args) == 1
+
+        def _rewrite(e):
+            if _is_basis_call(e):
+                new_arg = (e.args[0] - self._b) / self._h
+                return e.func(new_arg)
+            if _is_basis_derivative_subs(e):
+                value = e.args[2][0]
+                new_value = (value - self._b) / self._h
+                return sp.Subs(e.args[0], e.args[1], (new_value,))
+            if e.args:
+                new = tuple(_rewrite(a) for a in e.args)
+                if any(n is not o for n, o in zip(new, e.args)):
+                    return e.func(*new)
+            return e
+        return _rewrite(expr)
+
+
 class PartialIntegrate(Operation):
     """Rewrite a matching ``Integral(f, (var, lo, hi))`` to a running integral
     with variable upper bound: ``Integral(f, (var, lo, upper))``.
