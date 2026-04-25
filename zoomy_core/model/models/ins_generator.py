@@ -4151,6 +4151,69 @@ def _expand_preserve_integrals(expr):
     return sp.expand(protected).xreplace(integral_map)
 
 
+def _canonicalize_integral_dummies(expr):
+    """Rename every ``Integral`` 's bound variable to a depth-keyed
+    canonical ``Dummy``.
+
+    Sympy treats Integrals with different bound-variable names as
+    structurally distinct atoms, even when they are alpha-equivalent
+    (``∫ f(z) dz`` vs ``∫ f(ẑ) dẑ``).  That blocks ``Add``
+    canonicalisation from cancelling duplicates and ``merge_integrals``
+    from grouping by ``(limits, deriv-wrapper)`` signature.
+
+    Renaming each Integral's bound variable to a canonical Dummy keyed
+    by *nesting depth* (one Dummy per depth, shared across siblings)
+    makes alpha-equivalent integrals at the same depth structurally
+    equal — exactly the rule ``IntegralTransform`` already enforces for
+    its own outputs (see ``IntegralTransform._leaf_sp``), generalised
+    to every Integral in the expression.
+
+    Nested integrals get a fresh Dummy per depth, so the inner's bound
+    variable never collides with the outer's.
+    """
+    if not isinstance(expr, sp.Basic):
+        return expr
+    canon_by_depth: dict[int, sp.Dummy] = {}
+
+    def _canon(depth):
+        if depth not in canon_by_depth:
+            canon_by_depth[depth] = sp.Dummy(r"\hat{z}", positive=True)
+        return canon_by_depth[depth]
+
+    def _walk(e, depth=0):
+        if isinstance(e, Integral):
+            integrand = _walk(e.args[0], depth=depth + 1)
+            limits = e.args[1]
+            if hasattr(limits, "__len__") and len(limits) == 3:
+                old_var, lo, hi = limits
+                new_var = _canon(depth)
+                if old_var is new_var:
+                    if integrand is not e.args[0]:
+                        return Integral(integrand, *e.args[1:])
+                    return e
+                new_int = integrand.xreplace({old_var: new_var})
+                new_lo = (lo.xreplace({old_var: new_var})
+                          if isinstance(lo, sp.Basic) else lo)
+                new_hi = (hi.xreplace({old_var: new_var})
+                          if isinstance(hi, sp.Basic) else hi)
+                return Integral(new_int, (new_var, new_lo, new_hi))
+            if integrand is not e.args[0]:
+                return Integral(integrand, *e.args[1:])
+            return e
+        if isinstance(e, Derivative):
+            inner = _walk(e.args[0], depth=depth)
+            if inner is not e.args[0]:
+                return Derivative(inner, *e.args[1:])
+            return e
+        if e.args:
+            new_args = tuple(_walk(a, depth=depth) for a in e.args)
+            if any(n is not o for n, o in zip(new_args, e.args)):
+                return e.func(*new_args)
+        return e
+
+    return _walk(expr)
+
+
 def _split_integrals_expr(expr):
     """Distribute every ``Integral(Add(t1, t2, ...), lim)`` into a sum of
     single-term integrals ``Σ Integral(t_i, lim)``.
@@ -4219,6 +4282,9 @@ def _merge_integrals_expr(expr):
     """
     if not isinstance(expr, sp.Basic):
         return expr
+    # Canonicalise bound variables first so alpha-equivalent integrals
+    # (``∫ f dz`` vs ``∫ f dẑ``) reduce to the same signature.
+    expr = _canonicalize_integral_dummies(expr)
 
     def _classify(term):
         """Return ``(sig, coeff, integrand, limits, deriv_wrt)`` or None."""
@@ -4355,6 +4421,12 @@ def _simplify_preserve_integrals(expr):
 
     expr = _kill_free_derivatives(expr)
     expr = _kill_zero_length_integrals(expr)
+    # Alpha-rename every Integral's bound variable to a depth-keyed
+    # canonical Dummy so structurally-equivalent integrals (e.g. one
+    # with `z`, another with `\hat z`, both spanning [b, b+h]) match
+    # under sympy's ``Add`` canonicalisation.  Without this, sibling
+    # integrals from different sources never cancel.
+    expr = _canonicalize_integral_dummies(expr)
 
     integral_map = {}
     counter = [0]
