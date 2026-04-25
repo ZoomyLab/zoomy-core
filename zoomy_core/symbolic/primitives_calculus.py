@@ -45,6 +45,7 @@ from zoomy_core.symbolic.primitives_canonical import distribute_mul_over_add
 __all__ = [
     "fundamental_theorem",
     "leibniz",
+    "leibniz_general",
     "polynomial_integrate",
     "integration_by_parts",
     "product_rule_forward",
@@ -146,6 +147,52 @@ def leibniz(integrand, var, lower, upper):
     lower = sp.sympify(lower)
     inner_integrated = inner_integrated.subs(var, upper) - inner_integrated.subs(var, lower)
     main = Derivative(inner_integrated, y)
+    surface = S.Zero
+    if upper.has(y):
+        surface -= inner.subs(var, upper) * Derivative(upper, y)
+    if lower.has(y):
+        surface += inner.subs(var, lower) * Derivative(lower, y)
+    return main + surface
+
+
+def leibniz_general(integrand, var, lower, upper):
+    """Conservative-form Leibniz that does NOT require ``f`` to be
+    polynomial in ``var``.
+
+    For ``∫_lo^hi ∂_y f dvar`` with ``y ≠ var``::
+
+        = ∂_y[ ∫_lo^hi f dvar ]   −  f|_hi · ∂_y hi   +   f|_lo · ∂_y lo
+
+    The volume ``∫f dvar`` stays as a held :class:`sympy.Integral`
+    atom — no attempt to evaluate it.  Boundary terms are produced as
+    held :class:`sympy.Subs` atoms when the bounds depend on ``y``.
+
+    Use this when the integrand's antiderivative is unknown or
+    opaque; use :func:`leibniz` (poly-specialised) when ``f`` is
+    polynomial in ``var`` and you want the closed-form volume.
+
+    Returns ``None`` if:
+
+    * integrand is not a ``Derivative``,
+    * diff-tuple has more than one entry,
+    * differentiation is w.r.t. ``var`` itself
+      (``fundamental_theorem`` handles that).
+    """
+    if not isinstance(integrand, Derivative):
+        return None
+    diff_tuples = list(integrand.args[1:])
+    if len(diff_tuples) != 1:
+        return None
+    dv = diff_tuples[0]
+    if len(dv) != 2 or dv[1] != 1:
+        return None
+    y = dv[0]
+    if y == var:
+        return None
+    inner = integrand.args[0]
+    upper = sp.sympify(upper)
+    lower = sp.sympify(lower)
+    main = Derivative(Integral(inner, (var, lower, upper)), y)
     surface = S.Zero
     if upper.has(y):
         surface -= inner.subs(var, upper) * Derivative(upper, y)
