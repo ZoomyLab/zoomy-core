@@ -283,6 +283,46 @@ class _NodeProxy:
         self._replace(node.apply_to_term(index, *operations))
         return self
 
+    def split_integrals(self):
+        node = self._node
+        if isinstance(node, Expression):
+            self._replace(node.split_integrals())
+        elif _is_intermediate(node):
+            for key in list(node._filter_dict()):
+                _NodeProxy(self._system, self._path + (key,)).split_integrals()
+        return self
+
+    def merge_integrals(self):
+        node = self._node
+        if isinstance(node, Expression):
+            self._replace(node.merge_integrals())
+        elif _is_intermediate(node):
+            for key in list(node._filter_dict()):
+                _NodeProxy(self._system, self._path + (key,)).merge_integrals()
+        return self
+
+    def __getitem__(self, key):
+        """Index into a leaf (returns a term as Expression) or an
+        intermediate (returns a child proxy by integer index).
+        """
+        node = self._node
+        if isinstance(node, Expression):
+            return node[key]
+        if _is_intermediate(node) and isinstance(key, int):
+            children = list(node._filter_dict())
+            if not 0 <= key < len(children):
+                raise IndexError(
+                    f"_NodeProxy at {'/'.join(self._path) or 'root'!r} "
+                    f"has {len(children)} children; index {key} out of range"
+                )
+            return _NodeProxy(self._system, self._path + (children[key],))
+        if _is_intermediate(node) and isinstance(key, str):
+            return getattr(self, key)
+        raise TypeError(
+            f"_NodeProxy at {'/'.join(self._path) or 'root'!r} "
+            f"is not subscriptable with {key!r}"
+        )
+
     def solve_for(self, variable):
         """Solve leaf equation for ``variable``, isolate, return self.
 
