@@ -871,6 +871,43 @@ class Expression(SymbolicBase):
                           term_tags=new_tags, tag_order=self._tag_order,
                           solver_groups=new_solver_groups)
 
+    def split_integrals(self):
+        """Distribute each ``Integral(Add(...), lim)`` into a sum of
+        single-term Integrals, recursing through any ``Derivative``
+        wrapper.  Returns a new Expression whose ``.terms`` exposes one
+        logical equation term per Integral.
+        """
+        new_expr = _split_integrals_expr(self.expr)
+        if new_expr is self.expr:
+            return self
+        out = Expression(new_expr, self.name,
+                         term_tags=dict(self._term_tags),
+                         tag_order=list(self._tag_order),
+                         solver_groups=self._solver_groups)
+        rel = getattr(self, "_as_relation", None)
+        if rel is not None:
+            out._as_relation = rel
+        return out
+
+    def merge_integrals(self):
+        """Group sibling Integrals with matching ``(limits, deriv-wrapper)``
+        signature into a single ``Integral(Σ c·f, lim)``.  Inverse of
+        :meth:`split_integrals`; useful when cross-integrand
+        cancellations need sympy's ``Add`` canonicalisation to see them
+        in one integrand.
+        """
+        new_expr = _merge_integrals_expr(self.expr)
+        if new_expr is self.expr:
+            return self
+        out = Expression(new_expr, self.name,
+                         term_tags=dict(self._term_tags),
+                         tag_order=list(self._tag_order),
+                         solver_groups=self._solver_groups)
+        rel = getattr(self, "_as_relation", None)
+        if rel is not None:
+            out._as_relation = rel
+        return out
+
     def simplify(self):
         """Simplify: expand + cancel, preserving Integral and Derivative(Integral) terms."""
         simplified = _simplify_preserve_integrals(self.expr)
@@ -4114,6 +4151,152 @@ def _expand_preserve_integrals(expr):
     return sp.expand(protected).xreplace(integral_map)
 
 
+def _split_integrals_expr(expr):
+    """Distribute every ``Integral(Add(t1, t2, ...), lim)`` into a sum of
+    single-term integrals ``Σ Integral(t_i, lim)``.
+
+    Pushes through ``Derivative(Integral(...), v)`` by linearity.  Outer
+    multiplicative factors stay attached: after ``sp.Add.make_args`` on
+    the Mul-expanded outer expression, each summand contains at most one
+    Integral, and that Integral now has a single-term integrand.
+
+    This is the inverse of ``_merge_integrals_expr`` and is the
+    "user-visible" rest state of an Expression — one Integral per
+    logical equation term, so per-term operations
+    (``apply_to_term`` / ``terms[i].apply(...)``) act on what the user
+    reads as one term.
+    """
+    if not isinstance(expr, sp.Basic):
+        return expr
+
+    def _walk(e):
+        if isinstance(e, Integral):
+            integrand = _walk(e.args[0])
+            limits = e.args[1:]
+            expanded = _expand_preserve_integrals(integrand)
+            terms = Add.make_args(expanded)
+            if len(terms) <= 1:
+                if integrand is not e.args[0]:
+                    return Integral(integrand, *limits)
+                return e
+            return Add(*[Integral(t, *limits) for t in terms])
+        if isinstance(e, Derivative) and e.args[0].has(Integral):
+            inner = _walk(e.args[0])
+            wrt = e.args[1:]
+            if isinstance(inner, Add):
+                return Add(*[Derivative(a, *wrt) for a in inner.args])
+            if inner is not e.args[0]:
+                return Derivative(inner, *wrt)
+            return e
+        if e.args:
+            new_args = tuple(_walk(a) for a in e.args)
+            if any(n is not o for n, o in zip(new_args, e.args)):
+                return e.func(*new_args)
+        return e
+
+    return _expand_preserve_integrals(_walk(expr))
+
+
+def _merge_integrals_expr(expr):
+    """Combine sibling Integrals with matching ``(limits, deriv-wrapper)``
+    signature into a single ``Integral(Σ c_i · f_i, lim)``.
+
+    Walks every ``Add`` and groups summands by:
+      * the limits tuple of the contained Integral, and
+      * the variables of any ``Derivative(...)`` wrapper around it.
+
+    Each term contributes ``coeff · Integrand`` to the merged integrand,
+    where ``coeff`` is the multiplicative outer factor that does **not**
+    contain the integration variable (so it can safely move inside).
+    Terms whose outer factor *does* depend on the integration variable
+    pass through unchanged — moving them inside would change the math.
+
+    Inverse of ``_split_integrals_expr``.  Used internally by passes
+    that need cancellations between sibling integrands to fire (the
+    ``Integrate(method="auto")`` collector already does an in-pass
+    version of this); exposed publicly via
+    ``Expression.merge_integrals`` for users who want it.
+    """
+    if not isinstance(expr, sp.Basic):
+        return expr
+
+    def _classify(term):
+        """Return ``(sig, coeff, integrand, limits, deriv_wrt)`` or None."""
+        coeff_factors = []
+        target = term
+        if isinstance(term, sp.Mul):
+            cands = []
+            for f in term.args:
+                if isinstance(f, Integral):
+                    cands.append(f)
+                elif isinstance(f, Derivative) and isinstance(f.args[0], Integral):
+                    cands.append(f)
+                else:
+                    coeff_factors.append(f)
+            if len(cands) != 1:
+                return None
+            target = cands[0]
+        elif isinstance(term, Integral):
+            pass
+        elif isinstance(term, Derivative) and isinstance(term.args[0], Integral):
+            pass
+        else:
+            return None
+        if isinstance(target, Derivative):
+            inner = target.args[0]
+            deriv_wrt = tuple(target.args[1:])
+        else:
+            inner = target
+            deriv_wrt = ()
+        if not isinstance(inner, Integral):
+            return None
+        limits = inner.args[1]
+        if not (hasattr(limits, "__len__") and len(limits) == 3):
+            return None
+        var = limits[0]
+        coeff = sp.Mul(*coeff_factors) if coeff_factors else S.One
+        if coeff.has(var):
+            return None
+        sig = (limits, deriv_wrt)
+        return sig, coeff, inner.args[0], limits, deriv_wrt
+
+    def _walk(e):
+        if isinstance(e, Add):
+            new_args = [_walk(a) for a in e.args]
+            groups = {}
+            order = []
+            passthrough = []
+            for a in new_args:
+                cls = _classify(a)
+                if cls is None:
+                    passthrough.append(a)
+                    continue
+                sig, coeff, integrand, limits, deriv_wrt = cls
+                if sig not in groups:
+                    groups[sig] = (limits, deriv_wrt, S.Zero)
+                    order.append(sig)
+                lim, dwrt, acc = groups[sig]
+                groups[sig] = (lim, dwrt, acc + coeff * integrand)
+            merged = []
+            for sig in order:
+                lim, dwrt, integrand_sum = groups[sig]
+                integrand_sum = sp.expand(integrand_sum)
+                if integrand_sum == 0:
+                    continue
+                term = Integral(integrand_sum, lim)
+                if dwrt:
+                    term = Derivative(term, *dwrt)
+                merged.append(term)
+            return Add(*merged, *passthrough)
+        if e.args:
+            new_args = tuple(_walk(a) for a in e.args)
+            if any(n is not o for n, o in zip(new_args, e.args)):
+                return e.func(*new_args)
+        return e
+
+    return _walk(expr)
+
+
 def _kill_zero_length_integrals(expr):
     """``Integral(_, (var, a, a)) → 0``.
 
@@ -4268,7 +4451,17 @@ def _simplify_preserve_integrals(expr):
     # Integral has ``z`` in its limits — sympy's deliberate caution
     # against differentiating a z-dependent integral.  Structural
     # ``xreplace`` skips that wrapping.
-    return result.xreplace(integral_map)
+    restored = result.xreplace(integral_map)
+    # Rest-state: split Integrals so the user-visible ``.terms`` view
+    # exposes one logical equation term per Integral.  Cross-term
+    # cancellations have already happened above (sympy's Add
+    # canonicalisation on the integrands inside each protected Integral
+    # plus structural matching across siblings that share dummies);
+    # splitting after that is purely a display rewrite.  Operations
+    # that need merged form (``Integrate(method="auto")``, the merge
+    # pass inside ``IsolateBasisIntegrand``) merge internally and don't
+    # rely on input being merged.
+    return _split_integrals_expr(restored)
 
 
 def _resolve_subs_safe(expr):
