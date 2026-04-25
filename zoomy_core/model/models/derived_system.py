@@ -328,11 +328,41 @@ class _NodeProxy:
 
         Only valid on leaves (an intermediate node has no single equation
         to solve).
+
+        ``Derivative(Integral(...), v)`` atoms are protected as Dummies
+        before ``sp.solve``: sympy would otherwise Leibniz-expand them
+        into ``∫∂_v(...) − f|_b·∂_v b + f|_a·∂_v a``, which is the same
+        equation algebraically but breaks downstream substitution
+        targets.  Concretely, when the resulting ``variable = ...`` rule
+        is later used to eliminate ``variable`` from another equation,
+        the Leibniz-expanded RHS lands in *both* the boundary-evaluated
+        ``f|_b/f|_a`` form AND the volume integral form simultaneously
+        — and after a subsequent ``_FieldExpansion`` substitutes the
+        opaque ``f`` with an explicit ansatz, the boundary contributions
+        reduce to non-trivial polynomials in the ansatz coefficients
+        that pen-and-paper would not produce (because pen-and-paper
+        substitutes the *conservative* form once).  Keeping the
+        derivative-of-integral atom intact preserves the conservative
+        relation ``variable = −∂_v[Integral(...)]``, matching the
+        analytic derivation exactly.
         """
         node = self._node
         if not isinstance(node, Expression):
             raise TypeError("solve_for requires a leaf Expression")
-        solutions = sp.solve(node.expr, variable)
+        # Protect every Derivative(Integral(...), *) atom as a Dummy.
+        protect_map: dict[sp.Dummy, sp.Basic] = {}
+        def _protect(e):
+            if isinstance(e, sp.Derivative) and e.args[0].has(sp.Integral):
+                key = sp.Dummy(f"_solveprot_{len(protect_map)}")
+                protect_map[key] = e
+                return key
+            if e.args:
+                new_args = tuple(_protect(a) for a in e.args)
+                if any(n is not o for n, o in zip(new_args, e.args)):
+                    return e.func(*new_args)
+            return e
+        protected_expr = _protect(node.expr)
+        solutions = sp.solve(protected_expr, variable)
         if not solutions:
             raise ValueError(f"Cannot solve {self._path!r} for {variable}")
         if len(solutions) > 1:
@@ -340,7 +370,12 @@ class _NodeProxy:
                 f"Multiple solutions for {variable} in {self._path!r}, "
                 f"using first: {solutions[0]}"
             )
-        solution = solutions[0]
+        # Unprotect — restore each Dummy back to its original
+        # Derivative(Integral, *) atom.  ``xreplace`` (not ``.subs``) so
+        # no Subs wrapping is introduced when the protected atom lives
+        # under a Derivative whose differentiation variable also bounds
+        # the inner Integral.
+        solution = solutions[0].xreplace(protect_map)
         isolated = Expression(variable - solution, self._path[-1] if self._path else "",
                               term_tags=dict(node._term_tags),
                               tag_order=list(node._tag_order),
