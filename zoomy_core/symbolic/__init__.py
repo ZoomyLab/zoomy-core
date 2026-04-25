@@ -42,13 +42,96 @@ Primitives are added incrementally during Phase 0:
 from zoomy_core.symbolic.errors import PrimitiveDoesNotMatch
 from zoomy_core.symbolic.sp_safe import D, Int, Sub, held_function
 from zoomy_core.symbolic.auto_eval_guard import AutoEvalGuard, AutoEvalForbidden
+from zoomy_core.symbolic.canonicalise import canonicalise
+
+# Primitive groups — re-export the named functions so callers can
+# write ``from zoomy_core.symbolic import alpha_rename`` etc.
+from zoomy_core.symbolic.primitives_canonical import (
+    alpha_rename,
+    constant_integrand,
+    distribute_mul_over_add,
+    drop_zero_derivative_inner,
+    drop_zero_integrand,
+    kill_zero_length_integral,
+    merge_integrals_over_add,
+    protect_integrals,
+    split_integral_over_add,
+    un_subs,
+    zero_derivative_of_free_symbol,
+)
+from zoomy_core.symbolic.primitives_calculus import (
+    chain_rule,
+    distribute_derivative_over_add,
+    fundamental_theorem,
+    integration_by_parts,
+    leibniz,
+    leibniz_general,
+    polynomial_integrate,
+    product_rule_forward,
+    product_rule_inverse,
+    pull_scalar_out_of_derivative,
+    push_scalar_into_derivative,
+)
+from zoomy_core.symbolic.primitives_change_of_variable import (
+    affine_change_of_variable,
+)
+from zoomy_core.symbolic.primitives_basis import (
+    canonicalize_phi_derivative_subs,
+    has_phi_call,
+    project_basis_integrand,
+)
+from zoomy_core.symbolic.primitives_substitution import (
+    function_expand,
+    solve_for,
+    subs_at_point,
+    subst,
+)
 
 __all__ = [
+    # held constructors
     "D",
     "Int",
     "Sub",
     "held_function",
+    # exceptions / guards
     "PrimitiveDoesNotMatch",
     "AutoEvalGuard",
     "AutoEvalForbidden",
+    # the structural-normalisation pass
+    "canonicalise",
+    # canonical-rewrite primitives
+    "alpha_rename",
+    "constant_integrand",
+    "distribute_mul_over_add",
+    "drop_zero_derivative_inner",
+    "drop_zero_integrand",
+    "kill_zero_length_integral",
+    "merge_integrals_over_add",
+    "protect_integrals",
+    "split_integral_over_add",
+    "un_subs",
+    "zero_derivative_of_free_symbol",
+    # calculus primitives
+    "chain_rule",
+    "distribute_derivative_over_add",
+    "fundamental_theorem",
+    "integration_by_parts",
+    "leibniz",
+    "leibniz_general",
+    "polynomial_integrate",
+    "product_rule_forward",
+    "product_rule_inverse",
+    "pull_scalar_out_of_derivative",
+    "push_scalar_into_derivative",
+    # variable change
+    "affine_change_of_variable",
+    # basis projection
+    "canonicalize_phi_derivative_subs",
+    "has_phi_call",
+    "project_basis_integrand",
+    # substitution + solver
+    "function_expand",
+    "solve_for",
+    "subs_at_point",
+    "subst",
 ]

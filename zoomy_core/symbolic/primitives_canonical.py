@@ -367,7 +367,13 @@ def zero_derivative_of_free_symbol(expr):
             continue
         variables = []
         for v in d.args[1:]:
-            variables.append(v[0] if isinstance(v, tuple) else v)
+            # ``Derivative.args[1:]`` is a tuple of either ``sp.Tuple(var,
+            # order)`` or bare ``Symbol`` entries.  Both expose
+            # ``__getitem__``; sp.Tuple is *not* a Python ``tuple``.
+            if isinstance(v, (tuple, sp.Tuple)):
+                variables.append(v[0])
+            else:
+                variables.append(v)
         if all(isinstance(v, Symbol) for v in variables) and all(v != inner for v in variables):
             mapping[d] = S.Zero
     return expr.xreplace(mapping) if mapping else expr
