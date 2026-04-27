@@ -1,12 +1,14 @@
-"""Standard coordinate symbols + canonical state functions.
+"""Standard coordinate symbols for the physical-z workflow.
 
 Every model in this family uses the same coordinate quartet
-``(t, x, ξ, g)`` with ``h(t, x)`` for the depth and ``b(x)`` for the
-bottom topography (function of ``x`` only — the bottom is fixed in
-time for hyperbolic shallow-water-family analyses).
+``(t, x, z, g)`` with ``h(t, x)`` for the depth and ``b(x)`` for the
+bottom topography.  ``ξ`` is reserved for the *projection-step* basis
+argument (after the affine map z = ξh + b), and is created locally in
+the projection module — not part of the default coordinate set.
 
-Callers can either use these defaults or pass their own symbols; all
-the helpers in this package accept arbitrary symbols.
+Callers can use ``default_coords()`` and ``default_h``/``default_b``
+or pass their own symbols; all helpers in this package accept
+arbitrary symbols.
 """
 from __future__ import annotations
 
@@ -16,13 +18,13 @@ import sympy as sp
 
 
 def default_coords() -> Tuple[sp.Symbol, sp.Symbol, sp.Symbol, sp.Symbol]:
-    """Return ``(t, x, ξ, g)`` with the conventional sign / positivity
+    """Return ``(t, x, z, g)`` with the conventional sign / positivity
     constraints (g positive)."""
     t = sp.Symbol("t", real=True)
     x = sp.Symbol("x", real=True)
-    xi = sp.Symbol("xi", real=True)
+    z = sp.Symbol("z", real=True)
     g = sp.Symbol("g", positive=True)
-    return t, x, xi, g
+    return t, x, z, g
 
 
 def default_h(t: sp.Symbol, x: sp.Symbol):

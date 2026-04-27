@@ -1,139 +1,129 @@
-"""σ-coordinate Navier–Stokes setup, with hydrostatic / non-hydrostatic
-specialisations.
+"""Physical-z Navier–Stokes setup.
 
 Reference: Escalante, Morales de Luna, Cantero-Chinchilla, Castro-Orgaz
-(2024) eq (3) — the σ-coord form of incompressible NS over a varying
-bottom ``b(x)`` of depth ``h(t, x)`` with hydrostatic / non-hydrostatic
-pressure split ``p_total = p_H + p`` where ``p_H = -g h (ξ - 1)``.
+(2024) **eq (1)** — incompressible NS in physical (t, x, z)
+coordinates with constant density.  Equivalently the form K&T 2019
+starts from for SME.
 
-The classes here are **stateless containers for sympy expressions** —
-they don't manage their own derivations.  Callers wire them into a
-``GalerkinProjection`` once they've chosen a ``PolynomialAnsatz``.
+The PDEs stay in physical (t, x, z); the change of variable
+``ζ = (z - b)/h`` is used **only** as the argument to basis polynomials
+in the projection step.  No σ-coordinate ∂_ξ derivatives appear in the
+PDEs themselves — those would introduce trace terms via the chain
+rule that have to be balanced out by extra algebraic identities.
+
+Pressure split: ``p_total = p_H + p`` with ``p_H = ρg(η - z)``
+(hydrostatic; ``∂_z p_H = -ρg``, so the hydrostatic part exactly
+cancels gravity in z-momentum).  ``p`` is the *non-hydrostatic*
+remainder.  For density ρ = 1: ``p_H = g(η - z)``, ``∂_x p_H = g ∂_x η``.
+
+After substitution the equations read:
+
+    Continuity:    ∂_x u + ∂_z w = 0
+    x-momentum:    ∂_t u + u ∂_x u + w ∂_z u + g ∂_x η + ∂_x p
+                                                      = ∂_x σ_xx + ∂_z σ_xz
+    z-momentum:    ∂_t w + u ∂_x w + w ∂_z w + ∂_z p = ∂_x σ_zx + ∂_z σ_zz
+
+For inviscid models (σ ≡ 0) the right-hand sides are zero.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 import sympy as sp
 
-from .coords import default_coords, default_h, default_b
+
+def make_physical_z_coords():
+    """Return ``(t, x, z, g, h, b)`` with ``z`` the physical vertical."""
+    t = sp.Symbol("t", real=True)
+    x = sp.Symbol("x", real=True)
+    z = sp.Symbol("z", real=True)
+    g = sp.Symbol("g", positive=True)
+    h = sp.Function("h", real=True)(t, x)
+    b = sp.Function("b", real=True)(x)
+    return t, x, z, g, h, b
 
 
 @dataclass
 class FlowSetup:
-    """Symbolic σ-coord NS setup with stresses retained as opaque
-    user-supplied functions (default: zero, i.e. inviscid).
+    """Physical-z NS in (t, x, z) with stresses retained as opaque
+    user-supplied functions (default 0 — inviscid).
 
     The methods return symbolic LHS expressions for each conservation
-    law; callers project them onto a basis via ``GalerkinProjection``.
-
-    The non-hydrostatic pressure ``p`` is treated symbolically — for
-    the hydrostatic specialisation we'll fix ``p`` to zero in the
-    momentum equations, but the *expression* shape is identical.
+    law in physical-z coordinates; callers project them onto a basis
+    via ``GalerkinProjection`` (which handles the affine map
+    ``z = ξh + b`` only at integration time).
     """
     t: sp.Symbol
     x: sp.Symbol
-    xi: sp.Symbol
+    z: sp.Symbol
     g: sp.Symbol
     h: sp.Function
     b: sp.Function
-    # Stresses retained as opaque sympy expressions; default: 0
-    sigma_xz: sp.Expr = sp.S.Zero          # viscous shear stress
-    tau:       sp.Expr = sp.S.Zero         # bottom-friction term
+    sigma_xx: sp.Expr = sp.S.Zero
+    sigma_xz: sp.Expr = sp.S.Zero
+    sigma_zz: sp.Expr = sp.S.Zero
 
     @classmethod
     def with_defaults(cls):
-        t, x, xi, g = default_coords()
-        h = default_h(t, x)
-        b = default_b(x)
-        return cls(t=t, x=x, xi=xi, g=g, h=h, b=b)
+        t, x, z, g, h, b = make_physical_z_coords()
+        return cls(t=t, x=x, z=z, g=g, h=h, b=b)
 
     @property
     def eta(self) -> sp.Expr:
         return self.h + self.b
 
-    # ---- Equations (eq 3 of Escalante et al. 2024) ----
-    #
-    # All equations are written so that LHS = 0 holds.  ``u``, ``w``,
-    # ``p`` are the (t, x, ξ)-polynomials provided by the caller's
-    # ansatz; for VAM these are independent state polynomials, for SME
-    # ``w`` is the depth-integrated combination derived from continuity
-    # (set by the projection module).
+    # ---- Physical-z PDE LHS expressions (eq 1 of Escalante 2024) ----
 
     def continuity_lhs(self, u, w):
-        """``∂_t h + ∂_x(h u) + ∂_ξ(w − ∂_t(ξh+b) − u ∂_x(ξh+b))``.
-
-        This is the σ-coord continuity equation, rewritten with the
-        ``∂_ξ ω = ∂_ξ w − ∂_ξ ∂_t(ξh+b) − ∂_ξ(u ∂_x(ξh+b))`` identity
-        and using ``∂_ξ(ξh+b) = h``.  KBCs ω(0)=ω(1)=0 take care of
-        the boundary terms when this is later projected.
-        """
-        return (sp.Derivative(self.h, self.t)
-                + sp.Derivative(self.h * u, self.x)
-                + sp.Derivative(self._omega_argument(u, w), self.xi))
+        """``∂_x u + ∂_z w = 0``."""
+        return sp.Derivative(u, self.x) + sp.Derivative(w, self.z)
 
     def x_momentum_lhs(self, u, w, p):
-        """``∂_t(hu) + ∂_x(h u² + h p) + g h ∂_x η + ∂_ξ(ω u − p ∂_x(ξh+b)) − ∂_ξ σ_xz = 0``."""
-        omega = self._omega(u, w)
-        return (sp.Derivative(self.h * u, self.t)
-                + sp.Derivative(self.h * u**2 + self.h * p, self.x)
-                + self.g * self.h * sp.Derivative(self.eta, self.x)
-                + sp.Derivative(omega * u - p * self._d_xH_b(), self.xi)
-                - sp.Derivative(self.sigma_xz, self.xi))
+        """``∂_t u + u ∂_x u + w ∂_z u + g ∂_x η + ∂_x p
+              − ∂_x σ_xx − ∂_z σ_xz = 0``."""
+        return (sp.Derivative(u, self.t)
+                + u * sp.Derivative(u, self.x)
+                + w * sp.Derivative(u, self.z)
+                + self.g * sp.Derivative(self.eta, self.x)
+                + sp.Derivative(p, self.x)
+                - sp.Derivative(self.sigma_xx, self.x)
+                - sp.Derivative(self.sigma_xz, self.z))
 
     def z_momentum_lhs(self, u, w, p):
-        """``∂_t(hw) + ∂_x(h u w) + ∂_ξ(ω w + p) − ∂_x(h σ_zx) + ∂_ξ(σ_zx ∂_x(ξh+b)) = 0``.
+        """``∂_t w + u ∂_x w + w ∂_z w + ∂_z p
+              − ∂_x σ_zx − ∂_z σ_zz = 0``.
 
-        Hydrostatic models drop this equation; non-hydrostatic models
-        project it.
+        Note: gravity is already absorbed via the hydrostatic split
+        (``p_H = g(η - z)``, ``∂_z p_H = -g`` cancels the body force).
+        Hydrostatic models drop this equation entirely.
         """
-        omega = self._omega(u, w)
-        sigma_zx = self.sigma_xz                                # symmetric
-        return (sp.Derivative(self.h * w, self.t)
-                + sp.Derivative(self.h * u * w, self.x)
-                + sp.Derivative(omega * w + p, self.xi)
-                - sp.Derivative(self.h * sigma_zx, self.x)
-                + sp.Derivative(sigma_zx * self._d_xH_b(), self.xi))
+        sigma_zx = self.sigma_xz
+        return (sp.Derivative(w, self.t)
+                + u * sp.Derivative(w, self.x)
+                + w * sp.Derivative(w, self.z)
+                + sp.Derivative(p, self.z)
+                - sp.Derivative(sigma_zx, self.x)
+                - sp.Derivative(self.sigma_zz, self.z))
 
-    # --------- ω helpers ---------
+    # ---- Convenience: ζ(z) for downstream callers ----
 
-    def _d_xH_b(self) -> sp.Expr:
-        """``∂_x(ξ h + b) = ξ ∂_x h + ∂_x b``."""
-        return self.xi * sp.Derivative(self.h, self.x) + sp.Derivative(self.b, self.x)
-
-    def _omega(self, u, w) -> sp.Expr:
-        """σ-vertical velocity ``ω = w − ∂_t(ξh+b) − u ∂_x(ξh+b)``.
-
-        For models where ``w`` is opaque (depth-integrated continuity,
-        SME) the projection module substitutes the polynomial form for
-        ``ω`` directly; this method is mainly used by the σ-momentum
-        equations.
-        """
-        return (w
-                - self.xi * sp.Derivative(self.h, self.t)
-                - u * self._d_xH_b())
-
-    def _omega_argument(self, u, w) -> sp.Expr:
-        """The argument of ``∂_ξ`` in the σ-coord continuity equation
-        — slightly different from ``ω`` itself: ``w − u ∂_x(ξh+b)``.
-        Used by ``continuity_lhs`` to keep the equation in the form
-        eq (3) row 1 of the paper."""
-        return w - u * self._d_xH_b()
+    def zeta(self):
+        """``ζ = (z - b)/h`` — the basis-argument map.  NOT a coordinate
+        of the PDE — used only by the projection module as an argument
+        to the basis polynomials φ_i(ζ)."""
+        return (self.z - self.b) / self.h
 
 
 @dataclass
 class HydrostaticFlow(FlowSetup):
-    """Hydrostatic specialisation: non-hydrostatic remainder ``p ≡ 0``;
-    z-momentum equation is dropped (the depth-integrated ``w`` is
-    determined by continuity, not by an evolution equation)."""
+    """Hydrostatic specialisation: drop z-momentum (w determined by
+    depth-integrated continuity).  Non-hydrostatic ``p`` is identically
+    zero."""
     pass
 
 
 @dataclass
 class NonHydrostaticFlow(FlowSetup):
-    """Non-hydrostatic specialisation: keeps z-momentum + non-zero
-    ``p`` polynomial.  No specialisation needed beyond the base class —
-    callers project the z-momentum and treat ``p`` as a state
-    polynomial."""
+    """Non-hydrostatic: keep z-momentum and the non-hydrostatic
+    pressure remainder ``p`` as state."""
     pass
