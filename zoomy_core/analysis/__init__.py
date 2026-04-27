@@ -29,6 +29,7 @@ from .pencil import (
     sample_generalised_eigenvalues,
     symbolic_eigenvalues_at,
 )
+from .reduce_pencil import reduce_singular_pencil
 from .hyperbolicity import (
     is_hyperbolic_at,
     sample_hyperbolicity,
@@ -47,6 +48,7 @@ __all__ = [
     "generalised_eigenvalues",
     "sample_generalised_eigenvalues",
     "symbolic_eigenvalues_at",
+    "reduce_singular_pencil",
     "is_hyperbolic_at",
     "sample_hyperbolicity",
     "plot_dispersion",
