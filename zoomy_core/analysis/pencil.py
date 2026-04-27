@@ -113,6 +113,34 @@ def _eval_matrix_numerically(M: sp.Matrix, sub: Dict, dtype=complex):
     return arr
 
 
+def symbolic_eigenvalues_at(system, base_state: Dict, *,
+                            axis: int = 0,
+                            simplify: bool = True
+                            ) -> List[sp.Expr]:
+    """One-shot helper: linearise ``system`` at ``base_state``, extract
+    the principal-symbol pencil ``(M_x_axis, M_t)``, and return the
+    symbolic generalised eigenvalues.
+
+    Args:
+        system:      a ``PDESystem``.
+        base_state:  dict ``{field: value}`` for every field — values
+                     may be sympy symbols (kept symbolic) or numbers.
+        axis:        which spatial direction's pencil to use (default 0).
+        simplify:    apply ``sp.expand`` to the characteristic poly.
+
+    Returns:
+        list of symbolic eigenvalues.  May contain irrational
+        expressions (radicals); for higher-order systems sympy may not
+        return closed forms — use ``sample_generalised_eigenvalues`` in
+        that case.
+    """
+    # Imported here to avoid a circular import at module load.
+    from .linearisation import linearise
+    sys_lin = linearise(system, base_state)
+    M_t, M_xa, _ = extract_quasilinear_pencil(sys_lin)
+    return generalised_eigenvalues(M_xa[axis], M_t, simplify=simplify)
+
+
 def sample_generalised_eigenvalues(M_x: sp.Matrix, M_t: sp.Matrix,
                                   parameter_samples: List[Dict],
                                   *, dtype=complex,

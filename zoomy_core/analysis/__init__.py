@@ -27,6 +27,7 @@ from .pencil import (
     extract_quasilinear_pencil,
     generalised_eigenvalues,
     sample_generalised_eigenvalues,
+    symbolic_eigenvalues_at,
 )
 from .hyperbolicity import (
     is_hyperbolic_at,
@@ -45,6 +46,7 @@ __all__ = [
     "extract_quasilinear_pencil",
     "generalised_eigenvalues",
     "sample_generalised_eigenvalues",
+    "symbolic_eigenvalues_at",
     "is_hyperbolic_at",
     "sample_hyperbolicity",
     "plot_dispersion",
