@@ -32,6 +32,10 @@ from .hyperbolicity import (
     is_hyperbolic_at,
     sample_hyperbolicity,
 )
+from .plotting import (
+    plot_dispersion,
+    plot_hyperbolic_region_2d,
+)
 
 __all__ = [
     "PDESystem",
@@ -43,4 +47,6 @@ __all__ = [
     "sample_generalised_eigenvalues",
     "is_hyperbolic_at",
     "sample_hyperbolicity",
+    "plot_dispersion",
+    "plot_hyperbolic_region_2d",
 ]
