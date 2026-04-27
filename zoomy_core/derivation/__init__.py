@@ -60,6 +60,9 @@ from .closures import (
     kbc_bottom_solve_w_N,
     surface_bc_solve_p_N,
 )
+from .eliminate_constraints import (
+    eliminate_constraints,
+)
 
 __all__ = [
     # coords
@@ -79,4 +82,6 @@ __all__ = [
     # closures
     "kbc_bottom_solve_w_N",
     "surface_bc_solve_p_N",
+    # constraint elimination
+    "eliminate_constraints",
 ]
