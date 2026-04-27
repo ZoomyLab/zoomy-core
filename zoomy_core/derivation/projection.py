@@ -77,6 +77,42 @@ class GalerkinProjection:
                 sp.Derivative(eta, t) + u_opaque.subs(z, eta) * sp.Derivative(eta, x),
         }
 
+    # ---- Pre-processing: product rule on F · ∂_y F ----
+
+    def _preprocess_quadratic_derivatives(self, integrand, opaque_fields):
+        """Rewrite ``F · ∂_y F`` → ``(1/2) ∂_y(F²)`` once per Mul-term.
+
+        Single sweep, no recursion.  Without this, IBP loops on the
+        ``u · ∂_x u`` term (because IBP produces ``(∂_y G) · F`` where
+        ``G = phi_j · u`` so ``∂_y G`` itself contains ``∂_y u``).
+        """
+        def _sweep_one(expr):
+            if not isinstance(expr, sp.Mul):
+                return expr
+            factors = list(expr.args)
+            for i, a in enumerate(factors):
+                if a not in opaque_fields:
+                    continue
+                F = a
+                for k, c in enumerate(factors):
+                    if k == i or not isinstance(c, sp.Derivative):
+                        continue
+                    if c.args[0] != F:
+                        continue
+                    vc = c.variable_count
+                    if len(vc) != 1 or vc[0][1] != 1:
+                        continue
+                    y = vc[0][0]
+                    rest = factors[:i] + factors[i + 1:k] + factors[k + 1:]
+                    rest_mul = sp.Mul(*rest) if rest else sp.S.One
+                    return (sp.Rational(1, 2) * rest_mul
+                            * sp.Derivative(F**2, y))
+            return expr
+
+        if isinstance(integrand, sp.Add):
+            return sp.Add(*[_sweep_one(a) for a in integrand.args])
+        return _sweep_one(integrand)
+
     # ---- The integration helper: handles ∫G · ∂_y F dz ----
 
     def _integrate_term(self, integrand, var_z, lo, hi, t_x_vars):
@@ -190,6 +226,11 @@ class GalerkinProjection:
         # 1-3. Multiply by φ_j(z), distribute over Add, process each term.
         phi_j_z = self.ansatz.basis_at_z(j)
         full_integrand = sp.expand(phi_j_z * eq_lhs, mul=True, multinomial=False)
+        # Pre-process F·∂_y F → (1/2) ∂_y(F²) so IBP terminates.
+        opaque_fields = {u_opaque, w_opaque, p_opaque}
+        full_integrand = self._preprocess_quadratic_derivatives(
+            full_integrand, opaque_fields
+        )
 
         # Each term goes through _integrate_term separately.
         if isinstance(full_integrand, sp.Add):
