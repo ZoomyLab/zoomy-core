@@ -145,6 +145,130 @@ class Monomials(Basisfunction):
     name = "Monomials"
 
 
+class LayeredBasis(Basisfunction):
+    """Composable multi-layer basis: an inner basis rescaled onto each
+    of ``N`` sub-intervals of ``[0, 1]`` (or physical z-space).
+
+    For an inner basis with ``m = inner_level + 1`` functions and a
+    partition into ``N`` layers, ``LayeredBasis`` has ``N * m`` basis
+    functions.  Basis function ``j = i*m + k`` is the inner function
+    ``phi_k`` rescaled onto layer ``i``'s local coordinate
+    ``zeta_i = (z - lower_i) / h_i`` and zero outside the layer.
+
+    This subsumes several useful cases:
+
+    * **Piecewise constant** (multi-layer SWE): ``inner_cls=Monomials``,
+      ``inner_level=0``.  ``m = 1``, ``phi_inner_0 = 1``, so each
+      basis function is an indicator on its layer and
+      ``basis.alpha`` lists the layer-average velocities.
+    * **Multi-layer SME**: ``inner_cls=Legendre_shifted``,
+      ``inner_level = L``.  Each layer carries ``L + 1`` moments;
+      ``basis.alpha`` is flat-indexed as ``alpha_{i*m + k}``.
+    * **Single-layer smooth basis**: ``n_layers=1`` recovers the
+      plain inner basis on ``[0, 1]``.
+
+    Parameters
+    ----------
+    inner_cls : :class:`Basisfunction` subclass, default ``Monomials``
+        The per-layer basis.  Default produces piecewise-constant.
+    inner_level : int, default ``0``
+        Polynomial level of the inner basis.
+    interfaces : list of sympy, optional
+        Explicit breakpoints (len ``N + 1``).  May live in either
+        ζ-space (``[0, 1/2, 1]``) or physical z-space
+        (``[state.b, z_1, state.eta]``).
+    n_layers : int, optional
+        If ``interfaces`` isn't given, create ``n_layers + 1`` equal
+        breakpoints on ``[0, 1]``.
+    **inner_kwargs
+        Forwarded to ``inner_cls(level=inner_level, **inner_kwargs)``.
+
+    Usage::
+
+        # Two-layer SWE (piecewise constant on physical interfaces):
+        bf = LayeredBasis(interfaces=[state.b, z_1, state.eta])
+
+        # Two-layer level-1 SME (Legendre inside each layer):
+        bf = LayeredBasis(Legendre_shifted, inner_level=1,
+                          interfaces=[state.b, z_1, state.eta])
+
+        # Three equal layers in ζ-space, linear inner:
+        bf = LayeredBasis(Legendre_shifted, inner_level=1, n_layers=3)
+    """
+
+    name = "LayeredBasis"
+
+    def __init__(self, inner_cls=None, inner_level=0, interfaces=None,
+                 n_layers=None, **inner_kwargs):
+        if inner_cls is None:
+            inner_cls = Monomials
+        if interfaces is None:
+            if n_layers is None:
+                raise ValueError(
+                    "LayeredBasis requires either ``interfaces`` (explicit "
+                    "breakpoints) or ``n_layers`` (uniform partition of [0, 1])."
+                )
+            interfaces = [sympy.Rational(i, n_layers) for i in range(n_layers + 1)]
+        if len(interfaces) < 2:
+            raise ValueError("LayeredBasis needs at least two breakpoints.")
+        self.interfaces = list(interfaces)
+        self.n_layers = len(self.interfaces) - 1
+        self.inner = inner_cls(level=inner_level, **inner_kwargs)
+        self.inner_n_basis = inner_level + 1
+        # n_basis = level + 1 = N * m  (keeps the Legendre convention)
+        self.level = self.n_layers * self.inner_n_basis - 1
+        self.basis = self.basis_definition()
+
+    def basis_definition(self):
+        from sympy import Piecewise
+        z_sym = Symbol("z")
+        out = []
+        for i in range(self.n_layers):
+            lo, hi = self.interfaces[i], self.interfaces[i + 1]
+            h_i = hi - lo
+            zeta_i = (z_sym - lo) / h_i
+            for k in range(self.inner_n_basis):
+                phi_inner = self.inner.eval(k, zeta_i)
+                out.append(Piecewise(
+                    (phi_inner, (z_sym > lo) & (z_sym < hi)),
+                    (0, True),
+                ))
+        return out
+
+    def bounds(self):
+        return [self.interfaces[0], self.interfaces[-1]]
+
+    def weight(self, z):
+        # Weight per layer follows the inner basis; outside we treat
+        # it as 1 (weight only matters inside the layer's own integral).
+        return self.inner.weight(z) if hasattr(self.inner, "weight") else 1
+
+    def mean_coefficients(self):
+        """``c_{i*m+k}`` such that ``sum(c_j * phi_j) = 1`` where defined.
+
+        For a partition, exactly one layer is active at each point.
+        Inside layer ``i``, the inner basis reconstructs the constant
+        1 via its own mean coefficients.  Flatten them into the
+        layered ordering.
+        """
+        cm = self.inner.mean_coefficients()
+        out = []
+        for _ in range(self.n_layers):
+            out.extend(cm)
+        return out
+
+    # Convenience accessors for layer / moment indexing --------------
+    def flat_index(self, layer_idx, moment_idx):
+        """``(layer_idx, moment_idx) → flat basis index``."""
+        return layer_idx * self.inner_n_basis + moment_idx
+
+    def layer_zeta(self, layer_idx, z_value):
+        """Inner coordinate ``ζ_i(z_value) = (z_value - lower_i) / h_i``."""
+        lo = self.interfaces[layer_idx]
+        hi = self.interfaces[layer_idx + 1]
+        return (z_value - lo) / (hi - lo)
+
+
 class Legendre_shifted(Basisfunction):
     """Legendre shifted. (class)."""
     name = "Legendre_shifted"

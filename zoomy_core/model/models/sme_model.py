@@ -2,11 +2,11 @@
 
 Derivation::
 
-    system = FullINS(state).system()
-    system.equations["z_momentum"].apply({w: 0, τ_zz: 0, τ_zx: 0})
+    system = FullINS(state)
+    system.momentum.z.apply({w: 0, τ_zz: 0, τ_zx: 0})
     → ∂p/∂z/ρ + g = 0  →  p = p_atm + ρg(η - z)
     system.apply({p: p_hydro})
-    del system.equations["z_momentum"]
+    system.remove_equation("momentum.z")
     system.apply(DepthIntegrate)
     system.apply(ApplyKinematicBCs)
     ...
@@ -65,14 +65,11 @@ class SMEModel(INSModel):
         super().derive_model()
         s = self.state
 
-        # Hydrostatic: scale z-momentum, derive pressure, apply to system
-        self._system.equations["z_momentum"] = (
-            self._system.equations["z_momentum"]
-            .apply(hydrostatic_scaling(s))
-            .simplify()
-        )
+        # Hydrostatic: scale z-momentum (apply mutates the proxy in place),
+        # derive pressure, then remove z-momentum from the system.
+        self._system.momentum.z.apply(hydrostatic_scaling(s)).simplify()
         self.apply(HydrostaticPressure(s))
-        self._system.remove_equation("z_momentum")
+        self._system.remove_equation("momentum.z")
 
         # Depth integrate + closures
         self.apply(DepthIntegrate(s))
@@ -83,7 +80,8 @@ class SMEModel(INSModel):
         self.apply(Newtonian(s))
 
     def source(self):
-        return self.newtonian_viscosity() + self.navier_slip()
+        return (self.newtonian_viscosity() + self.navier_slip()
+                + self.gravity_body_force())
 
 
 class SMEInviscid(INSModel):
@@ -100,13 +98,9 @@ class SMEInviscid(INSModel):
         super().derive_model()
         s = self.state
 
-        self._system.equations["z_momentum"] = (
-            self._system.equations["z_momentum"]
-            .apply(hydrostatic_scaling(s))
-            .simplify()
-        )
+        self._system.momentum.z.apply(hydrostatic_scaling(s)).simplify()
         self.apply(HydrostaticPressure(s))
-        self._system.remove_equation("z_momentum")
+        self._system.remove_equation("momentum.z")
 
         self.apply(DepthIntegrate(s))
         self.apply(ApplyKinematicBCs(s))
@@ -114,3 +108,14 @@ class SMEInviscid(INSModel):
         self.apply(ZeroAtmosphericPressure(s))
         self.apply(SimplifyIntegrals(s))
         self.apply(Inviscid(s))
+
+    def source(self):
+        return self.gravity_body_force()
+
+
+# SMEModelTagged / VAMModelTagged (previously: tag-driven legacy adapters)
+# are superseded by ``SystemModel`` (``zoomy_core.model.models.system_model``),
+# which walks any closed, tagged derived ``System`` and exposes
+# ``flux / nonconservative_matrix / source`` for the solver with no
+# hand-coded physics.  See also ``tutorials/sme/symbolic_swe_simulation.py``
+# for the end-to-end path.

@@ -62,7 +62,7 @@ def vtk_project_2d_to_3d(
             Qnew = pde.project_2d_to_3d(
                 Q[:, : mesh.n_inner_cells],
                 Qaux[:, : mesh.n_inner_cells],
-                model.parameter_values,
+                np.array(list(model.parameters.values()), dtype=float),
                 z,
             ).T
 

@@ -51,8 +51,65 @@ class BoundaryCondition(param.Parameterized):
         Returns the state that the Riemann solver sees on the boundary side.
 
         Default: same as Q_face (Neumann / zero-flux).
+
+        .. deprecated:: Use ``face_value`` instead.
         """
         return Q_face.copy()
+
+    def face_value(self, Q_inner, Qaux_inner, normal, d_face, time, parameters):
+        """Boundary-side Riemann state for convective flux (ghost-cell-free).
+
+        Parameters
+        ----------
+        Q_inner : ndarray, shape (n_vars,)
+            Cell-center values of the adjacent interior cell.
+        Qaux_inner : ndarray, shape (n_aux,)
+            Auxiliary variables of the adjacent interior cell.
+        normal : ndarray, shape (dim,)
+            Outward unit face normal.
+        d_face : float
+            Distance from interior cell center to face center.
+        time : float
+            Current simulation time.
+        parameters : ndarray, shape (n_params,)
+            Model parameters.
+
+        Returns
+        -------
+        ndarray, shape (n_vars,)
+            The state that the Riemann solver sees on the boundary side.
+        """
+        return np.asarray(Q_inner, dtype=float).copy()
+
+    def face_gradient(self, Q_inner, Q_face, Qaux_inner, normal, d_face,
+                      time, parameters):
+        """Face-normal gradient dQ/dn for diffusive flux at boundary.
+
+        Parameters
+        ----------
+        Q_inner : ndarray, shape (n_vars,)
+            Cell-center values of the adjacent interior cell.
+        Q_face : ndarray, shape (n_vars,)
+            The ``face_value`` result (already computed upstream).
+        Qaux_inner : ndarray, shape (n_aux,)
+            Auxiliary variables of the adjacent interior cell.
+        normal : ndarray, shape (dim,)
+            Outward unit face normal.
+        d_face : float
+            Distance from interior cell center to face center.
+        time : float
+            Current simulation time.
+        parameters : ndarray, shape (n_params,)
+            Model parameters.
+
+        Returns
+        -------
+        ndarray, shape (n_vars,)
+            Face-normal gradient at the boundary face.
+        """
+        Q_inner = np.asarray(Q_inner, dtype=float)
+        Q_face = np.asarray(Q_face, dtype=float)
+        return (Q_face - Q_inner) / max(d_face, 1e-30)
 
 
 # --- Derived Boundary Conditions (Unchanged) ---
@@ -71,6 +128,15 @@ class Extrapolation(BoundaryCondition):
         """Extrapolation: boundary state = interior face state (zero flux)."""
         return Q_face.copy()
 
+    def face_value(self, Q_inner, Qaux_inner, normal, d_face, time, parameters):
+        """Extrapolation: boundary state = interior cell state."""
+        return np.asarray(Q_inner, dtype=float).copy()
+
+    def face_gradient(self, Q_inner, Q_face, Qaux_inner, normal, d_face,
+                      time, parameters):
+        """Extrapolation: zero Neumann (no normal gradient)."""
+        return np.zeros_like(np.asarray(Q_inner, dtype=float))
+
 
 class InflowOutflow(BoundaryCondition):
     """InflowOutflow. (class)."""
@@ -86,6 +152,18 @@ class InflowOutflow(BoundaryCondition):
                 val = eval(v)
             Qout[k] = val
         return Qout
+
+
+    def face_value(self, Q_inner, Qaux_inner, normal, d_face, time, parameters):
+        """InflowOutflow: prescribe selected fields, rest from interior."""
+        Q_out = np.asarray(Q_inner, dtype=float).copy()
+        for k, v in self.prescribe_fields.items():
+            try:
+                val = float(v)
+            except (ValueError, TypeError):
+                val = float(eval(v))
+            Q_out[k] = val
+        return Q_out
 
 
 class Lambda(BoundaryCondition):
@@ -190,6 +268,25 @@ class Wall(BoundaryCondition):
                              - (1 - self.permeability) * normal_component * n_vec[i])
         return Q_wall
 
+    def face_value(self, Q_inner, Qaux_inner, normal, d_face, time, parameters):
+        """Wall: reflect normal momentum, copy scalars.
+
+        Momentum decomposition:
+            u_wall = slip * u_tangential - (1 - perm) * u_normal
+        Scalars are extrapolated (copied from interior).
+        """
+        Q_inner = np.asarray(Q_inner, dtype=float)
+        Q_wall = Q_inner.copy()
+        for indices in self.momentum_field_indices:
+            dim = len(indices)
+            n_vec = np.asarray(normal[:dim], dtype=float)
+            mom = np.array([Q_inner[k] for k in indices], dtype=float)
+            normal_component = np.dot(mom, n_vec)
+            for i, k in enumerate(indices):
+                Q_wall[k] = (self.wall_slip * (mom[i] - normal_component * n_vec[i])
+                             - (1 - self.permeability) * normal_component * n_vec[i])
+        return Q_wall
+
 
 class RoughWall(Wall):
     """RoughWall. (class)."""
@@ -208,6 +305,18 @@ class RoughWall(Wall):
         )
         self.wall_slip = original_slip
         return res
+
+    def face_value(self, Q_inner, Qaux_inner, normal, d_face, time, parameters):
+        """RoughWall: Wall reflection with distance-dependent slip."""
+        slip_length = d_face * np.log(max((d_face * self.CsW) / self.Ks, 1e-30))
+        f = d_face / max(slip_length, 1e-30)
+        original_slip = self.wall_slip
+        self.wall_slip = (1 - f) / (1 + f)
+        result = super().face_value(
+            Q_inner, Qaux_inner, normal, d_face, time, parameters
+        )
+        self.wall_slip = original_slip
+        return result
 
 
 class Periodic(BoundaryCondition):

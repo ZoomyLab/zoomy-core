@@ -245,7 +245,7 @@ class VAMProjectedHyperbolic(Model):
     def get_primitives(self):
         n_u, n_w = self._n_u, self._n_w
         h = self.variables[0]
-        eps = getattr(self.parameters, 'eps', S.Zero)
+        eps = getattr(self._parameter_symbols, 'eps', S.Zero)
         hinv = 1 / (h + eps)
         b = self.variables[self._b_idx]
         alpha = [self.variables[1 + k] * hinv for k in range(n_u)]
@@ -307,7 +307,7 @@ class VAMProjectedHyperbolic(Model):
         n_u, n_w = self._n_u, self._n_w
         nv = self.n_variables
         b, h, alpha, gamma, hinv = self.get_primitives()
-        p = self.parameters
+        p = self._parameter_symbols
         B_mat = self._B_u
 
         nc = Matrix.zeros(nv, nv)
@@ -437,7 +437,7 @@ class VAMProjectedHyperbolic(Model):
         nv = self.n_variables
         n_u = self._n_u
         b, h, alpha, gamma, hinv = self.get_primitives()
-        p = self.parameters
+        p = self._parameter_symbols
         ev = ZArray.zeros(nv)
 
         if n_u >= 1:

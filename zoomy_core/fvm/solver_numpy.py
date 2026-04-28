@@ -46,8 +46,7 @@ def _var_index(model, name, fallback=None):
 
 def _param_value(model, name, default=None):
     if hasattr(model.parameters, "contains") and model.parameters.contains(name):
-        idx = list(model.parameters.keys()).index(name)
-        return float(model.parameter_values[idx])
+        return float(getattr(model.parameters, name))
     return default
 
 
@@ -74,6 +73,30 @@ def _detect_scaled_q_indices(model):
     return [i for i in range(model.n_variables) if i not in excluded]
 
 
+# -- Boundary condition helpers ------------------------------------------------
+
+def _compute_bf_face_gradients(Q, Qaux, bf_values, bc_objects, bf_cells, bf_fidx,
+                               d_face, normals_arr, n_bf, n_vars, has_aux,
+                               time, parameters):
+    """Compute per-variable face-normal gradients at boundary faces.
+
+    Returns dict {var_index: ndarray(n_bf,)} for use by DiffusionOperatorV2.
+    """
+    bf_grads = {v: np.zeros(n_bf) for v in range(n_vars)}
+    for i_bf in range(n_bf):
+        q_inner = Q[:, bf_cells[i_bf]]
+        q_face = bf_values[:, i_bf]
+        qaux_inner = Qaux[:, bf_cells[i_bf]] if has_aux else np.array([])
+        normal = normals_arr[:, bf_fidx[i_bf]]
+        fg = bc_objects[i_bf].face_gradient(
+            q_inner, q_face, qaux_inner, normal,
+            d_face[i_bf], time, parameters,
+        )
+        for v in range(n_vars):
+            bf_grads[v][i_bf] = fg[v]
+    return bf_grads
+
+
 # -- Base Solver ---------------------------------------------------------------
 
 class Solver(param.Parameterized):
@@ -92,42 +115,24 @@ class Solver(param.Parameterized):
 
     def initialize(self, mesh, model):
         n_variables = model.n_variables
-        n_cells = mesh.n_cells
+        nc = mesh.n_inner_cells
         n_aux_variables = model.aux_variables.length()
-        Q = np.empty((n_variables, n_cells), dtype=float)
-        Qaux = np.empty((n_aux_variables, n_cells), dtype=float)
+        Q = np.empty((n_variables, nc), dtype=float)
+        Qaux = np.empty((n_aux_variables, nc), dtype=float)
         return Q, Qaux
 
     def create_runtime(self, Q, Qaux, mesh, model):
         if hasattr(mesh, "resolve_periodic_bcs"):
             mesh.resolve_periodic_bcs(model.boundary_conditions)
         Q, Qaux = np.asarray(Q), np.asarray(Qaux)
-        parameters = np.asarray(model.parameter_values)
+        # Convert parameters Zstruct → numeric array at the symbolic→numeric boundary
+        parameters = np.array(list(model.parameters.values()), dtype=float)
         from zoomy_core.kernel import Kernel
         kernel = Kernel(model)
         kernel.regularize(model)
         self._kernel = kernel  # store for numerics regularization
         runtime_model = NumpyRuntimeModel(model, kernel=kernel)
         return Q, Qaux, parameters, mesh, runtime_model
-
-    def get_apply_boundary_conditions(self, mesh, model):
-        dim = model.dimension
-        def apply_boundary_conditions(time, Q, Qaux, parameters):
-            for i in range(mesh.n_boundary_faces):
-                i_face = mesh.boundary_face_face_indices[i]
-                i_bc_func = mesh.boundary_face_function_numbers[i]
-                q_cell = Q[:, mesh.boundary_face_cells[i]]
-                qaux_cell = Qaux[:, mesh.boundary_face_cells[i]]
-                normal = mesh.face_normals[:dim, i_face]
-                position = mesh.face_centers[i_face, :]
-                position_ghost = mesh.cell_centers[:, mesh.boundary_face_ghosts[i]]
-                distance = np.linalg.norm(position - position_ghost)
-                q_ghost = model.boundary_conditions(
-                    i_bc_func, time, position, distance, q_cell, qaux_cell, parameters, normal
-                )
-                Q[:, mesh.boundary_face_ghosts[i]] = q_ghost
-            return Q
-        return apply_boundary_conditions
 
     def update_q(self, Q, Qaux, mesh, model, parameters):
         """Apply model.update_variables (h clamp, momentum ramp) at each cell."""
@@ -177,8 +182,9 @@ class HyperbolicSolver(Solver):
 
     def initialize(self, mesh, model):
         Q, Qaux = super().initialize(mesh, model)
-        Q = model.initial_conditions.apply(mesh.cell_centers, Q)
-        Qaux = model.aux_initial_conditions.apply(mesh.cell_centers, Qaux)
+        nc = mesh.n_inner_cells
+        Q = model.initial_conditions.apply(mesh.cell_centers[:, :nc], Q)
+        Qaux = model.aux_initial_conditions.apply(mesh.cell_centers[:, :nc], Qaux)
         return Q, Qaux
 
     # -- Symbolic model helpers ----------------------------------------
@@ -243,34 +249,51 @@ class HyperbolicSolver(Solver):
         fi_h = keys.index("h") if "h" in keys else None
         dry_thr = self._get_dry_threshold(symbolic_model) if fi_h is not None else 0.0
         dim = symbolic_model.dimension
-        iA = mesh.face_cells[0]
-        iB = mesh.face_cells[1]
         normals = mesh.face_normals[:dim, :]
         has_aux = symbolic_model.n_aux_variables > 0
 
-        n_inner = mesh.n_inner_cells
+        nc = mesh.n_inner_cells
+        iA = mesh.face_cells[0]
+        iB = mesh.face_cells[1]
+
+        # Split faces into interior and boundary
+        int_mask = (iA < nc) & (iB < nc)
+        bnd_mask = ~int_mask
+        interior_faces = np.where(int_mask)[0]
+        boundary_faces = np.where(bnd_mask)[0]
+        iA_int = iA[interior_faces]
+        iB_int = iB[interior_faces]
+        # face_cells[0] is guaranteed to be the inner cell at boundary faces
+        iInner_bnd = iA[boundary_faces]
 
         def compute_max_eigenvalue(Q, Qaux, parameters):
             max_ev = np.zeros(mesh.n_faces)
-            for f in range(mesh.n_faces):
-                cA, cB = iA[f], iB[f]
-                # Skip faces where both sides are dry or ghost
-                if cA >= n_inner and cB >= n_inner:
-                    continue
+
+            # Interior faces: evaluate at both cells
+            for fi in range(len(interior_faces)):
+                f = interior_faces[fi]
                 if fi_h is not None:
-                    hA = Q[fi_h, cA] if cA < n_inner else 0.0
-                    hB = Q[fi_h, cB] if cB < n_inner else 0.0
-                    if hA < dry_thr and hB < dry_thr:
+                    if Q[fi_h, iA_int[fi]] < dry_thr and Q[fi_h, iB_int[fi]] < dry_thr:
                         continue
                 n = normals[:, f]
-                # Only evaluate at interior cells (skip ghost cells)
-                for i_cell in [cA, cB]:
-                    if i_cell >= n_inner:
-                        continue
+                for i_cell in [iA_int[fi], iB_int[fi]]:
                     q = Q[:, i_cell]
                     qaux = Qaux[:, i_cell] if has_aux else _EMPTY_AUX
                     ev = max_ws(*q, *qaux, *parameters, *n)
                     max_ev[f] = max(max_ev[f], ev)
+
+            # Boundary faces: evaluate at inner cell only
+            for bi in range(len(boundary_faces)):
+                f = boundary_faces[bi]
+                cInner = iInner_bnd[bi]
+                if fi_h is not None and Q[fi_h, cInner] < dry_thr:
+                    continue
+                n = normals[:, f]
+                q = Q[:, cInner]
+                qaux = Qaux[:, cInner] if has_aux else _EMPTY_AUX
+                ev = max_ws(*q, *qaux, *parameters, *n)
+                max_ev[f] = max(max_ev[f], ev)
+
             return max_ev
         return compute_max_eigenvalue
 
@@ -281,7 +304,7 @@ class HyperbolicSolver(Solver):
         return NonconservativeRusanov(symbolic_model)
 
     def _build_diffusion_operators(self, mesh, symbolic_model, dim, n_vars):
-        """Build DiffusionOperator for each variable (if model has diffusion)."""
+        """Build DiffusionOperatorV2 for each variable (if model has diffusion)."""
         if not hasattr(symbolic_model, 'diffusive_flux'):
             return None
         sym_dflux = symbolic_model.diffusive_flux()
@@ -291,19 +314,21 @@ class HyperbolicSolver(Solver):
         )
         if is_zero:
             return None
-        from zoomy_core.fvm.reconstruction import DiffusionOperator
+        from zoomy_core.fvm.reconstruction import DiffusionOperatorV2
         nu_val = _param_value(symbolic_model, "nu", default=0.0)
         if nu_val <= 0:
             return None
-        return {v: DiffusionOperator(mesh, dim, nu=nu_val) for v in range(n_vars)}
+        return {v: DiffusionOperatorV2(mesh, dim, nu=nu_val) for v in range(n_vars)}
 
     def _build_reconstruction(self, mesh, symbolic_model):
-        """Build the face reconstruction. Override for free-surface variants."""
-        from zoomy_core.fvm.reconstruction import ConstantReconstruction, MUSCLReconstruction
+        """Build ghost-cell-free face reconstruction."""
+        from zoomy_core.fvm.reconstruction import (
+            ConstantReconstructionV2, LSQMUSCLReconstruction,
+        )
         dim = symbolic_model.dimension
         if self.reconstruction_order >= 2:
-            return MUSCLReconstruction(mesh, dim, limiter=self.limiter)
-        return ConstantReconstruction(mesh, dim)
+            return LSQMUSCLReconstruction(mesh, dim, limiter=self.limiter)
+        return ConstantReconstructionV2(mesh, dim)
 
     def get_flux_operator(self, mesh, model):
         symbolic_model = self._get_symbolic_model(model)
@@ -317,63 +342,101 @@ class HyperbolicSolver(Solver):
             lambda Q, Qaux, p, n: max_wavespeed_fn(*Q, *Qaux, *p, *n)
         )
 
+        nc = mesh.n_inner_cells
         iA = mesh.face_cells[0]
         iB = mesh.face_cells[1]
         normals_arr = mesh.face_normals[:dim, :]
         face_volumes = mesh.face_volumes
-        cell_volumesA = mesh.cell_volumes[iA]
-        cell_volumesB = mesh.cell_volumes[iB]
+        cell_volumes = mesh.cell_volumes
         n_vars = symbolic_model.n_variables
         has_aux = symbolic_model.n_aux_variables > 0
 
-        # Build reconstruction (resolved at setup, not per-step)
+        # Build reconstruction (ghost-cell-free)
         reconstruct = self._build_reconstruction(mesh, symbolic_model)
 
-        # Build diffusion operators (explicit in HyperbolicSolver, implicit in IMEX)
+        # Build diffusion operators (ghost-cell-free)
         self._diffusion_ops = self._build_diffusion_operators(mesh, symbolic_model, dim, n_vars)
 
-        # Build per-boundary-face BC dispatchers for face_state
-        boundary_face_set = set()
-        boundary_face_bc = {}  # face_index → BoundaryCondition object
+        # Precompute face index sets — split into interior and boundary
+        bf_face_set = set(mesh.boundary_face_face_indices)
+        interior_faces = np.array(
+            [f for f in range(mesh.n_faces) if f not in bf_face_set], dtype=int)
+        boundary_faces = mesh.boundary_face_face_indices.copy()
+        iA_int = iA[interior_faces]
+        iB_int = iB[interior_faces]
+        # THIS-side cell at boundary faces (for reconstruction + flux accumulation).
+        # Use face_cells[0] (guaranteed by normalization), NOT boundary_face_cells
+        # (which may be remapped to the opposite cell for periodic BCs).
+        iInner_bnd = iA[boundary_faces]  # = face_cells[0] at boundary faces
+        cvA_int = cell_volumes[iA_int]
+        cvB_int = cell_volumes[iB_int]
+        cvInner_bnd = cell_volumes[iInner_bnd]
+        fv_int = face_volumes[interior_faces]
+        fv_bnd = face_volumes[boundary_faces]
+
+        # Build BC object list per boundary face + precompute d_face
+        n_bf = mesh.n_boundary_faces
+        # boundary_face_cells may be remapped for periodic BCs (opposite cell).
+        # This is what feeds into face_value() — correct for periodic.
+        bf_cells = mesh.boundary_face_cells
+        bf_fidx = mesh.boundary_face_face_indices
         bcs_obj = getattr(symbolic_model, 'boundary_conditions', None)
+        bc_objects = []
         if bcs_obj is not None and hasattr(bcs_obj, 'boundary_conditions_list'):
-            for i_bf in range(mesh.n_boundary_faces):
-                fidx = mesh.boundary_face_face_indices[i_bf]
+            for i_bf in range(n_bf):
                 bc_func_idx = mesh.boundary_face_function_numbers[i_bf]
-                if bc_func_idx < len(bcs_obj.boundary_conditions_list):
-                    boundary_face_set.add(fidx)
-                    boundary_face_bc[fidx] = bcs_obj.boundary_conditions_list[bc_func_idx]
+                bc_objects.append(bcs_obj.boundary_conditions_list[bc_func_idx])
+        else:
+            from zoomy_core.model.boundary_conditions import Extrapolation
+            bc_objects = [Extrapolation() for _ in range(n_bf)]
 
-        # Build wall face mirroring for O2 boundary accuracy
-        from zoomy_core.model.boundary_conditions import Wall as _WallBC
-        _wall_faces = set()
-        _wall_mom_idx = []
-        if bcs_obj is not None and hasattr(bcs_obj, 'boundary_conditions_list'):
-            for bc in bcs_obj.boundary_conditions_list:
-                if isinstance(bc, _WallBC):
-                    _wall_mom_idx = bc.momentum_field_indices
-                    for i_bf in range(mesh.n_boundary_faces):
-                        if mesh.boundary_face_function_numbers[i_bf] == bcs_obj._boundary_tags.index(bc.tag):
-                            _wall_faces.add(mesh.boundary_face_face_indices[i_bf])
-        _use_wall_mirror = len(_wall_faces) > 0 and self.reconstruction_order >= 2
+        d_face = np.array([
+            np.linalg.norm(
+                mesh.face_centers[bf_fidx[i], :dim] - mesh.cell_centers[:dim, bf_cells[i]]
+            )
+            for i in range(n_bf)
+        ]) if n_bf > 0 else np.array([])
 
-        def flux_operator(dt, Q, Qaux, parameters, dQ):
-            dQ = np.zeros_like(dQ)
-            Q_L, Q_R = reconstruct(Q)
-            for f in range(mesh.n_faces):
+        # Store BC metadata for IMEX access
+        self._bc_objects = bc_objects
+        self._bf_cells = bf_cells
+        self._bf_fidx = bf_fidx
+        self._d_face = d_face
+        self._n_bf = n_bf
+
+        def flux_operator(dt, time, Q, Qaux, parameters, dQ):
+            dQ = np.zeros((n_vars, nc))
+
+            # 1. Compute boundary face values via BC.face_value (cell-center values)
+            bf_values = np.zeros((n_vars, n_bf))
+            for i_bf in range(n_bf):
+                q_inner = Q[:, bf_cells[i_bf]]
+                qaux_inner = Qaux[:, bf_cells[i_bf]] if has_aux else _EMPTY_AUX
+                normal = normals_arr[:, bf_fidx[i_bf]]
+                bf_values[:, i_bf] = bc_objects[i_bf].face_value(
+                    q_inner, qaux_inner, normal, d_face[i_bf], time, parameters
+                )
+
+            # 2. Reconstruct (uses bf_values for limiter bounds + Q_R placeholder)
+            Q_L, Q_R = reconstruct(Q, bf_values)
+
+            # 3. Override Q_R at boundary faces with face_value(Q_L)
+            #    Q_L = reconstructed interior state (face_cells[0] = inner cell)
+            for i_bf in range(n_bf):
+                fidx = bf_fidx[i_bf]
+                qaux_inner = Qaux[:, bf_cells[i_bf]] if has_aux else _EMPTY_AUX
+                normal = normals_arr[:, fidx]
+                Q_R[:, fidx] = bc_objects[i_bf].face_value(
+                    Q_L[:, fidx], qaux_inner, normal, d_face[i_bf], time, parameters
+                )
+
+            # 4a. Interior face loop — both cells are valid inner cells
+            for fi in range(len(interior_faces)):
+                f = interior_faces[fi]
                 qA = Q_L[:, f]
-                if _use_wall_mirror and f in _wall_faces:
-                    qB = qA.copy()
-                    for indices in _wall_mom_idx:
-                        n_vec = normals_arr[:len(indices), f]
-                        mom = np.array([qA[k] for k in indices])
-                        nc = np.dot(mom, n_vec)
-                        for i, k in enumerate(indices):
-                            qB[k] = mom[i] - 2.0 * nc * n_vec[i]
-                else:
-                    qB = Q_R[:, f]
-                qauxA = Qaux[:, iA[f]] if has_aux else _EMPTY_AUX
-                qauxB = Qaux[:, iB[f]] if has_aux else _EMPTY_AUX
+                qB = Q_R[:, f]
+                qauxA = Qaux[:, iA_int[fi]] if has_aux else _EMPTY_AUX
+                qauxB = Qaux[:, iB_int[fi]] if has_aux else _EMPTY_AUX
                 n = normals_arr[:, f]
 
                 fluct = np.asarray(
@@ -388,14 +451,40 @@ class HyperbolicSolver(Solver):
                 ).reshape(-1)
                 Dp = fluct[:n_vars]
                 Dm = fluct[n_vars:]
-                dQ[:, iA[f]] -= (num_flux + Dm) * face_volumes[f] / cell_volumesA[f]
-                dQ[:, iB[f]] -= (-num_flux + Dp) * face_volumes[f] / cell_volumesB[f]
+                dQ[:, iA_int[fi]] -= (num_flux + Dm) * fv_int[fi] / cvA_int[fi]
+                dQ[:, iB_int[fi]] -= (-num_flux + Dp) * fv_int[fi] / cvB_int[fi]
 
-            # Explicit diffusion (skipped when IMEX handles it implicitly)
+            # 4b. Boundary face loop — one inner cell only
+            for bi in range(len(boundary_faces)):
+                f = boundary_faces[bi]
+                qA = Q_L[:, f]
+                qB = Q_R[:, f]
+                qauxA = Qaux[:, iInner_bnd[bi]] if has_aux else _EMPTY_AUX
+                qauxB = qauxA  # boundary: use inner cell aux
+                n = normals_arr[:, f]
+
+                fluct = np.asarray(
+                    runtime_numerics.numerical_fluctuations(
+                        qA, qB, qauxA, qauxB, parameters, n
+                    ), dtype=float,
+                ).reshape(-1)
+                num_flux = np.asarray(
+                    runtime_numerics.numerical_flux(
+                        qA, qB, qauxA, qauxB, parameters, n
+                    ), dtype=float,
+                ).reshape(-1)
+                Dm = fluct[n_vars:]
+                # Inner cell is always face_cells[0] (A-side)
+                dQ[:, iInner_bnd[bi]] -= (num_flux + Dm) * fv_bnd[bi] / cvInner_bnd[bi]
+
+            # 5. Explicit diffusion with boundary contributions
             if self._diffusion_ops is not None and self._diffusion_in_flux:
+                bf_grads = _compute_bf_face_gradients(
+                    Q, Qaux, bf_values, bc_objects, bf_cells, bf_fidx,
+                    d_face, normals_arr, n_bf, n_vars, has_aux, time, parameters,
+                )
                 for v, diff_op in self._diffusion_ops.items():
-                    Lu = diff_op.explicit(Q[v, :])
-                    dQ[v, :mesh.n_inner_cells] += Lu
+                    dQ[v, :] += diff_op.explicit_with_bc(Q[v, :], bf_grads[v])
 
             return dQ
         return flux_operator
@@ -410,9 +499,7 @@ class HyperbolicSolver(Solver):
 
     def get_compute_source_jacobian_wrt_variables(self, mesh, model):
         def compute(dt, Q, Qaux, parameters, dQ):
-            return model.source_jacobian_wrt_variables(
-                Q[:, :mesh.n_inner_cells], Qaux[:, :mesh.n_inner_cells], parameters
-            )
+            return model.source_jacobian_wrt_variables(Q, Qaux, parameters)
         return compute
 
     # -- Setup / Step / Run / Solve ------------------------------------
@@ -432,21 +519,28 @@ class HyperbolicSolver(Solver):
         self._sim_Qaux = Qaux
         self._sim_time = 0.0
 
-        # Build operators (once)
+        # Build operators (once) — no ghost-cell BC operator needed
         self._sim_compute_max_abs_eigenvalue = self.get_compute_max_abs_eigenvalue(mesh, model)
-        self._sim_boundary_operator = self.get_apply_boundary_conditions(mesh, model)
         self._sim_flux_operator = self.get_flux_operator(mesh, model)
-        self._sim_ode_step = ode.RK2 if self.reconstruction_order >= 2 else ode.RK1
+        self._sim_source_operator = self.get_compute_source(mesh, model)
 
-        # Apply initial BCs and update
-        self._sim_Q = self._sim_boundary_operator(0.0, Q, Qaux, parameters)
+        # Apply initial variable updates
         self._sim_Q = self.update_q(self._sim_Q, Qaux, mesh, model, parameters)
 
-        # Precompute mesh constant
-        self._sim_cell_inradius_face = np.minimum(
-            mesh.cell_inradius[mesh.face_cells[0, :]],
-            mesh.cell_inradius[mesh.face_cells[1, :]],
-        ).min()
+        # Precompute mesh constant for CFL
+        nc = mesh.n_inner_cells
+        inner_face_mask = (mesh.face_cells[0] < nc) & (mesh.face_cells[1] < nc)
+        inner_inradii = np.minimum(
+            mesh.cell_inradius[mesh.face_cells[0, inner_face_mask]],
+            mesh.cell_inradius[mesh.face_cells[1, inner_face_mask]],
+        )
+        bnd_inradii = mesh.cell_inradius[
+            mesh.face_cells[0, ~inner_face_mask]
+        ] if (~inner_face_mask).any() else np.array([np.inf])
+        self._sim_cell_inradius_face = min(
+            inner_inradii.min() if len(inner_inradii) > 0 else np.inf,
+            bnd_inradii.min() if len(bnd_inradii) > 0 else np.inf,
+        )
 
         # Output setup
         if write_output:
@@ -457,16 +551,14 @@ class HyperbolicSolver(Solver):
         else:
             self._sim_save_fields = lambda time, time_stamp, i_snapshot, Q, Qaux: i_snapshot
 
-    def _apply_bcs(self, time, Q, Qaux, parameters):
-        """Fill ghost cells for MUSCL gradient computation and limiter bounds."""
-        Q = self._sim_boundary_operator(time, Q, Qaux, parameters)
-        return Q
-
     def step(self, dt):
-        """One explicit timestep with per-stage BC application.
+        """One explicit timestep (ghost-cell-free).
 
-        O1 (RK1): BCs → flux → advance
-        O2 (RK2/Heun): BCs → flux → advance → BCs → flux → average
+        BCs are evaluated inline inside the flux operator — no separate
+        ghost-cell filling step. Loops are split into interior/boundary.
+
+        O1 (RK1): flux → advance
+        O2 (RK2/Heun): flux → advance → flux → average
         """
         Q = self._sim_Q
         Qaux = self._sim_Qaux
@@ -475,33 +567,25 @@ class HyperbolicSolver(Solver):
         mesh = self._sim_mesh
         model = self._sim_model
         flux = self._sim_flux_operator
+        source = self._sim_source_operator
+
+        def rhs(t, Q_in):
+            """Total RHS = flux + source."""
+            dQ_f = flux(dt, t, Q_in, Qaux, parameters, np.zeros_like(Q_in))
+            dQ_s = source(dt, Q_in, Qaux, parameters, np.zeros_like(Q_in))
+            return dQ_f + dQ_s
 
         if self.reconstruction_order >= 2:
-            # SSP-RK2 (Heun) with BCs applied per stage
+            # SSP-RK2 (Heun) — flux + source per stage
             Q0 = np.array(Q)
-
-            # Stage 1: BCs → reconstruct → flux → advance
-            Q = self._apply_bcs(time_now, Q, Qaux, parameters)
-            dQ = np.zeros_like(Q)
-            dQ = flux(dt, Q, Qaux, parameters, dQ)
-            Q1 = Q + dt * dQ
-
-            # Stage 2: BCs → reconstruct → flux → advance
-            Q1 = self._apply_bcs(time_now + dt, Q1, Qaux, parameters)
-            dQ = flux(dt, Q1, Qaux, parameters, dQ)
-            Q2 = Q1 + dt * dQ
-
-            # Average
+            Q1 = Q + dt * rhs(time_now, Q)
+            Q2 = Q1 + dt * rhs(time_now + dt, Q1)
             Qnew = 0.5 * (Q0 + Q2)
         else:
-            # RK1: BCs → flux → advance
-            Q = self._apply_bcs(time_now, Q, Qaux, parameters)
-            dQ = np.zeros_like(Q)
-            dQ = flux(dt, Q, Qaux, parameters, dQ)
-            Qnew = Q + dt * dQ
+            # RK1
+            Qnew = Q + dt * rhs(time_now, Q)
 
-        # Final BC application + variable updates
-        Qnew = self._apply_bcs(time_now, Qnew, Qaux, parameters)
+        # Variable updates (clamp, etc.)
         Qnew = self.update_q(Qnew, Qaux, mesh, model, parameters)
 
         # Auxiliary variable updates
@@ -590,9 +674,9 @@ class FreeSurfaceFlowSolver(HyperbolicSolver):
     def _build_reconstruction(self, mesh, symbolic_model):
         dim = symbolic_model.dimension
         if self.reconstruction_order >= 2:
-            from zoomy_core.fvm.reconstruction import FreeSurfaceMUSCL
+            from zoomy_core.fvm.reconstruction import FreeSurfaceLSQMUSCL
             h_idx = _var_index(symbolic_model, "h")
             eps_wet = self._get_dry_threshold(symbolic_model)
-            return FreeSurfaceMUSCL(mesh, dim, h_index=h_idx,
-                                    eps_wet=eps_wet, limiter=self.limiter)
+            return FreeSurfaceLSQMUSCL(mesh, dim, h_index=h_idx,
+                                       eps_wet=eps_wet, limiter=self.limiter)
         return super()._build_reconstruction(mesh, symbolic_model)
