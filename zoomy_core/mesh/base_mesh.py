@@ -257,6 +257,29 @@ class BaseMesh(param.Parameterized):
     # Optional
     z_ordering = param.Array(default=np.array([-1]))
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # Guarantee: face_cells[0] is always the inner cell at boundary faces.
+        # Some factory methods (e.g. create_1d) may produce the ghost at
+        # face_cells[0]; this normalizes the ordering so downstream code
+        # can assume face_cells[0] = inner, face_cells[1] = ghost.
+        if self.n_boundary_faces > 0 and self.face_cells.size > 0:
+            self._normalize_boundary_face_order()
+
+    def _normalize_boundary_face_order(self):
+        """Ensure face_cells[0] is the inner cell at every boundary face.
+
+        If face_cells[0] >= n_inner_cells (ghost on wrong side), swap both
+        the cell indices and negate the face normal direction (stored as a
+        flag for the 1D case where normals are computed from convention).
+        """
+        fc = self.face_cells
+        nc = self.n_inner_cells
+        for i_bf in range(self.n_boundary_faces):
+            fidx = self.boundary_face_face_indices[i_bf]
+            if fc[0, fidx] >= nc:
+                fc[0, fidx], fc[1, fidx] = fc[1, fidx], fc[0, fidx]
+
     # ── on-the-fly geometry ─────────────────────────────────────────────
 
     def cell_centers_computed(self) -> np.ndarray:
@@ -357,14 +380,22 @@ class BaseMesh(param.Parameterized):
     def face_normals_computed(self) -> np.ndarray:
         """Compute face normals. Shape (3, n_faces).
 
-        For 1D meshes all normals point in the +x direction (convention).
+        Normal always points from ``face_cells[0]`` toward ``face_cells[1]``.
+        Works for any dimension.
         """
         dim = self.dimension
         n_faces = self.n_faces
         normals = np.zeros((3, n_faces), dtype=float)
 
+        # Cell centers needed for orientation in all dimensions
+        centers = self.cell_centers_computed()
+
         if dim == 1:
-            normals[0, :] = 1.0
+            # In 1D a "face normal" is just a sign: +1 or -1.
+            # Direction = from face_cells[0] toward face_cells[1].
+            for f in range(n_faces):
+                c0, c1 = self.face_cells[0, f], self.face_cells[1, f]
+                normals[0, f] = np.sign(centers[0, c1] - centers[0, c0])
             return normals
 
         coords_3d = np.zeros((self.n_vertices, 3), dtype=float)

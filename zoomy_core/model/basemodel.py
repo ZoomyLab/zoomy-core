@@ -134,13 +134,19 @@ class Model(param.Parameterized, SymbolicRegistrar):
         var_def = self._resolve_input(self.variables)
         aux_def = self._resolve_input(self.aux_variables)
 
-        # 1. Parse Parameters
-        self.parameter_defaults_map = extract_parameter_defaults(p_def)
-        self.parameters = parse_definition_to_zstruct(p_def, "p")
-        self.parameters._symbolic_name = "p"
-        self.parameter_values = np.array(
-            [self.parameter_defaults_map.get(k, 0.0) for k in self.parameters.keys()]
+        # 1. Parameters
+        # Symbols (used in symbolic derivation) live in ``_parameter_symbols``.
+        # Values (the user-facing interface) live in ``parameters``.
+        self._parameter_symbols = parse_definition_to_zstruct(p_def, "p")
+        self._parameter_symbols._symbolic_name = "p"
+        defaults = extract_parameter_defaults(p_def)
+        # ``self.parameters`` is a plain Zstruct holding numeric values.
+        # Users can do ``model.parameters.nu = 0.01`` or
+        # ``model.parameters.update({"nu": 0.01, "lamda": 1e-2})``.
+        self.parameters = Zstruct(
+            **{k: float(defaults.get(k, 0.0)) for k in self._parameter_symbols.keys()}
         )
+        self.parameters._symbolic_name = "p"
 
         # 2. Parse Variables
         self.variables = parse_definition_to_zstruct(var_def, "q")
@@ -173,7 +179,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
         std_sig = Zstruct(
             variables=self.variables,
             aux_variables=self.aux_variables,
-            p=self.parameters,
+            p=self._parameter_symbols,
         )
         eig_sig = Zstruct(**std_sig.as_dict(), normal=self.normal)
         res_sig = Zstruct(
@@ -187,7 +193,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
         )
         proj_sig = Zstruct(position=self.position, **std_sig.as_dict())
 
-        ic_sig = Zstruct(position=self.position, p=self.parameters)
+        ic_sig = Zstruct(position=self.position, p=self._parameter_symbols)
 
         # Gradient symbols for diffusive_flux: gradQ[var, dim]
         grad_syms = []
@@ -203,7 +209,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
             variables=self.variables,
             aux_variables=self.aux_variables,
             gradient_variables=self.gradient_variables,
-            p=self.parameters,
+            p=self._parameter_symbols,
         )
 
         regs = [
@@ -259,7 +265,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
                 self.distance,
                 self.variables,
                 self.aux_variables,
-                self.parameters,
+                self._parameter_symbols,
                 self.normal,
                 function_name="boundary_conditions",
             )
@@ -305,7 +311,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
                 self.distance,
                 self.variables,
                 self.aux_variables,
-                self.parameters,
+                self._parameter_symbols,
                 self.normal,
                 function_name="aux_boundary_conditions",  # [FIX] Pass the name here!
             )
@@ -533,9 +539,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
                 eig_list = None
                 eig_summary = "symbolic (failed to compute)"
 
-        params = {}
-        for k in self.parameters.keys():
-            params[k] = self.parameter_defaults_map.get(k, 0.0)
+        params = dict(self.parameters.as_dict(recursive=False))
 
         config = {
             "class": self.__class__.__name__,

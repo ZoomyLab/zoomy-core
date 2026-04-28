@@ -65,7 +65,7 @@ def analytic_source_jvp(
     - Without chain rule: Jv = (dS/dQ) v
     - With chain rule:    Jv = (dS/dQ) v + (dS/dQaux) (dQaux/dQ v)
     """
-    parameters = np.asarray(symbolic_model.parameter_values)
+    parameters = np.array(list(symbolic_model.parameters.values()), dtype=float)
     Jq = runtime_model.source_jacobian_wrt_variables(Q, Qaux, parameters)
     # expected shape: (n_var, n_var, n_cells)
     jv = np.einsum("ijc,jc->ic", Jq, V)
