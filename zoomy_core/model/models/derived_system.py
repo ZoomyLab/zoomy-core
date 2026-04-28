@@ -605,6 +605,23 @@ class System:
     def leaves(self) -> Iterator[Tuple[tuple, Expression]]:
         yield from _iter_leaves(self._tree)
 
+    # -- backward-compat dict view (keeps legacy ``.equations[...]`` callers working) --
+
+    @property
+    def equations(self) -> "_EquationsDictView":
+        """Dict-like flat view of all leaf equations.
+
+        Keys are dotted paths joined into legacy flat names so
+        ``system.equations["x_momentum"]`` works for INS-style systems
+        whose tree is ``momentum.x``.  Generic dotted paths
+        (``"momentum.x"``) are also accepted.
+
+        Provided for backward compatibility with code that pre-dates
+        the tree-based ``System``.  New code should use proxy-style
+        ``system.momentum.x.apply(op)`` directly.
+        """
+        return _EquationsDictView(self)
+
     # -- apply / simplify / subs on the whole tree ------------------------
 
     def apply(self, *args, name=None, description=None, **kwargs):
@@ -1096,3 +1113,82 @@ def link_as_branches(*systems, reference=None):
         # consistent with the branch's new history length.
         for i, entry in enumerate(sys.history):
             entry["step"] = i
+
+
+class _EquationsDictView:
+    """Backward-compat dict-like view over a ``System``'s leaf tree.
+
+    Bridges legacy ``system.equations["x_momentum"]`` access onto the
+    tree-based storage.  Keys handle:
+      - dotted paths (``"momentum.x"``) — first-class.
+      - legacy flat names (``"x_momentum"``, ``"y_momentum"``,
+        ``"z_momentum"``) — automatically remapped to ``momentum.x`` etc.
+    """
+
+    _LEGACY_REWRITES = {
+        "x_momentum": ("momentum", "x"),
+        "y_momentum": ("momentum", "y"),
+        "z_momentum": ("momentum", "z"),
+    }
+
+    def __init__(self, system: "System"):
+        self._system = system
+
+    @staticmethod
+    def _to_path(key) -> tuple:
+        if isinstance(key, tuple):
+            return key
+        if not isinstance(key, str):
+            raise TypeError(f"equations key must be str or tuple, got {type(key)!r}")
+        if key in _EquationsDictView._LEGACY_REWRITES:
+            return _EquationsDictView._LEGACY_REWRITES[key]
+        return tuple(key.split("."))
+
+    @staticmethod
+    def _from_path(path: tuple) -> str:
+        return ".".join(path)
+
+    def __getitem__(self, key):
+        path = self._to_path(key)
+        node = self._system._tree
+        for p in path:
+            if not hasattr(node, p):
+                raise KeyError(key)
+            node = getattr(node, p)
+        return node
+
+    def __setitem__(self, key, value):
+        path = self._to_path(key)
+        if not isinstance(value, Expression):
+            value = Expression(value, path[-1])
+        self._system.add_equation(path, value)
+
+    def __delitem__(self, key):
+        path = self._to_path(key)
+        self._system.remove_equation(path)
+
+    def __contains__(self, key):
+        try:
+            self.__getitem__(key)
+            return True
+        except KeyError:
+            return False
+
+    def __iter__(self):
+        for path, _ in self._system.leaves():
+            yield self._from_path(path)
+
+    def __len__(self):
+        return sum(1 for _ in self._system.leaves())
+
+    def keys(self):
+        return list(self)
+
+    def values(self):
+        return [expr for _, expr in self._system.leaves()]
+
+    def items(self):
+        return [(self._from_path(p), expr) for p, expr in self._system.leaves()]
+
+    def __repr__(self):
+        return f"_EquationsDictView({list(self)})"
