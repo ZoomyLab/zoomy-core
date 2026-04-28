@@ -28,7 +28,7 @@ class ScalarAdvection(Model):
 
     def flux(self):
         u = self.variables[0]
-        p = self.parameters
+        p = self._parameter_symbols
         dim = self.dimension
         F = Matrix.zeros(1, dim)
         a_syms = list(p.values())
@@ -37,7 +37,7 @@ class ScalarAdvection(Model):
         return ZArray(F)
 
     def eigenvalues(self):
-        p = self.parameters
+        p = self._parameter_symbols
         n = self.normal
         a_syms = list(p.values())
         ev = sum(a_syms[d] * n[d] for d in range(self.dimension))
@@ -65,7 +65,7 @@ class ScalarAdvectionDiffusion(Model):
 
     def flux(self):
         u = self.variables[0]
-        p = self.parameters
+        p = self._parameter_symbols
         dim = self.dimension
         F = Matrix.zeros(1, dim)
         a_syms = [p[k] for k in list(p.keys()) if k.startswith("a_")]
@@ -75,7 +75,7 @@ class ScalarAdvectionDiffusion(Model):
 
     def diffusive_flux(self):
         """F_diff = -ν * ∇u. Shape (1, dim)."""
-        p = self.parameters
+        p = self._parameter_symbols
         gQ = self.gradient_variables
         dim = self.dimension
         nu = p.nu
@@ -87,7 +87,7 @@ class ScalarAdvectionDiffusion(Model):
         return ZArray(F)
 
     def eigenvalues(self):
-        p = self.parameters
+        p = self._parameter_symbols
         n = self.normal
         a_syms = [p[k] for k in list(p.keys()) if k.startswith("a_")]
         ev = sum(a_syms[d] * n[d] for d in range(self.dimension))

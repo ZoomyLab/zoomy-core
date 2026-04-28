@@ -229,7 +229,9 @@ class NumpyRuntimeModel:
         self.n_variables = model.n_variables
         self.n_aux_variables = model.n_aux_variables
         self.n_parameters = model.n_parameters
-        self.parameters: FArray = model.parameter_values
+        # Extract numeric parameter values from the symbolic model's Zstruct
+        # at compile time. Values live in ``model.parameters`` (a plain Zstruct).
+        self.parameters: FArray = np.array(list(model.parameters.values()), dtype=float)
 
         # Copy the class-level mapping to avoid shared mutable state.
         self.module = dict(type(self).module) if module is None else dict(module)
