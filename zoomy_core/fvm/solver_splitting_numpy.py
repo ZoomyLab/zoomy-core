@@ -20,7 +20,7 @@ from scipy.sparse import lil_matrix, csr_matrix
 from scipy.sparse.linalg import LinearOperator, gmres
 
 from zoomy_core.fvm.solver_imex_numpy import IMEXSolver, IMEXStats
-from zoomy_core.fvm.solver_numpy import _build_free_surface_numerics
+from zoomy_core.fvm.solver_numpy import _build_free_surface_numerics, _EMPTY_AUX
 from zoomy_core.mesh import ensure_lsq_mesh
 from zoomy_core.mesh.lsq_reconstruction import find_derivative_indices
 import zoomy_core.fvm.ode as ode
@@ -36,11 +36,24 @@ class SplittingSolver(IMEXSolver):
 
     The model state Q holds velocity components.  Pressure is a separate
     field solved at each timestep via the incompressibility constraint.
+
+    Subclasses for free-surface flow override ``_velocity_indices`` to
+    point at the actual velocity slots (e.g. ``[2, 3, ...]`` past the
+    bathymetry/depth pair) — by default we assume INS-style layout
+    where the velocity components are at indices ``0..dim-1``.
     """
 
     pressure_gmres_tol = param.Number(default=1e-6, doc="GMRES tolerance for Poisson")
     pressure_gmres_maxiter = param.Integer(default=200, doc="Max GMRES iterations for Poisson")
     viscosity = param.Number(default=0.01, doc="Kinematic viscosity v")
+
+    def _velocity_indices(self, model):
+        """State indices subject to viscous diffusion + pressure projection.
+
+        Default (INS-style state ``[u, v[, w]]``): ``[0, ..., dim-1]``.
+        Subclasses override for layouts like ``[b, h, hu, hv, ...]``.
+        """
+        return list(range(model.dimension))
 
     def setup_simulation(self, mesh, model, write_output=False):
         """Build all operators including Poisson infrastructure."""
@@ -82,20 +95,27 @@ class SplittingSolver(IMEXSolver):
         # Build sparse Laplacian matrix for Poisson
         self._sim_poisson_solver = self._build_poisson_solver(mesh, dim, nc, n_cells, iA, iB)
 
-        # Build operators from parent hierarchy
+        # Build operators from parent hierarchy (ghost-cell-free).
+        # get_flux_operator populates self._bc_objects, _bf_cells,
+        # _bf_fidx, _d_face, _n_bf — used by the viscous and pressure
+        # substeps to evaluate BCs inline at boundary faces.
         self._sim_compute_max_abs_eigenvalue = self.get_compute_max_abs_eigenvalue(mesh, model_rt)
-        self._sim_boundary_operator = self.get_apply_boundary_conditions(mesh, model_rt)
         self._sim_flux_operator = self.get_flux_operator(mesh, model_rt)
-        self._sim_ode_step = ode.RK1
+
+        # Precompute interior face index set (for split substep loops)
+        bf_face_set = set(mesh.boundary_face_face_indices)
+        self._sim_interior_faces = np.array(
+            [f for f in range(mesh.n_faces) if f not in bf_face_set], dtype=int,
+        )
+
+        # Velocity component slots in the state vector (subclass-overridable)
+        self._sim_vel_idx = self._velocity_indices(model)
 
         # Precompute mesh constant
         self._sim_cell_inradius_face = np.minimum(
             mesh.cell_inradius[mesh.face_cells[0, :]],
             mesh.cell_inradius[mesh.face_cells[1, :]],
         ).min()
-
-        # Apply initial BCs
-        self._sim_Q = self._sim_boundary_operator(0.0, Q, Qaux, parameters)
 
         # Output setup
         if write_output:
@@ -162,48 +182,69 @@ class SplittingSolver(IMEXSolver):
     def step(self, dt):
         """One splitting timestep: flux -> viscous diffusion -> pressure correction.
 
-        Each line is one physics operation. No if-clauses.
+        Ghost-cell-free: BCs are evaluated inline inside each substep at
+        boundary faces (via ``self._bc_objects[i_bf].face_value(...)``).
+        No separate ghost-cell fill between substeps.
         """
         Q = self._sim_Q
         Qaux = self._sim_Qaux
         parameters = self._sim_parameters
         time_now = self._sim_time
-        dim = self._sim_dim
-        n_vars = self._sim_n_vars
-        n_cells = self._sim_n_cells
 
-        # Step 1: Explicit convective flux
-        Q_star = self._sim_ode_step(self._sim_flux_operator, Q, Qaux, parameters, dt)
-        Q_star = self._sim_boundary_operator(time_now, Q_star, Qaux, parameters)
+        # Step 1: Explicit convective flux (BCs inline in flux_operator).
+        # RK1 step matches HyperbolicSolver.step's inline pattern; the new
+        # flux_operator takes (dt, time, Q, Qaux, parameters, dQ).
+        dQ = np.zeros_like(Q)
+        dQ = self._sim_flux_operator(dt, time_now, Q, Qaux, parameters, dQ)
+        Q_star = Q + dt * dQ
 
-        # Step 2: Explicit viscous diffusion
-        Q_star = self._apply_viscous_diffusion(Q_star, dt)
-        Q_star = self._sim_boundary_operator(time_now, Q_star, Qaux, parameters)
+        # Step 2: Explicit viscous diffusion (BC eval inline at boundary faces)
+        Q_star = self._apply_viscous_diffusion(
+            Q_star, Qaux, parameters, time_now, dt,
+        )
 
-        # Step 3: Pressure correction (Poisson solve + velocity update)
-        Qnew, p = self._pressure_correction(Q_star, dt)
-        Qnew = self._sim_boundary_operator(time_now + dt, Qnew, Qaux, parameters)
+        # Step 3: Pressure correction (Poisson solve + velocity update;
+        # u-divergence uses BC at boundary faces, p has Neumann).
+        Qnew, p = self._pressure_correction(
+            Q_star, Qaux, parameters, time_now, dt,
+        )
 
         # Commit new state
         self._sim_Q = Qnew
         self._sim_pressure = p
 
-    def _apply_viscous_diffusion(self, Q_star, dt):
-        """Explicit viscous diffusion for velocity components."""
+    def _apply_viscous_diffusion(self, Q_star, Qaux, parameters, time_now, dt):
+        """Explicit viscous diffusion for velocity components, ghost-cell-free.
+
+        Interior faces use both adjacent inner cells; boundary faces evaluate
+        the BC inline (``bc.face_value(...)``) to obtain ``u_face``, then form
+        the gradient against the inner cell center over distance ``d_face``.
+        """
         dim = self._sim_dim
         n_vars = self._sim_n_vars
-        n_cells = self._sim_n_cells
+        nc = self._sim_nc
         nu = self._sim_nu
         iA = self._sim_iA
         iB = self._sim_iB
         mesh = self._sim_mesh
         face_volumes = self._sim_face_volumes
         cell_vol = self._sim_cell_vol
+        face_normals = mesh.face_normals[:dim, :]
+        interior_faces = self._sim_interior_faces
+        bc_objects = self._bc_objects
+        bf_cells = self._bf_cells
+        bf_fidx = self._bf_fidx
+        d_face = self._d_face
+        n_bf = self._n_bf
+        vel_idx = self._sim_vel_idx
+        has_aux = Qaux.shape[0] > 0
 
-        for d in range(min(n_vars, dim)):
-            u_d = Q_star[d, :]
-            lap = np.zeros(n_cells)
-            for f in range(mesh.n_faces):
+        for k in vel_idx:
+            u_d = Q_star[k, :]
+            lap = np.zeros(nc)
+
+            # Interior faces — both cells valid
+            for f in interior_faces:
                 a, b = iA[f], iB[f]
                 diff = u_d[b] - u_d[a]
                 dist = np.linalg.norm(
@@ -213,37 +254,83 @@ class SplittingSolver(IMEXSolver):
                     lap_contrib = diff / dist * face_volumes[f]
                     lap[a] += lap_contrib / cell_vol[a]
                     lap[b] -= lap_contrib / cell_vol[b]
-            Q_star[d, :] += dt * nu * lap
+
+            # Boundary faces — evaluate BC inline at each face
+            for i_bf in range(n_bf):
+                f = bf_fidx[i_bf]
+                inner = bf_cells[i_bf]
+                q_inner = Q_star[:, inner]
+                qaux_inner = Qaux[:, inner] if has_aux else _EMPTY_AUX
+                normal = face_normals[:, f]
+                q_face = bc_objects[i_bf].face_value(
+                    q_inner, qaux_inner, normal, d_face[i_bf],
+                    time_now, parameters,
+                )
+                u_face = q_face[k]
+                diff = u_face - u_d[inner]
+                if d_face[i_bf] > 1e-14:
+                    lap_contrib = diff / d_face[i_bf] * face_volumes[f]
+                    lap[inner] += lap_contrib / cell_vol[inner]
+
+            Q_star[k, :] += dt * nu * lap
         return Q_star
 
-    def _pressure_correction(self, Q_star, dt):
-        """Compute divergence, solve Poisson, correct velocity."""
+    def _pressure_correction(self, Q_star, Qaux, parameters, time_now, dt):
+        """Compute divergence, solve Poisson, correct velocity. Ghost-cell-free.
+
+        Divergence of ``u*``: interior faces use the average of the two cell
+        values; boundary faces evaluate the BC inline to obtain ``u_face``.
+        Pressure has Neumann BCs at boundaries (``p_face = p_inner``) — this
+        matches the Poisson Laplacian assembly in ``_build_poisson_solver``,
+        which skips boundary-face entries.
+        """
         dim = self._sim_dim
-        n_cells = self._sim_n_cells
+        nc = self._sim_nc
         iA = self._sim_iA
         iB = self._sim_iB
-        mesh = self._sim_mesh
         face_normals = self._sim_face_normals
         face_volumes = self._sim_face_volumes
         cell_vol = self._sim_cell_vol
+        interior_faces = self._sim_interior_faces
+        bc_objects = self._bc_objects
+        bf_cells = self._bf_cells
+        bf_fidx = self._bf_fidx
+        d_face = self._d_face
+        n_bf = self._n_bf
+        vel_idx = self._sim_vel_idx
+        has_aux = Qaux.shape[0] > 0
 
-        # Compute divergence of u*
-        div_u = np.zeros(n_cells)
-        for f in range(mesh.n_faces):
+        # ── Compute divergence of u* ─────────────────────────────────
+        # The velocity components live at state slots ``vel_idx`` —
+        # ``[0..dim-1]`` for INS, ``[2..2+dim-1]`` for free-surface.
+        div_u = np.zeros(nc)
+        for f in interior_faces:
             a, b = iA[f], iB[f]
             n = face_normals[:, f]
-            u_face = 0.5 * (Q_star[:dim, a] + Q_star[:dim, b])
-            flux_div = sum(u_face[d] * n[d] for d in range(dim))
+            u_face = 0.5 * (Q_star[vel_idx, a] + Q_star[vel_idx, b])
+            flux_div = float(np.dot(u_face, n))
             div_u[a] += flux_div * face_volumes[f] / cell_vol[a]
             div_u[b] -= flux_div * face_volumes[f] / cell_vol[b]
+        for i_bf in range(n_bf):
+            f = bf_fidx[i_bf]
+            inner = bf_cells[i_bf]
+            q_inner = Q_star[:, inner]
+            qaux_inner = Qaux[:, inner] if has_aux else _EMPTY_AUX
+            n = face_normals[:, f]
+            q_face = bc_objects[i_bf].face_value(
+                q_inner, qaux_inner, n, d_face[i_bf], time_now, parameters,
+            )
+            u_face = np.asarray(q_face)[vel_idx]
+            flux_div = float(np.dot(u_face, n))
+            div_u[inner] += flux_div * face_volumes[f] / cell_vol[inner]
 
-        # Solve Poisson
+        # ── Poisson solve ────────────────────────────────────────────
         rhs = div_u / dt
-        p, gmres_info = self._sim_poisson_solver(rhs)
+        p, _ = self._sim_poisson_solver(rhs)
 
-        # Correct velocity: u = u* - dt * grad(p)
-        grad_p = np.zeros((dim, n_cells))
-        for f in range(mesh.n_faces):
+        # ── grad(p): Neumann at boundaries (p_face = p_inner) ────────
+        grad_p = np.zeros((dim, nc))
+        for f in interior_faces:
             a, b = iA[f], iB[f]
             n = face_normals[:, f]
             p_face = 0.5 * (p[a] + p[b])
@@ -251,9 +338,18 @@ class SplittingSolver(IMEXSolver):
                 contrib = p_face * n[d] * face_volumes[f]
                 grad_p[d, a] += contrib / cell_vol[a]
                 grad_p[d, b] -= contrib / cell_vol[b]
+        for i_bf in range(n_bf):
+            f = bf_fidx[i_bf]
+            inner = bf_cells[i_bf]
+            n = face_normals[:, f]
+            p_face = p[inner]  # Neumann
+            for d in range(dim):
+                contrib = p_face * n[d] * face_volumes[f]
+                grad_p[d, inner] += contrib / cell_vol[inner]
 
         Qnew = Q_star.copy()
-        Qnew[:dim, :] = Q_star[:dim, :] - dt * grad_p
+        for d_local, k in enumerate(vel_idx):
+            Qnew[k, :] = Q_star[k, :] - dt * grad_p[d_local]
         return Qnew, p
 
     def run_simulation(self):
@@ -301,8 +397,16 @@ class FSFSplittingSolver(SplittingSolver):
     - Implicit source stepping
     - Pressure Poisson correction
 
-    Requires model variables 'b' and 'h'.
+    Requires model variables 'b' and 'h' at state indices 0 and 1.
+    Velocity components (subject to viscous diffusion + Chorin pressure
+    projection) start at index 2 and span ``dim`` slots.
     """
 
     def _build_numerics(self, symbolic_model):
         return _build_free_surface_numerics(symbolic_model)
+
+    def _velocity_indices(self, model):
+        # Free-surface state layout: [b, h, hu_0, hv_0, ..., (extra moments)]
+        # Chorin projection acts on the horizontal momentum components,
+        # which sit at indices 2 .. 2+dim-1.
+        return list(range(2, 2 + model.dimension))
