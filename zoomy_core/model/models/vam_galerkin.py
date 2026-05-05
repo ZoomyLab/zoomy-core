@@ -81,13 +81,24 @@ class VAMModelGalerkin(VAMModel):
         Pre-declared coefficient functions ``[U_0, U_1, …]`` etc.
     """
 
-    def __init__(self, level=0, **kwargs):
+    def __init__(self, level=0, *, M=None, N_w=None, N_p=None, **kwargs):
         # ``VAMModel.__init__`` calls ``self.derive_model()`` *before*
         # ``Model.__init__`` populates ``self.level`` via param — so
         # ``_build_chain``'s ``getattr(self, "level", 0)`` would silently
-        # collapse every call to L=0.  Stash it on the instance up front
-        # so the chain reads the actual requested level.
-        self._chain_level = level
+        # collapse every call to L=0.  Stash the chain-relevant levels
+        # on the instance up front so the chain reads them correctly.
+        #
+        # Asymmetric basis levels per Escalante 2024:
+        #   ``M``   — horizontal velocity ``u`` modes (M+1 of them).
+        #   ``N_w`` — vertical velocity   ``w`` modes (N_w+1 of them).
+        #   ``N_p`` — non-hydrostatic     ``p`` modes (N_p+1 of them).
+        # Defaults: ``M = level``, ``N_w = N_p = M + 1``.  Escalante's
+        # canonical case is ``(M=1, N_w=2, N_p=2)``.
+        self._chain_M = M if M is not None else level
+        self._chain_N_w = N_w if N_w is not None else self._chain_M + 1
+        self._chain_N_p = N_p if N_p is not None else self._chain_M + 1
+        # Backwards-compat alias used by ``_build_chain`` legacy path.
+        self._chain_level = self._chain_M
         super().__init__(level=level, **kwargs)
 
     def derive_model(self):
@@ -105,34 +116,44 @@ class VAMModelGalerkin(VAMModel):
         self._build_chain()
 
     def _build_chain(self):
-        L = self._chain_level
+        M, N_w, N_p = self._chain_M, self._chain_N_w, self._chain_N_p
         # Run the chain twice — once stop right after Expand (gives us
         # an intermediate System with un-evaluated ``sp.Sum`` atoms,
         # ``describe`` renders the paper-form Σ_k U_k φ_k(ζ)), once
-        # all the way through ``EvaluateIntegrals`` (closed form).  The
-        # double-run is cheap (a few seconds for L≤2) and lets each
-        # System carry its own ``describe`` machinery.
-        self._chain_intermediate = self._run_chain(L, stop="expand")
-        self._chain_system = self._run_chain(L, stop="full")
+        # all the way through ``EvaluateIntegrals`` (closed form).
+        self._chain_intermediate = self._run_chain(M, N_w, N_p, stop="expand")
+        self._chain_system = self._run_chain(M, N_w, N_p, stop="full")
 
     @staticmethod
-    def _run_chain(level: int, *, stop: str):
+    def _run_chain(M: int, N_w: int, N_p: int, *, stop: str):
         state = StateSpace(dimension=2)
         z = state.z
 
-        basis_u = Legendre_shifted(level=level, symbol="phi")
-        basis_w = Legendre_shifted(level=level, symbol="eta")
-        basis_p = Legendre_shifted(level=level, symbol="mu")
+        # Three independent bases — different levels per field per
+        # Escalante 2024.  Distinct symbols (``phi``/``eta``/``mu``)
+        # so the basis-aware machinery can route per-field.
+        basis_u = Legendre_shifted(level=M,   symbol="phi")
+        basis_w = Legendre_shifted(level=N_w, symbol="eta")
+        basis_p = Legendre_shifted(level=N_p, symbol="mu")
 
         coeffs_u = [sp.Function(f"U_{k}", real=True)(state.t, state.x)
-                    for k in range(level + 1)]
+                    for k in range(M + 1)]
         coeffs_w = [sp.Function(f"W_{k}", real=True)(state.t, state.x)
-                    for k in range(level + 1)]
+                    for k in range(N_w + 1)]
         coeffs_p = [sp.Function(f"P_{k}", real=True)(state.t, state.x)
-                    for k in range(level + 1)]
+                    for k in range(N_p + 1)]
 
-        test_phi = Zstruct(
-            **{f"phi_{k}": basis_u.phi[k](z) for k in range(level + 1)}
+        # Test-function fans, one per equation type.  ``test_phi_u``
+        # has M+1 entries and is used to project x-momentum (one
+        # equation per u-mode).  ``test_phi_w`` has N_w+1 entries and
+        # is used to project z-momentum AND continuity (the latter
+        # gives the ``I_1`` / ``I_2`` constraints Escalante writes in
+        # eq (5)).
+        test_phi_u = Zstruct(
+            **{f"phi_{k}": basis_u.phi[k](z) for k in range(M + 1)}
+        )
+        test_phi_w = Zstruct(
+            **{f"phi_{k}": basis_w.phi[k](z) for k in range(N_w + 1)}
         )
 
         sys = FullINS(state)
@@ -154,22 +175,37 @@ class VAMModelGalerkin(VAMModel):
             {state.p: state.rho * state.g * (state.eta - z) + p_NH}
         ).simplify()
 
-        sys.momentum.x.apply(Multiply(test_phi, outer=True))
-        sys.momentum.z.apply(Multiply(test_phi, outer=True))
+        # Project equations against test functions:
+        #   continuity   ↦ N_w + 1 children (test_0..test_{N_w})
+        #   x-momentum   ↦ M  + 1 children (test_0..test_M)
+        #   z-momentum   ↦ N_w + 1 children (test_0..test_{N_w})
+        # The continuity projections beyond k=0 are the ``I_1``, ``I_2``
+        # constraints Escalante writes in eq (5).  We keep them in the
+        # system as separate equations rather than substituting them
+        # into momentum — the resulting system has more rows than the
+        # post-resolution Escalante form, but matches the structure
+        # before constraint resolution.
+        sys.continuity.apply(Multiply(test_phi_w, outer=True))
+        sys.momentum.x.apply(Multiply(test_phi_u, outer=True))
+        sys.momentum.z.apply(Multiply(test_phi_w, outer=True))
 
         # Convert ``phi(z) · ∂_z F`` terms into a form ``Integrate``'s
         # fundamental-theorem path can use.  The chain author identifies
-        # the term (here: the only one with a ∂_z derivative — the
-        # vertical advection ``∂_z(uw)`` from ``Inviscid``) and applies
-        # ProductRule(inverse) to rewrite as
-        # ``∂_z(phi·F) − ∂_z(phi)·F``.  The first piece is in
-        # conservative form (FT-friendly); the second piece is a
-        # regular volume integrand that ``Integrate`` handles directly.
-        for momdir in ("x", "z"):
-            for k in range(level + 1):
-                leaf_proxy = getattr(getattr(sys.momentum, momdir),
-                                     f"test_{k}")
-                VAMModelGalerkin._inverse_product_rule_on_z(leaf_proxy, z)
+        # the term (here: the only ones with a ∂_z derivative — the
+        # vertical advection ``∂_z(uw)`` in x-momentum and ``∂_z w`` in
+        # continuity) and applies ProductRule(inverse) to rewrite as
+        # ``∂_z(phi·F) − ∂_z(phi)·F``.
+        for k in range(M + 1):
+            VAMModelGalerkin._inverse_product_rule_on_z(
+                getattr(sys.momentum.x, f"test_{k}"), z
+            )
+        for k in range(N_w + 1):
+            VAMModelGalerkin._inverse_product_rule_on_z(
+                getattr(sys.continuity, f"test_{k}"), z
+            )
+            VAMModelGalerkin._inverse_product_rule_on_z(
+                getattr(sys.momentum.z, f"test_{k}"), z
+            )
 
         sys.apply(Integrate(z, state.b, state.eta, method="auto"))
 
