@@ -1625,6 +1625,51 @@ class Relation(SymbolicBase):
             result = result.subs(lhs, rhs)
         return result
 
+    def solve_for(self, variable):
+        """Re-solve every rule ``lhs = rhs`` for ``variable`` and return a
+        new :class:`Relation` with substitution dict ``{variable: solution}``.
+
+        Pipeline-style counterpart to :meth:`Expression.solve_for`: lets a
+        chain author flip the substitution direction of a relation
+        without rewriting the relation by hand.  Example: a kinematic
+        BC ``w|_eta = ∂_t eta + u·∂_x eta`` re-solved for
+        ``Derivative(state.h, state.t)`` returns
+        ``{Derivative(h, t): w|_eta - Derivative(b, t) - u·∂_x eta}``,
+        which is exactly the substitution Leibniz boundary terms need to
+        cancel against the ∂_z fundamental-theorem boundaries.
+
+        Each rule contributes one substitution; if multiple rules
+        contain ``variable`` in their balance ``lhs - rhs``, all are
+        re-solved and merged into one dict (later wins on duplicate
+        keys, matching ``dict.update`` semantics).
+
+        Raises ``ValueError`` if no rule's balance contains ``variable``
+        (so the call is never silently a no-op).
+        """
+        new_map = {}
+        found = False
+        for lhs, rhs in self.subs_map.items():
+            balance = lhs - rhs
+            if variable not in balance.free_symbols and not balance.has(variable):
+                continue
+            solutions = sp.solve(balance, variable)
+            if not solutions:
+                continue
+            new_map[variable] = solutions[0]
+            found = True
+        if not found:
+            raise ValueError(
+                f"{type(self).__name__}.solve_for: no rule of "
+                f"{self.name or 'this relation'} contains {variable!r}; "
+                f"cannot expose that direction."
+            )
+        # Build the inverse-direction relation as a plain ``Relation``:
+        # specialised subclasses (``InterfaceKBC``, ``HydrostaticPressure``,
+        # ...) carry constructor signatures tied to physics inputs, not
+        # raw substitution dicts, so the inverse instance lives at the
+        # base level.  The substitution semantics are identical.
+        return Relation(new_map, name=f"{self.name}_for_{variable}")
+
     def __len__(self):
         return len(self.subs_map)
 
