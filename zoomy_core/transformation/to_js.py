@@ -198,7 +198,7 @@ class JsModel(GenericJsBase):
         """
         funcs = self.generate()
         param_values = [
-            float(v) for v in self.model.parameter_values
+            float(v) for v in self.model.parameters.values()
         ]
         param_names = list(self.model.parameters.keys())
 
@@ -227,7 +227,7 @@ const generatedModel = {{
     def _generate_metadata(self):
         """Generate a JS comment block with model metadata."""
         param_names = list(self.model.parameters.keys())
-        param_vals = [float(v) for v in self.model.parameter_values]
+        param_vals = [float(v) for v in self.model.parameters.values()]
         lines = [
             f"// Generated JS model: {self.model.__class__.__name__}",
             f"// Dimension: {self.model.dimension}",

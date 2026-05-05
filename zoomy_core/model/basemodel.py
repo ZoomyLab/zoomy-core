@@ -68,7 +68,7 @@ def parse_definition_to_zstruct(definition, prefix="q_"):
 
 
 def extract_parameter_defaults(definition):
-    """Numeric defaults for parameters (feeds ``parameter_values`` arrays in solvers)."""
+    """Numeric defaults for parameters (feeds ``model.parameters`` Zstruct values)."""
     defaults = {}
     if isinstance(definition, dict):
         for name, val in definition.items():

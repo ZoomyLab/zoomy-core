@@ -387,16 +387,20 @@ class BaseMesh(param.Parameterized):
         n_faces = self.n_faces
         normals = np.zeros((3, n_faces), dtype=float)
 
-        # Cell centers needed for orientation in all dimensions
-        centers = self.cell_centers_computed()
-
         if dim == 1:
             # In 1D a "face normal" is just a sign: +1 or -1.
             # Direction = from face_cells[0] toward face_cells[1].
+            # 1D ghost-cell centers don't need face normals
+            # (cell_centers_computed line 309–310 just reflects in 1D),
+            # so this call is recursion-safe.
+            centers = self.cell_centers_computed()
             for f in range(n_faces):
                 c0, c1 = self.face_cells[0, f], self.face_cells[1, f]
                 normals[0, f] = np.sign(centers[0, c1] - centers[0, c0])
             return normals
+        # 2D+: orientation only needs inner cell centers, computed
+        # inline below (line 407). Calling cell_centers_computed() here
+        # would recurse: it needs face normals to place ghost cells.
 
         coords_3d = np.zeros((self.n_vertices, 3), dtype=float)
         coords_3d[:, :dim] = self.vertex_coordinates[:dim, :].T
