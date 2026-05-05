@@ -70,41 +70,56 @@ class Basisfunction:
     def __init__(self, level=0, symbol="phi", **kwargs):
         """Initialize the instance.
 
-        ``symbol`` names the opaque Function family (``phi_0, phi_1, …``);
-        defaults to ``"phi"``.  Use distinct ``symbol`` values when
-        multiple bases coexist on the same model (``phi`` for u-ansatz,
-        ``eta`` for w-ansatz, ``mu`` for p-ansatz, etc.).
+        ``symbol`` names the opaque Function family (the class name in
+        sympy will be exactly this string, e.g. ``"phi"``, ``"eta"``,
+        ``"mu"``).  Use distinct ``symbol`` values when multiple bases
+        coexist on the same model so atoms from different bases are
+        distinct sympy classes.
         """
         self.level = level
         self.symbol = symbol
         self.basis = self.basis_definition(**kwargs)
-        # Build opaque sympy Function subclasses tied back to this
-        # instance; ``_basis`` lets EvaluateIntegrals resolve integrals
-        # without going through any global registry.
+        # ONE opaque sympy Function class for this basis instance,
+        # with two arguments: ``(k, arg)`` — ``k`` is the basis index,
+        # ``arg`` is the ζ-coordinate.  ``_basis`` back-reference lets
+        # ``EvaluateIntegrals`` route integrals to this basis without
+        # any registry, and the single-class design makes the Sum-based
+        # ``Expand`` representation natural:
+        #
+        #     Sum(amp(k) · basis.phi_fn(k, ζ), (k, 0, L))
+        self.phi_fn = type(
+            symbol,
+            (sympy.Function,),
+            {"_basis": self, "nargs": 2},
+        )
+        # Backwards-compat per-index accessor ``self.phi[k](arg)``.
+        # Each entry is a thin lambda that pins the integer index.
         self.phi = [
-            type(
-                f"{symbol}_{k}",
-                (sympy.Function,),
-                {"_basis": self, "_index": k},
-            )
+            (lambda arg, _k=k, _fn=self.phi_fn: _fn(_k, arg))
             for k in range(level + 1)
         ]
 
     def resolve_atoms(self, expr):
-        """Replace every opaque ``phi_k(arg)`` atom registered to this
-        basis with the concrete polynomial ``self.eval(k, arg)``.
+        """Replace every ``phi_fn(k_concrete, arg)`` atom of this basis
+        with the concrete polynomial ``self.eval(int(k_concrete), arg)``.
 
-        Atoms of *other* bases (different ``_basis`` back-reference) are
-        left untouched, so multi-basis expressions can be resolved by
-        calling ``resolve_atoms`` once per basis present.
+        Calls with a *symbolic* ``k`` (i.e. atoms inside an unevaluated
+        ``sp.Sum`` whose summation index hasn't been substituted) are
+        left untouched — they'll resolve once the Sum is ``.doit()``-ed
+        and the index becomes a concrete integer.
+
+        Atoms of *other* bases (different ``_basis`` back-reference)
+        match different Function classes and are left untouched, so
+        multi-basis expressions resolve correctly by calling
+        ``resolve_atoms`` once per basis present.
         """
-        resolved = expr
-        for k, phi_k in enumerate(self.phi):
-            resolved = resolved.replace(
-                phi_k,
-                lambda *args, _k=k: self.eval(_k, args[0]),
-            )
-        return resolved
+        def _replace(k, z_arg):
+            if k.is_Integer:
+                return self.eval(int(k), z_arg)
+            # Symbolic index → leave opaque (un-doited Sum).
+            return self.phi_fn(k, z_arg)
+
+        return expr.replace(self.phi_fn, _replace)
 
     def get(self, k):
         """Get."""
