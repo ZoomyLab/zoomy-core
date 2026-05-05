@@ -157,7 +157,7 @@ def derive_shallow_moments(
     # → dh/dt + d(hū)/dx = 0
 
     result.continuity.append(TaggedTerm(
-        expr=Expression(Derivative(state.H, state.t), "dH/dt"),
+        expr=Expression(Derivative(state.h, state.t), "dH/dt"),
         role="temporal",
         origin="mass_conservation",
     ))
@@ -205,7 +205,7 @@ def _tag_momentum(tagged_list, momentum_expr, state, component, slip_length):
     rho = state.rho
     g = state.g
     b = state.b
-    H = state.H
+    H = state.h
     eta = state.eta
 
     vel_name = "u" if component == "x" else "v"
