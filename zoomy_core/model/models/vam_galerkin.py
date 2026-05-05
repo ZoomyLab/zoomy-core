@@ -46,6 +46,7 @@ from zoomy_core.model.models.ins_generator import (
     Integrate,
     Inviscid,
     Multiply,
+    ProductRule,
     StateSpace,
 )
 from zoomy_core.model.models.vam_model import VAMModel
@@ -138,9 +139,44 @@ class VAMModelGalerkin(VAMModel):
         sys.apply(Inviscid(state)).simplify()
         sys.momentum.x.apply(Multiply(test_phi, outer=True))
         sys.momentum.z.apply(Multiply(test_phi, outer=True))
+
+        # Convert ``phi(z) · ∂_z F`` terms into a form ``Integrate``'s
+        # fundamental-theorem path can use.  The chain author identifies
+        # the term (here: the only one with a ∂_z derivative — the
+        # vertical advection ``∂_z(uw)`` from ``Inviscid``) and applies
+        # ProductRule(inverse) to rewrite as
+        # ``∂_z(phi·F) − ∂_z(phi)·F``.  The first piece is in
+        # conservative form (FT-friendly); the second piece is a
+        # regular volume integrand that ``Integrate`` handles directly.
+        for momdir in ("x", "z"):
+            for k in range(level + 1):
+                leaf_proxy = getattr(getattr(sys.momentum, momdir),
+                                     f"test_{k}")
+                VAMModelGalerkin._inverse_product_rule_on_z(leaf_proxy, z)
+
         sys.apply(Integrate(z, state.b, state.eta, method="auto"))
+
+        # Kinematic BCs are applied in their natural (forward)
+        # direction: ``w|_interface → ∂_t interface + u·∂_x interface``.
+        # This converts the ``w(b+h)`` / ``w(b)`` atoms produced by the
+        # ∂_z fundamental theorem (introduced via the earlier
+        # ProductRule(inverse) on ``phi·∂_z(uw)``) into ∂_t interface
+        # forms.  Combined with the Leibniz time-boundaries (which
+        # already carry ``-u·phi·∂_t interface``), the ∂_t-pieces
+        # cancel cleanly in ``simplify``; only the conservative volume
+        # term ``∂_t ∫ u·phi dz`` (closed to ``∂_t(h U_k)`` after
+        # Expand+EvaluateIntegrals) survives.
         sys.apply(InterfaceKBC(state, state.b)).simplify()
         sys.apply(InterfaceKBC(state, state.eta)).simplify()
+
+        # Static bottom: bathymetry is time-independent.  Applied AFTER
+        # KBC so any ``Derivative(b, t)`` atoms introduced by KBC@b's
+        # forward substitution (``w|_b → ∂_t b + u·∂_x b``) collapse to
+        # zero in one step — turning the bottom KBC into ``w|_b = u·∂_x
+        # b`` exactly where it appears.  Apply-it-once chain step, not
+        # a structural assumption baked into the state.
+        sys.apply({sp.Derivative(state.b, state.t): sp.S.Zero}).simplify()
+
         sys.apply({state.p.subs(z, state.eta): 0}).simplify()
         sys.apply(AffineProjection(state))
         sys.apply(Expand(state.u, basis=basis_u, coefficients=coeffs_u,
@@ -153,6 +189,31 @@ class VAMModelGalerkin(VAMModel):
             return sys
         sys.apply(EvaluateIntegrals(state)).simplify()
         return sys
+
+    @staticmethod
+    def _inverse_product_rule_on_z(leaf_proxy, z):
+        """Apply ``ProductRule(direction='inverse', variables=[z])`` to
+        the single term of ``leaf_proxy`` whose ``Derivative`` is w.r.t.
+        ``z`` — typically the ``phi · ∂_z(uw)`` advection term left over
+        from ``Inviscid`` after Galerkin testing.
+
+        ``ProductRule`` is ``single_term_only`` — the chain author picks
+        the term, the operation transforms it.  Here we iterate
+        ``leaf_proxy._node.terms`` and call ``apply_to_term`` on the
+        first match.  No "intelligence": the rewrite is unconditional
+        once the term is identified.
+        """
+        leaf = leaf_proxy._node
+        pr = ProductRule(direction="inverse", variables=[z])
+        for i, term in enumerate(leaf.terms):
+            if any(
+                isinstance(d, sp.Derivative)
+                and len(d.variables) == 1
+                and d.variables[0] == z
+                for d in term.expr.atoms(sp.Derivative)
+            ):
+                leaf_proxy.apply_to_term(i, pr)
+                break
 
     # ── Display: model.describe() shows the chain's closed form ───────
 
