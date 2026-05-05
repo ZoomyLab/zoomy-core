@@ -1428,6 +1428,31 @@ class _StripArgsLatexPrinter(_LatexPrinter):
                 base = f"{base}^{{{exp}}}"
             return base
 
+        # Basis-function calls produced by Expand and Multiply carry a
+        # ``_basis`` class attribute (the back-ref to the
+        # ``Basisfunction`` instance).  The 2-arg signature is
+        # ``phi_fn(k, ζ_arg)`` — the index ``k`` becomes a subscript on
+        # the function name (``phi_k``), and the second arg follows the
+        # standard ζ bar-form convention (canonical ``ζ`` → strip;
+        # ``0``/``1``/``(z-b)/h`` → ``phi_k|_{ζ=…}``).  Multiplicative
+        # exponent is preserved.
+        if (hasattr(expr.func, "_basis")
+                and len(expr.args) == 2):
+            tex_name = self._deal_with_super_sub(expr.func.__name__)
+            tex_idx = self._print(expr.args[0])
+            subscripted = f"{tex_name}_{{{tex_idx}}}"
+            bar_value = expr.args[1]
+            if bar_value == self._zeta:
+                base = subscripted
+            else:
+                value_tex = self.doprint(bar_value)
+                var_tex = self.doprint(self._zeta)
+                base = (r"\left. %s \right|_{\substack{ %s=%s }}"
+                        % (subscripted, var_tex, value_tex))
+            if exp is not None:
+                base = f"{base}^{{{exp}}}"
+            return base
+
         name = expr.func.__name__
         tex = self._deal_with_super_sub(name)
         args = expr.args
