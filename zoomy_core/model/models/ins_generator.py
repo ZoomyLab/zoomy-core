@@ -2192,20 +2192,43 @@ class EvaluateIntegrals(Operation):
     def _leaf_sp(self, expr):
         from sympy import Integral, Derivative, Sum
 
-        def _doit_sums(e):
-            """Recursively unroll ``sp.Sum`` atoms via ``.doit()``.
+        def _resolve_coeff_calls(e):
+            """Substitute ``coeff_<symbol>(k_int)`` → coefficients[k_int]
+            for every per-Expand coeff Function class.
 
-            Per-instance ``amp_fn`` Functions auto-evaluate to the
-            corresponding amplitude when their integer-index argument
-            is concrete (see :class:`Expand`), so unrolling a Sum
-            implicitly substitutes all amplitudes too.  Other
-            ``.doit()``-able atoms (Derivatives, Integrals) are left
-            alone — the outer integral fixpoint loop handles those.
+            After ``Sum.doit()`` unrolls a Sum to ``Σ_k …``, the inner
+            ``coeff_fn(k_int)`` calls have concrete integer indices
+            and the per-class ``_coeff_table`` provides the lookup.
+            Symbolic-index calls (un-doited Sums) are left untouched.
+            """
+            coeff_classes = set()
+            for atom in e.atoms(sp.Function):
+                if hasattr(atom.func, "_coeff_table"):
+                    coeff_classes.add(atom.func)
+            for cls in coeff_classes:
+                table = cls._coeff_table
+
+                def _replace(*args, _t=table, _cls=cls):
+                    if len(args) == 1 and getattr(args[0], "is_Integer",
+                                                   False):
+                        return _t[int(args[0])]
+                    return _cls(*args)
+
+                e = e.replace(cls, _replace)
+            return e
+
+        def _doit_sums(e):
+            """Recursively unroll ``sp.Sum`` atoms via ``.doit()`` and
+            then substitute any per-Expand ``coeff_<symbol>(k_int)``
+            calls with the concrete coefficient.  Other ``.doit()``-able
+            atoms (Derivatives, Integrals) are left alone — the outer
+            integral fixpoint loop handles those.
             """
             if isinstance(e, Sum):
                 # Unroll this Sum; recurse into the unrolled result so
                 # nested Sums also expand.
-                return _doit_sums(e.doit())
+                unrolled = _doit_sums(e.doit())
+                return _resolve_coeff_calls(unrolled)
             if hasattr(e, "args") and e.args:
                 new_args = [_doit_sums(a) for a in e.args]
                 if any(n is not o for n, o in zip(new_args, e.args)):
@@ -2311,7 +2334,7 @@ class Expand(Operation):
 
     Replaces every call ``field(t, x, [y,] arg_z)`` with
 
-        ``Sum(amp_fn(k) · basis.phi_fn(k, (arg_z − b)/h), (k, 0, L))``
+        ``Sum(coeff_fn(k) · basis.phi_fn(k, (arg_z − b)/h), (k, 0, L))``
 
     — a single ``sp.Sum`` atom rather than the unrolled Add.  Two
     placeholders make this work as one symbolic chunk:
@@ -2319,13 +2342,14 @@ class Expand(Operation):
     * ``basis.phi_fn`` is the basis's opaque 2-arg Function (carries
       ``_basis = basis``); concrete polynomial substitution is deferred
       until :class:`EvaluateIntegrals`.
-    * ``amp_fn`` is a private sympy Function class created per Expand
-      call; its ``eval`` classmethod auto-substitutes the integer-
-      indexed amplitude (``amp_fn(0) → amplitudes[0]``, etc.) the
-      moment ``k`` becomes a concrete integer — i.e. when the Sum is
-      ``.doit()``-ed.  For a symbolic ``k`` it stays opaque, so the
-      Sum carries through ``ProductRule``, ``AffineProjection``, and
-      ``Integrate`` as a single mathematical term.
+    * ``coeff_fn`` is a private sympy Function class named
+      ``coeff_<basis.symbol>`` and carrying a ``_coeff_table``
+      class attribute holding the pre-declared coefficient list.
+      It stays opaque through ``ProductRule``, ``AffineProjection``,
+      and ``Integrate`` (the Sum carries through as a single
+      mathematical term).  ``EvaluateIntegrals`` substitutes
+      ``coeff_fn(k_concrete) → coefficients[k_concrete]`` after the
+      Sum has been ``.doit()``-ed.
 
     Boundary evaluations of the field (``arg_z = b``, ``arg_z = b+h``)
     are handled automatically: ``(arg_z − b)/h`` becomes 0 or 1
@@ -2347,24 +2371,24 @@ class Expand(Operation):
     basis : :class:`Basisfunction`
         The basis instance.  ``basis.phi_fn`` is the 2-arg opaque
         Function used inside the Sum.
-    amplitudes : sequence of sympy Function calls
+    coefficients : sequence of sympy Function calls
         Pre-declared horizontal coefficient functions
-        (``α_0(t, x), α_1(t, x), …``) — one per basis level.  Length
-        must equal ``basis.level + 1``.  Auto-substituted into the
-        Sum by ``amp_fn``'s eval classmethod when ``k`` becomes an
-        integer.
+        (``U_0(t, x), U_1(t, x), …``) — one per basis level.  Length
+        must equal ``basis.level + 1``.  Substituted into the Sum by
+        :class:`EvaluateIntegrals` after ``Sum.doit()`` unrolls the
+        symbolic index to concrete integers.
     state : :class:`StateSpace`
         The state space — used to read ``state.b`` and ``state.H``
         for the affine ζ-map.
     """
 
-    def __init__(self, field, basis, amplitudes, state,
+    def __init__(self, field, basis, coefficients, state,
                  name="expand", description=None):
-        amplitudes = list(amplitudes)
-        if len(amplitudes) != basis.level + 1:
+        coefficients = list(coefficients)
+        if len(coefficients) != basis.level + 1:
             raise ValueError(
-                f"Expand expects {basis.level + 1} amplitudes "
-                f"(basis.level + 1), got {len(amplitudes)}."
+                f"Expand expects {basis.level + 1} coefficients "
+                f"(basis.level + 1), got {len(coefficients)}."
             )
         super().__init__(
             name=name,
@@ -2374,36 +2398,28 @@ class Expand(Operation):
         )
         self._field_fn = field.func
         self._basis = basis
-        self._amplitudes = amplitudes
+        self._coefficients = coefficients
         self._state = state
 
-        # Build a per-instance ``amp`` Function whose ``eval`` returns
-        # the concrete amplitude when called with an integer index.
-        # Sympy invokes ``eval`` automatically: ``amp_fn(2)`` returns
-        # ``amplitudes[2]`` directly; ``amp_fn(k)`` (symbolic k) stays
-        # opaque inside the Sum.
-        amp_table = list(amplitudes)
-        symbol = basis.symbol
-
-        def _eval(cls, k_arg):
-            if getattr(k_arg, "is_Integer", False):
-                return amp_table[int(k_arg)]
-            return None  # leave opaque
-
-        self._amp_fn = type(
-            f"amp_{symbol}_{id(self):x}",
+        # Per-Expand sympy Function class that carries the coefficient
+        # table on the class itself.  Different bases on the same
+        # model have different ``basis.symbol`` values
+        # (``phi``/``eta``/``mu``/…) and therefore distinct coeff
+        # classes — no collisions.  The class stays opaque through
+        # the chain; ``EvaluateIntegrals`` substitutes
+        # ``coeff_<symbol>(k_int) → coefficients[k_int]`` after
+        # ``Sum.doit()`` produces concrete integer indices.
+        self._coeff_fn = type(
+            f"coeff_{basis.symbol}",
             (sp.Function,),
-            {
-                "eval": classmethod(_eval),
-                "_amp_table": amp_table,
-            },
+            {"_coeff_table": coefficients},
         )
 
     def _leaf_sp(self, expr):
         b = self._state.b
         h = self._state.H
         basis = self._basis
-        amp_fn = self._amp_fn
+        coeff_fn = self._coeff_fn
         L = basis.level
 
         def _rhs(*field_args):
@@ -2411,7 +2427,7 @@ class Expand(Operation):
             zeta_val = (arg_z - b) / h
             k = sp.Dummy("k", integer=True, nonnegative=True)
             return sp.Sum(
-                amp_fn(k) * basis.phi_fn(k, zeta_val),
+                coeff_fn(k) * basis.phi_fn(k, zeta_val),
                 (k, 0, L),
             )
 
