@@ -2185,12 +2185,44 @@ class EvaluateIntegrals(Operation):
     def _leaf_sp(self, expr):
         from sympy import Integral, Derivative
 
+        def _bases_in(integrand):
+            """Distinct ``Basisfunction`` instances referenced by opaque
+            atoms in ``integrand`` (matching ``func._basis`` back-ref)."""
+            found = []
+            seen = set()
+            for atom in integrand.atoms(sp.Function):
+                basis = getattr(atom.func, "_basis", None)
+                if basis is None:
+                    continue
+                if id(basis) not in seen:
+                    seen.add(id(basis))
+                    found.append(basis)
+            return found
+
+        def _resolve_integral(integrand, limits):
+            """Single integration step with opaque-phi routing.
+
+            If the integrand contains opaque ``phi_k(arg)`` atoms tied
+            to one or more :class:`Basisfunction` instances, substitute
+            each basis's atoms with its concrete polynomial form via
+            ``basis.resolve_atoms`` and then ``sympy.integrate`` the
+            now-polynomial-in-``var`` integrand.  Otherwise fall through
+            to the cached sympy.integrate path.
+            """
+            bases = _bases_in(integrand)
+            if bases:
+                resolved = integrand
+                for basis in bases:
+                    resolved = basis.resolve_atoms(resolved)
+                return sp.integrate(resolved, limits)
+            return _cached_integrate(integrand, limits)
+
         def _walk(e):
             if isinstance(e, Integral):
                 # Recurse into nested integrands first.
                 integrand = _walk(e.args[0])
                 limits = e.args[1]
-                evaluated = _cached_integrate(integrand, limits)
+                evaluated = _resolve_integral(integrand, limits)
                 if not isinstance(evaluated, Integral):
                     return evaluated
                 return Integral(integrand, limits, *e.args[2:])
@@ -2218,7 +2250,96 @@ class EvaluateIntegrals(Operation):
             result = _resolve_subs_safe(result)
             if result == prev:
                 break
+
+        # Final cleanup: resolve any remaining opaque basis atoms that
+        # weren't inside Integrals (typically boundary evaluations like
+        # ``phi_k(0)`` or ``phi_k(1)`` that sit alongside the closed
+        # bulk integrals — they need their concrete polynomial values
+        # before downstream tagging / quasilinear analysis can proceed).
+        bases_present = _bases_in(result)
+        for basis in bases_present:
+            result = basis.resolve_atoms(result)
         return result
+
+
+class Expand(Operation):
+    """Substitute a vertical field with its polynomial ansatz expansion.
+
+    Replaces every call ``field(t, x, [y,] arg_z)`` in the expression
+    with the truncated series
+
+        ``Σ_k amplitudes[k] · basis.phi[k]( (arg_z − b) / h )``
+
+    where ``basis.phi[k]`` is the *opaque* sympy Function subclass
+    produced by :class:`Basisfunction` (level ``k`` of the chosen
+    basis, carrying a ``_basis`` back-reference).  No concrete
+    polynomial is substituted at this stage — :class:`EvaluateIntegrals`
+    resolves the opaque atoms when a held ``Integral`` is closed.
+
+    Multiple bases may coexist in the same model (one per ansatz field
+    — typically ``phi`` for u, ``eta`` for w, ``mu`` for p in
+    non-hydrostatic models).  Atoms from different bases are distinct
+    SymPy classes (different ``__name__``s and ``_basis`` references)
+    and don't collide.
+
+    Boundary evaluations of the field (``arg_z = b``, ``arg_z = b+h``)
+    are handled automatically: after the affine substitution
+    ``(arg_z − b)/h`` becomes 0 or 1 respectively, so the ansatz at
+    the bottom is ``Σ_k amp_k · phi_k(0)`` and at the surface
+    ``Σ_k amp_k · phi_k(1)``.  EvaluateIntegrals later resolves these
+    via ``basis.resolve_atoms``.
+
+    Parameters
+    ----------
+    field : sympy Function call
+        The vertical field, e.g. ``state.u`` (which is ``u(t, x, z)``).
+    basis : :class:`Basisfunction`
+        The basis instance.  Its ``phi`` list provides the opaque
+        Function subclasses used in the expansion.
+    amplitudes : sequence of sympy Function calls
+        The pre-declared horizontal coefficient functions
+        (``α_0(t, x), α_1(t, x), …``) — one per basis level.  Length
+        must equal ``basis.level + 1``.
+    state : :class:`StateSpace`
+        The state space — used to read ``state.b`` and ``state.H``
+        for the affine ζ-map.
+    """
+
+    def __init__(self, field, basis, amplitudes, state,
+                 name="expand", description=None):
+        amplitudes = list(amplitudes)
+        if len(amplitudes) != basis.level + 1:
+            raise ValueError(
+                f"Expand expects {basis.level + 1} amplitudes "
+                f"(basis.level + 1), got {len(amplitudes)}."
+            )
+        super().__init__(
+            name=name,
+            description=description or
+                f"Expand {field} via {type(basis).__name__}"
+                f"(level={basis.level}, symbol={basis.symbol!r}) ansatz",
+        )
+        self._field_fn = field.func
+        self._basis = basis
+        self._amplitudes = amplitudes
+        self._state = state
+
+    def _leaf_sp(self, expr):
+        b = self._state.b
+        h = self._state.H
+        amps = self._amplitudes
+        phi = self._basis.phi
+        L = self._basis.level
+
+        def _rhs(*field_args):
+            arg_z = field_args[-1]
+            zeta_val = (arg_z - b) / h
+            return sum(
+                (amps[k] * phi[k](zeta_val) for k in range(L + 1)),
+                S.Zero,
+            )
+
+        return expr.replace(self._field_fn, _rhs)
 
 
 class ProjectBasisIntegrals(Operation):

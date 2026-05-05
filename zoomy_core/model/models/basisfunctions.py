@@ -10,7 +10,26 @@ from sympy.functions.special.polynomials import chebyshevu
 
 
 class Basisfunction:
-    """Basisfunction. (class)."""
+    """Basisfunction. (class).
+
+    Each instance carries:
+
+    * ``self.basis`` — list of *concrete* polynomial expressions in
+      ``z`` (used by :meth:`eval` and numeric reconstruction).
+    * ``self.phi`` — list of *opaque* sympy Function subclasses
+      ``phi_0, phi_1, …, phi_L`` (one per index ``k``).  Each subclass
+      carries class attributes ``_basis = self`` and ``_index = k``.
+      When an Integral's integrand contains atoms whose
+      ``func._basis`` points back to a :class:`Basisfunction`,
+      :class:`EvaluateIntegrals` routes the integral to that basis's
+      :meth:`evaluate_integral` for resolution against the concrete
+      polynomial — without the model author ever substituting the
+      polynomial form themselves.
+
+    The Function subclass ``__name__`` is ``"{symbol}_{k}"`` (e.g.
+    ``phi_0``, ``eta_2``, ``mu_1``), so different bases coexist in the
+    same equation as distinct sympy classes — mixing is automatic.
+    """
     name = "Basisfunction"
 
     def bounds(self):
@@ -41,17 +60,51 @@ class Basisfunction:
         c = [sympy.Integer(0)] * (self.level + 1)
         c[0] = sympy.Integer(1)
         return c
-    
+
     def weight_eval(self, z):
         """Weight eval."""
         z = Symbol("z")
         f = sympy.lambdify(z, self.weight(z))
         return f(z)
 
-    def __init__(self, level=0, **kwargs):
-        """Initialize the instance."""
+    def __init__(self, level=0, symbol="phi", **kwargs):
+        """Initialize the instance.
+
+        ``symbol`` names the opaque Function family (``phi_0, phi_1, …``);
+        defaults to ``"phi"``.  Use distinct ``symbol`` values when
+        multiple bases coexist on the same model (``phi`` for u-ansatz,
+        ``eta`` for w-ansatz, ``mu`` for p-ansatz, etc.).
+        """
         self.level = level
+        self.symbol = symbol
         self.basis = self.basis_definition(**kwargs)
+        # Build opaque sympy Function subclasses tied back to this
+        # instance; ``_basis`` lets EvaluateIntegrals resolve integrals
+        # without going through any global registry.
+        self.phi = [
+            type(
+                f"{symbol}_{k}",
+                (sympy.Function,),
+                {"_basis": self, "_index": k},
+            )
+            for k in range(level + 1)
+        ]
+
+    def resolve_atoms(self, expr):
+        """Replace every opaque ``phi_k(arg)`` atom registered to this
+        basis with the concrete polynomial ``self.eval(k, arg)``.
+
+        Atoms of *other* bases (different ``_basis`` back-reference) are
+        left untouched, so multi-basis expressions can be resolved by
+        calling ``resolve_atoms`` once per basis present.
+        """
+        resolved = expr
+        for k, phi_k in enumerate(self.phi):
+            resolved = resolved.replace(
+                phi_k,
+                lambda *args, _k=k: self.eval(_k, args[0]),
+            )
+        return resolved
 
     def get(self, k):
         """Get."""
