@@ -137,6 +137,23 @@ class VAMModelGalerkin(VAMModel):
 
         sys = FullINS(state)
         sys.apply(Inviscid(state)).simplify()
+
+        # Hydrostatic pressure split applied *before* Multiply: at this
+        # stage the equations only contain ``p(t, x, z)`` in their
+        # volume form (no boundary evaluations yet from Leibniz / FT),
+        # so a single ``Relation`` substitution fires uniformly.  After
+        # the split the chain produces the ``g·h·∂_x η`` and ``−g``
+        # contributions explicitly (the latter cancels the body-force
+        # gravity in z-mom), and the field ``p_NH`` carries only the
+        # non-hydrostatic remainder — matching Escalante 2024 eq (4)
+        # which writes hydrostatic flux as ``g·h·∂_x η`` and ``p_k`` as
+        # the non-hydrostatic moments.  Atmospheric pressure ``p_atm``
+        # is implicitly absorbed by leaving it out of the split.
+        p_NH = sp.Function("p_NH", real=True)(state.t, state.x, z)
+        sys.apply(
+            {state.p: state.rho * state.g * (state.eta - z) + p_NH}
+        ).simplify()
+
         sys.momentum.x.apply(Multiply(test_phi, outer=True))
         sys.momentum.z.apply(Multiply(test_phi, outer=True))
 
@@ -177,13 +194,16 @@ class VAMModelGalerkin(VAMModel):
         # a structural assumption baked into the state.
         sys.apply({sp.Derivative(state.b, state.t): sp.S.Zero}).simplify()
 
-        sys.apply({state.p.subs(z, state.eta): 0}).simplify()
+        # Surface BC for the non-hydrostatic remainder: ``p_NH(η) = 0``
+        # (the hydrostatic part contributes ``ρ·g·(η − η) = 0`` at the
+        # surface trivially).
+        sys.apply({p_NH.subs(z, state.eta): 0}).simplify()
         sys.apply(AffineProjection(state))
         sys.apply(Expand(state.u, basis=basis_u, coefficients=coeffs_u,
                          state=state))
         sys.apply(Expand(state.w, basis=basis_w, coefficients=coeffs_w,
                          state=state))
-        sys.apply(Expand(state.p, basis=basis_p, coefficients=coeffs_p,
+        sys.apply(Expand(p_NH, basis=basis_p, coefficients=coeffs_p,
                          state=state))
         if stop == "expand":
             return sys
