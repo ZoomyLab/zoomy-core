@@ -631,17 +631,26 @@ class System:
         Operations (``Multiply(outer=True)`` etc.) can replace a leaf
         with an intermediate ``Zstruct`` in place.
 
+        Operations with ``system_level = True`` (e.g.
+        :class:`InvertMassMatrix`) couple multiple equations and are
+        dispatched directly with the whole system; the leaf walk is
+        skipped.
+
         ``name``/``description`` override the history label; otherwise
         fall back to the op's own ``name``/``description``.  Exactly
         one history entry is recorded per ``System.apply`` call,
         targeted at the root.
         """
+        op = args[0] if args else None
+        if op is not None and getattr(op, "system_level", False):
+            op(self)
+            self._record_history((), op, name, description)
+            return self
         # Snapshot paths so a rank-changing op that adds children doesn't
         # make us re-visit the freshly inserted leaves.
         leaf_paths = [p for p, _ in list(self.leaves())]
         for path in leaf_paths:
             _NodeProxy(self, path)._apply_internal(*args, **kwargs)
-        op = args[0] if args else None
         self._record_history((), op, name, description)
         return self
 
