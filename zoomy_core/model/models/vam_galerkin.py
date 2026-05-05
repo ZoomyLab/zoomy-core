@@ -80,6 +80,15 @@ class VAMModelGalerkin(VAMModel):
         Pre-declared coefficient functions ``[U_0, U_1, …]`` etc.
     """
 
+    def __init__(self, level=0, **kwargs):
+        # ``VAMModel.__init__`` calls ``self.derive_model()`` *before*
+        # ``Model.__init__`` populates ``self.level`` via param — so
+        # ``_build_chain``'s ``getattr(self, "level", 0)`` would silently
+        # collapse every call to L=0.  Stash it on the instance up front
+        # so the chain reads the actual requested level.
+        self._chain_level = level
+        super().__init__(level=level, **kwargs)
+
     def derive_model(self):
         # Run the parent VAMModel's derivation first so the inherited
         # operator-API path (flux / NCP / source / mass / hydrostatic
@@ -95,7 +104,7 @@ class VAMModelGalerkin(VAMModel):
         self._build_chain()
 
     def _build_chain(self):
-        L = getattr(self, "level", 0)
+        L = self._chain_level
         # Run the chain twice — once stop right after Expand (gives us
         # an intermediate System with un-evaluated ``sp.Sum`` atoms,
         # ``describe`` renders the paper-form Σ_k U_k φ_k(ζ)), once
