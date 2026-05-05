@@ -592,6 +592,25 @@ class Expression(SymbolicBase):
             lhs = conditions[0]
             lhs_sp = lhs.expr if isinstance(lhs, Expression) else lhs
             conditions = ({lhs_sp: rhs},)
+
+        # ``single_term_only`` Operations (e.g. ProductRule) are
+        # invalid on multi-term expressions — the author must pick a
+        # term explicitly via ``apply_to_term(idx, op)``.  Allowing
+        # them at whole-leaf level would let the operation implicitly
+        # decide which terms to rewrite, which is the anti-pattern.
+        n_terms = len(Add.make_args(sp.expand(self.expr)))
+        if n_terms > 1:
+            for cond in conditions:
+                if isinstance(cond, Operation) and getattr(
+                        cond, "single_term_only", False):
+                    raise RuntimeError(
+                        f"{type(cond).__name__} is single-term-only and "
+                        f"cannot be applied to a multi-term expression "
+                        f"({n_terms} terms in {self.name!r}). Use "
+                        f"expression.apply_to_term(idx, {type(cond).__name__}()) "
+                        f"to target a specific term by index."
+                    )
+
         _resolve_subs = _resolve_subs_safe  # module-level helper
 
         def _apply_one(expr, cond):
@@ -1678,6 +1697,23 @@ class Operation(SymbolicBase):
     # like ``rank_changes_leaf``, but the result must remain an
     # Expression (not a rank-changing Zstruct).
     whole_leaf_op = False
+
+    # Ops that need the entire System at once — they couple multiple
+    # leaf equations (``InvertMassMatrix`` is the canonical example: it
+    # left-multiplies a vector of equations by ``M⁻¹`` so per-leaf
+    # dispatch is meaningless).  ``System.apply`` routes these directly
+    # to ``op(system)``, bypassing the leaf walk entirely.
+    system_level = False
+
+    # Ops that are invalid on a multi-term Expression — the author
+    # MUST pick a single term via ``apply_to_term(idx, op)``.
+    # ``ProductRule`` is the canonical example: applying it to every
+    # term of a multi-term equation is the "operation deciding which
+    # terms to rewrite" anti-pattern we want to forbid.
+    # ``Expression.apply`` checks this flag before the per-term loop
+    # and raises if the receiving expression has more than one
+    # additive term.
+    single_term_only = False
 
     def _repr_latex_(self):
         return ""
@@ -3276,10 +3312,13 @@ class Recombine(Operation):
 
 
 class ProductRule(Operation):
-    """Product rule — term-level, identity-preserving.
+    """Product rule — single term, unconditional, identity-preserving.
 
-    Applied per term (use ``expr.terms[i].apply(ProductRule())`` or
-    ``model.<leaf>.apply(ProductRule())`` which iterates per term).
+    **Must** be applied via :meth:`Expression.apply_to_term`
+    (or :meth:`DerivedSystem.apply_to_term`) — leaf-level invocation
+    raises.  The operation has no selection logic; it transforms
+    whatever single term it is given.  The author picks which term to
+    rewrite by index.
 
     ``direction="inverse"`` (default) — term is a ``Mul`` with exactly
     one ``Derivative`` factor:
@@ -3287,11 +3326,10 @@ class ProductRule(Operation):
         ``coeff · ∂_v(f)  →  ∂_v(coeff · f)  −  ∂_v(coeff).doit() · f``
 
     The second piece is the residual that keeps the rewrite an exact
-    identity.  Already-conservative terms (``coeff`` free of ``v``)
-    are left untouched — they'd produce a zero residual and churn
-    simplify needlessly.  Bare ``Derivative`` terms are also left
-    alone so that ``Integrate(method="auto")`` can Leibniz / fund-thm
-    them.
+    identity.  No skip on coefficient that's free of ``v``: the
+    residual ``∂_v(coeff)`` is zero in that case, the rewrite reduces
+    to ``∂_v(coeff · f)``, simplify cleans up — that's the right
+    behaviour, the operation does not second-guess.
 
     ``direction="forward"`` — term is a bare
     ``Derivative(Π f_i, v)`` or ``Derivative(f**n, v)``:
@@ -3300,29 +3338,22 @@ class ProductRule(Operation):
         ``∂_v(f**n)    →  n · f**(n-1) · ∂_v(f)``  (integer ``n ≥ 2``)
 
     ``direction="both"`` — forward on bare ``Derivative``, inverse on
-    ``Mul`` with one ``Derivative`` factor.  Use with care: applied
-    leaf-wide it will break apart conservative forms that
-    ``Integrate`` relies on.
+    ``Mul`` with one ``Derivative`` factor.
 
     ``variables=None`` (default) — act on derivatives w.r.t. any
-    ``Symbol`` named ``t``, ``x``, ``y``, or ``z`` (the conventional
-    independent coordinates).  Derivatives in layer-height functions,
-    test-function indices, or other auxiliaries are left alone —
-    which keeps multi-layer derivations tractable by avoiding
-    expensive ``.doit()`` chain-rule expansions on coefficients whose
-    only dependence on the differentiation variable is through a
-    layered basis argument.  Pass ``variables=[state.t, state.x, ...]``
-    for an explicit whitelist by Symbol identity.
+    ``Symbol`` named ``t``, ``x``, ``y``, or ``z``.  Pass
+    ``variables=[state.t, state.x, ...]`` for an explicit whitelist
+    by Symbol identity.
 
-    The operation is strictly *local*: no cross-term recombination.
-    To turn ``h·∂_t α + α·∂_t h`` into ``∂_t(h·α)``, apply
-    :class:`ProductRule` to **one** sibling only; the residual produced
-    by the inverse rewrite cancels against the untouched sibling via
-    sympy's like-term combining in the next ``.simplify()``.
+    Cross-term combinations (``h·∂_t α + α·∂_t h → ∂_t(h·α)``) are
+    not the operation's job.  Apply ProductRule to one sibling only;
+    the residual cancels against the untouched sibling via sympy's
+    like-term combining in the next ``.simplify()``.
     """
 
     _DIRECTIONS = ("inverse", "forward", "both")
     _DEFAULT_COORD_NAMES = frozenset({"t", "x", "y", "z"})
+    single_term_only = True
 
     def __init__(self, variables=None, direction="inverse"):
         if direction not in self._DIRECTIONS:
@@ -3346,12 +3377,11 @@ class ProductRule(Operation):
         return getattr(var, "name", None) in self._DEFAULT_COORD_NAMES
 
     def _leaf_sp(self, expr):
-        # Per-term dispatch even if we happen to receive a multi-term Add
-        # directly (e.g. when called without going through Expression.apply).
-        return sum(
-            (self._one_term(t) for t in Add.make_args(sp.expand(expr))),
-            S.Zero,
-        )
+        # ``Expression.apply`` enforces the single-term rule via the
+        # ``single_term_only`` flag before the per-term loop ever
+        # reaches us, so by the time we land here the expression has
+        # exactly one additive term.  Apply unconditionally.
+        return self._one_term(sp.expand(expr))
 
     def _one_term(self, term):
         # Forward: bare Derivative whose inner is a product or integer power.
@@ -3376,7 +3406,9 @@ class ProductRule(Operation):
                     n = int(exp)
                     return n * base**(n - 1) * Derivative(base, var)
             return term
-        # Inverse: Mul with exactly one Derivative factor.
+        # Inverse: Mul with exactly one Derivative factor.  Unconditional —
+        # if coeff is free of var the residual ∂_v(coeff) is zero and the
+        # rewrite reduces to ∂_v(coeff · f); we don't pre-decide.
         if (self._direction in ("inverse", "both")
                 and isinstance(term, Mul)):
             factors = list(term.args)
@@ -3392,12 +3424,6 @@ class ProductRule(Operation):
             inner = d.args[0]
             coeff_factors = [f for f in factors if f is not d]
             coeff = Mul(*coeff_factors) if coeff_factors else S.One
-            # Already-conservative shortcut: coeff free of var means the
-            # residual ∂_v(coeff)·f vanishes, so the rewrite would just
-            # re-wrap the term with no gain — skip entirely to save the
-            # per-term .doit() + simplify churn.
-            if var not in coeff.free_symbols:
-                return term
             return (Derivative(coeff * inner, var)
                     - Derivative(coeff, var).doit() * inner)
         return term
