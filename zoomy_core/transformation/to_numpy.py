@@ -266,6 +266,100 @@ class NumpyRuntimeModel:
         for name, function in self.runtime_functions.items():
             setattr(self, name, function)
 
+    @classmethod
+    def from_system_model(cls, sm, *, module=None, printer=None):
+        """Build a runtime by lambdifying a :class:`SystemModel`'s
+        stored matrices.
+
+        Lightweight adapter that mirrors the operator-API surface of
+        the runtime built from a ``Model``: the resulting object has
+        ``flux``, ``nonconservative_matrix``, ``source``,
+        ``hydrostatic_pressure``, ``mass_matrix`` callable attributes,
+        each accepting ``(Q, Qaux, p)`` and returning the corresponding
+        numpy array.
+
+        For most solver code paths the existing ``NumpyRuntimeModel(model)``
+        flow is still preferred because it carries the model's full
+        function registry (``boundary_conditions`` kernel etc.) — this
+        factory is the right entry point when the analysis or
+        transformation pipeline starts from a SystemModel that may not
+        have a backing Model (e.g. SystemModel constructed from
+        scratch).
+        """
+        rt = cls.__new__(cls)
+        rt.model = None
+        rt.name = "SystemModelRuntime"
+        rt.dimension = sm.n_dim
+        rt.n_variables = sm.n_equations
+        rt.n_aux_variables = len(sm.aux_state)
+        rt.n_parameters = len(sm.parameters)
+        rt.parameters = np.array(list(sm.parameters.values()),
+                                 dtype=float)
+        rt.module = dict(cls.module) if module is None else dict(module)
+        rt.printer = cls.printer if printer is None else printer
+
+        modules = [rt.module]
+        if rt.printer:
+            modules.append(rt.printer)
+
+        # Lambdify each stored matrix into a runtime callable.  The
+        # signature is ``(Q, Qaux, p)`` — matching the convention of
+        # the Model-based runtime.
+        Q_syms = list(sm.state)
+        Qaux_syms = list(sm.aux_state)
+        p_syms = list(sm.parameters.keys())
+        all_args = (Q_syms, Qaux_syms, p_syms)
+
+        def _flatten(args):
+            out = []
+            for a in args:
+                out.extend(a)
+            return out
+
+        flat_args = _flatten(all_args)
+
+        rt.runtime_functions = {}
+        for name, mat in [
+            ("flux", sm.flux),
+            ("hydrostatic_pressure", sm.hydrostatic_pressure),
+            ("source", sm.source),
+            ("mass_matrix", sm.mass_matrix),
+        ]:
+            compiled = sp.lambdify(flat_args, mat, modules=modules,
+                                   cse=True)
+
+            def _make(_compiled):
+                def _runtime(Q, Qaux, p):
+                    return np.asarray(
+                        _compiled(*Q, *Qaux, *p), dtype=float)
+                return _runtime
+            rt.runtime_functions[name] = _make(compiled)
+            setattr(rt, name, rt.runtime_functions[name])
+
+        # NCP — convert NDimArray to a sympy MutableDenseNDimArray and
+        # lambdify per-axis.
+        n_dim = sm.n_dim
+        n_eq = sm.n_equations
+        ncp_compiled = []
+        for d in range(n_dim):
+            slab = sp.Matrix(
+                n_eq, n_eq,
+                lambda i, j, _d=d: sm.nonconservative_matrix[i, j, _d],
+            )
+            ncp_compiled.append(
+                sp.lambdify(flat_args, slab, modules=modules, cse=True)
+            )
+
+        def _ncp(Q, Qaux, p):
+            slabs = [np.asarray(c(*Q, *Qaux, *p), dtype=float)
+                     for c in ncp_compiled]
+            return np.stack(slabs, axis=-1)
+
+        rt.runtime_functions["nonconservative_matrix"] = _ncp
+        rt.nonconservative_matrix = _ncp
+
+        return rt
+
 
 class NumpyRuntimeSymbolic(NumpyRuntimeModel):
     """
