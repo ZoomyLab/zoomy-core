@@ -2248,7 +2248,13 @@ class EvaluateIntegrals(Operation):
                 resolved = integrand
                 for basis in bases:
                     resolved = basis.resolve_atoms(resolved)
-                return sp.integrate(resolved, limits)
+                # Use ``_cached_integrate`` (Zoomy's rule set) rather
+                # than raw ``sp.integrate`` — the post-resolution
+                # integrand often has shapes (``Derivative`` outer over
+                # rational-in-h polynomial integrand) that the rule
+                # set handles cleanly but raw sympy.integrate leaves
+                # unevaluated.
+                return _cached_integrate(resolved, limits)
             return _cached_integrate(integrand, limits)
 
         def _walk(e):
