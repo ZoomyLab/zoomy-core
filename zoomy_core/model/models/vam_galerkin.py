@@ -154,6 +154,30 @@ class VAMModelGalerkin(VAMModel):
         sys.apply(EvaluateIntegrals(state)).simplify()
         return sys
 
+    # ── Display: model.describe() shows the chain's closed form ───────
+
+    def describe(self, **kwargs):
+        """Render the closed Galerkin chain (post-EvaluateIntegrals) —
+        not the inherited VAMModel system.
+
+        ``VAMModel.derive_model`` (called via ``super().derive_model()``)
+        leaves ``self._system`` populated with the parent's
+        depth-integrate-then-stop chain, whose leaves carry
+        un-evaluated integrals like
+        ``∂_x ∫_b^{b+h} u² dz``.  The parent renders fine for
+        ``flux()`` / ``source()`` etc. only because those operator
+        methods bypass ``_system`` entirely and consume hand-coded
+        basis matrices instead.
+
+        For display the chain's closed primitive-form equations are
+        the right object — every integral is resolved, every term is
+        polynomial in ``(h, U_k, W_k, P_k)``.
+        """
+        return self._chain_system.describe(**kwargs)
+
+    def _repr_markdown_(self):
+        return self._chain_system._repr_markdown_()
+
     # ── Convenience: render the chain artefacts ────────────────────────
 
     def describe_chain_intermediate(self):
@@ -165,7 +189,8 @@ class VAMModelGalerkin(VAMModel):
 
     def describe_chain_closed(self):
         """Markdown rendering of the closed primitive-form equations
-        after ``EvaluateIntegrals``.
+        after ``EvaluateIntegrals``.  Same as :meth:`describe`; kept
+        for symmetry with ``describe_chain_intermediate``.
         """
         return self._chain_system.describe()
 
