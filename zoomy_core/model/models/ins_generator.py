@@ -2175,6 +2175,13 @@ class EvaluateIntegrals(Operation):
     or ones whose result would need a closed form sympy can't find).
     """
 
+    # Inspecting the whole leaf at once is necessary: an outer
+    # ``Derivative(Integral(...), x)`` shape has the Integral nested
+    # inside an Add inside a Derivative inside the leaf, and the
+    # per-term walk would miss the cross-term interactions of the
+    # ``_walk`` recursion.  See the level=1 VAM closure regression.
+    whole_leaf_op = True
+
     def __init__(self, state=None, name="evaluate_integrals",
                  description=None):
         super().__init__(
@@ -2183,7 +2190,27 @@ class EvaluateIntegrals(Operation):
         )
 
     def _leaf_sp(self, expr):
-        from sympy import Integral, Derivative
+        from sympy import Integral, Derivative, Sum
+
+        def _doit_sums(e):
+            """Recursively unroll ``sp.Sum`` atoms via ``.doit()``.
+
+            Per-instance ``amp_fn`` Functions auto-evaluate to the
+            corresponding amplitude when their integer-index argument
+            is concrete (see :class:`Expand`), so unrolling a Sum
+            implicitly substitutes all amplitudes too.  Other
+            ``.doit()``-able atoms (Derivatives, Integrals) are left
+            alone — the outer integral fixpoint loop handles those.
+            """
+            if isinstance(e, Sum):
+                # Unroll this Sum; recurse into the unrolled result so
+                # nested Sums also expand.
+                return _doit_sums(e.doit())
+            if hasattr(e, "args") and e.args:
+                new_args = [_doit_sums(a) for a in e.args]
+                if any(n is not o for n, o in zip(new_args, e.args)):
+                    return e.func(*new_args)
+            return e
 
         def _bases_in(integrand):
             """Distinct ``Basisfunction`` instances referenced by opaque
@@ -2200,15 +2227,22 @@ class EvaluateIntegrals(Operation):
             return found
 
         def _resolve_integral(integrand, limits):
-            """Single integration step with opaque-phi routing.
+            """Single integration step with Sum-unroll + opaque-phi routing.
 
-            If the integrand contains opaque ``phi_k(arg)`` atoms tied
-            to one or more :class:`Basisfunction` instances, substitute
+            (1) Unroll any ``sp.Sum`` atoms in the integrand — ``Expand``
+            produced unevaluated Sums to keep ``ProductRule`` etc.
+            tractable; here at integration time we expand them so each
+            term is individually integrable.  ``amp_fn`` auto-evaluation
+            substitutes amplitudes for concrete integer indices.
+
+            (2) If the resulting integrand contains opaque basis atoms
+            (``phi_fn(k, arg)`` with ``func._basis`` set), substitute
             each basis's atoms with its concrete polynomial form via
-            ``basis.resolve_atoms`` and then ``sympy.integrate`` the
-            now-polynomial-in-``var`` integrand.  Otherwise fall through
-            to the cached sympy.integrate path.
+            ``basis.resolve_atoms`` and ``sympy.integrate`` the
+            polynomial-in-``var`` integrand.  Otherwise fall through to
+            the cached ``sympy.integrate`` path.
             """
+            integrand = _doit_sums(integrand)
             bases = _bases_in(integrand)
             if bases:
                 resolved = integrand
@@ -2251,11 +2285,14 @@ class EvaluateIntegrals(Operation):
             if result == prev:
                 break
 
-        # Final cleanup: resolve any remaining opaque basis atoms that
-        # weren't inside Integrals (typically boundary evaluations like
-        # ``phi_k(0)`` or ``phi_k(1)`` that sit alongside the closed
-        # bulk integrals — they need their concrete polynomial values
-        # before downstream tagging / quasilinear analysis can proceed).
+        # Final cleanup: unroll any remaining standalone Sums (e.g. the
+        # boundary-evaluation Sum produced when ``Expand`` substituted
+        # ``field(t, x, b)`` or ``field(t, x, b+h)`` outside of an
+        # Integral context — those Sums never went through the integral
+        # path).  Then resolve any opaque basis atoms with concrete
+        # polynomials so downstream tagging / quasilinear analysis sees
+        # a fully closed expression.
+        result = _doit_sums(result)
         bases_present = _bases_in(result)
         for basis in bases_present:
             result = basis.resolve_atoms(result)
@@ -2263,43 +2300,53 @@ class EvaluateIntegrals(Operation):
 
 
 class Expand(Operation):
-    """Substitute a vertical field with its polynomial ansatz expansion.
+    """Substitute a vertical field with its polynomial ansatz expansion
+    in **unevaluated Sum form**.
 
-    Replaces every call ``field(t, x, [y,] arg_z)`` in the expression
-    with the truncated series
+    Replaces every call ``field(t, x, [y,] arg_z)`` with
 
-        ``Σ_k amplitudes[k] · basis.phi[k]( (arg_z − b) / h )``
+        ``Sum(amp_fn(k) · basis.phi_fn(k, (arg_z − b)/h), (k, 0, L))``
 
-    where ``basis.phi[k]`` is the *opaque* sympy Function subclass
-    produced by :class:`Basisfunction` (level ``k`` of the chosen
-    basis, carrying a ``_basis`` back-reference).  No concrete
-    polynomial is substituted at this stage — :class:`EvaluateIntegrals`
-    resolves the opaque atoms when a held ``Integral`` is closed.
+    — a single ``sp.Sum`` atom rather than the unrolled Add.  Two
+    placeholders make this work as one symbolic chunk:
 
-    Multiple bases may coexist in the same model (one per ansatz field
-    — typically ``phi`` for u, ``eta`` for w, ``mu`` for p in
-    non-hydrostatic models).  Atoms from different bases are distinct
-    SymPy classes (different ``__name__``s and ``_basis`` references)
-    and don't collide.
+    * ``basis.phi_fn`` is the basis's opaque 2-arg Function (carries
+      ``_basis = basis``); concrete polynomial substitution is deferred
+      until :class:`EvaluateIntegrals`.
+    * ``amp_fn`` is a private sympy Function class created per Expand
+      call; its ``eval`` classmethod auto-substitutes the integer-
+      indexed amplitude (``amp_fn(0) → amplitudes[0]``, etc.) the
+      moment ``k`` becomes a concrete integer — i.e. when the Sum is
+      ``.doit()``-ed.  For a symbolic ``k`` it stays opaque, so the
+      Sum carries through ``ProductRule``, ``AffineProjection``, and
+      ``Integrate`` as a single mathematical term.
 
     Boundary evaluations of the field (``arg_z = b``, ``arg_z = b+h``)
-    are handled automatically: after the affine substitution
-    ``(arg_z − b)/h`` becomes 0 or 1 respectively, so the ansatz at
-    the bottom is ``Σ_k amp_k · phi_k(0)`` and at the surface
-    ``Σ_k amp_k · phi_k(1)``.  EvaluateIntegrals later resolves these
-    via ``basis.resolve_atoms``.
+    are handled automatically: ``(arg_z − b)/h`` becomes 0 or 1
+    respectively, the Sum is ``Σ_k amp_k · phi_fn(k, 0|1)``, and
+    EvaluateIntegrals' final cleanup pass resolves these via
+    ``basis.resolve_atoms`` once the Sum has been ``.doit()``-ed.
+
+    Why Sum-form: at higher levels (L ≥ 1), the unrolled Add form has
+    ``L+1`` terms per expanded field — products of two expanded fields
+    explode quadratically, and ``ProductRule`` would have to be
+    applied to each one individually.  The single-Sum representation
+    keeps the equation compact and makes ``ProductRule`` a single
+    apply per expansion, which is the way the math reads on paper.
 
     Parameters
     ----------
     field : sympy Function call
         The vertical field, e.g. ``state.u`` (which is ``u(t, x, z)``).
     basis : :class:`Basisfunction`
-        The basis instance.  Its ``phi`` list provides the opaque
-        Function subclasses used in the expansion.
+        The basis instance.  ``basis.phi_fn`` is the 2-arg opaque
+        Function used inside the Sum.
     amplitudes : sequence of sympy Function calls
-        The pre-declared horizontal coefficient functions
+        Pre-declared horizontal coefficient functions
         (``α_0(t, x), α_1(t, x), …``) — one per basis level.  Length
-        must equal ``basis.level + 1``.
+        must equal ``basis.level + 1``.  Auto-substituted into the
+        Sum by ``amp_fn``'s eval classmethod when ``k`` becomes an
+        integer.
     state : :class:`StateSpace`
         The state space — used to read ``state.b`` and ``state.H``
         for the affine ζ-map.
@@ -2324,19 +2371,42 @@ class Expand(Operation):
         self._amplitudes = amplitudes
         self._state = state
 
+        # Build a per-instance ``amp`` Function whose ``eval`` returns
+        # the concrete amplitude when called with an integer index.
+        # Sympy invokes ``eval`` automatically: ``amp_fn(2)`` returns
+        # ``amplitudes[2]`` directly; ``amp_fn(k)`` (symbolic k) stays
+        # opaque inside the Sum.
+        amp_table = list(amplitudes)
+        symbol = basis.symbol
+
+        def _eval(cls, k_arg):
+            if getattr(k_arg, "is_Integer", False):
+                return amp_table[int(k_arg)]
+            return None  # leave opaque
+
+        self._amp_fn = type(
+            f"amp_{symbol}_{id(self):x}",
+            (sp.Function,),
+            {
+                "eval": classmethod(_eval),
+                "_amp_table": amp_table,
+            },
+        )
+
     def _leaf_sp(self, expr):
         b = self._state.b
         h = self._state.H
-        amps = self._amplitudes
-        phi = self._basis.phi
-        L = self._basis.level
+        basis = self._basis
+        amp_fn = self._amp_fn
+        L = basis.level
 
         def _rhs(*field_args):
             arg_z = field_args[-1]
             zeta_val = (arg_z - b) / h
-            return sum(
-                (amps[k] * phi[k](zeta_val) for k in range(L + 1)),
-                S.Zero,
+            k = sp.Dummy("k", integer=True, nonnegative=True)
+            return sp.Sum(
+                amp_fn(k) * basis.phi_fn(k, zeta_val),
+                (k, 0, L),
             )
 
         return expr.replace(self._field_fn, _rhs)
