@@ -6,7 +6,7 @@ projection at the requested ``level`` (number of u-moments retained).
 Concretely, applies (in order):
   - ``Multiply(basis.phi, outer=True)`` on momentum.x (and y if 3D):
     creates ``test_0..test_L`` clones of each momentum equation.
-  - ``ZetaTransform``: affine change ``z → ζ·h + b`` inside Integrals.
+  - ``AffineProjection``: affine change ``z → ζ·h + b`` inside Integrals.
   - ``EvaluateIntegrals``: ``sympy.integrate`` the now-polynomial-in-ζ
     integrals.
   - ``ProjectBasisIntegrals``: extract the polynomial coefficients
@@ -20,7 +20,7 @@ from __future__ import annotations
 from zoomy_core.model.models.basisfunctions import Legendre_shifted
 from zoomy_core.model.models.ins_generator import (
     Multiply,
-    ZetaTransform,
+    AffineProjection,
     EvaluateIntegrals,
     ProjectBasisIntegrals,
 )
@@ -61,6 +61,6 @@ class SME(Hydrostatic):
             child.apply(Multiply(self.basis.phi, outer=True))
 
         # Affine map and integrate.
-        sys_.apply(ZetaTransform(s))
+        sys_.apply(AffineProjection(s))
         sys_.apply(EvaluateIntegrals(s))
         sys_.apply(ProjectBasisIntegrals(s, basis=self.basis))

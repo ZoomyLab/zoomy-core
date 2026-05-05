@@ -1,11 +1,11 @@
 """Change-of-variable primitive: affine map + Jacobian.
 
 Replaces both ``IntegralTransform`` (ins_generator.py:2523) and
-``ZetaTransform`` (ins_generator.py:2874) with a single primitive
+``AffineProjection`` (ins_generator.py:2874) with a single primitive
 that requires the caller to specify the source ``(var, lower,
 upper)`` triple explicitly — no implicit ``state.b/state.eta``
 defaults, no ``sp.simplify(bound_diff) == 0`` matching for running
-integrals (the legacy ``ZetaTransform`` Pass 2 logic).
+integrals (the legacy ``AffineProjection`` Pass 2 logic).
 
 The redesigned primitive matches Integral atoms by **structural
 equality** of the limits tuple.  Callers who have outer + nested

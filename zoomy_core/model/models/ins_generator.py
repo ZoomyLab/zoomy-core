@@ -2124,7 +2124,7 @@ def integrate_cache_clear():
 class EvaluateIntegrals(Operation):
     """Run ``sympy.integrate`` on every ``Integral`` node in the expression.
 
-    After :class:`ZetaTransform` + basis expansion the volume integrals
+    After :class:`AffineProjection` + basis expansion the volume integrals
     look like ``Integral(polynomial_in_zeta, (zeta, 0, 1))``.  This op
     collapses each such integral to a scalar.
 
@@ -2871,7 +2871,7 @@ class PartialIntegrate(Operation):
                 f"(\\cdot)\\, d{sp.latex(self._var)}$")
 
 
-class ZetaTransform(Operation):
+class AffineProjection(Operation):
     """Transform vertical coordinate: z = ζ·(upper−lower) + lower, dz = (upper−lower)·dζ.
 
     Transforms z-integrals whose bounds match the configured
@@ -2888,7 +2888,7 @@ class ZetaTransform(Operation):
     Only ``Integral`` nodes whose bounds structurally equal the
     configured pair are rewritten; other integrals (including
     already-transformed ``(zeta, 0, 1)`` ones) are left untouched.
-    That makes it safe to apply multiple ZetaTransforms back-to-back
+    That makes it safe to apply multiple AffineProjections back-to-back
     on a branch with several integration ranges.
     """
 
@@ -3820,11 +3820,11 @@ class Basis:
         from zoomy_core.model.models.basisfunctions import Legendre_shifted
         basis = Basis(state, Legendre_shifted, level=2)
         model.momentum.x.apply(Multiply(basis.phi, outer=True))
-        model.apply(ZetaTransform(state))
+        model.apply(AffineProjection(state))
         model.apply(basis.expand(state.u))
 
     The volume substitution uses the ζ-transformed key
-    ``field.subs(z, ζ·h + b)`` — apply it **after** :class:`ZetaTransform`
+    ``field.subs(z, ζ·h + b)`` — apply it **after** :class:`AffineProjection`
     so it matches what's under the integrals.
     """
 
@@ -3863,7 +3863,7 @@ class Basis:
         # Use this BEFORE depth-integration so the test function
         # participates in the Leibniz rule and produces the W_sigma-like
         # coupling terms on ∂_t phi, ∂_x phi.  Use ``self.phi`` (in zeta)
-        # AFTER ZetaTransform, inside integrands.
+        # AFTER AffineProjection, inside integrands.
         zeta_of_z = (state.z - state.b) / state.H
         self.phi_of_z = Zstruct(**{
             f"phi_{k}": self._bf.eval(k, zeta_of_z)
@@ -3954,7 +3954,7 @@ class Basis:
             If ``False`` (the SWE case), the bulk key is ``field``
             itself — substitutes ``u(t,x,z) → Σ α·φ_inner(ζ_i(z))``.
             If ``True`` (the SME case, applied *after*
-            :class:`ZetaTransform`), the bulk key becomes
+            :class:`AffineProjection`), the bulk key becomes
             ``field.subs(z, ζ·h_i + z_i)`` and the substituted form
             reduces to ``Σ α·φ_inner(ζ)`` in the shared zeta symbol,
             ready for ``EvaluateIntegrals`` to collapse the
@@ -3994,16 +3994,16 @@ class Basis:
             )
 
         if zeta_transformed:
-            # After ZetaTransform the bulk form is ``field.subs(z, ζ·h_i + lower)``.
-            # ``ZetaTransform`` + the lightweight simplify path store the
+            # After AffineProjection the bulk form is ``field.subs(z, ζ·h_i + lower)``.
+            # ``AffineProjection`` + the lightweight simplify path store the
             # subbed argument in **expanded** form (``ζ·upper − ζ·lower + lower``),
             # while a naive ``ζ·(upper−lower)+lower`` stays factored.
             # We need the bulk key to match the expanded form produced by
-            # ZetaTransform, because ``xreplace`` is structural and
+            # AffineProjection, because ``xreplace`` is structural and
             # ``a·(b−c)+c`` isn't the same subtree as ``a·b − a·c + c``.
             zeta_of_z = sp.expand(state.zeta * (upper - lower) + lower)
             bulk_key = field.subs(state.z, zeta_of_z)
-            # RHS shortcut: after ZetaTransform the bulk argument is
+            # RHS shortcut: after AffineProjection the bulk argument is
             # identically ``ζ``, so we evaluate the inner basis at
             # ``state.zeta`` directly.  Going through ``_closure`` would
             # produce ``ζ·(upper-lower)/(upper-lower)`` which sympy
@@ -4031,7 +4031,7 @@ class Basis:
         """Zstruct of inner test functions in the shared ``ζ`` symbol.
 
         Equivalent to ``basis.phi`` but for one layer of a
-        :class:`LayeredBasis`.  Use after ZetaTransform, inside
+        :class:`LayeredBasis`.  Use after AffineProjection, inside
         integrands, when you need ``φ_inner_k(ζ)`` multiplied into an
         ``EvaluateIntegrals`` target.
 
