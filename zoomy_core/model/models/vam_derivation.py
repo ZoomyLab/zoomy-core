@@ -143,7 +143,7 @@ def derive_vam_moments(
     t, x, z = state.t, state.x, state.z
     u, w, p = state.u, state.w, state.p
     rho, g = state.rho, state.g
-    b, H, eta = state.b, state.H, state.eta
+    b, H, eta = state.b, state.h, state.eta
 
     # ===== Continuity =====================================================
     # du/dx + dw/dz = 0
@@ -333,7 +333,7 @@ def _tag_vam_momentum(
     # -- Topography NC: g*h*db/dx (x-momentum only, from depth integration) --
     if component == "x" and include_gravity:
         tagged_list.append(TaggedTerm(
-            expr=Expression(state.g * state.H, "g*H_topography"),
+            expr=Expression(state.g * state.h, "g*H_topography"),
             role="nonconservative",
             origin="topography",
         ))

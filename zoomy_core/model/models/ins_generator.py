@@ -78,8 +78,8 @@ class StateSpace:
         self._build_stress_tensor(has_y, args_3d)
 
         self.b = Function("b", real=True)(*args_h)
-        self.H = Function("h", real=True)(*args_h)
-        self.eta = self.b + self.H
+        self.h = Function("h", real=True)(*args_h)
+        self.eta = self.b + self.h
 
         self.coords_h = [self.x] + ([self.y] if has_y else [])
         self.velocities_h = [self.u] + ([self.v] if has_y else [])
@@ -2419,7 +2419,7 @@ class Expand(Operation):
         :class:`EvaluateIntegrals` after ``Sum.doit()`` unrolls the
         symbolic index to concrete integers.
     state : :class:`StateSpace`
-        The state space — used to read ``state.b`` and ``state.H``
+        The state space — used to read ``state.b`` and ``state.h``
         for the affine ζ-map.
     """
 
@@ -2470,18 +2470,21 @@ class Expand(Operation):
         )
 
     def _leaf_sp(self, expr):
-        b = self._state.b
-        h = self._state.H
+        # Reference-defined basis: write the ansatz with the basis arg
+        # in physical-z form ``phi_fn(k, arg_z)``.  AffineProjection's
+        # basis-arg rewrite collapses this to ``phi_fn(k, ζ)`` (or
+        # ``0`` / ``1`` at boundaries) when the change of variables
+        # happens.  No manual ``(arg_z − b)/h`` composition at the
+        # call site.
         basis = self._basis
         coeff_fn = self._coeff_fn
         L = basis.level
 
         def _rhs(*field_args):
             arg_z = field_args[-1]
-            zeta_val = (arg_z - b) / h
             k = sp.Dummy("k", integer=True, nonnegative=True)
             return sp.Sum(
-                coeff_fn(k) * basis.phi_fn(k, zeta_val),
+                coeff_fn(k) * basis.phi_fn(k, arg_z),
                 (k, 0, L),
             )
 
@@ -2721,7 +2724,7 @@ class Integrate(Operation):
 
         zmom.apply(Integrate(state.z, state.b, state.z))             # partial
         zmom.apply(Integrate(state.z, state.b, state.eta))           # full depth
-        zmom.apply(Integrate(state.z, state.b, state.b + state.H,
+        zmom.apply(Integrate(state.z, state.b, state.b + state.h,
                              method="analytical"))                    # sympy.integrate
     """
 
@@ -3040,7 +3043,7 @@ class MapBasisToReference(Operation):
     ----------
     b, h : sympy expressions
         The bottom topography and column height entering the affine
-        map ``z = ζ·h + b``.  Typically ``state.b`` and ``state.H``.
+        map ``z = ζ·h + b``.  Typically ``state.b`` and ``state.h``.
     """
 
     def __init__(self, b, h, name="map_basis_to_reference",
@@ -3284,7 +3287,39 @@ class AffineProjection(Operation):
                     return e.func(*new_args)
             return e
 
-        return _transform_running(_transform_outer(expr))
+        result = _transform_running(_transform_outer(expr))
+        result = self._rewrite_basis_args(result)
+        return result
+
+    def _rewrite_basis_args(self, expr):
+        """Pass 3 — basis-arg rewrite.
+
+        The basis is reference-defined (on [0, 1]).  Calls of
+        ``phi_fn(k, arg_z)`` in the original physical-z integrand are
+        physically interpreted as ``phi_fn(k, (arg_z − b)/h)`` (the
+        affine composition).  After ``_transform_outer`` substitutes
+        ``z → ζ·h + lower``, basis atoms carry args like
+        ``ζ·h + lower`` (bulk), ``lower`` (bottom boundary), or
+        ``upper = lower + h`` (top boundary).  Folding
+        ``arg → (arg − lower)/h`` and simplifying collapses these to
+        reference-ζ form: ``ζ``, ``0``, ``1`` respectively — exactly
+        the canonical pattern ``Basisfunction.resolve_atoms`` /
+        ``EvaluateIntegrals`` expect.
+        """
+        lower = self._lower
+        h = self._h
+
+        basis_funcs = {
+            atom.func
+            for atom in expr.atoms(sp.Function)
+            if hasattr(atom.func, "_basis")
+        }
+        for cls in basis_funcs:
+            def _rewrite(k_arg, z_arg, _cls=cls):
+                new_z = sp.simplify((z_arg - lower) / h)
+                return _cls(k_arg, new_z)
+            expr = expr.replace(cls, _rewrite)
+        return expr
 
     def _repr_latex_(self):
         return (f"$z = \\zeta \\cdot ({sp.latex(self._upper)} - "
@@ -4157,7 +4192,7 @@ class Basis:
         # participates in the Leibniz rule and produces the W_sigma-like
         # coupling terms on ∂_t phi, ∂_x phi.  Use ``self.phi`` (in zeta)
         # AFTER AffineProjection, inside integrands.
-        zeta_of_z = (state.z - state.b) / state.H
+        zeta_of_z = (state.z - state.b) / state.h
         self.phi_of_z = Zstruct(**{
             f"phi_{k}": self._bf.eval(k, zeta_of_z)
             for k in range(self.level + 1)
@@ -4194,7 +4229,7 @@ class Basis:
         ``u`` has been expanded.
         """
         state = self._state
-        z, zeta, b, h = state.z, state.zeta, state.b, state.H
+        z, zeta, b, h = state.z, state.zeta, state.b, state.h
 
         # Build a function-level rewriter.  A plain ``{u(t,x,z): rhs}``
         # dict substituted via ``xreplace`` is structural and won't match

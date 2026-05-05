@@ -38,7 +38,7 @@ class SystemModel:
         ``{Function : symbol_expression}`` mapping every state-bearing
         Function in the derivation to its conservative / primitive
         Symbol form.  For SWE: ``{h_fn: h_sym, q_fn: q_sym,
-        alpha_0_fn: q_sym/h_sym, state.H: h_sym}``.  Any Function in
+        alpha_0_fn: q_sym/h_sym, state.h: h_sym}``.  Any Function in
         the system's leaves that isn't covered here or by
         ``parameter_substitutions`` will mark the term as unclosed in
         the output.
