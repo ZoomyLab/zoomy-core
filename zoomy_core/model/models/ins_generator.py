@@ -1412,6 +1412,22 @@ class _StripArgsLatexPrinter(_LatexPrinter):
     _zeta = sp.Symbol("zeta", real=True)
 
     def _print_Function(self, expr, exp=None):
+        # Coefficient-lookup Functions produced by ``Expand`` carry a
+        # ``_coeff_table`` class attribute and a ``_user_name`` (the
+        # name the user gave the family — ``U`` for ``[U_0, U_1, …]``).
+        # Render them as ``U_{k}`` rather than the default 1-arg
+        # basis-bar form ``coeff|_{ζ=k}``.
+        if (hasattr(expr.func, "_coeff_table")
+                and len(expr.args) == 1):
+            user_name = getattr(expr.func, "_user_name",
+                                expr.func.__name__)
+            tex_name = self._deal_with_super_sub(user_name)
+            tex_idx = self._print(expr.args[0])
+            base = f"{tex_name}_{{{tex_idx}}}"
+            if exp is not None:
+                base = f"{base}^{{{exp}}}"
+            return base
+
         name = expr.func.__name__
         tex = self._deal_with_super_sub(name)
         args = expr.args
@@ -2409,10 +2425,23 @@ class Expand(Operation):
         # the chain; ``EvaluateIntegrals`` substitutes
         # ``coeff_<symbol>(k_int) → coefficients[k_int]`` after
         # ``Sum.doit()`` produces concrete integer indices.
+        #
+        # ``_user_name`` is the LaTeX-display name inferred from the
+        # user's coefficients (``U_0`` / ``U_1`` → ``U``).  The
+        # ``_StripArgsLatexPrinter`` reads it to render the opaque
+        # symbolic-index call as ``U_{k}`` rather than the default
+        # 1-arg basis-bar form ``coeff|_{ζ=k}``.
+        import re
+        first_name = coefficients[0].func.__name__
+        m = re.match(r"^(.+?)_\d+$", first_name)
+        user_name = m.group(1) if m else first_name
         self._coeff_fn = type(
             f"coeff_{basis.symbol}",
             (sp.Function,),
-            {"_coeff_table": coefficients},
+            {
+                "_coeff_table": coefficients,
+                "_user_name": user_name,
+            },
         )
 
     def _leaf_sp(self, expr):
