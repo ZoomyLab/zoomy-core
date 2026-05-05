@@ -95,14 +95,22 @@ class FVMMesh(BaseMesh):
             z_ordering=base.z_ordering,
         )
 
-        # Compute geometry.  Order:
-        #   1. face_centers  (vertex averages — no dependencies)
-        #   2. cell_centers  (vertex averages + face-center reflection for ghosts)
-        #   3. face_normals  (uses cell_centers for orientation)
-        #   4. volumes, inradius
+        # Compute geometry.  Order matters because of the
+        # cell_centers ↔ face_normals dependency:
+        #   * 2D+: cell_centers needs face_normals (for ghost-cell
+        #     reflection across the boundary face).  face_normals (2D+
+        #     branch in BaseMesh) computes inner-cell centers inline,
+        #     so it has no cell_centers dependency.
+        #   * 1D: face_normals needs cell_centers (for sign of normal).
+        #     cell_centers (1D) does not need face_normals.
+        # Compute face_normals first in 2D+, cell_centers first in 1D.
         fvm._face_centers = BaseMesh.face_centers_computed(fvm)
-        fvm._cell_centers = BaseMesh.cell_centers_computed(fvm)
-        fvm._face_normals = BaseMesh.face_normals_computed(fvm)
+        if fvm.dimension > 1:
+            fvm._face_normals = BaseMesh.face_normals_computed(fvm)
+            fvm._cell_centers = BaseMesh.cell_centers_computed(fvm)
+        else:
+            fvm._cell_centers = BaseMesh.cell_centers_computed(fvm)
+            fvm._face_normals = BaseMesh.face_normals_computed(fvm)
         fvm._face_volumes = BaseMesh.face_volumes_computed(fvm)
         fvm._cell_volumes = BaseMesh.cell_volumes_computed(fvm)
         fvm._cell_inradius = BaseMesh.cell_inradius_computed(fvm)

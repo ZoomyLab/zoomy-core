@@ -65,14 +65,23 @@ def linearise(system: PDESystem, base_state: Dict, *, eps=None,
 
     # Substitute and extract O(ε) coefficient.  ``xreplace`` propagates
     # through ``Derivative`` atoms — we then call ``.doit()`` so the
-    # outer derivative distributes onto the new linear sum.
+    # outer derivative distributes onto the new linear sum.  For
+    # equations with rational nonlinearities (e.g. ``q²/h`` in
+    # conservative-variable strong form), ``expand().coeff(eps, 1)``
+    # alone fails because ``1/(h₀ + ε δh)`` is not a polynomial in ε —
+    # so we fall back to ``sp.series`` to Taylor-expand to first order.
     lin_eqs = []
     for eq in system.equations:
         eq_sub = eq.xreplace(repl)
-        # Force derivatives to evaluate on the substituted expressions
-        # so we can pick out the ε coefficient.
         eq_sub = eq_sub.doit()
-        lin = sp.expand(eq_sub).coeff(eps, 1)
+        try:
+            lin = sp.expand(eq_sub).coeff(eps, 1)
+            # ``coeff`` silently drops ε-dependent rationals; cross-check
+            # that no ε remains in the result and fall back if it does.
+            if lin.has(eps):
+                raise ValueError("ε-dependent residue after coeff")
+        except (sp.PolynomialError, ValueError, AttributeError):
+            lin = sp.series(eq_sub, eps, 0, 2).removeO().coeff(eps, 1)
         if simplify:
             lin = sp.expand(lin)
         lin_eqs.append(lin)

@@ -730,3 +730,101 @@ class DerivedModel(Model):
                 for k in range(n_mom):
                     out[row_base_v + k] += self._apply_Minv(raw_slip_v, k)
         return out
+
+    # ── Analysis API (symbolic PDE for zoomy_core.analysis) ───────────
+
+    def get_pde(self, *, time=None, space=None):
+        """Return the symbolic ``PDESystem`` representation for analysis.
+
+        Assembles ``∂_t q + Σ_d ∂_d F[:,d] + Σ_d B[:,:,d] · ∂_d q − S = 0``
+        from the model's symbolic ``flux()``, ``nonconservative_matrix()``
+        and ``source()`` methods, plus the algebraic aux closures stored
+        in ``aux_equations``.  The result feeds directly into
+        :func:`zoomy_core.analysis.linearise`,
+        :func:`plane_wave_dispersion`, :func:`is_hyperbolic_at`,
+        :func:`extract_quasilinear_pencil`.
+
+        Args:
+            time:  optional time symbol (default ``Symbol('t', real=True)``).
+            space: optional list of spatial symbols of length
+                   ``self.dimension`` (default ``[x]``, ``[x, y]`` or
+                   ``[x, y, z]`` with ``real=True``).
+
+        Returns:
+            ``PDESystem`` whose ``fields`` are ``q_i(t, x[, y])`` Function
+            calls in the order of ``self.variables`` and whose
+            ``aux_fields`` are the corresponding aux Function calls.
+        """
+        from zoomy_core.analysis import PDESystem
+
+        dim = self.dimension
+        n_vars = self.n_variables
+
+        if time is None:
+            time = sp.Symbol("t", real=True)
+        if space is None:
+            coord_names = ["x", "y", "z"]
+            space = [sp.Symbol(coord_names[d], real=True) for d in range(dim)]
+        elif len(space) != dim:
+            raise ValueError(
+                f"space must have length {dim} (model.dimension), "
+                f"got {len(space)}"
+            )
+
+        var_keys = list(self.variables.keys())
+        var_syms = [self.variables[k] for k in var_keys]
+        var_funcs = [sp.Function(str(s), real=True)(time, *space)
+                     for s in var_syms]
+
+        aux_keys = list(self.aux_variables.keys())
+        aux_syms = [self.aux_variables[k] for k in aux_keys]
+        aux_funcs = [sp.Function(str(s), real=True)(time, *space)
+                     for s in aux_syms]
+
+        sym_to_func = dict(zip(var_syms, var_funcs))
+        sym_to_func.update(dict(zip(aux_syms, aux_funcs)))
+
+        def _to_func(expr):
+            return sp.sympify(expr).xreplace(sym_to_func)
+
+        # Combine advective flux + hydrostatic pressure, matching
+        # ``quasilinear_matrix`` which uses ``JacF + JacP + NCP``.
+        F = self.flux() + self.hydrostatic_pressure()
+        B = self.nonconservative_matrix()
+        Src = self.source()
+
+        equations = []
+        for i in range(n_vars):
+            eq = sp.Derivative(var_funcs[i], time)
+            for d in range(dim):
+                F_id = _to_func(F[i, d])
+                if F_id != 0:
+                    eq += sp.Derivative(F_id, space[d])
+                for j in range(n_vars):
+                    B_ijd = _to_func(B[i, j, d])
+                    if B_ijd != 0:
+                        eq += B_ijd * sp.Derivative(var_funcs[j], space[d])
+            S_i = _to_func(Src[i])
+            if S_i != 0:
+                eq -= S_i
+            equations.append(eq)
+
+        for name, expr in self.aux_equations.items():
+            if name in aux_keys:
+                aux_func = aux_funcs[aux_keys.index(name)]
+                equations.append(aux_func - _to_func(expr))
+
+        parameters = {}
+        for k in self._parameter_symbols.keys():
+            sym = self._parameter_symbols[k]
+            if hasattr(self.parameters, k):
+                parameters[sym] = getattr(self.parameters, k)
+
+        return PDESystem(
+            equations=equations,
+            fields=var_funcs,
+            time=time,
+            space=list(space),
+            parameters=parameters,
+            aux_fields=aux_funcs,
+        )
