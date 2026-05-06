@@ -207,6 +207,68 @@ class SystemModel:
                             "description": f"extracted from {type(model).__name__}"})
         return sm
 
+    # ── from_pdesystem factory ────────────────────────────────────────
+
+    @classmethod
+    def from_pdesystem(cls, pdesys) -> "SystemModel":
+        """Build a SystemModel from a :class:`PDESystem` (e.g. the chain
+        DAE returned by ``VAMModelGalerkin._chain_dae``).
+
+        The mass matrix ``M`` is extracted via symbolic linearisation
+        around the state itself (``base = f`` for each field).  For
+        evolution rows ``M`` carries state-dependent entries
+        (e.g. ``u_0`` on the ``h`` column when the equation is
+        ``∂_t(h u_0)``); for algebraic rows (``kbc_top_alg`` /
+        ``kbc_bot`` / ``surface_bc``) ``M`` is all-zero — that is the
+        DAE form the user wants.
+
+        Other operators (``flux``, ``nonconservative_matrix``,
+        ``source``, ``hydrostatic_pressure``) are left as zero
+        placeholders.  Term-by-term tag-driven extraction into those
+        operators is the next workstream — once each equation carries
+        per-term solver tags, ``collect_solver_tag`` will populate
+        them.
+        """
+        from zoomy_core.analysis.linearisation import linearise
+        from zoomy_core.analysis.pencil import extract_quasilinear_pencil
+
+        # Linearise around the symbolic state to extract M_t.
+        base_state = {f: f for f in pdesys.fields}
+        sys_lin = linearise(pdesys, base_state)
+        M_t, _, _ = extract_quasilinear_pencil(sys_lin)
+
+        # State exposed as Symbols (SystemModel convention) — map
+        # field Functions ``h(t, x)`` etc. to ``Symbol("h")``.
+        state_syms = [sp.Symbol(f.func.__name__, real=True)
+                      for f in pdesys.fields]
+
+        params = (dict(pdesys.parameters)
+                  if hasattr(pdesys, "parameters") else {})
+
+        n_eq = len(pdesys.equations)
+        n_dim = len(pdesys.space)
+
+        sm = cls(
+            time=pdesys.time,
+            space=list(pdesys.space),
+            state=state_syms,
+            aux_state=[],
+            parameters=params,
+            flux=sp.zeros(n_eq, n_dim),
+            hydrostatic_pressure=sp.zeros(n_eq, n_dim),
+            nonconservative_matrix=sp.MutableDenseNDimArray.zeros(
+                n_eq, n_eq, n_dim
+            ),
+            source=sp.zeros(n_eq, 1),
+            mass_matrix=M_t,
+        )
+        sm.history.append({
+            "name": "from_pdesystem",
+            "description": (f"extracted from PDESystem with "
+                            f"{n_eq} equations / {n_eq} fields"),
+        })
+        return sm
+
     # ── describe ──────────────────────────────────────────────────────
 
     def describe(self, full: bool = False) -> "SystemModelDescription":
