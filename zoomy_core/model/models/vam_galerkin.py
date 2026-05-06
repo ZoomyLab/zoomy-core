@@ -1,37 +1,40 @@
 """VAMModelGalerkin — VAM derived via the explicit Galerkin chain.
 
-Inherits from :class:`VAMModel` to keep the existing solver-compatible
-state structure (``[b, h, hu_k, hw_k, hp_k]``, conservative form,
-``M = I``) and the operator-API method bodies that downstream
-runtimes depend on.  Adds:
+The class has exactly one job per the user's preferred shape:
 
-1. A `derive_model` that **also** runs the explicit symbolic chain
-   from ``zoomy_core.model.models.ins_generator`` —
-   ``Multiply`` (Galerkin test) → ``Integrate`` (depth) →
-   ``InterfaceKBC`` × 2 → atmospheric pressure → ``AffineProjection``
-   → three ``Expand``s (u/w/p) → ``EvaluateIntegrals`` — producing a
-   fully closed primitive-form derived `System` saved as
-   ``self._chain_system`` for inspection via ``describe``.
+  1. Inherit from :class:`VAMModel` (the base) so the solver-compatible
+     state structure ``[b, h, hu_k, hw_k, hp_k]`` and operator-API
+     surface stay populated for downstream consumers.
+  2. ``derive_model`` is **linear**: a sequence of primitive
+     applications + equation additions, no nested helpers, no big
+     orchestration methods.  Everything is visible top-to-bottom.
 
-2. ``self._chain_intermediate`` — the same derivation snapshot
-   stopped right after the three ``Expand`` calls, before
-   ``EvaluateIntegrals`` resolves them.  Carries the unevaluated
-   ``sp.Sum`` form of the ansatz substitution so a walkthrough can
-   render the paper-notation intermediate.
+The primitives the chain consumes — ``Multiply``, ``ProductRule``,
+``Integrate``, ``InterfaceKBC``, ``AffineProjection``, ``Expand``,
+``EvaluateIntegrals`` — already exist; we apply them in order.
+Adding the algebraic constraints (mass / KBC / surface BC) is just
+``System.add_equation(name, expr)`` calls — no new primitives, the
+system's tree already supports add / remove.
 
-Today the chain output (primitive form: ``∂_t (U_k h) + …``) and the
-conservative-form operator surface (``flux / NCP / source / mass``
-extracted via ``DerivedModel`` machinery and consumed by solvers) are
-two **mathematically equivalent** representations of the same model.
-The chain documents the derivation; the inherited operator path
-delivers the canonical M=I matrices the numerical solver needs.
-A separate workstream will collapse them — re-doing the operator
-extraction directly from the chain's tagged equations after a
-primitive→conservative substitution + author-side tagging.  Until
-then: derivation is shown, operators are correct, numerics run.
+Outputs stored on the model:
+
+* ``_chain_intermediate`` — snapshot after the ``Expand`` step and
+  before ``EvaluateIntegrals``.  Leaves carry ``sp.Sum`` atoms;
+  ``describe()`` renders them as paper-form ``Σ_k U_k φ_k(ζ)``.
+* ``_chain_system`` — the closed augmented system: 9 equations for
+  ``(M=1, N_w=2, N_p=2)`` (Escalante 2024 eq (4)+(5)).
+* ``_chain_dae`` — same equations packaged as a
+  :class:`zoomy_core.analysis.PDESystem` so analysis routines and
+  ``SystemModel.from_pdesystem`` can consume it.
+* ``_chain_dae_systemmodel`` — operator-form SystemModel built from
+  the chain DAE.  Mass matrix is zero on algebraic rows; flux / NCP /
+  source / hydrostatic_pressure are zero placeholders awaiting
+  per-term tagging.
 """
 
 from __future__ import annotations
+
+import copy
 
 import sympy as sp
 
@@ -57,247 +60,188 @@ class VAMModelGalerkin(VAMModel):
 
     Parameters
     ----------
-    level, n_layers, basis_type, eigenvalue_mode, dimension, **kwargs
+    level : int
+        Default basis level for ``u``-modes (``M`` defaults to ``level``).
+    M, N_w, N_p : int, optional
+        Asymmetric basis levels per Escalante 2024.  Defaults:
+        ``M = level``, ``N_w = N_p = M + 1``.
+    **kwargs
         Forwarded to :class:`VAMModel`.
-
-    Attributes (added by ``derive_model``)
-    --------------------------------------
-    _chain_system : :class:`DerivedSystem`
-        The fully closed primitive-form system after
-        ``EvaluateIntegrals`` — every leaf is closed in the basis
-        coefficients ``(U_k, W_k, P_k)`` with no held integrals or
-        unevaluated sums.  ``self._chain_system.describe()`` renders
-        the closed equations in LaTeX.
-    _chain_intermediate : :class:`DerivedSystem`
-        The same chain stopped right after the three ``Expand``
-        operations, before ``EvaluateIntegrals``.  Each leaf carries
-        ``sp.Sum`` atoms representing the un-evaluated ansatz —
-        useful for walkthroughs that want to show the
-        ``Σ_k U_k φ_k`` form on paper before resolving.
-    _chain_basis : dict[str, :class:`Basisfunction`]
-        ``{"u": …, "w": …, "p": …}`` — the three independent bases
-        used in the chain.
-    _chain_coefficients : dict[str, list[sp.Function call]]
-        Pre-declared coefficient functions ``[U_0, U_1, …]`` etc.
     """
 
     def __init__(self, level=0, *, M=None, N_w=None, N_p=None, **kwargs):
         # ``VAMModel.__init__`` calls ``self.derive_model()`` *before*
-        # ``Model.__init__`` populates ``self.level`` via param — so
-        # ``_build_chain``'s ``getattr(self, "level", 0)`` would silently
-        # collapse every call to L=0.  Stash the chain-relevant levels
-        # on the instance up front so the chain reads them correctly.
-        #
-        # Asymmetric basis levels per Escalante 2024:
-        #   ``M``   — horizontal velocity ``u`` modes (M+1 of them).
-        #   ``N_w`` — vertical velocity   ``w`` modes (N_w+1 of them).
-        #   ``N_p`` — non-hydrostatic     ``p`` modes (N_p+1 of them).
-        # Defaults: ``M = level``, ``N_w = N_p = M + 1``.  Escalante's
-        # canonical case is ``(M=1, N_w=2, N_p=2)``.
+        # ``Model.__init__`` populates ``self.level`` via param, so we
+        # have to stash the chain levels on the instance up front.
         self._chain_M = M if M is not None else level
         self._chain_N_w = N_w if N_w is not None else self._chain_M + 1
         self._chain_N_p = N_p if N_p is not None else self._chain_M + 1
-        # Backwards-compat alias used by ``_build_chain`` legacy path.
-        self._chain_level = self._chain_M
         super().__init__(level=level, **kwargs)
 
+    # ------------------------------------------------------------------
+    # The derivation, written linearly.
+    # ------------------------------------------------------------------
+
     def derive_model(self):
-        # Run the parent VAMModel's derivation first so the inherited
-        # operator-API path (flux / NCP / source / mass / hydrostatic
-        # pressure via the basis-matrix machinery) is fully populated
-        # — that's what downstream solvers consume today.
+        # Parent VAMModel populates the inherited operator-API path
+        # (flux / NCP / source via the basis-matrix machinery) — the
+        # solver consumes that; we leave it untouched and add the
+        # explicit Galerkin chain on top.
         super().derive_model()
 
-        # Now also run the explicit Galerkin chain on a parallel
-        # ``StateSpace``, capturing both the intermediate (after Expand)
-        # and final (after EvaluateIntegrals) forms.  These are stored
-        # on the model for inspection / walkthroughs; they don't feed
-        # the operator API yet.
-        self._build_chain()
+        M = self._chain_M
+        N_w = self._chain_N_w
+        N_p = self._chain_N_p
 
-    def _build_chain(self):
-        M, N_w, N_p = self._chain_M, self._chain_N_w, self._chain_N_p
-        # Run the chain twice — once stop right after Expand (gives us
-        # an intermediate System with un-evaluated ``sp.Sum`` atoms,
-        # ``describe`` renders the paper-form Σ_k U_k φ_k(ζ)), once
-        # all the way through ``EvaluateIntegrals`` (closed form).
-        self._chain_intermediate = self._run_chain(M, N_w, N_p, stop="expand")
-        self._chain_system = self._run_chain(M, N_w, N_p, stop="full")
-        # Escalante-aligned DAE: mass + xmom_j0..M + zmom_j0..N_w +
-        # kbc_top_alg + kbc_bot + surface_bc (+ cont_j1..M-1 when M>=2).
-        # Currently bridged via the verified April-2026 builder; the
-        # next iteration will produce these from the chain primitives
-        # by carrying the KBC equations alongside the projections
-        # rather than substituting them inline.
-        self._chain_dae = self._build_chain_dae(M, N_w, N_p)
-
-        # SystemModel built from the chain DAE.  Mass matrix has
-        # all-zero rows for the algebraic constraints
-        # (``kbc_top_alg`` / ``kbc_bot`` / ``surface_bc``) and
-        # state-dependent entries on evolution rows; the other
-        # operators (flux / NCP / source / hydrostatic_pressure) are
-        # zero placeholders pending the per-term tagging step.
-        from zoomy_core.model.models.system_model import SystemModel
-        self._chain_dae_systemmodel = SystemModel.from_pdesystem(
-            self._chain_dae
-        )
-
-    @staticmethod
-    def _build_chain_dae(M, N_w, N_p):
-        """Build the Escalante-aligned PDESystem (`build_vam_pdesystem`).
-
-        The April-2026 builder in ``tutorials/vam/vam_pdesystem.py``
-        produces exactly the DAE shape Escalante 2024 eq (4)+(5) writes:
-
-          * evolution: ``mass`` + ``xmom_j0..M`` + ``zmom_j0..N_w``
-          * algebraic: ``kbc_top_alg, kbc_bot, surface_bc``
-                       (+ ``cont_j1..M-1`` when ``M >= 2``)
-
-        For ``(M=1, N_w=2, N_p=2)``: 9 equations / 9 fields, partition
-        6+3.  The builder uses sympy + ``polynomial_integrate`` rather
-        than our chain primitives — the chain's projection leaves
-        agree with the builder's ``xmom_j*`` / ``zmom_j*`` rows
-        modulo simplification.  Goal: replace this bridge with a
-        chain-primitive path that carries KBC / surface BC as
-        additional explicit equations.
-        """
-        import sys as _sys
-        from pathlib import Path as _Path
-        # ``library/zoomy_core/zoomy_core/model/models/vam_galerkin.py``
-        # → up six parents lands on the workspace root.
-        repo_root = _Path(__file__).resolve().parents[5]
-        tut_dir = str(repo_root / "tutorials/vam")
-        _sys.path.insert(0, tut_dir)
-        try:
-            from vam_pdesystem import build_vam_pdesystem  # type: ignore
-        finally:
-            try:
-                _sys.path.remove(tut_dir)
-            except ValueError:
-                pass
-        return build_vam_pdesystem(M=M, N_w=N_w, N_p=N_p, flat_bottom=False)
-
-    @staticmethod
-    def _run_chain(M: int, N_w: int, N_p: int, *, stop: str):
+        # State + bases + coefficients (data; not primitives).
         state = StateSpace(dimension=2)
         z = state.z
-
-        # Three independent bases — different levels per field per
-        # Escalante 2024.  Distinct symbols (``phi``/``eta``/``mu``)
-        # so the basis-aware machinery can route per-field.
         basis_u = Legendre_shifted(level=M,   symbol="phi")
         basis_w = Legendre_shifted(level=N_w, symbol="eta")
         basis_p = Legendre_shifted(level=N_p, symbol="mu")
-
         coeffs_u = [sp.Function(f"U_{k}", real=True)(state.t, state.x)
                     for k in range(M + 1)]
         coeffs_w = [sp.Function(f"W_{k}", real=True)(state.t, state.x)
                     for k in range(N_w + 1)]
         coeffs_p = [sp.Function(f"P_{k}", real=True)(state.t, state.x)
                     for k in range(N_p + 1)]
-
-        # Test-function fans, one per equation type.  ``test_phi_u``
-        # has M+1 entries and is used to project x-momentum (one
-        # equation per u-mode).  ``test_phi_w`` has N_w+1 entries and
-        # is used to project z-momentum AND continuity (the latter
-        # gives the ``I_1`` / ``I_2`` constraints Escalante writes in
-        # eq (5)).
         test_phi_u = Zstruct(
-            **{f"phi_{k}": basis_u.phi[k](z) for k in range(M + 1)}
-        )
+            **{f"phi_{k}": basis_u.phi[k](z) for k in range(M + 1)})
         test_phi_w = Zstruct(
-            **{f"phi_{k}": basis_w.phi[k](z) for k in range(N_w + 1)}
-        )
+            **{f"phi_{k}": basis_w.phi[k](z) for k in range(N_w + 1)})
 
+        # 1. Build the 3D INS system, drop viscosity, split pressure.
         sys = FullINS(state)
         sys.apply(Inviscid(state)).simplify()
-
-        # Hydrostatic pressure split applied *before* Multiply: at this
-        # stage the equations only contain ``p(t, x, z)`` in their
-        # volume form (no boundary evaluations yet from Leibniz / FT),
-        # so a single ``Relation`` substitution fires uniformly.  After
-        # the split the chain produces the ``g·h·∂_x η`` and ``−g``
-        # contributions explicitly (the latter cancels the body-force
-        # gravity in z-mom), and the field ``p_NH`` carries only the
-        # non-hydrostatic remainder — matching Escalante 2024 eq (4)
-        # which writes hydrostatic flux as ``g·h·∂_x η`` and ``p_k`` as
-        # the non-hydrostatic moments.  Atmospheric pressure ``p_atm``
-        # is implicitly absorbed by leaving it out of the split.
         p_NH = sp.Function("p_NH", real=True)(state.t, state.x, z)
-        sys.apply(
-            {state.p: state.rho * state.g * (state.eta - z) + p_NH}
-        ).simplify()
+        sys.apply({state.p: state.rho * state.g * (state.eta - z) + p_NH}
+                  ).simplify()
 
-        # Project equations against test functions:
-        #   continuity   ↦ N_w + 1 children (test_0..test_{N_w})
-        #   x-momentum   ↦ M  + 1 children (test_0..test_M)
-        #   z-momentum   ↦ N_w + 1 children (test_0..test_{N_w})
-        # The continuity projections beyond k=0 are the ``I_1``, ``I_2``
-        # constraints Escalante writes in eq (5).  We keep them in the
-        # system as separate equations rather than substituting them
-        # into momentum — the resulting system has more rows than the
-        # post-resolution Escalante form, but matches the structure
-        # before constraint resolution.
+        # 2. Project against test functions.  Continuity gets ``N_w + 1``
+        # children (the higher k's are Escalante's ``I_1`` / ``I_2``
+        # constraints); x-momentum gets ``M + 1``; z-momentum gets
+        # ``N_w + 1``.
         sys.continuity.apply(Multiply(test_phi_w, outer=True))
         sys.momentum.x.apply(Multiply(test_phi_u, outer=True))
         sys.momentum.z.apply(Multiply(test_phi_w, outer=True))
 
-        # Convert ``phi(z) · ∂_z F`` terms into a form ``Integrate``'s
-        # fundamental-theorem path can use.  The chain author identifies
-        # the term (here: the only ones with a ∂_z derivative — the
-        # vertical advection ``∂_z(uw)`` in x-momentum and ``∂_z w`` in
-        # continuity) and applies ProductRule(inverse) to rewrite as
-        # ``∂_z(phi·F) − ∂_z(phi)·F``.
+        # 3. Inverse product rule on the single ``∂_z`` term in each
+        # leaf — converts ``phi·∂_z(uw) → ∂_z(phi·uw) − ∂_z(phi)·uw``
+        # so ``Integrate``'s fundamental-theorem path handles it.
         for k in range(M + 1):
-            VAMModelGalerkin._inverse_product_rule_on_z(
-                getattr(sys.momentum.x, f"test_{k}"), z
-            )
+            self._inverse_product_rule_on_z(
+                getattr(sys.momentum.x, f"test_{k}"), z)
         for k in range(N_w + 1):
-            VAMModelGalerkin._inverse_product_rule_on_z(
-                getattr(sys.continuity, f"test_{k}"), z
-            )
-            VAMModelGalerkin._inverse_product_rule_on_z(
-                getattr(sys.momentum.z, f"test_{k}"), z
-            )
+            self._inverse_product_rule_on_z(
+                getattr(sys.continuity, f"test_{k}"), z)
+            self._inverse_product_rule_on_z(
+                getattr(sys.momentum.z, f"test_{k}"), z)
 
+        # 4. Depth-integrate.  Leibniz on ∂_t / ∂_x; fundamental theorem
+        # on ∂_z.  Boundary atoms at z=b and z=b+h emerge.
         sys.apply(Integrate(z, state.b, state.eta, method="auto"))
 
-        # Kinematic BCs are applied in their natural (forward)
-        # direction: ``w|_interface → ∂_t interface + u·∂_x interface``.
-        # This converts the ``w(b+h)`` / ``w(b)`` atoms produced by the
-        # ∂_z fundamental theorem (introduced via the earlier
-        # ProductRule(inverse) on ``phi·∂_z(uw)``) into ∂_t interface
-        # forms.  Combined with the Leibniz time-boundaries (which
-        # already carry ``-u·phi·∂_t interface``), the ∂_t-pieces
-        # cancel cleanly in ``simplify``; only the conservative volume
-        # term ``∂_t ∫ u·phi dz`` (closed to ``∂_t(h U_k)`` after
-        # Expand+EvaluateIntegrals) survives.
+        # 5. Apply kinematic BCs at the bottom and the surface, then
+        # drop ∂_t b (static bottom).  This absorbs all the boundary
+        # ``u·w`` cross-terms into the conservative volume — what
+        # survives is ``∂_t (h U_k) + ∂_x (h U_k …)``.
         sys.apply(InterfaceKBC(state, state.b)).simplify()
         sys.apply(InterfaceKBC(state, state.eta)).simplify()
-
-        # Static bottom: bathymetry is time-independent.  Applied AFTER
-        # KBC so any ``Derivative(b, t)`` atoms introduced by KBC@b's
-        # forward substitution (``w|_b → ∂_t b + u·∂_x b``) collapse to
-        # zero in one step — turning the bottom KBC into ``w|_b = u·∂_x
-        # b`` exactly where it appears.  Apply-it-once chain step, not
-        # a structural assumption baked into the state.
         sys.apply({sp.Derivative(state.b, state.t): sp.S.Zero}).simplify()
 
-        # Surface BC for the non-hydrostatic remainder: ``p_NH(η) = 0``
-        # (the hydrostatic part contributes ``ρ·g·(η − η) = 0`` at the
-        # surface trivially).
+        # 6. Surface BC for the non-hydrostatic pressure remainder.
         sys.apply({p_NH.subs(z, state.eta): 0}).simplify()
+
+        # 7. Affine map z → ζ = (z−b)/h on basis arguments, then
+        # substitute the polynomial ansatz for u / w / p_NH.
         sys.apply(AffineProjection(state))
         sys.apply(Expand(state.u, basis=basis_u, coefficients=coeffs_u,
                          state=state))
         sys.apply(Expand(state.w, basis=basis_w, coefficients=coeffs_w,
                          state=state))
-        sys.apply(Expand(p_NH, basis=basis_p, coefficients=coeffs_p,
+        sys.apply(Expand(p_NH,    basis=basis_p, coefficients=coeffs_p,
                          state=state))
-        if stop == "expand":
-            return sys
+
+        # Snapshot the Sum-form intermediate (paper notation) before we
+        # resolve the polynomial integrals.  ``deepcopy`` is fine — the
+        # System carries only sympy / Zstruct / Expression objects.
+        self._chain_intermediate = copy.deepcopy(sys)
+
+        # 8. Resolve the ζ integrals using the basis cache.  Leaves are
+        # now polynomial in ``(h, U_k, W_k, P_k, b)``; no integrals or
+        # held sums remain.
         sys.apply(EvaluateIntegrals(state)).simplify()
-        return sys
+
+        # 9. Augment with the algebraic DAE rows Escalante 2024 eq (4)+
+        # (5) carries alongside the projections.  Drop the continuity
+        # projections that are redundant with these rows
+        # (``test_0`` → replaced by ``mass``; ``test_M..test_{N_w}`` →
+        # trivially zero / not retained).  No new primitives — every
+        # equation is added with ``System.add_equation(name, expr)``.
+        h, b, eta = state.h, state.b, state.eta
+        t, x = state.t, state.x
+        u_at_b   = sum(coeffs_u[k] * basis_u.eval(k, sp.S.Zero)
+                       for k in range(M + 1))
+        u_at_eta = sum(coeffs_u[k] * basis_u.eval(k, sp.S.One)
+                       for k in range(M + 1))
+        w_at_b   = sum(coeffs_w[k] * basis_w.eval(k, sp.S.Zero)
+                       for k in range(N_w + 1))
+        w_at_eta = sum(coeffs_w[k] * basis_w.eval(k, sp.S.One)
+                       for k in range(N_w + 1))
+        p_at_eta = sum(coeffs_p[k] * basis_p.eval(k, sp.S.One)
+                       for k in range(N_p + 1))
+
+        sys.remove_equation(("continuity", "test_0"))
+        for k in range(M, N_w + 1):
+            sys.remove_equation(("continuity", f"test_{k}"))
+
+        sys.add_equation("mass", sp.expand(
+            sp.Derivative(h, t) + sp.Derivative(h * coeffs_u[0], x).doit()))
+        sys.add_equation("kbc_top_alg", sp.expand(
+            w_at_eta
+            - u_at_eta * sp.Derivative(eta, x).doit()
+            + sp.Derivative(h * coeffs_u[0], x).doit()))
+        sys.add_equation("kbc_bot", sp.expand(
+            w_at_b - u_at_b * sp.Derivative(b, x).doit()))
+        sys.add_equation("surface_bc", sp.expand(p_at_eta))
+
+        # Stash the closed augmented system + its scaffolding.  The
+        # PDESystem and SystemModel views are derived from these.
+        self._chain_system = sys
+        self._chain_state = state
+        self._chain_coeffs = {"u": coeffs_u, "w": coeffs_w, "p": coeffs_p}
+
+        # PDESystem view (Escalante row order) + SystemModel.
+        from zoomy_core.analysis import PDESystem
+        from zoomy_core.model.models.system_model import SystemModel
+
+        ordered = [("mass", sys._tree.mass)]
+        for k in range(M + 1):
+            ordered.append((f"xmom_j{k}",
+                            getattr(sys._tree.momentum.x, f"test_{k}")))
+        for k in range(N_w + 1):
+            ordered.append((f"zmom_j{k}",
+                            getattr(sys._tree.momentum.z, f"test_{k}")))
+        ordered.append(("kbc_top_alg", sys._tree.kbc_top_alg))
+        ordered.append(("kbc_bot", sys._tree.kbc_bot))
+        ordered.append(("surface_bc", sys._tree.surface_bc))
+        for k in range(1, M):  # cont_j1..M-1 (Escalante eq (5) I_k)
+            ordered.append((f"cont_j{k}",
+                            getattr(sys._tree.continuity, f"test_{k}")))
+        self._chain_dae = PDESystem(
+            equations=[leaf.expr for _, leaf in ordered],
+            fields=[state.h] + coeffs_u + coeffs_w + coeffs_p,
+            time=state.t,
+            space=[state.x],
+            parameters={state.g: state.g},
+        )
+        self._chain_dae.equation_names = [n for n, _ in ordered]
+        self._chain_dae_systemmodel = SystemModel.from_pdesystem(
+            self._chain_dae)
+
+    # ------------------------------------------------------------------
+    # Tiny helper for the per-leaf ProductRule call.
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _inverse_product_rule_on_z(leaf_proxy, z):
@@ -307,10 +251,8 @@ class VAMModelGalerkin(VAMModel):
         from ``Inviscid`` after Galerkin testing.
 
         ``ProductRule`` is ``single_term_only`` — the chain author picks
-        the term, the operation transforms it.  Here we iterate
-        ``leaf_proxy._node.terms`` and call ``apply_to_term`` on the
-        first match.  No "intelligence": the rewrite is unconditional
-        once the term is identified.
+        the term, the operation transforms it.  No "intelligence": once
+        the term is identified, the rewrite is unconditional.
         """
         leaf = leaf_proxy._node
         pr = ProductRule(direction="inverse", variables=[z])
@@ -324,44 +266,27 @@ class VAMModelGalerkin(VAMModel):
                 leaf_proxy.apply_to_term(i, pr)
                 break
 
-    # ── Display: model.describe() shows the chain's closed form ───────
+    # ------------------------------------------------------------------
+    # Display.
+    # ------------------------------------------------------------------
 
     def describe(self, **kwargs):
-        """Render the closed Galerkin chain (post-EvaluateIntegrals) —
-        not the inherited VAMModel system.
-
-        ``VAMModel.derive_model`` (called via ``super().derive_model()``)
-        leaves ``self._system`` populated with the parent's
-        depth-integrate-then-stop chain, whose leaves carry
-        un-evaluated integrals like
-        ``∂_x ∫_b^{b+h} u² dz``.  The parent renders fine for
-        ``flux()`` / ``source()`` etc. only because those operator
-        methods bypass ``_system`` entirely and consume hand-coded
-        basis matrices instead.
-
-        For display the chain's closed primitive-form equations are
-        the right object — every integral is resolved, every term is
-        polynomial in ``(h, U_k, W_k, P_k)``.
-        """
+        """Render the augmented chain (closed equations + DAE rows)."""
         return self._chain_system.describe(**kwargs)
 
     def _repr_markdown_(self):
         return self._chain_system._repr_markdown_()
 
-    # ── Convenience: render the chain artefacts ────────────────────────
-
     def describe_chain_intermediate(self):
-        """Markdown rendering of the chain intermediate (post-Expand,
-        pre-EvaluateIntegrals) — leaves carry ``sp.Sum`` atoms,
-        rendering as paper-form ``Σ_k U_k φ_k(ζ)``.
+        """Render the Sum-form intermediate (post-Expand, pre-Evaluate).
+
+        Leaves carry ``sp.Sum`` atoms — useful for showing the
+        paper-notation ``Σ_k U_k φ_k(ζ)`` form.
         """
         return self._chain_intermediate.describe()
 
     def describe_chain_closed(self):
-        """Markdown rendering of the closed primitive-form equations
-        after ``EvaluateIntegrals``.  Same as :meth:`describe`; kept
-        for symmetry with ``describe_chain_intermediate``.
-        """
+        """Same as :meth:`describe`; kept for symmetry."""
         return self._chain_system.describe()
 
 
