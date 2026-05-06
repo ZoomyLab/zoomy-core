@@ -123,6 +123,59 @@ class VAMModelGalerkin(VAMModel):
         # all the way through ``EvaluateIntegrals`` (closed form).
         self._chain_intermediate = self._run_chain(M, N_w, N_p, stop="expand")
         self._chain_system = self._run_chain(M, N_w, N_p, stop="full")
+        # Escalante-aligned DAE: mass + xmom_j0..M + zmom_j0..N_w +
+        # kbc_top_alg + kbc_bot + surface_bc (+ cont_j1..M-1 when M>=2).
+        # Currently bridged via the verified April-2026 builder; the
+        # next iteration will produce these from the chain primitives
+        # by carrying the KBC equations alongside the projections
+        # rather than substituting them inline.
+        self._chain_dae = self._build_chain_dae(M, N_w, N_p)
+
+        # SystemModel built from the chain DAE.  Mass matrix has
+        # all-zero rows for the algebraic constraints
+        # (``kbc_top_alg`` / ``kbc_bot`` / ``surface_bc``) and
+        # state-dependent entries on evolution rows; the other
+        # operators (flux / NCP / source / hydrostatic_pressure) are
+        # zero placeholders pending the per-term tagging step.
+        from zoomy_core.model.models.system_model import SystemModel
+        self._chain_dae_systemmodel = SystemModel.from_pdesystem(
+            self._chain_dae
+        )
+
+    @staticmethod
+    def _build_chain_dae(M, N_w, N_p):
+        """Build the Escalante-aligned PDESystem (`build_vam_pdesystem`).
+
+        The April-2026 builder in ``tutorials/vam/vam_pdesystem.py``
+        produces exactly the DAE shape Escalante 2024 eq (4)+(5) writes:
+
+          * evolution: ``mass`` + ``xmom_j0..M`` + ``zmom_j0..N_w``
+          * algebraic: ``kbc_top_alg, kbc_bot, surface_bc``
+                       (+ ``cont_j1..M-1`` when ``M >= 2``)
+
+        For ``(M=1, N_w=2, N_p=2)``: 9 equations / 9 fields, partition
+        6+3.  The builder uses sympy + ``polynomial_integrate`` rather
+        than our chain primitives — the chain's projection leaves
+        agree with the builder's ``xmom_j*`` / ``zmom_j*`` rows
+        modulo simplification.  Goal: replace this bridge with a
+        chain-primitive path that carries KBC / surface BC as
+        additional explicit equations.
+        """
+        import sys as _sys
+        from pathlib import Path as _Path
+        # ``library/zoomy_core/zoomy_core/model/models/vam_galerkin.py``
+        # → up six parents lands on the workspace root.
+        repo_root = _Path(__file__).resolve().parents[5]
+        tut_dir = str(repo_root / "tutorials/vam")
+        _sys.path.insert(0, tut_dir)
+        try:
+            from vam_pdesystem import build_vam_pdesystem  # type: ignore
+        finally:
+            try:
+                _sys.path.remove(tut_dir)
+            except ValueError:
+                pass
+        return build_vam_pdesystem(M=M, N_w=N_w, N_p=N_p, flat_bottom=False)
 
     @staticmethod
     def _run_chain(M: int, N_w: int, N_p: int, *, stop: str):
