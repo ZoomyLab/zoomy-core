@@ -2515,21 +2515,25 @@ class Expand(Operation):
         )
 
     def _leaf_sp(self, expr):
-        # Reference-defined basis: write the ansatz with the basis arg
-        # in physical-z form ``phi_fn(k, arg_z)``.  AffineProjection's
-        # basis-arg rewrite collapses this to ``phi_fn(k, ζ)`` (or
-        # ``0`` / ``1`` at boundaries) when the change of variables
-        # happens.  No manual ``(arg_z − b)/h`` composition at the
-        # call site.
+        # Compose the ansatz with the affine ζ-map at construction
+        # time: ``u(t, x, arg_z) → Σ_k U_k · phi_fn(k, (arg_z − b)/h)``.
+        # The basis is defined on ``ζ ∈ [0, 1]``, so the arg has to be
+        # ``(arg_z − b)/h`` for ``EvaluateIntegrals`` /
+        # ``basis.resolve_atoms`` to evaluate the polynomial in the
+        # right domain.  At boundary calls (``arg_z = b`` /
+        # ``arg_z = b + h``) the ratio collapses to ``0`` / ``1``.
         basis = self._basis
         coeff_fn = self._coeff_fn
         L = basis.level
+        b = self._state.b
+        h = self._state.h
 
         def _rhs(*field_args):
             arg_z = field_args[-1]
+            zeta = (arg_z - b) / h
             k = sp.Dummy("k", integer=True, nonnegative=True)
             return sp.Sum(
-                coeff_fn(k) * basis.phi_fn(k, arg_z),
+                coeff_fn(k) * basis.phi_fn(k, zeta),
                 (k, 0, L),
             )
 
@@ -3659,33 +3663,20 @@ class Recombine(Operation):
 
 
 class ProductRule(Operation):
-    """Product rule — single term, unconditional, identity-preserving.
+    """Product rule — auto-routes per term based on outermost shape.
 
-    **Must** be applied via :meth:`Expression.apply_to_term`
-    (or :meth:`DerivedSystem.apply_to_term`) — leaf-level invocation
-    raises.  The operation has no selection logic; it transforms
-    whatever single term it is given.  The author picks which term to
-    rewrite by index.
+    Default ``direction="both"`` — applied to a leaf, dispatches per
+    additive term:
 
-    ``direction="inverse"`` (default) — term is a ``Mul`` with exactly
-    one ``Derivative`` factor:
+      * Bare ``Derivative(Π f_i, v)`` outer → **forward**:
+        ``∂_v(Π f_i) → Σ_i (Π_{j≠i} f_j) · ∂_v(f_i)``.
+      * ``Mul`` with exactly one ``Derivative(f, v)`` factor → **inverse**:
+        ``coeff · ∂_v(f) → ∂_v(coeff · f) − ∂_v(coeff).doit() · f``
+        (gets us into divergence form for the integration step).
+      * Anything else → unchanged (no-op).
 
-        ``coeff · ∂_v(f)  →  ∂_v(coeff · f)  −  ∂_v(coeff).doit() · f``
-
-    The second piece is the residual that keeps the rewrite an exact
-    identity.  No skip on coefficient that's free of ``v``: the
-    residual ``∂_v(coeff)`` is zero in that case, the rewrite reduces
-    to ``∂_v(coeff · f)``, simplify cleans up — that's the right
-    behaviour, the operation does not second-guess.
-
-    ``direction="forward"`` — term is a bare
-    ``Derivative(Π f_i, v)`` or ``Derivative(f**n, v)``:
-
-        ``∂_v(Π f_i)   →  Σ_i (Π_{j≠i} f_j) · ∂_v(f_i)``
-        ``∂_v(f**n)    →  n · f**(n-1) · ∂_v(f)``  (integer ``n ≥ 2``)
-
-    ``direction="both"`` — forward on bare ``Derivative``, inverse on
-    ``Mul`` with one ``Derivative`` factor.
+    Use ``direction="inverse"`` / ``direction="forward"`` to force one
+    direction.
 
     ``variables=None`` (default) — act on derivatives w.r.t. any
     ``Symbol`` named ``t``, ``x``, ``y``, or ``z``.  Pass
@@ -3693,14 +3684,15 @@ class ProductRule(Operation):
     by Symbol identity.
 
     Cross-term combinations (``h·∂_t α + α·∂_t h → ∂_t(h·α)``) are
-    not the operation's job.  Apply ProductRule to one sibling only;
-    the residual cancels against the untouched sibling via sympy's
-    like-term combining in the next ``.simplify()``.
+    not the operation's job — apply ProductRule once on the leaf and
+    sympy's ``Add`` canonicalisation in the next ``simplify`` pulls
+    sibling terms together.
     """
 
     _DIRECTIONS = ("inverse", "forward", "both")
     _DEFAULT_COORD_NAMES = frozenset({"t", "x", "y", "z"})
-    single_term_only = True
+    # Apply per term automatically — no caller-side ``apply_to_term`` needed.
+    single_term_only = False
 
     def __init__(self, variables=None, direction="inverse"):
         if direction not in self._DIRECTIONS:
@@ -3724,11 +3716,13 @@ class ProductRule(Operation):
         return getattr(var, "name", None) in self._DEFAULT_COORD_NAMES
 
     def _leaf_sp(self, expr):
-        # ``Expression.apply`` enforces the single-term rule via the
-        # ``single_term_only`` flag before the per-term loop ever
-        # reaches us, so by the time we land here the expression has
-        # exactly one additive term.  Apply unconditionally.
-        return self._one_term(sp.expand(expr))
+        # Auto-route per additive term.  Each term's outermost shape
+        # decides forward vs inverse vs no-op; the operation has no
+        # cross-term logic.
+        out = S.Zero
+        for term in Add.make_args(sp.expand(expr)):
+            out = out + self._one_term(term)
+        return out
 
     def _one_term(self, term):
         # Forward: bare Derivative whose inner is a product or integer power.
