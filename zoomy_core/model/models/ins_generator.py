@@ -1379,7 +1379,9 @@ class _StripArgsLatexPrinter(_LatexPrinter):
     a tuple of "natural" arguments where the call should be displayed
     bare (just the function name, no parentheses).  When the actual
     call deviates in its **last** argument only, the deviation is
-    rendered as a *restriction* ``f|_{var=value}``.  Anything else
+    rendered as a *restriction* ``f|_{var=value}`` (or, for basis
+    atoms, ``f|_{value}`` without the variable label, since ζ vs z is
+    just a pre/post-AffineProjection convention).  Anything else
     falls through to the full ``f(args)`` form.
 
     Shapes recognised:
@@ -1391,7 +1393,8 @@ class _StripArgsLatexPrinter(_LatexPrinter):
     ``f(t,x,y)`` ``(t, x, y)`` *none — 3D horizontal, strip*
     ``f(t,x,z)`` ``(t, x, z)`` ``z``  — vertical / 2D vertical
     ``f(t,x,y,z)`` ``(t,x,y,z)`` ``z`` — vertical / 3D vertical
-    ``f(ζ)``     ``(ζ,)``      ``ζ``  — basis test functions
+    ``f(ζ) / f(z)`` ``(ζ,)`` or ``(z,)`` — basis test functions
+                                (bar variable elided)
     ===========  ============  ================================
 
     Examples (in 2D)::
@@ -1400,8 +1403,10 @@ class _StripArgsLatexPrinter(_LatexPrinter):
         u(t, x, b+h)       →  u|_{z=b+h}
         b(t, x)            →  b
         phi_0(zeta)        →  phi_0
-        phi_0(0)           →  phi_0|_{ζ=0}
-        phi_0((z-b)/h)     →  phi_0|_{ζ=(z-b)/h}
+        phi_0(z)           →  phi_0
+        phi_0(0)           →  phi_0|_{0}
+        phi_0(b+h)         →  phi_0|_{b+h}
+        phi_0((z-b)/h)     →  phi_0|_{(z-b)/h}
         Subs(u(t,x,z),z,b) →  u|_{z=b}        (via sympy's Subs printer)
     """
 
@@ -1442,13 +1447,12 @@ class _StripArgsLatexPrinter(_LatexPrinter):
             tex_idx = self._print(expr.args[0])
             subscripted = f"{tex_name}_{{{tex_idx}}}"
             bar_value = expr.args[1]
-            if bar_value == self._zeta:
+            if bar_value == self._zeta or bar_value == self._z:
                 base = subscripted
             else:
                 value_tex = self.doprint(bar_value)
-                var_tex = self.doprint(self._zeta)
-                base = (r"\left. %s \right|_{\substack{ %s=%s }}"
-                        % (subscripted, var_tex, value_tex))
+                base = (r"\left. %s \right|_{%s}"
+                        % (subscripted, value_tex))
             if exp is not None:
                 base = f"{base}^{{{exp}}}"
             return base
@@ -3267,15 +3271,22 @@ class AffineProjection(Operation):
         )
 
         def _transform_outer(e):
-            """Pass 1: map full-layer ``∫_lower^upper f(z) dz`` → ``h·∫_0^1 f(ζ·h+lower) dζ``."""
+            """Pass 1: map full-layer ``∫_lower^upper f(v) dv`` → ``h·∫_0^1 f(ζ·h+lower) dζ``.
+
+            Matches by bounds, accepting any integration variable — after
+            ``Integrate(method="auto")`` Leibniz can rename the bound
+            variable to a ``Dummy`` (e.g. ``\\hat{z}``), so a strict
+            ``v == state.z`` check would silently skip those integrals.
+            """
             if isinstance(e, Integral):
                 integrand = e.args[0]
                 limits = e.args[1]
                 if (len(limits) == 3
-                        and limits[0] == z
                         and limits[1] == lower
                         and limits[2] == upper):
-                    new_integrand = integrand.subs(z, zeta * h + lower) * h
+                    inner_var = limits[0]
+                    new_integrand = integrand.subs(
+                        inner_var, zeta * h + lower) * h
                     return Integral(new_integrand, (zeta, S.Zero, S.One))
                 return e
             if isinstance(e, Derivative):
