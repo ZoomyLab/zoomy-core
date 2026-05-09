@@ -821,6 +821,17 @@ class System:
         _tree_walk_apply(self._tree, lambda e: e.expand())
         return self
 
+    def doit(self):
+        """Apply sympy ``.doit()`` to every leaf.
+
+        Forces evaluation of unevaluated objects (``Derivative``,
+        ``Integral``, ``Subs``).  In particular, expands compound atoms
+        like ``Derivative(c·b, t)`` into ``c·∂_t b + b·∂_t c`` so that
+        a subsequent substitution rule keyed on the bare atom matches.
+        """
+        _tree_walk_apply(self._tree, lambda e: e.doit())
+        return self
+
     def subs(self, *args, **kwargs):
         _tree_walk_apply(self._tree, lambda e: e.subs(*args, **kwargs))
         return self

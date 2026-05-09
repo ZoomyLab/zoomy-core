@@ -86,6 +86,17 @@ from zoomy_core.symbolic.primitives_substitution import (
     subs_at_point,
     subst,
 )
+from zoomy_core.symbolic.domains import (
+    BoundaryIntegral,
+    Box,
+    BoxBoundary,
+    Domain,
+    Interval,
+    NormalVector,
+    PointSet,
+    Simplex,
+    SimplexBoundary,
+)
 
 __all__ = [
     # held constructors
@@ -134,4 +145,14 @@ __all__ = [
     "solve_for",
     "subs_at_point",
     "subst",
+    # symbolic domains / boundary / normals
+    "BoundaryIntegral",
+    "Box",
+    "BoxBoundary",
+    "Domain",
+    "Interval",
+    "NormalVector",
+    "PointSet",
+    "Simplex",
+    "SimplexBoundary",
 ]
