@@ -107,23 +107,36 @@ def plane_wave_dispersion(
     *,
     axis: int = 0,
     parameters: Optional[Dict[Any, Any]] = None,
+    return_omega_k: bool = True,
 ) -> Dict[str, Any]:
-    """Compute the principal-symbol dispersion of ``sm`` linearised at
-    ``base_state``.
+    """Compute the dispersion of ``sm`` linearised at ``base_state``.
 
-    Linearisation is done on the **quasilinear matrix** (the
-    state-symbolic Jacobian ``∂F/∂Q + ∂P/∂Q + B``) rather than on
-    the flux matrix.  The Jacobian must be taken *before* substituting
-    the base state — substituting first would collapse the flux to a
-    constant, whose Jacobian is zero.
+    Two output modes are supported (controlled by ``return_omega_k``):
+
+    * ``return_omega_k=True`` (default, **fixes G7** from the plan):
+      assemble the full plane-wave matrix ``M(ω, k)`` from the
+      linearised system and solve ``det M(ω, k) = 0`` for the true
+      ``ω(k)`` curves — symbolic functions of ``k`` rather than just
+      eigenvalues at a fixed base state.  This matches what
+      :func:`zoomy_core.analysis.plane_wave_dispersion` does on a
+      ``PDESystem``, but starting from a ``SystemModel`` directly.
+    * ``return_omega_k=False`` (legacy): return only generalised
+      eigenvalues of ``(M_x, M_t)`` — phase velocities at the base
+      state, no ``k``-dependence.
 
     Returns a dict with:
 
-    * ``M_t`` — mass matrix at base state (``I`` for canonical models).
+    * ``M_t`` — mass matrix at base state.
     * ``M_x`` — quasilinear matrix at base state in direction ``axis``.
     * ``M_0`` — ``-∂S/∂Q`` at base state.
-    * ``eigenvalues`` — symbolic generalised eigenvalues of
-      ``(M_x, M_t)`` (wave speeds; real for hyperbolic systems).
+    * ``eigenvalues`` — generalised eigenvalues (legacy, always present).
+    * ``omega_solutions`` (only when ``return_omega_k=True``) — list of
+      symbolic ``ω(k)`` solutions of ``det M(ω, k) = 0``.
+    * ``phase_velocity_solutions`` (only when ``return_omega_k=True``)
+      — ``[ω/k for ω in omega_solutions]``.
+    * ``k`` (only when ``return_omega_k=True``) — the wavenumber symbol.
+    * ``omega`` (only when ``return_omega_k=True``) — the angular‑frequency
+      symbol.
     """
     sub = dict(base_state)
     if parameters:
@@ -151,17 +164,46 @@ def plane_wave_dispersion(
         lambda i, j: sp.simplify(sm.mass_matrix[i, j].xreplace(sub)),
     )
 
-    # Generalised eigenvalues of (M_x, M_t) — solves det(M_x − λ M_t) = 0.
+    # Legacy: generalised eigenvalues of (M_x, M_t) — wave speeds.
     lam = sp.Symbol("lambda")
     char_poly = (M_x - lam * M_t).det(method="berkowitz")
     eigenvalues = sp.solve(sp.Eq(sp.simplify(char_poly), 0), lam)
 
-    return {
+    out = {
         "M_t": M_t,
         "M_x": M_x,
         "M_0": M_0,
         "eigenvalues": eigenvalues,
     }
+
+    if return_omega_k:
+        # Full ω(k) dispersion: plane-wave ansatz q = q̂ exp(i(k·x − ωt)).
+        # The linearised system M_t ∂_t q + M_x ∂_x q + M_0 q = 0
+        # under the plane-wave substitution becomes
+        #     M(ω, k) q̂ = (-iω M_t + ik M_x + M_0) q̂ = 0,
+        # and dispersion solutions are the roots of det M(ω, k) = 0.
+        omega = sp.Symbol("omega", real=True)
+        k = sp.Symbol("k", real=True)
+        I = sp.I
+        M_disp = -I * omega * M_t + I * k * M_x + M_0
+        det_disp = sp.simplify(M_disp.det(method="berkowitz"))
+        try:
+            omega_solutions = sp.solve(sp.Eq(det_disp, 0), omega)
+        except Exception:
+            omega_solutions = []
+        out["omega"] = omega
+        out["k"] = k
+        out["dispersion_matrix"] = M_disp
+        out["dispersion_determinant"] = det_disp
+        out["omega_solutions"] = omega_solutions
+        try:
+            out["phase_velocity_solutions"] = [
+                sp.simplify(s / k) for s in omega_solutions
+            ]
+        except Exception:
+            out["phase_velocity_solutions"] = []
+
+    return out
 
 
 def hyperbolic_eigenvalues(

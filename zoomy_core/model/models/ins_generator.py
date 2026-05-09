@@ -56,7 +56,6 @@ class StateSpace:
         self.x = Symbol("x", real=True)
         self.y = Symbol("y", real=True)
         self.z = Symbol("z", real=True)
-        self.zeta = Symbol("zeta", real=True)
 
         has_y = dimension > 2
 
@@ -66,6 +65,13 @@ class StateSpace:
         args_3d = args_h + [self.z]
         self._args_h = args_h
         self._args_3d = args_3d
+
+        # Reference-element symbol used for ζ-integrals on [0, 1] and as the
+        # post-AffineProjection coordinate; opaque ``state.zeta`` carries the
+        # full (t, x, [y,] z) dependence so sympy's native chain rule fires
+        # cleanly through ``phi_k(state.zeta)``.
+        self.zeta_ref = Symbol("zeta", real=True)
+        self.zeta = Function("zeta", real=True)(*args_3d)
 
         self.u = Function("u", real=True)(*args_3d)
         self.v = Function("v", real=True)(*args_3d) if has_y else S.Zero
@@ -610,6 +616,18 @@ class Expression(SymbolicBase):
                         f"expression.apply_to_term(idx, {type(cond).__name__}()) "
                         f"to target a specific term by index."
                     )
+
+        # ``whole_leaf_op`` Operations need the whole leaf at once
+        # (cross-term scanning, integral merging, ...).  Route those
+        # via ``Operation.__call__`` directly — same dispatch path as
+        # ``System.apply`` uses on a leaf — instead of the per-term
+        # iteration below, which would fragment the integrand and
+        # break cross-term merges (e.g. summing two boundary atoms
+        # produced by the same divergence-theorem call).
+        if (len(conditions) == 1
+                and isinstance(conditions[0], Operation)
+                and getattr(conditions[0], "whole_leaf_op", False)):
+            return conditions[0](self)
 
         _resolve_subs = _resolve_subs_safe  # module-level helper
 
@@ -1372,6 +1390,33 @@ class Expression(SymbolicBase):
 from sympy.printing.latex import LatexPrinter as _LatexPrinter
 
 
+def _append_subscript(tex_name: str, idx_tex: str) -> str:
+    """Append ``_{idx_tex}`` to ``tex_name`` without producing an invalid
+    double-subscript form.
+
+    sympy's ``_deal_with_super_sub`` translates a name like ``"phi_p"`` into
+    ``\\phi_{p}``.  Naively appending ``_{0}`` then yields ``\\phi_{p}_{0}``
+    — KaTeX raises *Double subscript* and the equation fails to render.
+    This helper detects an existing trailing ``_{...}`` group on ``tex_name``
+    and merges the new index into it as ``\\phi_{p,0}``.
+    """
+    if tex_name.endswith("}"):
+        depth = 0
+        for i in range(len(tex_name) - 1, -1, -1):
+            ch = tex_name[i]
+            if ch == "}":
+                depth += 1
+            elif ch == "{":
+                depth -= 1
+                if depth == 0:
+                    if i >= 1 and tex_name[i - 1] == "_":
+                        existing = tex_name[i + 1:-1]
+                        base = tex_name[:i - 1]
+                        return f"{base}_{{{existing},{idx_tex}}}"
+                    break
+    return f"{tex_name}_{{{idx_tex}}}"
+
+
 class _StripArgsLatexPrinter(_LatexPrinter):
     """LaTeX printer for function calls.
 
@@ -1416,7 +1461,30 @@ class _StripArgsLatexPrinter(_LatexPrinter):
     _z = sp.Symbol("z", real=True)
     _zeta = sp.Symbol("zeta", real=True)
 
+    @staticmethod
+    def _is_canonical_zeta(bar_value):
+        """True for the reference-element ζ-symbol *or* the opaque
+        ``state.zeta(...)`` Function-call head — both render bare."""
+        if bar_value == _StripArgsLatexPrinter._zeta:
+            return True
+        if isinstance(bar_value, sp.Dummy):
+            return True
+        if (isinstance(bar_value, sp.Function)
+                and getattr(bar_value.func, "__name__", "") == "zeta"):
+            return True
+        return False
+
     def _print_Function(self, expr, exp=None):
+        # Custom-rendering atoms (e.g. ``BoundaryIntegral`` /
+        # ``NormalVector`` from ``zoomy_core.symbolic.domains``) attach
+        # a ``_latex`` method to their manufactured Function subclass.
+        # Defer to it before any of the project-specific shape rules
+        # fire, otherwise generic 1-arg ``f(i)`` calls (like a normal
+        # vector component ``n(0)``) would be misinterpreted as
+        # basis-style restrictions ``f|_{ζ=0}``.
+        custom_latex = expr.func.__dict__.get("_latex")
+        if custom_latex is not None:
+            return custom_latex(expr, self, exp=exp)
         # Coefficient-lookup Functions produced by ``Expand`` carry a
         # ``_coeff_table`` class attribute and a ``_user_name`` (the
         # name the user gave the family — ``U`` for ``[U_0, U_1, …]``).
@@ -1428,7 +1496,7 @@ class _StripArgsLatexPrinter(_LatexPrinter):
                                 expr.func.__name__)
             tex_name = self._deal_with_super_sub(user_name)
             tex_idx = self._print(expr.args[0])
-            base = f"{tex_name}_{{{tex_idx}}}"
+            base = _append_subscript(tex_name, tex_idx)
             if exp is not None:
                 base = f"{base}^{{{exp}}}"
             return base
@@ -1445,9 +1513,15 @@ class _StripArgsLatexPrinter(_LatexPrinter):
                 and len(expr.args) == 2):
             tex_name = self._deal_with_super_sub(expr.func.__name__)
             tex_idx = self._print(expr.args[0])
-            subscripted = f"{tex_name}_{{{tex_idx}}}"
+            subscripted = _append_subscript(tex_name, tex_idx)
             bar_value = expr.args[1]
-            if bar_value == self._zeta or bar_value == self._z:
+            # ``Dummy`` args appear when ``Subs`` is binding the bar
+            # variable (sympy's chain-rule output).  The outer ``Subs``
+            # printer prints the binding bar; the inner basis call
+            # should print bare to avoid the doubled-bar artefact
+            # ``\phi_k|_{_xi}|_{_xi = …}``.
+            if (self._is_canonical_zeta(bar_value)
+                    or bar_value == self._z):
                 base = subscripted
             else:
                 value_tex = self.doprint(bar_value)
@@ -1498,7 +1572,15 @@ class _StripArgsLatexPrinter(_LatexPrinter):
             recognised = True
 
         if recognised:
-            if bar_var is not None and bar_value != bar_var:
+            # When ``bar_var`` is the reference ζ symbol, also accept the
+            # opaque ``state.zeta(...)`` Function-call head as canonical;
+            # both represent the same coordinate and rendering a bar
+            # ``|_{ζ=ζ}`` is a no-op artefact of sympy chain-rule output.
+            zeta_canonical = (bar_var == self._zeta
+                              and self._is_canonical_zeta(bar_value))
+            if (bar_var is not None
+                    and bar_value != bar_var
+                    and not zeta_canonical):
                 value_tex = self.doprint(bar_value)
                 var_tex = self.doprint(bar_var)
                 tex = r"\left. %s \right|_{\substack{ %s=%s }}" % (
@@ -3252,12 +3334,22 @@ class AffineProjection(Operation):
     """
 
     def __init__(self, state, lower=None, upper=None, zeta=None,
-                 name=None, description=None):
+                 name=None, description=None, *,
+                 rewrite_basis_args=True):
         self._z = state.z
         self._lower = lower if lower is not None else state.b
         self._upper = upper if upper is not None else state.eta
         self._h = self._upper - self._lower
-        self._zeta = zeta if zeta is not None else state.zeta
+        self._state = state
+        self._zeta = zeta if zeta is not None else state.zeta_ref
+        self._zeta_fn = state.zeta
+        # Control whether to apply ``_rewrite_basis_args`` after
+        # ``_transform_outer``.  Default True for backward compatibility
+        # (test functions passed with z-only argument, the affine map
+        # is encoded only here).  Set False when test functions were
+        # already passed with explicit ``(z-b)/h`` argument upstream
+        # (e.g. by ``AffinifyBasisArgs``); avoids double-application.
+        self._rewrite_basis_args_flag = rewrite_basis_args
         super().__init__(
             name=name or "zeta_transform",
             description=(description or
@@ -3347,9 +3439,143 @@ class AffineProjection(Operation):
                     return e.func(*new_args)
             return e
 
+        expr = self._pre_collapse_opaque_zeta(expr)
         result = _transform_running(_transform_outer(expr))
-        result = self._rewrite_basis_args(result)
+        result = self._collapse_opaque_zeta(result)
+        if self._rewrite_basis_args_flag:
+            result = self._rewrite_basis_args(result)
+        else:
+            # Test functions are already in (z-b)/h form upstream;
+            # _transform_outer's z→ζh+b substitution leaves their args
+            # as ((ζh+b)-b)/h.  Canonicalise to ζ via simplification.
+            result = self._simplify_basis_args(result)
         return result
+
+    def _pre_collapse_opaque_zeta(self, expr):
+        """Substitute concrete values for opaque ζ-derivatives.
+
+        Must run **before** ``_transform_outer`` so that
+        ``Derivative(zeta_fn, v)`` patterns are resolved before sympy
+        turns them into ``Subs`` atoms.
+
+        ``_simplify_expr`` calls ``_canonicalize_integral_dummies`` which
+        alpha-renames integration bound variables (e.g. ``z → _\\hat{z}``
+        inside integrals).  This turns ``Derivative(zeta(t,x,z), z)`` into
+        ``Derivative(zeta(t,x,_\\hat{z}), _\\hat{z})`` — a different sympy
+        object that ``xreplace`` with a ``state.z``-keyed dict misses.
+
+        Fix: collect all ``Derivative`` nodes via ``atoms()`` and match by
+        structure — ``Derivative(zeta_head(*args_h, v), v)`` for any ``v``
+        (z-like derivative), or ``Derivative(zeta_head(*args_h, v), t/x)``
+        for the cross-derivatives (t, x).  Use the actual last arg ``v`` of
+        the zeta call to build ``(v-b)/h`` so the result is correct whether
+        ``v`` is ``state.z`` or any renamed Dummy.
+
+        No-op when ``state.zeta`` is a plain ``Symbol`` (legacy path).
+        """
+        zeta_fn = self._zeta_fn
+        if not isinstance(zeta_fn, sp.Function):
+            return expr
+
+        zeta_head = zeta_fn.func
+        state = self._state
+        b, h = self._lower, self._h
+
+        replacements = {}
+        for d in expr.atoms(sp.Derivative):
+            inner = d.args[0]
+            if not (isinstance(inner, sp.Function) and inner.func == zeta_head):
+                continue
+            if len(d.variables) != 1:
+                continue
+            var = d.variables[0]
+            # last arg of zeta(t, x[, y,] v) is the z-like coordinate
+            v = inner.args[-1]
+            zeta_explicit = (v - b) / h
+            if var == v:
+                # ∂ζ/∂v = 1/h (z-like derivative)
+                replacements[d] = sp.S.One / h
+            elif var == state.t:
+                replacements[d] = (
+                    -(sp.Derivative(b, state.t)
+                      + zeta_explicit * sp.Derivative(h, state.t)) / h
+                )
+            elif var == state.x:
+                replacements[d] = (
+                    -(sp.Derivative(b, state.x)
+                      + zeta_explicit * sp.Derivative(h, state.x)) / h
+                )
+            elif state.has_y and var == state.y:
+                replacements[d] = (
+                    -(sp.Derivative(b, state.y)
+                      + zeta_explicit * sp.Derivative(h, state.y)) / h
+                )
+        if replacements:
+            return expr.xreplace(replacements)
+        return expr
+
+    def _collapse_opaque_zeta(self, expr):
+        """Materialise the opaque ``state.zeta(t,x,[y,]z)`` call-sites
+        that remain **after** ``_transform_outer`` has substituted
+        ``z → ζ_ref · h + lower``.
+
+        Derivative substitutions were already handled by
+        ``_pre_collapse_opaque_zeta`` before the transform.  This
+        pass deals with two remaining shapes:
+
+        (ii) Boundary evaluations of the opaque head — Leibniz terms
+        leave ``phi(ζ(t,x,η))``, ``phi(ζ(t,x,b))`` in the expression;
+        collapse them to ``ζ_ref = 1`` and ``ζ_ref = 0``.
+
+        (iii) Bulk-call collapse: ``_transform_outer`` rewrites the
+        integration variable from ``z`` to ``ζ_ref``, turning the
+        opaque head's last arg from ``z`` to ``ζ_ref·h+lower``; map
+        the whole call to ``ζ_ref`` so basis atoms read
+        ``phi_k(ζ_ref)``.
+
+        No-op if ``state.zeta`` is not a ``Function`` (legacy path).
+        """
+        zeta_fn = self._zeta_fn
+        if not isinstance(zeta_fn, sp.Function):
+            return expr
+
+        zeta_ref = self._zeta
+        b, h = self._lower, self._h
+        state = self._state
+        args_h = state._args_h
+
+        replacements = {}
+
+        # (ii) boundary evaluations of the opaque head
+        replacements[zeta_fn.func(*args_h, self._upper)] = sp.S.One
+        replacements[zeta_fn.func(*args_h, self._lower)] = sp.S.Zero
+
+        # (iii) bulk-call collapse
+        replacements[zeta_fn.func(*args_h, zeta_ref * h + b)] = zeta_ref
+
+        return expr.xreplace(replacements)
+
+    def _simplify_basis_args(self, expr):
+        """Canonicalise basis-function arguments after ``_transform_outer``.
+
+        When test functions were passed with explicit ``(z-b)/h`` arg
+        upstream, after ``_transform_outer`` substitutes ``z → ζh+b`` in
+        integrands the basis args read ``((ζh+b)-b)/h`` — which sympy
+        does not auto-simplify to ``ζ``.  This pass walks every basis
+        atom and applies ``sp.cancel`` to the argument to canonicalise.
+        Boundary-Subs basis atoms (which still contain ``z``) are left
+        alone — they'll be evaluated when ``Subs.doit()`` fires.
+        """
+        basis_funcs = {
+            atom.func
+            for atom in expr.atoms(sp.Function)
+            if hasattr(atom.func, "_basis")
+        }
+        for cls in basis_funcs:
+            def _simplify(k_arg, z_arg, _cls=cls):
+                return _cls(k_arg, sp.cancel(z_arg))
+            expr = expr.replace(cls, _simplify)
+        return expr
 
     def _rewrite_basis_args(self, expr):
         """Pass 3 — basis-arg rewrite.
@@ -4184,7 +4410,10 @@ class Basis:
     exposes symbolic pieces for the apply-based walkthrough:
 
     * ``basis.phi`` — ``Zstruct(phi_0, …, phi_N)`` of sympy expressions in
-      ``state.zeta``.  Drop-in factor for ``Multiply(basis.phi, outer=True)``.
+      ``state.zeta_ref`` (the reference-element symbol on ``[0, 1]``).
+      Drop-in factor for ``Multiply(basis.phi, outer=True)`` *after*
+      ``AffineProjection`` has collapsed the opaque ``state.zeta`` to
+      ``state.zeta_ref``.
     * ``basis.alpha`` — ``Zstruct(alpha_0, …, alpha_N)`` of
       :class:`Function` coefficients ``α_k(t, x, [y])``.  Using Functions
       (not bare Symbols) keeps downstream partial derivatives honest and
@@ -4227,7 +4456,7 @@ class Basis:
             self.level = level
         self._alpha_name = alpha_name
 
-        zeta = state.zeta
+        zeta = state.zeta_ref
         self.phi = Zstruct(**{
             f"phi_{k}": self._bf.eval(k, zeta)
             for k in range(self.level + 1)
@@ -4279,7 +4508,7 @@ class Basis:
         ``u`` has been expanded.
         """
         state = self._state
-        z, zeta, b, h = state.z, state.zeta, state.b, state.h
+        z, zeta, b, h = state.z, state.zeta_ref, state.b, state.h
 
         # Build a function-level rewriter.  A plain ``{u(t,x,z): rhs}``
         # dict substituted via ``xreplace`` is structural and won't match
@@ -4379,12 +4608,12 @@ class Basis:
             # We need the bulk key to match the expanded form produced by
             # AffineProjection, because ``xreplace`` is structural and
             # ``a·(b−c)+c`` isn't the same subtree as ``a·b − a·c + c``.
-            zeta_of_z = sp.expand(state.zeta * (upper - lower) + lower)
+            zeta_of_z = sp.expand(state.zeta_ref * (upper - lower) + lower)
             bulk_key = field.subs(state.z, zeta_of_z)
             # RHS shortcut: after AffineProjection the bulk argument is
             # identically ``ζ``, so we evaluate the inner basis at
-            # ``state.zeta`` directly.  Going through ``_closure`` would
-            # produce ``ζ·(upper-lower)/(upper-lower)`` which sympy
+            # ``state.zeta_ref`` directly.  Going through ``_closure``
+            # would produce ``ζ·(upper-lower)/(upper-lower)`` which sympy
             # doesn't cancel (it can't rule out ``upper == lower``),
             # leaving unsimplified ratios inside integrands and
             # blocking ``EvaluateIntegrals`` from collapsing them.
@@ -4392,7 +4621,7 @@ class Basis:
                 getattr(self.alpha,
                         f"{self._alpha_name}_"
                         f"{self._bf.flat_index(layer_idx, k)}")
-                * self._bf.inner.eval(k, state.zeta)
+                * self._bf.inner.eval(k, state.zeta_ref)
                 for k in range(self._bf.inner_n_basis)
             )
         else:
@@ -4421,7 +4650,7 @@ class Basis:
             raise ValueError("layer_phi requires a LayeredBasis.")
         if not (0 <= layer_idx < self._bf.n_layers):
             raise IndexError(f"layer_idx={layer_idx} out of range.")
-        zeta = self._state.zeta
+        zeta = self._state.zeta_ref
         return Zstruct(**{
             f"phi_{k}": self._bf.inner.eval(k, zeta)
             for k in range(self._bf.inner_n_basis)
