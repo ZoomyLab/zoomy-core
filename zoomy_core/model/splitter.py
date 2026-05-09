@@ -139,35 +139,60 @@ def build_pressure_elliptic_block(
         no_p = expr.subs({p: sp.S.Zero for p in pressure_vars})
         return sp.expand(expr - no_p)
 
-    # Per-conservative-variable pressure sources, computed directly
-    # via the Escalante master formula (mirrors
-    # ``derive_xmom_j`` / ``derive_zmom_j`` in
-    # ``escalante2024_poisson_generic.py``).  We do NOT extract from
-    # the input pdesys's xmom/zmom rows because Zoomy's
-    # ``Multiply + Integrate`` chain misses the chain-rule contribution
-    # from ``∂_x φ_j|_z`` for non-constant test functions (j ≥ 1),
-    # producing rows that are correct at j=0 but missing terms at
-    # j ≥ 1.  Direct master-formula evaluation sidesteps that bug.
+    # Per-conservative-variable pressure sources extracted directly
+    # from the chain DAE's ``xmom_jk`` / ``zmom_jk`` rows.  Each row
+    # has the residual form ``mu_k ∂_t(h Q_k) + ... + (pressure
+    # terms) = 0``; the pressure-linear part divided by ``mu_k``
+    # gives the source per conserved variable ``h Q_k`` matching the
+    # ``Q_k^(corr) = Q_k_tilde - (dt/h) T_*[k]`` corrector convention.
     #
-    # Convention: the chain DAE works with dynamic pressure P_k and
-    # the momentum equations carry a ``(1/rho) ∂_x p_NH`` term, so the
-    # master-formula pressure sources need a ``1/rho`` factor.
+    # The chain momentum equations use ``(1/rho) ∂_x p_NH`` form so
+    # the rho factor is already baked into the extracted source.
     rho = next((s for s in pdesys.parameters if str(s) == "rho"), None)
     if rho is None:
         # No density parameter — treat as unit (kinematic convention).
         rho = sp.S.One
-    T_u = _master_formula_T_u(
+
+    T_u = [
+        _extract_pressure_T_from_chain(
+            pdesys, f"xmom_j{k}", pressure_vars, mu(k))
+        for k in range(M + 1)
+    ]
+    T_w = [
+        _extract_pressure_T_from_chain(
+            pdesys, f"zmom_j{k}", pressure_vars, mu(k))
+        for k in range(N_w_active)
+    ]
+
+    # Side-by-side verification against the Escalante master formula.
+    # Once this assertion has held over a representative range of
+    # configurations, the master-formula path can be retired.
+    T_u_master = _master_formula_T_u(
         coeffs_u=coeffs_u, coeffs_w=coeffs_w,
         pressure_vars=pressure_vars,
         h=h, bottom=bottom, t=t, x=x,
         M=M, N_w_active=N_w_active, rho=rho,
     )
-    T_w = _master_formula_T_w(
+    T_w_master = _master_formula_T_w(
         coeffs_u=coeffs_u, coeffs_w=coeffs_w,
         pressure_vars=pressure_vars,
         h=h, bottom=bottom, t=t, x=x,
         M=M, N_w_active=N_w_active, rho=rho,
     )
+    for k, (chain_v, master_v) in enumerate(zip(T_u, T_u_master)):
+        diff = sp.simplify(sp.together(chain_v - master_v).cancel())
+        if diff != 0:
+            raise AssertionError(
+                f"T_u[{k}] chain extraction disagrees with master "
+                f"formula: chain - master = {diff}"
+            )
+    for k, (chain_v, master_v) in enumerate(zip(T_w, T_w_master)):
+        diff = sp.simplify(sp.together(chain_v - master_v).cancel())
+        if diff != 0:
+            raise AssertionError(
+                f"T_w[{k}] chain extraction disagrees with master "
+                f"formula: chain - master = {diff}"
+            )
 
     # Corrector update in primitive form:
     #     U_k^(corr) = U_k_tilde - (dt / h) * T_uk(P)
@@ -269,8 +294,35 @@ def verify_p_linearity(rows, pressure_vars, x):
 
 
 # ---------------------------------------------------------------------------
+# Chain-row extraction (post opaque-ζ migration).
+# ---------------------------------------------------------------------------
+
+
+def _extract_pressure_T_from_chain(pdesys, equation_name, pressure_vars, mu_k):
+    """Extract the pressure source ``T_*[k]`` from a chain DAE row.
+
+    The chain DAE row ``xmom_jk`` / ``zmom_jk`` is the residual
+
+        ``mu_k ∂_t(h Q_k) + (flux + boundary terms) + (pressure terms) = 0``
+
+    where ``mu_k = 1/(2k+1)`` is the shifted-Legendre normalisation.
+    The pressure-linear part divided by ``mu_k`` is the source per
+    conserved variable ``h Q_k`` — i.e. the ``T_*[k]`` used in the
+    corrector update ``Q_k^(corr) = Q_k_tilde - (dt/h) T_*[k]``.
+    """
+    idx = pdesys.equation_names.index(equation_name)
+    eq = pdesys.equations[idx]
+    no_p = eq.subs({p: sp.S.Zero for p in pressure_vars})
+    pressure_part = sp.expand(eq - no_p)
+    return sp.expand(pressure_part / mu_k)
+
+
+# ---------------------------------------------------------------------------
 # Master-formula projections.  Adapted from
 # ``tutorials/vam/escalante2024_poisson_generic.py:103-136``.
+# Kept as a side-by-side cross-check until the chain extraction path
+# has been validated across all VAM(M, N_w, N_p) configurations of
+# interest, then retired.
 # ---------------------------------------------------------------------------
 
 
