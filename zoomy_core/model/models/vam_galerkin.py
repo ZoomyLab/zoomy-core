@@ -360,6 +360,29 @@ class VAMModelGalerkin(VAMModel):
             self._chain_dae)
 
     # ------------------------------------------------------------------
+    # Tag-driven operator surface
+    # ------------------------------------------------------------------
+    #
+    # The chain DAE is term-tagged at the end of ``derive_model``;
+    # ``self._chain_dae_systemmodel`` is the SystemModel that
+    # ``SystemModel.from_pdesystem`` constructed by walking those tags
+    # via ``collect_solver_tag``.  Its ``flux``, ``hydrostatic_pressure``,
+    # ``nonconservative_matrix``, ``source`` matrices live on the chain
+    # state ``[h, U_k, W_k, P_k]``.
+    #
+    # The parent ``VAMModel`` keeps its hard-coded operator API
+    # (``self.flux()``/``self.source()``/...) on the legacy 6-state
+    # convention ``[b, h, hu_k, hw_k]`` for backwards compatibility with
+    # existing solvers.  We deliberately do NOT override those methods —
+    # the parent's ``derive_model`` calls them during initialisation,
+    # and overriding them with chain-DAE-state matrices would cause
+    # shape mismatches there.
+    #
+    # Downstream code wanting tag-driven matrices should read
+    # ``self._chain_dae_systemmodel.{flux,hydrostatic_pressure,
+    # nonconservative_matrix,source,mass_matrix}`` directly.
+
+    # ------------------------------------------------------------------
     # Display.
     # ------------------------------------------------------------------
 

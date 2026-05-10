@@ -31,6 +31,15 @@ from typing import Any, Dict, List, Optional
 import sympy as sp
 
 
+def _iter_indices(shape):
+    if not shape:
+        yield ()
+        return
+    for i in range(shape[0]):
+        for rest in _iter_indices(shape[1:]):
+            yield (i,) + rest
+
+
 @dataclass
 class SystemModel:
     """Symbolic operator-form PDE system.
@@ -248,19 +257,18 @@ class SystemModel:
         around the state itself (``base = f`` for each field).  For
         evolution rows ``M`` carries state-dependent entries
         (e.g. ``u_0`` on the ``h`` column when the equation is
-        ``∂_t(h u_0)``); for algebraic rows (``kbc_top_alg`` /
-        ``kbc_bot`` / ``surface_bc``) ``M`` is all-zero — that is the
-        DAE form the user wants.
+        ``∂_t(h u_0)``); for algebraic rows ``M`` is all-zero — that is
+        the DAE form the user wants.
 
-        Other operators (``flux``, ``nonconservative_matrix``,
-        ``source``, ``hydrostatic_pressure``) are left as zero
-        placeholders.  Term-by-term tag-driven extraction into those
-        operators is the next workstream — once each equation carries
-        per-term solver tags, ``collect_solver_tag`` will populate
-        them.
+        ``flux``, ``hydrostatic_pressure``, ``nonconservative_matrix``,
+        ``source`` are populated by walking the PDESystem equations'
+        ``solver_tags`` via :func:`collect_solver_tag`.  If the
+        equations carry no tags (plain ``sp.Expr`` instances), those
+        slots are left as zero placeholders.
         """
         from zoomy_core.analysis.linearisation import linearise
         from zoomy_core.analysis.pencil import extract_quasilinear_pencil
+        from zoomy_core.model.models.tag_extraction import collect_solver_tag
 
         # Linearise around the symbolic state to extract M_t.
         base_state = {f: f for f in pdesys.fields}
@@ -271,6 +279,7 @@ class SystemModel:
         # field Functions ``h(t, x)`` etc. to ``Symbol("h")``.
         state_syms = [sp.Symbol(f.func.__name__, real=True)
                       for f in pdesys.fields]
+        func_to_sym = dict(zip(pdesys.fields, state_syms))
 
         params = (dict(pdesys.parameters)
                   if hasattr(pdesys, "parameters") else {})
@@ -278,25 +287,101 @@ class SystemModel:
         n_eq = len(pdesys.equations)
         n_state = len(pdesys.fields)
         n_dim = len(pdesys.space)
+        coords = list(pdesys.space)
+
+        # Decide whether the PDESystem rows are tagged: every equation
+        # must be an Expression with a non-empty _solver_groups dict.
+        from zoomy_core.model.models.ins_generator import Expression
+        tagged = all(
+            isinstance(eq, Expression) and bool(eq._solver_groups)
+            for eq in pdesys.equations
+        )
+
+        if tagged:
+            equation_names = list(getattr(pdesys, "equation_names",
+                                          [f"eq_{i}" for i in range(n_eq)]))
+
+            class _NamedSystem:
+                pass
+            sys_obj = _NamedSystem()
+            sys_obj.equations = dict(zip(equation_names, pdesys.equations))
+            variable_map = {name: [i] for i, name in enumerate(equation_names)}
+
+            def _func_to_sym(M):
+                if isinstance(M, sp.Matrix):
+                    return M.xreplace(func_to_sym)
+                out = sp.MutableDenseNDimArray.zeros(*M.shape)
+                for idx in _iter_indices(M.shape):
+                    out[idx] = M[idx].xreplace(func_to_sym)
+                return out
+
+            F_func = collect_solver_tag(
+                sys_obj, "flux",
+                variable_map=variable_map, n_variables=n_eq,
+                n_directions=n_dim, coords=coords,
+                state_variables=pdesys.fields, policy="strict",
+            )
+            P_func = collect_solver_tag(
+                sys_obj, "hydrostatic_pressure",
+                variable_map=variable_map, n_variables=n_eq,
+                n_directions=n_dim, coords=coords,
+                state_variables=pdesys.fields, policy="strict",
+            )
+            B_func = collect_solver_tag(
+                sys_obj, "nonconservative_flux",
+                variable_map=variable_map, n_variables=n_eq,
+                n_directions=n_dim, coords=coords,
+                state_variables=pdesys.fields, policy="strict",
+            )
+            S_list = collect_solver_tag(
+                sys_obj, "source",
+                variable_map=variable_map, n_variables=n_eq,
+                policy="strict",
+            )
+            S_func = sp.Matrix(n_eq, 1, lambda i, _j: S_list[i])
+            # The NC slab is (n_eq, n_state, n_dim); collect_solver_tag
+            # returned (n_eq, n_eq, n_dim) on the assumption n_eq == n_state.
+            # Reshape to (n_eq, n_state, n_dim) — for chain-DAE-derived
+            # systems they happen to coincide.
+            B_resized = sp.MutableDenseNDimArray.zeros(n_eq, n_state, n_dim)
+            for i in range(n_eq):
+                for j in range(min(n_state, B_func.shape[1])):
+                    for k in range(n_dim):
+                        B_resized[i, j, k] = B_func[i, j, k]
+            F = _func_to_sym(F_func)
+            P = _func_to_sym(P_func)
+            B = _func_to_sym(B_resized)
+            S_mat = _func_to_sym(S_func)
+            mass_descr = (f"chain-DAE PDESystem, {n_eq} equations / "
+                          f"{n_state} fields, F/P/B/S extracted via "
+                          f"solver_tags")
+        else:
+            F = sp.zeros(n_eq, n_dim)
+            P = sp.zeros(n_eq, n_dim)
+            B = sp.MutableDenseNDimArray.zeros(n_eq, n_state, n_dim)
+            S_mat = sp.zeros(n_eq, 1)
+            mass_descr = (f"PDESystem, {n_eq} equations / {n_state} "
+                          f"fields, untagged (F/P/B/S = 0 placeholders)")
+
+        # M_t lives in Function form from linearise; convert to Symbols
+        # so the SystemModel state ordering matches.
+        M_t_sym = M_t.xreplace(func_to_sym)
 
         sm = cls(
             time=pdesys.time,
-            space=list(pdesys.space),
+            space=coords,
             state=state_syms,
             aux_state=[],
             parameters=params,
-            flux=sp.zeros(n_eq, n_dim),
-            hydrostatic_pressure=sp.zeros(n_eq, n_dim),
-            nonconservative_matrix=sp.MutableDenseNDimArray.zeros(
-                n_eq, n_state, n_dim
-            ),
-            source=sp.zeros(n_eq, 1),
-            mass_matrix=M_t,
+            flux=F,
+            hydrostatic_pressure=P,
+            nonconservative_matrix=B,
+            source=S_mat,
+            mass_matrix=M_t_sym,
         )
         sm.history.append({
             "name": "from_pdesystem",
-            "description": (f"extracted from PDESystem with "
-                            f"{n_eq} equations / {n_eq} fields"),
+            "description": mass_descr,
         })
         return sm
 
