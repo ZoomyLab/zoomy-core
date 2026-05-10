@@ -44,8 +44,21 @@ class SystemModel:
             + \\sum_d B(Q)[:,:,d] \\, \\partial_d Q
             - S(Q) = 0
 
-    Attributes are sympy ``Matrix`` / ``MutableDenseNDimArray``
-    objects; row/column indexing follows ``state`` order.
+    Operators are indexed ``(equation_row, state_col[, dim])``.  In
+    general the system is **rectangular** — there can be fewer (or
+    more) equations than state entries; this is the case for the
+    splitter sub-systems, where each stage updates only a subset of
+    the shared state vector.  ``equation_to_state_index[r]`` records
+    which state entry equation ``r`` updates; for square systems the
+    default is the identity map ``[0, 1, …, n_state-1]``.
+
+    Shape contract:
+
+    * ``flux``                  — ``(n_eq, n_dim)``
+    * ``hydrostatic_pressure``  — ``(n_eq, n_dim)``
+    * ``nonconservative_matrix``— ``(n_eq, n_state, n_dim)``
+    * ``source``                — ``(n_eq, 1)``
+    * ``mass_matrix``           — ``(n_eq, n_state)``
     """
 
     time: sp.Symbol
@@ -58,8 +71,13 @@ class SystemModel:
     nonconservative_matrix: Any              # sp.MutableDenseNDimArray
     source: sp.Matrix
     mass_matrix: sp.Matrix
+    equation_to_state_index: Optional[List[int]] = None
     boundary_conditions: Optional[Any] = None
     history: List[Dict[str, str]] = field(default_factory=list)
+
+    def __post_init__(self):
+        if self.equation_to_state_index is None:
+            self.equation_to_state_index = list(range(self.n_equations))
 
     # ── Shape accessors ────────────────────────────────────────────────
 
@@ -68,18 +86,29 @@ class SystemModel:
         return self.flux.shape[0]
 
     @property
+    def n_state(self) -> int:
+        return len(self.state)
+
+    @property
     def n_dim(self) -> int:
         return len(self.space)
+
+    @property
+    def is_square(self) -> bool:
+        """True when n_equations == n_state and equations map identity-style."""
+        return (self.n_equations == self.n_state
+                and self.equation_to_state_index == list(range(self.n_state)))
 
     # ── Operator-API methods (mirror Model) ─────────────────────────────
 
     def quasilinear_matrix(self):
-        """``∂F/∂Q + ∂P/∂Q + B`` — shape ``(n_eq, n_eq, n_dim)``."""
-        n = self.n_equations
+        """``∂F/∂Q + ∂P/∂Q + B`` — shape ``(n_eq, n_state, n_dim)``."""
+        n_eq = self.n_equations
+        n_st = self.n_state
         d = self.n_dim
-        Q = sp.MutableDenseNDimArray.zeros(n, n, d)
-        for i in range(n):
-            for j in range(n):
+        Q = sp.MutableDenseNDimArray.zeros(n_eq, n_st, d)
+        for i in range(n_eq):
+            for j in range(n_st):
                 for k in range(d):
                     djF = sp.diff(self.flux[i, k], self.state[j])
                     djP = sp.diff(self.hydrostatic_pressure[i, k],
@@ -88,11 +117,12 @@ class SystemModel:
         return Q
 
     def source_jacobian_wrt_state(self):
-        """``∂S/∂Q`` — shape ``(n_eq, n_eq)``."""
-        n = self.n_equations
-        out = sp.zeros(n, n)
-        for i in range(n):
-            for j in range(n):
+        """``∂S/∂Q`` — shape ``(n_eq, n_state)``."""
+        n_eq = self.n_equations
+        n_st = self.n_state
+        out = sp.zeros(n_eq, n_st)
+        for i in range(n_eq):
+            for j in range(n_st):
                 out[i, j] = sp.diff(self.source[i, 0], self.state[j])
         return out
 
@@ -246,6 +276,7 @@ class SystemModel:
                   if hasattr(pdesys, "parameters") else {})
 
         n_eq = len(pdesys.equations)
+        n_state = len(pdesys.fields)
         n_dim = len(pdesys.space)
 
         sm = cls(
@@ -257,7 +288,7 @@ class SystemModel:
             flux=sp.zeros(n_eq, n_dim),
             hydrostatic_pressure=sp.zeros(n_eq, n_dim),
             nonconservative_matrix=sp.MutableDenseNDimArray.zeros(
-                n_eq, n_eq, n_dim
+                n_eq, n_state, n_dim
             ),
             source=sp.zeros(n_eq, 1),
             mass_matrix=M_t,
@@ -326,29 +357,41 @@ class SystemModelDescription:
     def _operator_block(self) -> str:
         sm = self._sm
         parts = []
-        if any(sm.flux):
-            parts.append("**Flux** $F$:")
-            parts.append(f"$$\n{sp.latex(sm.flux)}\n$$")
-        if any(sm.hydrostatic_pressure):
-            parts.append("**Hydrostatic pressure** $P$:")
-            parts.append(f"$$\n{sp.latex(sm.hydrostatic_pressure)}\n$$")
+
+        # Canonical equation form.
+        parts.append("**System form:**")
+        parts.append(
+            r"$$"
+            r"M(Q)\,\partial_t Q "
+            r"+ \nabla\cdot\!\big(F(Q) + P(Q)\big)"
+            r" + \sum_{d} B_{d}(Q)\,\partial_{d} Q "
+            r"- S(Q) = 0"
+            r"$$"
+        )
+
+        # State vector.
+        Q_vec = sp.Matrix(list(sm.state))
+        parts.append("**State $Q$:**")
+        parts.append(f"$$\n{sp.latex(Q_vec)}\n$$")
+
+        def _render(label, mat):
+            if mat.is_zero_matrix:
+                parts.append(f"**{label} $= 0$**")
+            else:
+                parts.append(f"**{label}:**")
+                parts.append(f"$$\n{sp.latex(mat)}\n$$")
+
+        _render("Mass matrix $M$", sm.mass_matrix)
+        _render("Flux $F$", sm.flux)
+        _render("Hydrostatic pressure $P$", sm.hydrostatic_pressure)
         for d in range(sm.n_dim):
             slab = sp.Matrix(sm.n_equations, sm.n_equations,
                              lambda i, j, _d=d:
                                  sm.nonconservative_matrix[i, j, _d])
-            if any(slab):
-                parts.append(
-                    f"**NCP** $B_{{{d}}}$ (direction ${sp.latex(sm.space[d])}$):"
-                )
-                parts.append(f"$$\n{sp.latex(slab)}\n$$")
-        if any(sm.source):
-            parts.append("**Source** $S$:")
-            parts.append(f"$$\n{sp.latex(sm.source)}\n$$")
-        if sm.mass_matrix != sp.eye(sm.n_equations):
-            parts.append("**Mass matrix** $M$ (non-identity):")
-            parts.append(f"$$\n{sp.latex(sm.mass_matrix)}\n$$")
-        else:
-            parts.append("**Mass matrix** $M = I$ (canonical form).")
+            label = (f"NCP $B_{{{d}}}$ "
+                     f"(direction ${sp.latex(sm.space[d])}$)")
+            _render(label, slab)
+        _render("Source $S$", sm.source)
         return "\n\n".join(parts)
 
     def _repr_markdown_(self) -> str:
@@ -396,6 +439,13 @@ class InvertMassMatrix:
     description = "Left-multiply by M⁻¹ to reach canonical ∂_t Q form."
 
     def __call__(self, sm: SystemModel):
+        if not sm.is_square:
+            raise ValueError(
+                "InvertMassMatrix: requires a square system "
+                f"(n_eq == n_state); got n_eq={sm.n_equations}, "
+                f"n_state={sm.n_state}, "
+                f"equation_to_state_index={sm.equation_to_state_index}."
+            )
         state_atoms = set(sm.state) | set(sm.aux_state)
         if state_atoms and sm.mass_matrix.has(*state_atoms):
             raise ValueError(

@@ -144,23 +144,25 @@ def plane_wave_dispersion(
 
     # Quasilinear / source-Jacobian on the FULL state-symbolic matrices,
     # then substitute the base state into the result.
+    n_eq = sm.n_equations
+    n_st = sm.n_state
     qm_sym = sm.quasilinear_matrix()
     M_x = sp.Matrix(
-        sm.n_equations,
-        sm.n_equations,
+        n_eq,
+        n_st,
         lambda i, j: sp.simplify(qm_sym[i, j, axis].xreplace(sub)),
     )
 
     src_jac_sym = sm.source_jacobian_wrt_state()
     M_0 = sp.Matrix(
-        sm.n_equations,
-        sm.n_equations,
+        n_eq,
+        n_st,
         lambda i, j: -sp.simplify(src_jac_sym[i, j].xreplace(sub)),
     )
 
     M_t = sp.Matrix(
-        sm.n_equations,
-        sm.n_equations,
+        n_eq,
+        n_st,
         lambda i, j: sp.simplify(sm.mass_matrix[i, j].xreplace(sub)),
     )
 
