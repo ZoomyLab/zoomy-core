@@ -45,6 +45,7 @@ from zoomy_core.model.models.ins_generator import (
     AffineProjection,
     EvaluateIntegrals,
     Expand,
+    Expression,
     FullINS,
     InterfaceKBC,
     Integrate,
@@ -53,7 +54,77 @@ from zoomy_core.model.models.ins_generator import (
     ProductRule,
     StateSpace,
 )
+from zoomy_core.model.models.tag_extraction import _split_coeff_and_derivative
 from zoomy_core.model.models.vam_model import VAMModel
+
+
+def _classify_term(term, *, state_funcs, gravity_param, t, x):
+    """Classify a single chain-DAE term by canonical solver-tag category.
+
+    Heuristic (priority-ordered):
+
+    - any ``Derivative(*, t)`` atom → ``time_derivative``
+    - ``coeff * Derivative(F(state), x)`` with state-independent coeff
+      and ``g·state`` inside → ``hydrostatic_pressure``
+    - ``coeff * Derivative(F(state), x)`` with state-independent coeff
+      → ``flux``
+    - ``coeff * Derivative(state_var, x)`` (deriv arg is a single state
+      Function) → ``nonconservative_flux``
+    - everything else (no derivative, derivative of parameter, …)
+      → ``source`` (the catch-all).
+    """
+    if any(isinstance(d, sp.Derivative) and t in d.variables
+           for d in term.atoms(sp.Derivative)):
+        return "time_derivative"
+    coeff, deriv = _split_coeff_and_derivative(term)
+    if deriv is None:
+        return "source"
+    if len(deriv.variables) != 1 or deriv.variables[0] != x:
+        return "source"
+    inner = deriv.args[0]
+    # ``coeff * Derivative(state_var, x)`` is the non-conservative
+    # product the NC slot was made for — regardless of whether ``coeff``
+    # has state in it (collect_solver_tag stores ``coeff`` at
+    # ``B[row, state_idx, x_idx]``).
+    if inner in state_funcs:
+        return "nonconservative_flux"
+    # ``coeff * Derivative(parameter, x)`` (e.g. ∂_x b for VAM where b
+    # is a parameter): not NC, not flux — it's just a source forcing.
+    inner_has_state = any(inner.has(f) for f in state_funcs)
+    if not inner_has_state:
+        return "source"
+    # ``coeff * Derivative(F(state), x)`` with state inside the
+    # derivative.  If ``coeff`` carries state too the term is not in
+    # clean conservative form — punt to source.
+    coeff_has_state = any(coeff.has(f) for f in state_funcs)
+    if coeff_has_state:
+        return "source"
+    if inner.has(gravity_param):
+        return "hydrostatic_pressure"
+    return "flux"
+
+
+def _auto_solver_tag(expr_or_leaf, *, state_funcs, gravity_param, t, x):
+    """Walk additive terms of ``expr_or_leaf`` and group them by
+    canonical solver tag.  Returns an :class:`Expression` carrying the
+    grouped solver tags so ``collect_solver_tag`` can extract them.
+    """
+    raw = (expr_or_leaf.expr
+           if isinstance(expr_or_leaf, Expression)
+           else sp.sympify(expr_or_leaf))
+    name = (expr_or_leaf.name
+            if isinstance(expr_or_leaf, Expression)
+            else "")
+    groups: dict[str, sp.Expr] = {}
+    for term in sp.Add.make_args(sp.expand(raw)):
+        if term == sp.S.Zero:
+            continue
+        tag = _classify_term(
+            term, state_funcs=state_funcs, gravity_param=gravity_param,
+            t=t, x=x,
+        )
+        groups[tag] = groups.get(tag, sp.S.Zero) + term
+    return Expression(raw, name).solver_tag(**groups)
 
 
 class VAMModelGalerkin(VAMModel):
@@ -153,14 +224,18 @@ class VAMModelGalerkin(VAMModel):
         sys.apply(Integrate(z, state.b, state.eta, method="auto"))
 
         # 5. Apply kinematic BCs at bottom + surface.  Surface KBC at
-        # z = η substitutes ``∂_t η = ∂_t b + ∂_t h``; the ``∂_t b``
-        # piece is dropped further below — after EvaluateIntegrals plus
-        # ``.doit()`` — so that compound atoms like
-        # ``Derivative(c·b, t)`` (where ``c`` is a basis-evaluation
-        # constant from EvaluateIntegrals) have collapsed into the bare
-        # ``Derivative(b, t)`` form the substitution can match.
+        # z = η substitutes ``∂_t η = ∂_t b + ∂_t h``; we then drop the
+        # ``∂_t b`` piece **immediately** while it is still a bare
+        # ``Derivative(b, t)`` atom — before EvaluateIntegrals can wrap
+        # it in compound ``Derivative(c·b, t)`` atoms (where ``c`` is a
+        # basis-evaluation constant).  This avoids needing a system-wide
+        # ``.doit()`` later, which would expand every conservative
+        # ``Derivative(F, x)`` flux atom and prevent solver-tag
+        # extraction in conservative form.  ``b(t, x)`` stays a Function
+        # of ``(t, x)`` — only the time derivative is zeroed.
         sys.apply(InterfaceKBC(state, state.b)).simplify()
         sys.apply(InterfaceKBC(state, state.eta)).simplify()
+        sys.apply({sp.Derivative(state.b, state.t): sp.S.Zero}).simplify()
 
         # 6. Surface BC for the non-hydrostatic pressure remainder
         # (applied at the field level so the integrand sees
@@ -184,18 +259,14 @@ class VAMModelGalerkin(VAMModel):
         self._chain_intermediate = copy.deepcopy(sys)
 
         # 8. Resolve the ζ integrals using the basis cache.  Leaves
-        # are now polynomial in ``(h, U_k, W_k, P_k, b)``.
+        # are now polynomial in ``(h, U_k, W_k, P_k, b)``.  Compound
+        # ``Derivative(F(Q), x)`` atoms are preserved (no system-wide
+        # ``.doit()``) so downstream tag extraction can read them as
+        # conservative fluxes.  EvaluateIntegrals can re-introduce
+        # ``Derivative(b, t)`` via boundary-evaluation pull-throughs
+        # in the test_1 (and higher) leaves; re-apply the static-bottom
+        # rule to clear them.
         sys.apply(EvaluateIntegrals(state)).simplify()
-
-        # 9. Drop ``∂_t b`` (static bottom).  Apply ``.doit()`` first so
-        # compound ``Derivative(c·b, t)`` atoms (where ``c`` is a
-        # basis-evaluation constant) distribute their constants out and
-        # produce the bare ``Derivative(b, t)`` atom that the
-        # substitution rule matches.  ``b(t, x)`` stays a Function on
-        # ``(t, x)`` — only the time derivative is zeroed, so transient
-        # bottom topography can be reintroduced by removing this
-        # substitution.
-        sys.doit()
         sys.apply({sp.Derivative(state.b, state.t): sp.S.Zero}).simplify()
 
         # 10. Bottom KBC modal closure: solve
@@ -259,14 +330,32 @@ class VAMModelGalerkin(VAMModel):
             cont_jk_alg = sp.expand(cont_jk.doit().subs(dt_h_sub))
             ordered.append((f"cont_j{k}", cont_jk_alg))
 
+        # 13. Auto-tag every chain-DAE row with canonical solver tags
+        # (time_derivative / flux / hydrostatic_pressure /
+        # nonconservative_flux / source).  The tagging is heuristic and
+        # term-by-term; once tagged the rows can be passed to
+        # ``collect_solver_tag`` to assemble F, P, B, S matrices on the
+        # SystemModel side without any hard-coded operator construction.
+        state_funcs = ([state.h] + coeffs_u + coeffs_w[:N_w]
+                       + coeffs_p[:N_p])
+        tagged = []
+        for name, expr in ordered:
+            tagged_expr = _auto_solver_tag(
+                Expression(expr, name=name),
+                state_funcs=state_funcs,
+                gravity_param=state.g,
+                t=state.t, x=state.x,
+            )
+            tagged.append((name, tagged_expr))
+
         self._chain_dae = PDESystem(
-            equations=[expr for _, expr in ordered],
+            equations=[expr for _, expr in tagged],
             fields=[state.h] + coeffs_u + coeffs_w[:N_w] + coeffs_p[:N_p],
             time=state.t,
             space=[state.x],
             parameters={state.g: state.g, state.rho: state.rho},
         )
-        self._chain_dae.equation_names = [n for n, _ in ordered]
+        self._chain_dae.equation_names = [n for n, _ in tagged]
         self._chain_dae_systemmodel = SystemModel.from_pdesystem(
             self._chain_dae)
 
