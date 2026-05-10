@@ -309,6 +309,67 @@ class SplitForPressureResult:
     SM_corr: "SystemModel"
 
 
+def _build_subsystem(
+    *,
+    eq_names,
+    eq_expressions,
+    state_funcs,
+    state_syms,
+    space,
+    time,
+    parameters,
+    aux_state,
+    equation_to_state_index,
+    gravity_param,
+    history_entry,
+):
+    """Build one stage SystemModel from a list of (named, raw-Expr)
+    equations.
+
+    Pipeline used:
+
+      1. Auto-tag every equation with canonical solver tags.
+      2. Wrap into a temporary ``PDESystem``.
+      3. Hand to :meth:`SystemModel.from_pdesystem` so F/P/B/S/M get
+         extracted from the tags via :func:`collect_solver_tag` —
+         the same path the parent chain DAE went through.
+
+    The returned SystemModel inherits ``equation_to_state_index``
+    overwritten on the result and an ``equation_names`` annotation
+    so :meth:`SystemModel.describe` can label the rows.
+    """
+    from zoomy_core.analysis.pde_system import PDESystem
+    from zoomy_core.model.models.system_model import SystemModel
+    from zoomy_core.model.models.tag_extraction import auto_solver_tag
+
+    x = space[0]
+    tagged = [
+        auto_solver_tag(
+            sp.expand(eq) if not hasattr(eq, "expr") else eq,
+            state_funcs=state_funcs,
+            t=time,
+            x=x,
+            gravity_param=gravity_param,
+        )
+        for eq in eq_expressions
+    ]
+    sub_pdesys = PDESystem(
+        equations=tagged,
+        fields=list(state_funcs),
+        time=time,
+        space=list(space),
+        parameters=dict(parameters),
+    )
+    sub_pdesys.equation_names = list(eq_names)
+
+    sm = SystemModel.from_pdesystem(sub_pdesys)
+    sm.aux_state = list(aux_state)
+    sm.equation_to_state_index = list(equation_to_state_index)
+    sm.equation_names = list(eq_names)
+    sm.history.append(history_entry)
+    return sm
+
+
 def split_for_pressure(pdesys, pressure_vars, dt, *, bottom=None):
     """Split a chain-DAE PDESystem into three :class:`SystemModel`
     sub-systems ``(SM_pred, SM_press, SM_corr)`` sharing the same
@@ -319,34 +380,35 @@ def split_for_pressure(pdesys, pressure_vars, dt, *, bottom=None):
     equation updates.  All other state entries are implicitly held
     constant by the stage (the runtime harness passes them through).
 
-    See :class:`SplitForPressureResult` for the per-stage
-    description of what each sub-system updates.
-    """
-    from zoomy_core.model.models.system_model import SystemModel
+    Implementation: every sub-system's equations are auto-tagged with
+    the same canonical solver-tag classifier the parent chain DAE
+    went through, then handed to :meth:`SystemModel.from_pdesystem` —
+    so F, P, B, S, M get **populated** on the sub-systems via the
+    same :func:`collect_solver_tag` pipeline as the parent.  The
+    sub-systems are not "fresh" objects with empty operator slots;
+    they are filtered/transformed restrictions of the parent's
+    operator surface.
 
+    See :class:`SplitForPressureResult` for the per-stage description.
+    """
     block = build_pressure_elliptic_block(pdesys, pressure_vars, dt,
                                           bottom=bottom)
 
     state_funcs = list(pdesys.fields)
     state_names = [f.func.__name__ for f in state_funcs]
     state_syms = [sp.Symbol(n, real=True) for n in state_names]
-    func_to_sym = dict(zip(state_funcs, state_syms))
 
     pressure_name_set = {p.func.__name__ for p in pressure_vars}
     pressure_indices = [
         i for i, n in enumerate(state_names) if n in pressure_name_set
     ]
-    non_pressure_indices = [
-        i for i in range(len(state_funcs)) if i not in pressure_indices
-    ]
 
     t = pdesys.time
     x = pdesys.space[0]
     space = list(pdesys.space)
-    n_state = len(state_funcs)
-    n_dim = len(space)
     params = (dict(pdesys.parameters)
               if hasattr(pdesys, "parameters") else {})
+    g_param = next((s for s in params if str(s) == "g"), None)
 
     # Stage-aux placeholders (Q_n, Q_star, P_new) — the runtime carries
     # the previous-stage output into the next stage via these.
@@ -360,13 +422,11 @@ def split_for_pressure(pdesys, pressure_vars, dt, *, bottom=None):
     pred_p_freeze = {pressure_vars[i]: Q_n[pressure_indices[i]]
                      for i in range(len(pressure_vars))}
     pred_eq_names = []
-    pred_eq_residuals = []
+    pred_eq_expressions = []
     pred_e2s_index = []
     for name, eq in zip(pdesys.equation_names, pdesys.equations):
         if name.startswith("cont_j"):
-            continue  # algebraic constraint rows belong to SM_press
-        # Determine which state entry this row updates.  By chain DAE
-        # naming convention: mass→h, xmom_jk→U_k, zmom_jk→W_k.
+            continue
         if name == "mass":
             target = "h"
         elif name.startswith("xmom_j"):
@@ -377,75 +437,53 @@ def split_for_pressure(pdesys, pressure_vars, dt, *, bottom=None):
             continue
         if target not in state_names:
             continue
-        # Substitute P → Q_n constants and convert state Functions to
-        # Symbols so the operator surface lines up with state_syms.
         eq_raw = eq.expr if hasattr(eq, "expr") else eq
+        # Freeze pressure entries at the previous time step's value.
         eq_pred = sp.expand(eq_raw.subs(pred_p_freeze))
         pred_eq_names.append(name)
-        pred_eq_residuals.append(eq_pred.xreplace(func_to_sym))
+        pred_eq_expressions.append(eq_pred)
         pred_e2s_index.append(state_names.index(target))
-
-    # Build mass matrix from the chain DAE's M_t (rows aligned with
-    # pred_eq_names).  Linearise the original chain rows around the
-    # symbolic state to get the mass-matrix coefficients per row.
-    from zoomy_core.analysis.linearisation import linearise
-    from zoomy_core.analysis.pencil import extract_quasilinear_pencil
-    base_state = {f: f for f in state_funcs}
-    sys_lin = linearise(pdesys, base_state)
-    M_t_full, _, _ = extract_quasilinear_pencil(sys_lin)
-    M_t_full = M_t_full.xreplace(func_to_sym)
-
-    pred_n_eq = len(pred_eq_names)
-    M_pred = sp.Matrix(pred_n_eq, n_state, lambda i, j:
-                       M_t_full[pdesys.equation_names.index(pred_eq_names[i]), j])
-    SM_pred = SystemModel(
-        time=t, space=space,
-        state=state_syms, aux_state=list(Q_n),
-        parameters=params,
-        flux=sp.zeros(pred_n_eq, n_dim),
-        hydrostatic_pressure=sp.zeros(pred_n_eq, n_dim),
-        nonconservative_matrix=sp.MutableDenseNDimArray.zeros(
-            pred_n_eq, n_state, n_dim),
-        source=sp.Matrix(pred_n_eq, 1,
-                         lambda i, _j: -pred_eq_residuals[i]),
-        mass_matrix=M_pred,
-        equation_to_state_index=pred_e2s_index,
+    SM_pred = _build_subsystem(
+        eq_names=pred_eq_names,
+        eq_expressions=pred_eq_expressions,
+        state_funcs=state_funcs, state_syms=state_syms,
+        space=space, time=t, parameters=params,
+        aux_state=Q_n, equation_to_state_index=pred_e2s_index,
+        gravity_param=g_param,
+        history_entry={
+            "name": "split_for_pressure[pred]",
+            "description": (
+                f"predictor: {len(pred_eq_names)} rows updating "
+                f"{[state_names[i] for i in pred_e2s_index]} with "
+                f"P_k frozen at Q_n_P_k"),
+        },
     )
-    SM_pred.history.append({
-        "name": "split_for_pressure[pred]",
-        "description": (f"predictor stage, {pred_n_eq} evolution rows "
-                        f"updating {[state_names[i] for i in pred_e2s_index]}"),
-    })
 
     # ── SM_press: elliptic block on pressure entries ─────────────────────
     press_eq_names = [f"elliptic_j{j}" for j in sorted(block["rows"])]
-    press_eq_residuals = [
-        sp.expand(block["rows"][j]).xreplace(func_to_sym)
-        for j in sorted(block["rows"])
+    press_eq_expressions = [
+        sp.expand(block["rows"][j]) for j in sorted(block["rows"])
     ]
-    press_n_eq = len(press_eq_names)
-    SM_press = SystemModel(
-        time=t, space=space,
-        state=state_syms, aux_state=list(Q_star),
-        parameters=params,
-        flux=sp.zeros(press_n_eq, n_dim),
-        hydrostatic_pressure=sp.zeros(press_n_eq, n_dim),
-        nonconservative_matrix=sp.MutableDenseNDimArray.zeros(
-            press_n_eq, n_state, n_dim),
-        source=sp.Matrix(press_n_eq, 1,
-                         lambda i, _j: -press_eq_residuals[i]),
-        mass_matrix=sp.zeros(press_n_eq, n_state),
+    SM_press = _build_subsystem(
+        eq_names=press_eq_names,
+        eq_expressions=press_eq_expressions,
+        state_funcs=state_funcs, state_syms=state_syms,
+        space=space, time=t, parameters=params,
+        aux_state=Q_star,
         equation_to_state_index=list(pressure_indices),
+        gravity_param=g_param,
+        history_entry={
+            "name": "split_for_pressure[press]",
+            "description": (
+                f"pressure: {len(press_eq_names)} algebraic rows "
+                f"determining {[p.func.__name__ for p in pressure_vars]} "
+                f"(Q ∖ P frozen at Q^*)"),
+        },
     )
-    SM_press.history.append({
-        "name": "split_for_pressure[press]",
-        "description": (f"pressure stage, {press_n_eq} algebraic rows "
-                        f"determining {[p.func.__name__ for p in pressure_vars]}"),
-    })
 
     # ── SM_corr: corrector updates on (U_k, W_k) ─────────────────────────
     corr_eq_names = []
-    corr_eq_residuals = []
+    corr_eq_expressions = []
     corr_e2s_index = []
     M_M = len(block["U_corr"]) - 1
     N_w_active = len(block["W_corr"])
@@ -457,9 +495,9 @@ def split_for_pressure(pdesys, pressure_vars, dt, *, bottom=None):
         U_corr_expr = block["U_corr"][k]
         for i_p, p in enumerate(pressure_vars):
             U_corr_expr = U_corr_expr.subs(p, P_new[i_p])
-        residual = sp.expand(U_k_func - U_corr_expr).xreplace(func_to_sym)
+        residual = sp.expand(U_k_func - U_corr_expr)
         corr_eq_names.append(f"corr_U_{k}")
-        corr_eq_residuals.append(residual)
+        corr_eq_expressions.append(residual)
         corr_e2s_index.append(state_names.index(target))
     for k in range(N_w_active):
         target = f"W_{k}"
@@ -469,34 +507,26 @@ def split_for_pressure(pdesys, pressure_vars, dt, *, bottom=None):
         W_corr_expr = block["W_corr"][k]
         for i_p, p in enumerate(pressure_vars):
             W_corr_expr = W_corr_expr.subs(p, P_new[i_p])
-        residual = sp.expand(W_k_func - W_corr_expr).xreplace(func_to_sym)
+        residual = sp.expand(W_k_func - W_corr_expr)
         corr_eq_names.append(f"corr_W_{k}")
-        corr_eq_residuals.append(residual)
+        corr_eq_expressions.append(residual)
         corr_e2s_index.append(state_names.index(target))
-    corr_n_eq = len(corr_eq_names)
-    SM_corr = SystemModel(
-        time=t, space=space,
-        state=state_syms, aux_state=list(Q_star) + list(P_new),
-        parameters=params,
-        flux=sp.zeros(corr_n_eq, n_dim),
-        hydrostatic_pressure=sp.zeros(corr_n_eq, n_dim),
-        nonconservative_matrix=sp.MutableDenseNDimArray.zeros(
-            corr_n_eq, n_state, n_dim),
-        source=sp.Matrix(corr_n_eq, 1,
-                         lambda i, _j: -corr_eq_residuals[i]),
-        mass_matrix=sp.zeros(corr_n_eq, n_state),
+    SM_corr = _build_subsystem(
+        eq_names=corr_eq_names,
+        eq_expressions=corr_eq_expressions,
+        state_funcs=state_funcs, state_syms=state_syms,
+        space=space, time=t, parameters=params,
+        aux_state=list(Q_star) + list(P_new),
         equation_to_state_index=corr_e2s_index,
+        gravity_param=g_param,
+        history_entry={
+            "name": "split_for_pressure[corr]",
+            "description": (
+                f"corrector: {len(corr_eq_names)} algebraic rows "
+                f"updating {[state_names[i] for i in corr_e2s_index]} "
+                f"via T_*[k](P^{{n+1}})"),
+        },
     )
-    SM_corr.history.append({
-        "name": "split_for_pressure[corr]",
-        "description": (f"corrector stage, {corr_n_eq} algebraic rows "
-                        f"updating {[state_names[i] for i in corr_e2s_index]}"),
-    })
-
-    # Attach descriptive equation_names so describe() can label the rows.
-    SM_pred.equation_names = pred_eq_names
-    SM_press.equation_names = press_eq_names
-    SM_corr.equation_names = corr_eq_names
 
     return SplitForPressureResult(
         SM_pred=SM_pred,
