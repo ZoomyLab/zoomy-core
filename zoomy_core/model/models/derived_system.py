@@ -418,19 +418,28 @@ class _NodeProxy:
         # Intermediate: concatenate children
         parts = []
         for key in node._filter_dict():
+            # ``\text{}`` in KaTeX rejects unescaped underscores
+            # (which would otherwise look like subscripts), so escape
+            # them in the row label.
+            label = key.replace("_", r"\_")
             child = getattr(node, key)
             if isinstance(child, Expression):
-                parts.append(f"\\text{{{key}}}: {child.latex(**kwargs)} = 0")
+                parts.append(f"\\text{{{label}}}: {child.latex(**kwargs)} = 0")
             elif _is_intermediate(child):
                 child_proxy = _NodeProxy(self._system, self._path + (key,))
-                parts.append(f"\\text{{{key}}}: {child_proxy.latex(**kwargs)}")
+                parts.append(f"\\text{{{label}}}: {child_proxy.latex(**kwargs)}")
         return r"\\ ".join(parts)
 
     def _repr_latex_(self):
         node = self._node
         if isinstance(node, Expression):
             return node._repr_latex_()
-        return f"${self.latex()}$"
+        # Forward ``strip_args=True`` to ``Expression.latex`` so the
+        # ``_StripArgsLatexPrinter`` handles 2-arg basis-function calls
+        # like ``phi_w(0, ζ(t,x,z))`` — sympy's default printer would
+        # produce ``\phi_{w}{\left(...\right)}`` which KaTeX rejects
+        # as a double-subscript construct.
+        return f"${self.latex(strip_args=True)}$"
 
     def describe(self, **kwargs):
         from zoomy_core.misc.description import Description
