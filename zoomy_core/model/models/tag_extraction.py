@@ -257,3 +257,74 @@ def _enforce_untagged_policy(eq, eq_name, policy):
         import warnings
         warnings.warn(msg, stacklevel=3)
     # policy == "ignore" → do nothing
+
+
+# ---------------------------------------------------------------------------
+# Heuristic auto-tagger
+# ---------------------------------------------------------------------------
+
+def _classify_term(term, *, state_funcs, gravity_param, t, x):
+    """Classify a single PDE term by canonical solver-tag category.
+
+    Heuristic (priority-ordered):
+
+    - any ``Derivative(*, t)`` atom → ``time_derivative``
+    - ``coeff * Derivative(state_var, x)`` (deriv arg is a single state
+      Function) → ``nonconservative_flux``
+    - ``coeff * Derivative(parameter, x)`` (deriv of pure parameter)
+      → ``source``
+    - ``coeff(state) * Derivative(F(state), x)`` (state coeff on a
+      compound deriv argument) → ``source`` (too complex for the
+      flux/NC slots)
+    - ``Derivative(F(state), x)`` with state-independent coeff and
+      ``g·state`` inside → ``hydrostatic_pressure``
+    - ``Derivative(F(state), x)`` with state-independent coeff
+      → ``flux``
+    - everything else (no derivative, …) → ``source`` (catch-all).
+    """
+    if any(isinstance(d, sp.Derivative) and t in d.variables
+           for d in term.atoms(sp.Derivative)):
+        return "time_derivative"
+    coeff, deriv = _split_coeff_and_derivative(term)
+    if deriv is None:
+        return "source"
+    if len(deriv.variables) != 1 or deriv.variables[0] != x:
+        return "source"
+    inner = deriv.args[0]
+    if inner in state_funcs:
+        return "nonconservative_flux"
+    inner_has_state = any(inner.has(f) for f in state_funcs)
+    if not inner_has_state:
+        return "source"
+    coeff_has_state = any(coeff.has(f) for f in state_funcs)
+    if coeff_has_state:
+        return "source"
+    if gravity_param is not None and inner.has(gravity_param):
+        return "hydrostatic_pressure"
+    return "flux"
+
+
+def auto_solver_tag(expr_or_leaf, *, state_funcs, t, x, gravity_param=None):
+    """Walk additive terms and auto-tag with canonical solver tags.
+
+    Returns an :class:`Expression` carrying the grouped solver tags so
+    :func:`collect_solver_tag` can extract operator matrices from it.
+    """
+    from zoomy_core.model.models.ins_generator import Expression
+
+    raw = (expr_or_leaf.expr
+           if isinstance(expr_or_leaf, Expression)
+           else sp.sympify(expr_or_leaf))
+    name = (expr_or_leaf.name
+            if isinstance(expr_or_leaf, Expression)
+            else "")
+    groups: dict[str, sp.Expr] = {}
+    for term in sp.Add.make_args(sp.expand(raw)):
+        if term == sp.S.Zero:
+            continue
+        tag = _classify_term(
+            term, state_funcs=state_funcs, gravity_param=gravity_param,
+            t=t, x=x,
+        )
+        groups[tag] = groups.get(tag, sp.S.Zero) + term
+    return Expression(raw, name).solver_tag(**groups)

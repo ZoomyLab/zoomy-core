@@ -312,7 +312,8 @@ class SystemModel:
                     return M.xreplace(func_to_sym)
                 out = sp.MutableDenseNDimArray.zeros(*M.shape)
                 for idx in _iter_indices(M.shape):
-                    out[idx] = M[idx].xreplace(func_to_sym)
+                    entry = sp.sympify(M[idx])
+                    out[idx] = entry.xreplace(func_to_sym)
                 return out
 
             F_func = collect_solver_tag(

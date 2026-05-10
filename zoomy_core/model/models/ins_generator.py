@@ -1469,6 +1469,23 @@ class _StripArgsLatexPrinter(_LatexPrinter):
     _z = sp.Symbol("z", real=True)
     _zeta = sp.Symbol("zeta", real=True)
 
+    def _print_Subs(self, subs):
+        """KaTeX-friendly ``Subs(expr, vars, vals)`` rendering.
+
+        Sympy's default uses ``\\substack{ var=val }``, which KaTeX
+        (Jupyter / VSCode) does not implement.  For the single-variable
+        case we drop ``\\substack`` entirely and render
+        ``\\left.expr\\right|_{var=val}``; for multi-variable we fall
+        back to a comma-joined subscript still without ``\\substack``.
+        """
+        expr, old, new = subs.args
+        latex_expr = self._print(expr)
+        latex_subs = ", ".join(
+            f"{self._print(o)}={self._print(n)}"
+            for o, n in zip(old, new)
+        )
+        return r"\left. %s \right|_{%s}" % (latex_expr, latex_subs)
+
     @staticmethod
     def _is_canonical_zeta(bar_value):
         """True for the reference-element ζ-symbol *or* the opaque
@@ -1591,7 +1608,10 @@ class _StripArgsLatexPrinter(_LatexPrinter):
                     and not zeta_canonical):
                 value_tex = self.doprint(bar_value)
                 var_tex = self.doprint(bar_var)
-                tex = r"\left. %s \right|_{\substack{ %s=%s }}" % (
+                # KaTeX (used by Jupyter / VSCode notebook renderers)
+                # does not implement ``\substack``; use a plain
+                # ``\left.…\right|_{x=v}`` instead.
+                tex = r"\left. %s \right|_{%s=%s}" % (
                     tex, var_tex, value_tex)
             # else: canonical call — strip args entirely.
         else:

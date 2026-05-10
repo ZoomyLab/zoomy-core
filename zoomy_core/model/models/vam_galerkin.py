@@ -54,77 +54,8 @@ from zoomy_core.model.models.ins_generator import (
     ProductRule,
     StateSpace,
 )
-from zoomy_core.model.models.tag_extraction import _split_coeff_and_derivative
+from zoomy_core.model.models.tag_extraction import auto_solver_tag
 from zoomy_core.model.models.vam_model import VAMModel
-
-
-def _classify_term(term, *, state_funcs, gravity_param, t, x):
-    """Classify a single chain-DAE term by canonical solver-tag category.
-
-    Heuristic (priority-ordered):
-
-    - any ``Derivative(*, t)`` atom → ``time_derivative``
-    - ``coeff * Derivative(F(state), x)`` with state-independent coeff
-      and ``g·state`` inside → ``hydrostatic_pressure``
-    - ``coeff * Derivative(F(state), x)`` with state-independent coeff
-      → ``flux``
-    - ``coeff * Derivative(state_var, x)`` (deriv arg is a single state
-      Function) → ``nonconservative_flux``
-    - everything else (no derivative, derivative of parameter, …)
-      → ``source`` (the catch-all).
-    """
-    if any(isinstance(d, sp.Derivative) and t in d.variables
-           for d in term.atoms(sp.Derivative)):
-        return "time_derivative"
-    coeff, deriv = _split_coeff_and_derivative(term)
-    if deriv is None:
-        return "source"
-    if len(deriv.variables) != 1 or deriv.variables[0] != x:
-        return "source"
-    inner = deriv.args[0]
-    # ``coeff * Derivative(state_var, x)`` is the non-conservative
-    # product the NC slot was made for — regardless of whether ``coeff``
-    # has state in it (collect_solver_tag stores ``coeff`` at
-    # ``B[row, state_idx, x_idx]``).
-    if inner in state_funcs:
-        return "nonconservative_flux"
-    # ``coeff * Derivative(parameter, x)`` (e.g. ∂_x b for VAM where b
-    # is a parameter): not NC, not flux — it's just a source forcing.
-    inner_has_state = any(inner.has(f) for f in state_funcs)
-    if not inner_has_state:
-        return "source"
-    # ``coeff * Derivative(F(state), x)`` with state inside the
-    # derivative.  If ``coeff`` carries state too the term is not in
-    # clean conservative form — punt to source.
-    coeff_has_state = any(coeff.has(f) for f in state_funcs)
-    if coeff_has_state:
-        return "source"
-    if inner.has(gravity_param):
-        return "hydrostatic_pressure"
-    return "flux"
-
-
-def _auto_solver_tag(expr_or_leaf, *, state_funcs, gravity_param, t, x):
-    """Walk additive terms of ``expr_or_leaf`` and group them by
-    canonical solver tag.  Returns an :class:`Expression` carrying the
-    grouped solver tags so ``collect_solver_tag`` can extract them.
-    """
-    raw = (expr_or_leaf.expr
-           if isinstance(expr_or_leaf, Expression)
-           else sp.sympify(expr_or_leaf))
-    name = (expr_or_leaf.name
-            if isinstance(expr_or_leaf, Expression)
-            else "")
-    groups: dict[str, sp.Expr] = {}
-    for term in sp.Add.make_args(sp.expand(raw)):
-        if term == sp.S.Zero:
-            continue
-        tag = _classify_term(
-            term, state_funcs=state_funcs, gravity_param=gravity_param,
-            t=t, x=x,
-        )
-        groups[tag] = groups.get(tag, sp.S.Zero) + term
-    return Expression(raw, name).solver_tag(**groups)
 
 
 class VAMModelGalerkin(VAMModel):
@@ -301,15 +232,19 @@ class VAMModelGalerkin(VAMModel):
         from zoomy_core.analysis import PDESystem
         from zoomy_core.model.models.system_model import SystemModel
 
-        # 12. Substitute the mass equation ``∂_t h = -∂_x(h U_0)`` into
-        # the cont_j algebraic rows so they are purely algebraic in
-        # ``(h, U_k, W_k, P_k, ∂_x ·)`` — no time derivatives.  This is
-        # what makes them DAE algebraic constraints (zero-row in the
-        # mass matrix).
-        mass_expr = sys._tree.continuity.test_0.expr
-        # mass = ∂_t h + ∂_x(h U_0) ⇒ ∂_t h = -∂_x(h U_0).
-        dt_h_sub = {sp.Derivative(state.h, state.t):
-                    -sp.Derivative(state.h * coeffs_u[0], state.x).doit()}
+        # 12. Substitute the mass equation into the cont_j algebraic
+        # rows so they are purely algebraic in ``(h, U_k, W_k, P_k,
+        # ∂_x ·)`` — no time derivatives.  This is what makes them DAE
+        # algebraic constraints (zero-row in the mass matrix).  Derive
+        # the ``∂_t h = …`` substitution **from** the mass leaf via
+        # :meth:`Expression.solve_for` instead of hardcoding it; if
+        # the chain produces a different mass form (different
+        # normalisation, conservative variables, …) the rule follows
+        # automatically.
+        mass_leaf = sys._tree.continuity.test_0
+        mass_expr = mass_leaf.expr
+        dt_h_relation = mass_leaf.solve_for(sp.Derivative(state.h, state.t))
+        dt_h_sub = dt_h_relation._as_relation
 
         # Row order: mass evolution first (continuity.test_0), then
         # x-momentum (test_0..M), z-momentum (test_0..N_w-1), then the
@@ -340,7 +275,7 @@ class VAMModelGalerkin(VAMModel):
                        + coeffs_p[:N_p])
         tagged = []
         for name, expr in ordered:
-            tagged_expr = _auto_solver_tag(
+            tagged_expr = auto_solver_tag(
                 Expression(expr, name=name),
                 state_funcs=state_funcs,
                 gravity_param=state.g,
