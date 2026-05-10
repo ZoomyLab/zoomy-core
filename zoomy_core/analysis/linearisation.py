@@ -72,7 +72,10 @@ def linearise(system: PDESystem, base_state: Dict, *, eps=None,
     # so we fall back to ``sp.series`` to Taylor-expand to first order.
     lin_eqs = []
     for eq in system.equations:
-        eq_sub = eq.xreplace(repl)
+        # Unwrap Expression objects (which carry solver tags but lack
+        # xreplace) to their bare sympy expr for the linearisation math.
+        eq_raw = eq.expr if hasattr(eq, "expr") and hasattr(eq, "_term_tags") else eq
+        eq_sub = eq_raw.xreplace(repl)
         eq_sub = eq_sub.doit()
         try:
             lin = sp.expand(eq_sub).coeff(eps, 1)

@@ -984,6 +984,14 @@ class Expression(SymbolicBase):
     def has(self, *args):
         return self.expr.has(*args)
 
+    def atoms(self, *types):
+        return self.expr.atoms(*types)
+
+    def xreplace(self, rule):
+        return Expression(self.expr.xreplace(rule), self.name,
+                          term_tags=self._term_tags,
+                          tag_order=self._tag_order)
+
     @property
     def free_symbols(self):
         return self.expr.free_symbols
