@@ -683,8 +683,16 @@ class DAESolver(Solver):
 
     def project_to_manifold(self, Q, *, time=0.0, tol=1e-10, maxit=20):
         """Newton-project ``Q`` onto the algebraic constraint manifold
-        ``f_I[alg] = 0`` by adjusting algebraic state entries."""
-        Y = self._Q_to_Y(Q)
+        ``f_I[alg] = 0`` by adjusting algebraic state entries.
+
+        Aborts (returns the original ``Q``) if the Newton residual
+        does not decrease or if any iterate becomes non-finite — the
+        caller can then proceed with the un-projected IC and let the
+        IMEX-ARK Newton (which uses a more conservative update) do
+        the projection.
+        """
+        Y0 = self._Q_to_Y(Q)
+        Y = Y0.copy()
         nc = self.nc
         n_state = self.n_state
         alg_idx = self.alg_idx
@@ -693,19 +701,29 @@ class DAESolver(Solver):
         alg_rows = np.concatenate([
             c * n_state + alg_idx for c in range(nc)
         ])
+        prev_norm = np.inf
         for _ in range(maxit):
             f = self.f_I(time, Y)
+            if not np.all(np.isfinite(f)):
+                return Q
             f_alg = f[alg_rows]
-            if np.linalg.norm(f_alg) < tol:
+            norm = float(np.linalg.norm(f_alg))
+            if norm < tol:
                 return self._Y_to_Q(Y)
+            # Divergence guard: residual must drop monotonically once
+            # within an order of magnitude of the initial norm; let it
+            # increase early but bail if it explodes.
+            if norm > 1e3 * prev_norm and prev_norm != np.inf:
+                return Q
+            prev_norm = norm
             J = self.J_I(time, Y)
             sub = J[np.ix_(alg_rows, alg_rows)]
             try:
                 delta = np.linalg.solve(sub, -f_alg)
             except np.linalg.LinAlgError:
-                # Singular algebraic block — give up gracefully and
-                # let the first IMEX Newton step do the projection.
-                break
+                return Q
+            if not np.all(np.isfinite(delta)):
+                return Q
             Y[alg_rows] += delta
         return self._Y_to_Q(Y)
 
