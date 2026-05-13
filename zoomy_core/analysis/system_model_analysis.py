@@ -117,9 +117,7 @@ def plane_wave_dispersion(
       assemble the full plane-wave matrix ``M(ω, k)`` from the
       linearised system and solve ``det M(ω, k) = 0`` for the true
       ``ω(k)`` curves — symbolic functions of ``k`` rather than just
-      eigenvalues at a fixed base state.  This matches what
-      :func:`zoomy_core.analysis.plane_wave_dispersion` does on a
-      ``PDESystem``, but starting from a ``SystemModel`` directly.
+      eigenvalues at a fixed base state.
     * ``return_omega_k=False`` (legacy): return only generalised
       eigenvalues of ``(M_x, M_t)`` — phase velocities at the base
       state, no ``k``-dependence.

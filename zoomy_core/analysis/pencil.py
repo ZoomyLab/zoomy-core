@@ -20,9 +20,9 @@ For the principal symbol (high-k limit, or systems with M_0 = 0):
     A_n q̂ = λ M_t q̂          A_n := Σ_a n_a M_xa.
 
 This module extracts ``(M_t, [M_xa], M_0)`` mechanically from a
-linearised ``PDESystem`` and computes the generalised eigenvalues
-either symbolically (``sp.solve(charpoly)``) or numerically
-(``scipy.linalg.eig``).
+linearised :class:`SystemModel` and computes the generalised
+eigenvalues either symbolically (``sp.solve(charpoly)``) or
+numerically (``scipy.linalg.eig``).
 """
 from __future__ import annotations
 
@@ -31,48 +31,49 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import sympy as sp
 
-from .pde_system import PDESystem
-
 
 # ---------------------------------------------------------------------------
 # Pencil extraction
 # ---------------------------------------------------------------------------
 
-def extract_quasilinear_pencil(linear_system: PDESystem
+def extract_quasilinear_pencil(linear_sm
                               ) -> Tuple[sp.Matrix, List[sp.Matrix], sp.Matrix]:
-    """Extract ``(M_t, [M_xa], M_0)`` from a *linearised* PDE system.
+    """Extract ``(M_t, [M_xa], M_0)`` from a *linearised* SystemModel.
 
-    Each equation must be linear in the perturbation fields and their
-    first derivatives; nonlinear remnants raise ``ValueError``.  Higher
-    derivatives (∂_xx, ∂_tt, ∂_xt) are also surfaced as a non-zero
-    extra structure — see ``M_higher`` returned in the optional 4th
-    element when ``return_higher=True`` (not on by default).
+    Each entry of the linearised SystemModel's operator slots is
+    expected to be linear in the perturbation state.
 
     Returns
     -------
-    M_t    : (n_eq × n_field) sp.Matrix — coefficient of ∂_t δq_j.
-    M_xa   : list of (n_eq × n_field) sp.Matrix — one per spatial axis.
-    M_0    : (n_eq × n_field) sp.Matrix — coefficient of δq_j (no derivative).
+    M_t    : (n_eq × n_state) sp.Matrix — coefficient of ∂_t δq_j.
+    M_xa   : list of (n_eq × n_state) sp.Matrix — one per spatial axis.
+    M_0    : (n_eq × n_state) sp.Matrix — coefficient of δq_j (no derivative).
     """
-    eqs = linear_system.equations
-    fields = linear_system.fields
-    t = linear_system.time
-    spaces = linear_system.space
-    n_eq = len(eqs)
-    n_field = len(fields)
-    n_dim = len(spaces)
+    n_eq = linear_sm.n_equations
+    n_state = linear_sm.n_state
+    n_dim = linear_sm.n_dim
+    state = list(linear_sm.state)
 
-    M_t = sp.zeros(n_eq, n_field)
-    M_xa = [sp.zeros(n_eq, n_field) for _ in range(n_dim)]
-    M_0 = sp.zeros(n_eq, n_field)
+    # M_t straight from the linearised mass matrix.
+    M_t = sp.Matrix(linear_sm.mass_matrix)
 
-    for i, eq in enumerate(eqs):
-        eq_e = sp.expand(eq)
-        for j, f in enumerate(fields):
-            M_t[i, j] = eq_e.coeff(sp.Derivative(f, t))
-            for a, x_a in enumerate(spaces):
-                M_xa[a][i, j] = eq_e.coeff(sp.Derivative(f, x_a))
-            M_0[i, j] = eq_e.coeff(f)
+    # Spatial: M_xa[a][i, j] = ∂(F[i, a] + P[i, a])/∂(δq_j) + B[i, j, a].
+    M_xa = [sp.zeros(n_eq, n_state) for _ in range(n_dim)]
+    for a in range(n_dim):
+        for i in range(n_eq):
+            f_ia = sp.sympify(linear_sm.flux[i, a])
+            p_ia = sp.sympify(linear_sm.hydrostatic_pressure[i, a])
+            for j in range(n_state):
+                jac = sp.diff(f_ia, state[j]) + sp.diff(p_ia, state[j])
+                b_ija = sp.sympify(linear_sm.nonconservative_matrix[i, j, a])
+                M_xa[a][i, j] = sp.expand(jac + b_ija)
+
+    # M_0: residual sign is ``... − S``; so M_0[i, j] = −∂S[i]/∂(δq_j).
+    M_0 = sp.zeros(n_eq, n_state)
+    for i in range(n_eq):
+        s_i = sp.sympify(linear_sm.source[i, 0])
+        for j in range(n_state):
+            M_0[i, j] = sp.expand(-sp.diff(s_i, state[j]))
 
     return M_t, M_xa, M_0
 
@@ -113,31 +114,27 @@ def _eval_matrix_numerically(M: sp.Matrix, sub: Dict, dtype=complex):
     return arr
 
 
-def symbolic_eigenvalues_at(system, base_state: Dict, *,
+def symbolic_eigenvalues_at(sm, base_state: Dict, *,
                             axis: int = 0,
                             simplify: bool = True
                             ) -> List[sp.Expr]:
-    """One-shot helper: linearise ``system`` at ``base_state``, extract
-    the principal-symbol pencil ``(M_x_axis, M_t)``, and return the
-    symbolic generalised eigenvalues.
+    """One-shot helper: linearise ``sm`` (a SystemModel) at
+    ``base_state``, extract the principal-symbol pencil
+    ``(M_x_axis, M_t)``, and return the symbolic generalised
+    eigenvalues.
 
     Args:
-        system:      a ``PDESystem``.
-        base_state:  dict ``{field: value}`` for every field — values
-                     may be sympy symbols (kept symbolic) or numbers.
+        sm:          a :class:`SystemModel`.
+        base_state:  dict ``{state_sym: value}`` for every state entry.
         axis:        which spatial direction's pencil to use (default 0).
         simplify:    apply ``sp.expand`` to the characteristic poly.
 
     Returns:
-        list of symbolic eigenvalues.  May contain irrational
-        expressions (radicals); for higher-order systems sympy may not
-        return closed forms — use ``sample_generalised_eigenvalues`` in
-        that case.
+        list of symbolic eigenvalues.
     """
-    # Imported here to avoid a circular import at module load.
     from .linearisation import linearise
-    sys_lin = linearise(system, base_state)
-    M_t, M_xa, _ = extract_quasilinear_pencil(sys_lin)
+    sm_lin = linearise(sm, base_state)
+    M_t, M_xa, _ = extract_quasilinear_pencil(sm_lin)
     return generalised_eigenvalues(M_xa[axis], M_t, simplify=simplify)
 
 

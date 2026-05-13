@@ -1,10 +1,10 @@
 """Sample-based hyperbolicity test.
 
-Given a linearised ``PDESystem`` (or a model with a quasilinear matrix
-already in hand), evaluate the generalised eigenvalues at a grid /
-random sample of base states and check the imaginary parts.  Reports
-the fraction of samples that are hyperbolic (all eigenvalues real to
-within tolerance) and a summary of any non-hyperbolic regions.
+Given a linearised :class:`SystemModel` (or pencil matrices already in
+hand), evaluate the generalised eigenvalues at a grid / random sample
+of base states and check the imaginary parts.  Reports the fraction of
+samples that are hyperbolic (all eigenvalues real to within tolerance)
+and a summary of any non-hyperbolic regions.
 """
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import sympy as sp
 
-from .pde_system import PDESystem
 from .pencil import (
     extract_quasilinear_pencil,
     sample_generalised_eigenvalues,
