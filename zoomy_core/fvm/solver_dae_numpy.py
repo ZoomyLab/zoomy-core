@@ -75,6 +75,17 @@ class DAESolver(Solver):
     nc_integration_order = param.Integer(default=3, bounds=(1, 8),
                             doc="Gauss-Legendre quadrature order for "
                                 "the non-conservative path integral")
+    well_balanced = param.Boolean(default=True,
+                            doc="If True, apply Audusse-Bristeau-Klein "
+                                "hydrostatic reconstruction (h_L*, h_R* "
+                                "= max(0, h + b − b*)) before the "
+                                "Rusanov flux + add the (P_raw − P_star) "
+                                "pressure-jump terms to the NC "
+                                "fluctuations.  Required for "
+                                "lake-at-rest preservation over "
+                                "varying bathymetry.  ``h`` and ``b`` "
+                                "are auto-located in state / Qaux via "
+                                ":class:`FieldHandle`-style lookup.")
     jacobian_mode = param.Selector(default="sparse_fd",
                             objects=["sparse_fd", "dense_fd"],
                             doc="Newton Jacobian assembly strategy.  "
@@ -150,6 +161,12 @@ class DAESolver(Solver):
             if name.startswith("U_") or name == "u":
                 self._u_idx_cached = i
                 break
+
+        # Field handles for hydrostatic reconstruction (``h``, ``b``).
+        # Searched in state then aux_state — works regardless of where
+        # bathymetry lives (Q-state for legacy SWE, Qaux for chain DAE).
+        self._h_loc = self._find_field_location("h")
+        self._b_loc = self._find_field_location("b")
 
         # IC from model.
         Q = np.zeros((n_state, nc))
@@ -294,6 +311,60 @@ class DAESolver(Solver):
             dtype=float,
         )
 
+    def _find_field_location(self, name):
+        """Return ``("state", idx)`` if ``name`` is a state variable
+        of ``self.sm``, ``("aux", idx)`` if an aux variable, else
+        ``None``.  Numpy analogue of ``Numerics.find_field``.
+        """
+        state_names = [str(s) for s in self.sm.state]
+        if name in state_names:
+            return ("state", state_names.index(name))
+        aux_names = [str(s) for s in self.sm.aux_state]
+        if name in aux_names:
+            return ("aux", aux_names.index(name))
+        return None
+
+    @staticmethod
+    def _read_field(loc, q, qaux):
+        return q[loc[1]] if loc[0] == "state" else qaux[loc[1]]
+
+    @staticmethod
+    def _write_field(loc, q, qaux, value):
+        if loc[0] == "state":
+            q[loc[1]] = value
+        else:
+            qaux[loc[1]] = value
+
+    def _hydrostatic_reconstruction(self, Q_L, Qaux_L, Q_R, Qaux_R):
+        """Audusse-Bristeau-Klein reconstruction.  Returns the
+        ``*``-state versions of (Q_L, Qaux_L, Q_R, Qaux_R) with ``h``
+        and ``b`` slots updated.  If ``h`` or ``b`` isn't located in
+        the model, returns the inputs unchanged."""
+        if (self._h_loc is None or self._b_loc is None
+                or not self.well_balanced):
+            return Q_L, Qaux_L, Q_R, Qaux_R
+        bL = self._read_field(self._b_loc, Q_L, Qaux_L)
+        bR = self._read_field(self._b_loc, Q_R, Qaux_R)
+        hL = self._read_field(self._h_loc, Q_L, Qaux_L)
+        hR = self._read_field(self._h_loc, Q_R, Qaux_R)
+        b_star = max(bL, bR)
+        hL_star = max(0.0, hL + bL - b_star)
+        hR_star = max(0.0, hR + bR - b_star)
+        # Copies so we don't mutate the caller's arrays.
+        Q_Ls = np.array(Q_L, copy=True)
+        Q_Rs = np.array(Q_R, copy=True)
+        Qaux_Ls = np.array(Qaux_L, copy=True)
+        Qaux_Rs = np.array(Qaux_R, copy=True)
+        self._write_field(self._h_loc, Q_Ls, Qaux_Ls, hL_star)
+        self._write_field(self._h_loc, Q_Rs, Qaux_Rs, hR_star)
+        self._write_field(self._b_loc, Q_Ls, Qaux_Ls, b_star)
+        self._write_field(self._b_loc, Q_Rs, Qaux_Rs, b_star)
+        # The chain state is primitive (U_k, W_k, …) so no depth-
+        # rescaling of conservative momenta is needed; if a future
+        # model uses conservative state, add hu_k → (h_star/h_eff)·hu_k
+        # here.
+        return Q_Ls, Qaux_Ls, Q_Rs, Qaux_Rs
+
     # ------------------------------------------------------------------
     # Residual assembly (Rusanov flux + NC fluctuations + source)
     # ------------------------------------------------------------------
@@ -366,28 +437,37 @@ class DAESolver(Solver):
                 Qaux_R = Qaux[:, cB]
                 inner_is_A = True
 
-            # Rusanov conservative flux F + P.
-            FL = (np.asarray(self.rt.flux(Q_L, Qaux_L, p), dtype=float)
+            # Hydrostatic reconstruction (well-balanced): rewrite h,b
+            # on both sides so dissipation across the bump vanishes at
+            # lake-at-rest.  At zero topography this is a no-op.
+            Q_Ls, Qaux_Ls, Q_Rs, Qaux_Rs = (
+                self._hydrostatic_reconstruction(
+                    Q_L, Qaux_L, Q_R, Qaux_R,
+                )
+            )
+
+            # Rusanov conservative flux F + P on the *-states.
+            FL = (np.asarray(self.rt.flux(Q_Ls, Qaux_Ls, p), dtype=float)
                   .reshape(n_state, dim)
                   + np.asarray(self.rt.hydrostatic_pressure(
-                      Q_L, Qaux_L, p), dtype=float).reshape(n_state, dim))
-            FR = (np.asarray(self.rt.flux(Q_R, Qaux_R, p), dtype=float)
+                      Q_Ls, Qaux_Ls, p), dtype=float).reshape(n_state, dim))
+            FR = (np.asarray(self.rt.flux(Q_Rs, Qaux_Rs, p), dtype=float)
                   .reshape(n_state, dim)
                   + np.asarray(self.rt.hydrostatic_pressure(
-                      Q_R, Qaux_R, p), dtype=float).reshape(n_state, dim))
-            s_L = self._cell_max_eigenvalue(Q_L)
-            s_R = self._cell_max_eigenvalue(Q_R)
+                      Q_Rs, Qaux_Rs, p), dtype=float).reshape(n_state, dim))
+            s_L = self._cell_max_eigenvalue(Q_Ls)
+            s_R = self._cell_max_eigenvalue(Q_Rs)
             s_max = max(s_L, s_R)
             num_flux = (0.5 * (FL + FR) @ normal
-                        - 0.5 * s_max * (Q_R - Q_L))
+                        - 0.5 * s_max * (Q_Rs - Q_Ls))
 
-            # NC path-integral fluctuations.
-            dQ = Q_R - Q_L
-            dAux = Qaux_R - Qaux_L
+            # NC path-integral fluctuations on the *-states.
+            dQ = Q_Rs - Q_Ls
+            dAux = Qaux_Rs - Qaux_Ls
             A_n = np.zeros((n_state, n_state))
             for xi, wi in zip(xi_nodes, wi_nodes):
-                Q_path = Q_L + xi * dQ
-                Qaux_path = Qaux_L + xi * dAux
+                Q_path = Q_Ls + xi * dQ
+                Qaux_path = Qaux_Ls + xi * dAux
                 B_path = np.asarray(
                     self.rt.nonconservative_matrix(Q_path, Qaux_path, p),
                     dtype=float,
@@ -401,6 +481,29 @@ class DAESolver(Solver):
             diss[0] = 0.0
             Dp = 0.5 * (adv + diss)
             Dm = 0.5 * (adv - diss)
+
+            # Pressure-jump correction (well-balanced reconstruction):
+            # add ``(P_raw − P_star)·n`` from the *-state mismatch so
+            # cell A sees ``Dm + (P_L_raw − P_L_*)·n`` and cell B sees
+            # ``Dp + (P_R_* − P_R_raw)·n``.
+            if (self.well_balanced and self._h_loc is not None
+                    and self._b_loc is not None):
+                P_L_raw = np.asarray(
+                    self.rt.hydrostatic_pressure(Q_L, Qaux_L, p),
+                    dtype=float).reshape(n_state, dim)
+                P_R_raw = np.asarray(
+                    self.rt.hydrostatic_pressure(Q_R, Qaux_R, p),
+                    dtype=float).reshape(n_state, dim)
+                P_L_star = np.asarray(
+                    self.rt.hydrostatic_pressure(Q_Ls, Qaux_Ls, p),
+                    dtype=float).reshape(n_state, dim)
+                P_R_star = np.asarray(
+                    self.rt.hydrostatic_pressure(Q_Rs, Qaux_Rs, p),
+                    dtype=float).reshape(n_state, dim)
+                Dm_jump = (P_L_raw - P_L_star) @ normal
+                Dp_jump = (P_R_star - P_R_raw) @ normal
+                Dm = Dm + Dm_jump
+                Dp = Dp + Dp_jump
 
             if f in self._bf_face_to_idx:
                 c_in = cA if inner_is_A else cB
