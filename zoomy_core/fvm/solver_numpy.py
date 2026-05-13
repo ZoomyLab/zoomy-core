@@ -50,18 +50,6 @@ def _param_value(model, name, default=None):
     return default
 
 
-def _detect_field_map(model):
-    if hasattr(model, "get_field_map"):
-        return model.get_field_map()
-    keys = list(model.variables.keys())
-    field_map = {}
-    if "h" in keys:
-        field_map["h"] = {"container": "q", "index": keys.index("h")}
-    if "b" in keys:
-        field_map["b"] = {"container": "q", "index": keys.index("b")}
-    return field_map
-
-
 def _detect_scaled_q_indices(model):
     if hasattr(model, "numerics_scaled_q_indices"):
         return model.numerics_scaled_q_indices
@@ -693,18 +681,13 @@ class HyperbolicSolver(Solver):
 # -- Free-surface variant ------------------------------------------------------
 
 def _build_free_surface_numerics(symbolic_model):
-    """Build positive Rusanov for free-surface models (requires h/b)."""
-    keys = list(symbolic_model.variables.keys())
-    if "h" not in keys or "b" not in keys:
-        raise ValueError(
-            f"Free-surface solver requires 'h' and 'b' in model variables, "
-            f"got {keys}. Use HyperbolicSolver for general models."
-        )
-    field_map = _detect_field_map(symbolic_model)
+    """Build positive Rusanov for free-surface models.  ``h`` and
+    ``b`` are auto-located in ``model.variables`` or
+    ``model.aux_variables`` via :class:`FieldHandle` — no explicit
+    ``field_map`` is needed."""
     scaled_q_indices = _detect_scaled_q_indices(symbolic_model)
     return PositiveNonconservativeRusanov(
         symbolic_model,
-        field_map=field_map,
         scaled_q_indices=scaled_q_indices,
     )
 

@@ -1,4 +1,12 @@
-"""Symbolic Riemann solvers: Rusanov, positive, nonconservative variants."""
+"""Symbolic Riemann solvers: Rusanov, positive, nonconservative variants.
+
+Every index-dependent class (``PositiveRusanov``, ``NonconservativeRusanov``,
+``PositiveNonconservativeRusanov``, …) auto-locates the named fields
+``h`` and ``b`` (and ``hinv`` when present) in ``model.variables`` /
+``model.aux_variables`` via :class:`FieldHandle` so the same Riemann
+code path works whether bathymetry is part of the conservative state
+(legacy SWE) or lives in ``Qaux`` (chain-DAE convention).
+"""
 
 import numpy as np
 import param
@@ -11,20 +19,77 @@ from zoomy_core.model.kernel_functions import max_wavespeed
 from zoomy_core.transformation.to_numpy import NumpyRuntimeSymbolic
 
 
+class FieldHandle:
+    """A named field resolved to either ``Q`` (state) or ``Qaux``.
+
+    Looks up the location at construction time via :meth:`Numerics.find_field`,
+    then exposes the symbolic Symbol on the **minus / plus / state** side of
+    a face so callers can write reconstruction code without knowing where
+    the field lives.
+
+    Attributes
+    ----------
+    name : str
+        Field name (e.g. ``"h"``, ``"b"``, ``"hinv"``).
+    container : {"q", "qaux"}
+        Which array carries this field.
+    index : int
+        Index into that array.
+    minus, plus, state : sympy.Symbol
+        Direct references — ``minus`` and ``plus`` are the per-face
+        symbolic state on the L / R side of a Rusanov face; ``state``
+        is the cell-centre reference.  Using these in symbolic code
+        produces the same lambdified output as ``Q[index]`` /
+        ``Qaux[index]`` — a true placeholder.
+    """
+
+    __slots__ = ("name", "container", "index", "minus", "plus", "state")
+
+    def __init__(self, name, container, index, minus, plus, state):
+        if container not in {"q", "qaux"}:
+            raise ValueError(
+                f"FieldHandle({name}): container must be 'q' or 'qaux', "
+                f"got {container!r}"
+            )
+        self.name = name
+        self.container = container
+        self.index = index
+        self.minus = minus
+        self.plus = plus
+        self.state = state
+
+    def access(self, q_array, qaux_array):
+        """Return ``q_array[index]`` or ``qaux_array[index]``
+        depending on container.  Works for symbolic ``ZArray`` and
+        numeric numpy arrays alike."""
+        return (q_array[self.index] if self.container == "q"
+                else qaux_array[self.index])
+
+    def assign(self, q_array, qaux_array, value):
+        """In-place write into the appropriate container."""
+        if self.container == "q":
+            q_array[self.index] = value
+        else:
+            qaux_array[self.index] = value
+
+    def __repr__(self):
+        return (f"FieldHandle({self.name!r}: "
+                f"{self.container}[{self.index}])")
+
+
 class Numerics(param.Parameterized, SymbolicRegistrar):
-    """Numerics. (class)."""
+    """Numerics. (class).
+
+    Subclasses that depend on the location of named fields (``h``,
+    ``b``, ``hinv``, …) call :meth:`find_field` at the top of their
+    own ``__init__`` to obtain a :class:`FieldHandle` — the search
+    walks state then aux automatically, so the same numerics works
+    whether bathymetry is in ``Q`` (legacy SWE) or in ``Qaux``
+    (chain-DAE)."""
+
     name = param.String(default="NumericsV2")
     model = param.ClassSelector(class_=Model, is_instance=True)
 
-    # Field map format:
-    # {
-    #   "h": {"container": "q", "index": 1},
-    #   "b": {"container": "q", "index": 0},
-    #   "hinv": {"container": "qaux", "index": 0},  # optional
-    # }
-    field_map = param.Dict(
-        default=None, allow_None=True,
-    )
     scaled_q_indices = param.List(default=None, allow_None=True)
 
     def __init__(self, model, **params):
@@ -47,13 +112,66 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         self.flux_plus = self._create_v("flux_plus", self.model.n_variables)
         self.source_term = self._create_v("source_term", self.model.n_variables)
 
-        if self.field_map:
-            self._field_map = self._normalize_and_validate_field_map(self.field_map)
-        else:
-            self._field_map = {}
+        # Auto-locate the standard named fields (``h``, ``b``, ``hinv``)
+        # if present.  Subclasses can call ``find_field`` to register
+        # additional handles.
+        self._field_handles = {}
+        for name in ("h", "b", "hinv"):
+            h = self.find_field(name, required=False)
+            if h is not None:
+                self._field_handles[name] = h
         self._scaled_q_indices = self._resolve_scaled_q_indices(self.scaled_q_indices)
 
         self._initialize_functions()
+
+    # ── Field-search API ──────────────────────────────────────────
+
+    def find_field(self, name, *, required=True):
+        """Return a :class:`FieldHandle` for the named field.
+
+        Searches ``self.model.variables`` (Q) first, then
+        ``self.model.aux_variables`` (Qaux).  Caches the result in
+        ``self._field_handles[name]`` so repeat lookups are free.
+
+        Parameters
+        ----------
+        name : str
+        required : bool
+            If True (default), raise ``KeyError`` when the field is
+            in neither container.  Otherwise return ``None``.
+        """
+        cache = getattr(self, "_field_handles", None) or {}
+        if name in cache:
+            return cache[name]
+        state_list = self.model.variables.get_list()
+        state_names = [str(s) for s in state_list]
+        if name in state_names:
+            i = state_names.index(name)
+            h = FieldHandle(name, "q", i,
+                            minus=self.variables_minus[i],
+                            plus=self.variables_plus[i],
+                            state=self.variables[i])
+            cache[name] = h
+            return h
+        aux_list = self.model.aux_variables.get_list()
+        aux_names = [str(s) for s in aux_list]
+        if name in aux_names:
+            i = aux_names.index(name)
+            h = FieldHandle(name, "qaux", i,
+                            minus=self.aux_variables_minus[i],
+                            plus=self.aux_variables_plus[i],
+                            state=self.aux_variables[i])
+            cache[name] = h
+            return h
+        if required:
+            raise KeyError(
+                f"Field {name!r} not found in model.variables "
+                f"({state_names}) nor model.aux_variables ({aux_names})"
+            )
+        return None
+
+    def has_field(self, name):
+        return self.find_field(name, required=False) is not None
 
     def _create_v(self, name, size):
         """Internal helper `_create_v`."""
@@ -61,35 +179,10 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         v._symbolic_name = name
         return v
 
-    def _normalize_and_validate_field_map(self, field_map):
-        """Internal helper `_normalize_and_validate_field_map`."""
-        if "h" not in field_map or "b" not in field_map:
-            raise ValueError("field_map must define entries for both 'h' and 'b'.")
-
-        out = {}
-        for key, spec in field_map.items():
-            if not isinstance(spec, dict):
-                raise TypeError(f"field_map['{key}'] must be a dict.")
-            if "container" not in spec or "index" not in spec:
-                raise ValueError(
-                    f"field_map['{key}'] must contain 'container' and 'index'."
-                )
-            container = str(spec["container"])
-            index = int(spec["index"])
-            if container not in {"q", "qaux"}:
-                raise ValueError(
-                    f"field_map['{key}']['container'] must be 'q' or 'qaux', got '{container}'."
-                )
-            upper = self.model.n_variables if container == "q" else self.model.n_aux_variables
-            if index < 0 or index >= upper:
-                raise IndexError(
-                    f"field_map['{key}'] index {index} out of bounds for {container} (size={upper})."
-                )
-            out[key] = {"container": container, "index": index}
-        return out
-
     def _resolve_scaled_q_indices(self, scaled_q_indices):
-        """Internal helper `_resolve_scaled_q_indices`."""
+        """Internal helper `_resolve_scaled_q_indices`.  Default excludes
+        ``h`` and ``b`` from the depth-scaled Q rows when they live in
+        the state."""
         if scaled_q_indices is not None:
             cleaned = [int(i) for i in scaled_q_indices]
             for i in cleaned:
@@ -100,26 +193,11 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
             return cleaned
 
         excluded = set()
-        for key in ("h", "b"):
-            if key in self._field_map:
-                spec = self._field_map[key]
-                if spec["container"] == "q":
-                    excluded.add(spec["index"])
+        for name in ("h", "b"):
+            h = self._field_handles.get(name)
+            if h is not None and h.container == "q":
+                excluded.add(h.index)
         return [i for i in range(self.model.n_variables) if i not in excluded]
-
-    def _field_value(self, field_name, q_state, qaux_state):
-        """Internal helper `_field_value`."""
-        spec = self._field_map[field_name]
-        arr = q_state if spec["container"] == "q" else qaux_state
-        return arr[spec["index"]]
-
-    def _set_field_value(self, field_name, q_state, qaux_state, value):
-        """Internal helper `_set_field_value`."""
-        spec = self._field_map[field_name]
-        if spec["container"] == "q":
-            q_state[spec["index"]] = value
-        else:
-            qaux_state[spec["index"]] = value
 
     def _eps_symbol(self):
         """Internal helper `_eps_symbol`."""
@@ -229,11 +307,9 @@ class Rusanov(Numerics):
             Id[i, i] = 1
         # Exclude bottom-topography from Rusanov dissipation when b is part of
         # the conservative state. This preserves the stationary bed variable.
-        b_spec = self._field_map["b"]
-        if b_spec["container"] == "q":
-            b_idx = b_spec["index"]
-            if 0 <= b_idx < self.model.n_variables:
-                Id[b_idx, b_idx] = 0
+        b = self._field_handles.get("b")
+        if b is not None and b.container == "q":
+            Id[b.index, b.index] = 0
         return Id
 
     def get_viscosity_identity_fluctuations(self):
@@ -268,8 +344,23 @@ class Rusanov(Numerics):
 
 
 class PositiveRusanov(Rusanov):
-    """PositiveRusanov. (class)."""
+    """PositiveRusanov. (class).
+
+    Hydrostatic reconstruction follows Audusse-Bristeau-Klein:
+    ``h_L* = max(0, h_L + b_L − b*)``, ``b* = max(b_L, b_R)``.
+    The ``h``, ``b`` and (optional) ``hinv`` fields are resolved via
+    :meth:`Numerics.find_field` so the same logic works whether
+    bathymetry is part of conservative state or lives in ``Qaux``.
+    """
+
     name = param.String(default="PositiveRusanovV2")
+
+    def __init__(self, model, **params):
+        super().__init__(model=model, **params)
+        # Cache the field handles for tight access in the reconstruction.
+        self.h_field = self.find_field("h")
+        self.b_field = self.find_field("b")
+        self.hinv_field = self.find_field("hinv", required=False)
 
     def hydrostatic_reconstruction(self, qL, qR, auxL, auxR):
         """Hydrostatic reconstruction."""
@@ -278,10 +369,10 @@ class PositiveRusanov(Rusanov):
         qauxL = ZArray(auxL)
         qauxR = ZArray(auxR)
 
-        bL = self._field_value("b", qL, auxL)
-        bR = self._field_value("b", qR, auxR)
-        hL = self._field_value("h", qL, auxL)
-        hR = self._field_value("h", qR, auxR)
+        bL = self.b_field.access(qL, auxL)
+        bR = self.b_field.access(qR, auxR)
+        hL = self.h_field.access(qL, auxL)
+        hR = self.h_field.access(qR, auxR)
 
         b_star = sp.Max(bL, bR)
         hL_star = sp.Max(0.0, hL + bL - b_star)
@@ -291,18 +382,18 @@ class PositiveRusanov(Rusanov):
         hL_eff = sp.Max(hL, eps)
         hR_eff = sp.Max(hR, eps)
 
-        self._set_field_value("b", qLs, qauxL, b_star)
-        self._set_field_value("b", qRs, qauxR, b_star)
-        self._set_field_value("h", qLs, qauxL, hL_star)
-        self._set_field_value("h", qRs, qauxR, hR_star)
+        self.b_field.assign(qLs, qauxL, b_star)
+        self.b_field.assign(qRs, qauxR, b_star)
+        self.h_field.assign(qLs, qauxL, hL_star)
+        self.h_field.assign(qRs, qauxR, hR_star)
 
         for idx in self._scaled_q_indices:
             qLs[idx] = qL[idx] * hL_star / hL_eff
             qRs[idx] = qR[idx] * hR_star / hR_eff
 
-        if "hinv" in self._field_map:
-            self._set_field_value("hinv", qLs, qauxL, 1 / (hL_star + eps))
-            self._set_field_value("hinv", qRs, qauxR, 1 / (hR_star + eps))
+        if self.hinv_field is not None:
+            self.hinv_field.assign(qLs, qauxL, 1 / (hL_star + eps))
+            self.hinv_field.assign(qRs, qauxR, 1 / (hR_star + eps))
 
         return qLs, qRs, qauxL, qauxR
 
@@ -386,12 +477,9 @@ class NonconservativeRusanov(Rusanov):
         for i in range(n):
             Id[i, i] = 1
         # Preserve stationary bed variable when b is part of conservative state.
-        if "b" in self._field_map:
-            b_spec = self._field_map["b"]
-            if b_spec["container"] == "q":
-                b_idx = b_spec["index"]
-                if 0 <= b_idx < self.model.n_variables:
-                    Id[b_idx, b_idx] = 0
+        b = self._field_handles.get("b")
+        if b is not None and b.container == "q":
+            Id[b.index, b.index] = 0
         return Id
 
     def numerical_fluctuations(self):
