@@ -434,7 +434,11 @@ def generate_vtk(
         field_names = field_names + aux_field_names
 
         vertex_coordinates_3d = np.zeros((mesh.vertex_coordinates.shape[1], 3))
-        vertex_coordinates_3d[:, : mesh.dimension] = mesh.vertex_coordinates.T
+        # mesh.vertex_coordinates has shape (3, N) with zeros in unused
+        # rows for 1D / 2D meshes — slice to dim before assignment.
+        vertex_coordinates_3d[:, : mesh.dimension] = (
+            mesh.vertex_coordinates.T[:, : mesh.dimension]
+        )
 
         _write_to_vtk_from_vertices_edges(
             os.path.join(path, output_vtk),

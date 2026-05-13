@@ -145,7 +145,55 @@ class Solver(param.Parameterized):
         return Q
 
     def update_qaux(self, Q, Qaux, Qold, Qauxold, mesh, model, parameters, time, dt):
+        """Default: walk ``model._chain_systemmodel.aux_registry`` (or
+        ``self._sm.aux_registry`` if set up that way) and fill every
+        ``kind == 'derivative'`` row via ``LSQMesh.compute_derivatives``
+        on the underlying source field (state Q for state derivatives,
+        Qaux for derivatives of function-aux entries).
+
+        Subclasses override to supply the ``kind == 'function'`` rows
+        (e.g. user-supplied bathymetry, time-dependent forcing) and
+        call ``super().update_qaux(...)`` to handle the derivative
+        part.
+
+        No-op if no SystemModel / registry is attached.
+        """
+        sm = self._sm_from_solver_or_model(model)
+        if sm is None:
+            return Qaux
+        registry = getattr(sm, "aux_registry", None) or []
+        if not registry:
+            return Qaux
+        nc = Q.shape[1]
+        n_cells = mesh.n_cells
+        u_full = np.zeros(n_cells)
+        for entry in registry:
+            if entry["kind"] != "derivative":
+                continue
+            row = entry["row"]
+            mi = entry["multi_index"]
+            tk = entry["target_kind"]
+            if tk == "state":
+                u_full[:nc] = Q[entry["state_index"], :]
+            elif tk == "function":
+                u_full[:nc] = Qaux[entry["function_row"], :]
+            else:
+                # Unknown target — leave whatever the caller put there.
+                continue
+            u_full[nc:] = 0.0
+            d = mesh.compute_derivatives(
+                u_full, degree=max(mi), derivatives_multi_index=[mi],
+            )
+            Qaux[row, :] = d[:nc, 0]
         return Qaux
+
+    def _sm_from_solver_or_model(self, model):
+        """Look up the SystemModel: prefer ``self.sm`` (when the
+        solver was built that way), else ``model._chain_systemmodel``
+        if present, else None."""
+        if hasattr(self, "sm") and self.sm is not None:
+            return self.sm
+        return getattr(model, "_chain_systemmodel", None)
 
 
 # -- HyperbolicSolver ----------------------------------------------------------

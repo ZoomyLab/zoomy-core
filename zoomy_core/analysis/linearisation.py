@@ -1,14 +1,15 @@
-"""Generic linearisation around a base state.
+"""Generic linearisation around a base state for a :class:`SystemModel`.
 
-Replaces every state field ``q(t, x[, y, ...])`` in a ``PDESystem``'s
-equations with ``q_0 + ε δq(t, x[, y, ...])``, expands to first order
-in ε, and returns a new ``PDESystem`` whose fields are the
-perturbations ``δq``.
+Replaces every state slot ``q`` in the SystemModel's operator-form
+residual ``M·∂_t Q + ∂_x F + ∂_x P + B·∂_x Q − S`` with
+``q_0 + ε δq``, expands to first order in ε, and returns a new
+:class:`SystemModel` whose state is the perturbation vector ``δq``.
 
-Works for arbitrary equations — differential, algebraic, or mixed.
-The base values ``q_0`` may themselves be expressions in coordinates
-(useful when the steady state is non-uniform, e.g. a varying bottom
-profile ``b(x)``).
+Works for arbitrary state shapes — differential or algebraic rows
+(zero mass-matrix rows pass through unchanged in form).  The base
+values ``q_0`` may themselves be expressions in coordinates (useful
+when the steady state is non-uniform, e.g. a varying bottom profile
+``b(x)``).
 """
 from __future__ import annotations
 
@@ -16,84 +17,118 @@ from typing import Dict
 
 import sympy as sp
 
-from .pde_system import PDESystem
 
+def linearise(sm, base_state: Dict, *, eps=None, simplify=True):
+    """Insert ``Q = Q_0 + ε δQ``, expand, return O(ε) SystemModel.
 
-def _delta_function(field, prefix=r"\delta "):
-    """Construct ``δq(*args)`` for a state field ``q(*args)``."""
-    head = field.func
-    name = head.__name__ if hasattr(head, "__name__") else str(head)
-    delta_head = sp.Function(prefix + name, real=True)
-    return delta_head(*field.args)
+    Parameters
+    ----------
+    sm : SystemModel
+        Input operator-form system.
+    base_state : dict
+        Maps each entry in ``sm.state`` to its base value (a scalar
+        or an expression in coordinates).
+    eps : sympy Symbol, optional
+        Small parameter; created internally if None.
+    simplify : bool
+        Apply ``sp.expand`` to each linearised operator entry.
 
-
-def linearise(system: PDESystem, base_state: Dict, *, eps=None,
-              simplify=True) -> PDESystem:
-    """Insert ``q = q_0 + ε δq``, expand, return O(ε) system.
-
-    Args:
-        system:      the input PDE system.
-        base_state:  dict mapping each field in ``system.fields`` to its
-                     base value (can be a constant or an expression in
-                     coordinates).
-        eps:         small parameter symbol; created internally if None.
-        simplify:    apply ``sp.expand`` to each linearised equation.
-
-    Returns:
-        a new ``PDESystem`` whose ``equations`` are the O(ε)
-        coefficients and whose ``fields`` are the perturbation
-        ``δq`` Function-calls (in the same order as the input fields).
+    Returns
+    -------
+    SystemModel
+        New SystemModel whose state is ``[δq_0, …, δq_{n-1}]`` and
+        whose operator matrices are linearised around ``base_state``.
     """
+    from zoomy_core.model.models.system_model import SystemModel
+
     if eps is None:
         eps = sp.Symbol("epsilon", positive=True)
 
-    if set(base_state.keys()) != set(system.fields):
-        missing = set(system.fields) - set(base_state.keys())
-        extra = set(base_state.keys()) - set(system.fields)
+    if set(base_state.keys()) != set(sm.state):
+        missing = set(sm.state) - set(base_state.keys())
+        extra = set(base_state.keys()) - set(sm.state)
         raise ValueError(
-            f"base_state must list every field; missing={missing!r}, "
-            f"extra={extra!r}."
+            f"base_state must list every state entry; "
+            f"missing={missing!r}, extra={extra!r}."
         )
 
-    # Build replacement map: q → q_0 + ε δq.
-    delta_fields = []
+    # Build the perturbation state and the substitution map.
+    delta_state = []
     repl = {}
-    for f in system.fields:
-        df = _delta_function(f)
-        delta_fields.append(df)
-        repl[f] = base_state[f] + eps * df
+    for s in sm.state:
+        name = str(s)
+        delta = sp.Symbol(rf"\delta {name}", real=True)
+        delta_state.append(delta)
+        repl[s] = base_state[s] + eps * delta
 
-    # Substitute and extract O(ε) coefficient.  ``xreplace`` propagates
-    # through ``Derivative`` atoms — we then call ``.doit()`` so the
-    # outer derivative distributes onto the new linear sum.  For
-    # equations with rational nonlinearities (e.g. ``q²/h`` in
-    # conservative-variable strong form), ``expand().coeff(eps, 1)``
-    # alone fails because ``1/(h₀ + ε δh)`` is not a polynomial in ε —
-    # so we fall back to ``sp.series`` to Taylor-expand to first order.
-    lin_eqs = []
-    for eq in system.equations:
-        # Unwrap Expression objects (which carry solver tags but lack
-        # xreplace) to their bare sympy expr for the linearisation math.
-        eq_raw = eq.expr if hasattr(eq, "expr") and hasattr(eq, "_term_tags") else eq
-        eq_sub = eq_raw.xreplace(repl)
-        eq_sub = eq_sub.doit()
+    # F, P, S are functions of Q evaluated INSIDE a derivative
+    # ``∂_x F(Q)`` in the residual; their linearisation is the O(ε)
+    # coefficient of ``F(Q_0 + ε δQ)`` (= ``∇F(Q_0)·δQ``).
+    base_only = {s: base_state[s] for s in sm.state}
+
+    def _lin_func(expr):
+        e = sp.sympify(expr).xreplace(repl)
         try:
-            lin = sp.expand(eq_sub).coeff(eps, 1)
-            # ``coeff`` silently drops ε-dependent rationals; cross-check
-            # that no ε remains in the result and fall back if it does.
+            lin = sp.expand(e).coeff(eps, 1)
             if lin.has(eps):
                 raise ValueError("ε-dependent residue after coeff")
         except (sp.PolynomialError, ValueError, AttributeError):
-            lin = sp.series(eq_sub, eps, 0, 2).removeO().coeff(eps, 1)
+            lin = sp.series(e, eps, 0, 2).removeO().coeff(eps, 1)
         if simplify:
             lin = sp.expand(lin)
-        lin_eqs.append(lin)
+        return lin
 
-    return PDESystem(
-        equations=lin_eqs,
-        fields=delta_fields,
-        time=system.time,
-        space=list(system.space),
-        parameters=dict(system.parameters),
-        aux_fields=list(system.aux_fields),
+    # M, B are coefficients of ∂_t Q[j] and ∂_x Q[j] respectively.  The
+    # residual contribution is e.g. ``M[i, j](Q)·∂_t Q[j]``; with
+    # ``∂_t Q = ε ∂_t δQ`` the O(ε) coefficient is ``M[i, j](Q_0)·∂_t δQ[j]``.
+    # So M_lin[i, j] = M[i, j] evaluated AT Q_0 (NOT a coefficient of ε).
+    def _eval_at_base(expr):
+        e = sp.sympify(expr).xreplace(base_only)
+        if simplify:
+            e = sp.expand(e)
+        return e
+
+    n_eq = sm.n_equations
+    n_st = sm.n_state
+    n_dim = sm.n_dim
+
+    F_lin = sp.zeros(n_eq, n_dim)
+    P_lin = sp.zeros(n_eq, n_dim)
+    M_lin = sp.zeros(n_eq, n_st)
+    S_lin = sp.zeros(n_eq, 1)
+    B_lin = sp.MutableDenseNDimArray.zeros(n_eq, n_st, n_dim)
+
+    for i in range(n_eq):
+        for d in range(n_dim):
+            F_lin[i, d] = _lin_func(sm.flux[i, d])
+            P_lin[i, d] = _lin_func(sm.hydrostatic_pressure[i, d])
+        S_lin[i, 0] = _lin_func(sm.source[i, 0])
+        for j in range(n_st):
+            M_lin[i, j] = _eval_at_base(sm.mass_matrix[i, j])
+            for d in range(n_dim):
+                B_lin[i, j, d] = _eval_at_base(
+                    sm.nonconservative_matrix[i, j, d])
+
+    sm_lin = SystemModel(
+        time=sm.time,
+        space=list(sm.space),
+        state=delta_state,
+        aux_state=list(sm.aux_state),
+        parameters=dict(sm.parameters),
+        flux=F_lin,
+        hydrostatic_pressure=P_lin,
+        nonconservative_matrix=B_lin,
+        source=S_lin,
+        mass_matrix=M_lin,
+        equation_to_state_index=(
+            list(sm.equation_to_state_index)
+            if sm.equation_to_state_index is not None else None
+        ),
     )
+    if hasattr(sm, "equation_names"):
+        sm_lin.equation_names = list(sm.equation_names)
+    sm_lin.history.append({
+        "name": "linearise",
+        "description": f"linearised around base_state ({len(base_state)} fields)",
+    })
+    return sm_lin

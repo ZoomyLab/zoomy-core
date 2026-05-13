@@ -1,24 +1,15 @@
 """Solve a system of algebraic constraints jointly + substitute.
 
-Given a PDESystem with algebraic constraint equations that determine
-some fields (e.g. ``w_0..w_N`` from the continuity j>=1 + KBC bottom
-projections), this module:
+Given a list of differential equations + algebraic constraint
+equations that determine some fields (e.g. ``w_0..w_N`` from the
+continuity j>=1 + KBC bottom projections), this module:
 
   1. Solves the constraint subset as a single linear system in the
      constrained fields (using ``sp.solve``).
   2. Substitutes the solution into the remaining (evolution)
      equations.
 
-The result is a reduced PDESystem on the evolved fields only — what
-the standard derivations (K&T 2019, Aguillon 2026, Escalante 2024 eq 4)
-produce by construction.
-
-Why this matters: setting constrained fields to zero (as
-``w_N_as_input=True`` does in vam_builder) gives a different system,
-because the constraints aren't enforced — they're just ignored.
-Solving the constraints jointly produces the algebraically-equivalent
-reduced system that has the SAME spectral structure as standard
-formulations.
+The result is a reduced equation list on the evolved fields only.
 """
 from __future__ import annotations
 

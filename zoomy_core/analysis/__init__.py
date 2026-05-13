@@ -1,17 +1,14 @@
 """Generic linear-analysis tools for shallow-water-family PDE systems.
 
-The unified entry point is :class:`PDESystem` — a thin wrapper around a
-list of sympy equations (LHS = 0), the state fields, and the
-coordinate symbols.  Every analysis routine accepts a ``PDESystem``
-and never inspects model-specific attributes.
+The unified analysis entry point is :class:`SystemModel` (in
+:mod:`zoomy_core.model.models.system_model`).  Every analysis routine
+in this package consumes a SystemModel and never inspects
+model-specific attributes.
 
-This package replaces the model-bound interfaces of
-``zoomy_core.model.analysis_linear`` and the basemodel-coupled
-``eigenvalues()``/``quasilinear_matrix()`` paths for the *analysis*
-half of the workflow.  Models may continue to use those for
-derivation; once an equation set is in hand, this package handles:
+Package contents:
 
-* Linearisation around a base state.
+* Linearisation around a base state (:func:`linearise`) — operates on a
+  SystemModel, returns a SystemModel of perturbation fields.
 * Plane-wave dispersion analysis (`ω(k)` solutions).
 * Generalised-eigenvalue ("pencil") form for systems with constraints.
 * Numerical eigenvalue sampling for hyperbolicity over a parameter
@@ -20,7 +17,6 @@ derivation; once an equation set is in hand, this package handles:
 The library knows nothing about VAM, SME, ML-SWE, etc. — every
 model-specific bit is in tutorials/.
 """
-from .pde_system import PDESystem
 from .linearisation import linearise
 from .plane_wave import plane_wave_dispersion, plane_wave_matrix
 from .pencil import (
@@ -40,7 +36,6 @@ from .plotting import (
 )
 
 __all__ = [
-    "PDESystem",
     "linearise",
     "plane_wave_dispersion",
     "plane_wave_matrix",
