@@ -505,6 +505,204 @@ struct SimpleArray {
 
 
 # =========================================================================
+#  2b. OUT-PARAMETER CODE PRINTER (shared JS / GLSL base)
+# =========================================================================
+
+
+class OutParamCodePrinter(GenericCppBase):
+    """Shared base for the out-parameter code printers (JS, GLSL).
+
+    Generated kernels return ``void`` / nothing and write their result
+    through a trailing ``res`` array parameter the caller owns — no
+    per-call heap allocation, which is what keeps the browser solver
+    fast.  The body-generation, Piecewise handling and kernel/BC
+    wrapping all live here; subclasses supply the language-specific
+    bits via :meth:`_temp_decl`, :meth:`_generate_args` and
+    :meth:`wrap_function_signature`.
+    """
+
+    # ``parameters`` is the BoundaryCondition Function's key for the
+    # model parameter vector; map it onto the same ``p`` accessor.
+    ARG_MAPPING = {**GenericCppBase.ARG_MAPPING, "parameters": "p"}
+
+    @staticmethod
+    def _shape_size(shape):
+        """Total number of components for a (possibly nested) shape."""
+        total = 1
+        for s in shape:
+            total *= s
+        return total
+
+    # ── Language hooks ───────────────────────────────────────────────
+
+    def _temp_decl(self, lhs, rhs):
+        """Declaration line for one CSE temporary.  Default is a
+        JS-style ``const``; GLSL overrides to pick ``bool`` / ``float``."""
+        return f"const {self.doprint(lhs)} = {self.doprint(rhs)};"
+
+    def _generate_args(self, func_obj, shape):
+        """Parameter list for a Function object, including the trailing
+        ``res`` out-parameter.  Language-specific — must be overridden."""
+        raise NotImplementedError
+
+    # ── Piecewise ────────────────────────────────────────────────────
+
+    def _print_Piecewise(self, expr):
+        """Nested *scalar* Piecewise → a chained ternary.
+
+        The top-level vector Piecewise (a boundary-condition dispatch)
+        is handled by :meth:`_print_piecewise_structure`; this prints a
+        scalar Piecewise appearing *inside* an expression — e.g. a
+        piecewise-linear Q(t) interpolation.
+        """
+        args = list(expr.args)
+        last = args[-1]
+        if last.cond is True or last.cond == sp.true:
+            result = f"({self._print(last.expr)})"
+            rest = args[:-1]
+        else:
+            # Exhaustive-but-no-literal-True chains (e.g. the time
+            # interpolation) — the fallback is never reached.
+            result = "0.0"
+            rest = args
+        for pair in reversed(rest):
+            cond = self.doprint(pair.cond)
+            val = self._print(pair.expr)
+            result = f"(({cond}) ? ({val}) : ({result}))"
+        return result
+
+    # ── Body generation (out-parameter, no return) ───────────────────
+
+    def convert_expression_body(self, expr, shape, target="res"):
+        """Convert an expression into a body that writes ``target`` — the
+        function's out-parameter array.  No local declaration, no
+        ``return``."""
+        if isinstance(expr, sp.Piecewise):
+            return self._print_piecewise_structure(expr, shape, target)
+
+        flat_expr = (
+            list(sp.flatten(expr))
+            if hasattr(expr, "__iter__") and not isinstance(expr, sp.Matrix)
+            else list(expr)
+            if isinstance(expr, sp.Matrix)
+            else [expr]
+        )
+        call_defs, optim_exprs = self._optimize_array_calls(flat_expr)
+        if call_defs:
+            raise NotImplementedError(
+                "out-parameter printer: nested array-valued function "
+                "calls are not supported"
+            )
+
+        total = self._shape_size(shape)
+        lines = []
+        if optim_exprs:
+            temps, simplified = sp.cse(
+                optim_exprs, symbols=sp.numbered_symbols("t")
+            )
+            for lhs, rhs in temps:
+                lines.append(self._temp_decl(lhs, rhs))
+            result_array = sp.Array(simplified).reshape(*shape)
+            for indices in itertools.product(*[range(s) for s in shape]):
+                val = self.doprint(result_array[indices])
+                lines.append(self.format_assignment(target, indices, val, shape))
+        else:
+            for i in range(total):
+                lines.append(f"{target}[{i}] = 0.0;")
+        return "\n".join("    " + ln for ln in lines)
+
+    def _print_piecewise_structure(self, expr, shape, target):
+        """Emit an if / else-if chain assigning into ``target``.
+
+        ``target`` is zero-initialised first so any fall-through (a
+        Piecewise with no final ``True`` branch — e.g. a
+        boundary-condition dispatch) is well-defined."""
+        total = self._shape_size(shape)
+        lines = [f"    {target}[{i}] = 0.0;" for i in range(total)]
+        for i, arg in enumerate(expr.args):
+            val, cond = (
+                (arg.expr, arg.cond) if hasattr(arg, "expr") else (arg[0], arg[1])
+            )
+            if cond is True or cond == sp.true:
+                if i == 0:
+                    return self.convert_expression_body(val, shape, target)
+                lines.append("    } else {")
+            elif i == 0:
+                lines.append(f"    if ({self.doprint(cond)}) {{")
+            else:
+                lines.append(f"    }} else if ({self.doprint(cond)}) {{")
+            lines.append(
+                textwrap.indent(
+                    self.convert_expression_body(val, shape, target), "    "
+                )
+            )
+        lines.append("    }")
+        return "\n".join(lines)
+
+    # ── Kernel / boundary-condition generation ───────────────────────
+
+    def _generate_kernel(self, name, func_obj):
+        """Generate one out-parameter kernel from a Function object.
+
+        Returns ``None`` for a zero-size result (a zero-component
+        out-parameter is pointless and GLSL forbids it)."""
+        expr = func_obj.definition
+        expr = self._expand_vector_conditionals(expr)
+        if isinstance(expr, (list, tuple)):
+            expr = self._flatten_ragged_list(expr)
+            expr = sp.Array(expr)
+        shape, expr = get_nested_shape(expr)
+        if self._shape_size(shape) == 0:
+            return None
+        body = self.convert_expression_body(expr, shape)
+        args_str = self._generate_args(func_obj, shape)
+        return self.wrap_function_signature(name, args_str, body, shape)
+
+    def generate_boundary_conditions(self):
+        """Generate the model's boundary-condition dispatch kernels —
+        ``boundary_conditions`` and ``aux_boundary_conditions``, each a
+        Piecewise over the integer ``bc_idx``."""
+        blocks = []
+        for attr in ("_boundary_conditions", "_aux_boundary_conditions"):
+            func_obj = getattr(self.model, attr, None)
+            if func_obj is None:
+                continue
+            kernel = self._generate_bc_kernel(func_obj)
+            if kernel is not None:
+                blocks.append(kernel)
+        return "\n\n".join(blocks)
+
+    def _generate_bc_kernel(self, func_obj):
+        """Generate one boundary-condition kernel.
+
+        Unlike :meth:`_generate_kernel` this does *not* run
+        ``_expand_vector_conditionals`` — the BC definition is already a
+        Piecewise of vector branches.  The scalar BC symbols (``bc_idx``,
+        ``time``, ``distance``) are registered so they print as their
+        parameter names."""
+        scalar_map = {}
+        for key, param_name in (
+            ("idx", "bc_idx"),
+            ("time", self.ARG_MAPPING.get("time", "time")),
+            ("distance", self.ARG_MAPPING.get("distance", "dX")),
+        ):
+            if func_obj.args.contains(key):
+                scalar_map[func_obj.args[key]] = param_name
+        self.symbol_maps.append(scalar_map)
+        try:
+            shape, expr = get_nested_shape(func_obj.definition)
+            if self._shape_size(shape) == 0:
+                return None
+            body = self.convert_expression_body(expr, shape)
+            args_str = self._generate_args(func_obj, shape)
+            return self.wrap_function_signature(
+                func_obj.name, args_str, body, shape
+            )
+        finally:
+            self.symbol_maps.pop()
+
+
+# =========================================================================
 #  3. GENERIC MODEL (Clean)
 # =========================================================================
 

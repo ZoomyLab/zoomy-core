@@ -1,25 +1,24 @@
 """Module `zoomy_core.transformation.to_js`.
 
 SymPy → JavaScript code printer for generating Model2D-compatible
-functions from any Zoomy symbolic model.
+kernels from any Zoomy symbolic model.
 
-Subclasses GenericCppBase to reuse the Zoomy symbol-mapping,
-CSE pipeline, and convert_expression_body() machinery.
-Only the language-specific output formatting is overridden.
+Subclasses :class:`OutParamCodePrinter` — generated kernels write their
+result through a trailing ``res`` array parameter the caller owns,
+instead of returning a freshly-allocated ``Float64Array``.  That keeps
+the browser solver's hot loop allocation-free; the body generation,
+Piecewise handling and kernel/BC wrapping are shared with the GLSL
+printer.  Only the JS-specific output formatting lives here.
 
 Usage::
 
-    from zoomy_core.model.models.shallow_water import ShallowWaterEquations
     from zoomy_core.transformation.to_js import JsModel
-
-    model = ShallowWaterEquations(dimension=2)
-    printer = JsModel(model)
-    print(printer.generate())
+    print(JsModel(model).generate())
 """
 
 import sympy as sp
 
-from zoomy_core.transformation.generic_c import GenericCppBase, get_nested_shape
+from zoomy_core.transformation.generic_c import OutParamCodePrinter
 
 
 # =========================================================================
@@ -27,21 +26,16 @@ from zoomy_core.transformation.generic_c import GenericCppBase, get_nested_shape
 # =========================================================================
 
 
-class GenericJsBase(GenericCppBase):
-    """JavaScript code printer extending GenericCppBase.
+class GenericJsBase(OutParamCodePrinter):
+    """JavaScript code printer.
 
-    Inherits symbol-map registration, CSE, convert_expression_body(),
-    _expand_vector_conditionals(), _optimize_array_calls(), etc.
-    Overrides only the output formatting to emit valid JavaScript.
+    Inherits the out-parameter body generation, Piecewise handling and
+    kernel / boundary-condition wrapping from
+    :class:`OutParamCodePrinter`; overrides only the JS-specific output
+    formatting.
     """
 
     math_namespace = "Math."
-    real_type = "const"
-    gpu_enabled = False
-
-    # ``parameters`` is the BoundaryCondition Function's key for the
-    # model parameter vector; map it onto the same ``p`` accessor.
-    ARG_MAPPING = {**GenericCppBase.ARG_MAPPING, "parameters": "p"}
 
     c_functions = {
         "conditional": lambda p, c, t, f: (
@@ -58,35 +52,12 @@ class GenericJsBase(GenericCppBase):
         "Abs": lambda p, a: f"Math.abs({p.doprint(a)})",
     }
 
-    # ── Array / type formatting ──────────────────────
+    # ── Function arguments / wrapping ────────────────────────────────
 
-    def get_array_type(self, shape):
-        """Not needed for JS (no static type), but keep for API compat."""
-        total = 1
-        for s in shape:
-            total *= s
-        return f"Float64Array({total})"
-
-    def get_array_declaration(self, target_name, shape, init_zero=False):
-        """Declare a local result array."""
-        total = 1
-        for s in shape:
-            total *= s
-        return f"const {target_name} = new Float64Array({total});"
-
-    def format_array_initialization(self, sym_name, elements):
-        """Initialize a local array from CSE-optimized values."""
-        init_str = ", ".join([self.doprint(e) for e in elements])
-        return f"const {sym_name} = [{init_str}];"
-
-    # ── Function wrapping ────────────────────────────
-
-    def wrap_function_signature(self, name, args_str, body_str, shape):
-        """Wrap a function body in a JS function declaration."""
-        return f"function {name}({args_str}) {{\n{body_str}\n}}"
-
-    def _generate_js_args(self, func_obj):
-        """Generate JS function parameter list from a Function object."""
+    def _generate_args(self, func_obj, shape):
+        """JS parameter list for a Function object, with the trailing
+        ``res`` out-parameter appended.  JS imposes no type or
+        zero-length-array restrictions, so every argument is kept."""
         parts = []
         for key, val in func_obj.args.items():
             if key == "idx":
@@ -94,91 +65,14 @@ class GenericJsBase(GenericCppBase):
                 parts.append("bc_idx")
             else:
                 parts.append(self.ARG_MAPPING.get(key, key))
+        parts.append("res")
         return ", ".join(parts)
 
-    # ── Kernel generation ────────────────────────────────────────────
+    def wrap_function_signature(self, name, args_str, body_str, shape):
+        """Wrap a JS body in a function declaration."""
+        return f"function {name}({args_str}) {{\n{body_str}\n}}"
 
-    def _generate_kernel(self, name, func_obj):
-        """Generate one JS function from a Function object."""
-        expr = func_obj.definition
-        expr = self._expand_vector_conditionals(expr)
-        if isinstance(expr, (list, tuple)):
-            expr = self._flatten_ragged_list(expr)
-            expr = sp.Array(expr)
-        shape, expr = get_nested_shape(expr)
-        body = self.convert_expression_body(expr, shape)
-        args_str = self._generate_js_args(func_obj)
-        return self.wrap_function_signature(name, args_str, body, shape)
-
-    # ── Boundary conditions ──────────────────────────────────────────
-
-    def generate_boundary_conditions(self):
-        """Generate the model's boundary-condition dispatch kernels.
-
-        Emits ``boundary_conditions`` and ``aux_boundary_conditions`` —
-        each a Piecewise over the integer ``bc_idx`` selecting the
-        per-tag ghost/face state.
-        """
-        blocks = []
-        for attr in ("_boundary_conditions", "_aux_boundary_conditions"):
-            func_obj = getattr(self.model, attr, None)
-            if func_obj is None:
-                continue
-            blocks.append(self._generate_bc_kernel(func_obj))
-        return "\n\n".join(blocks)
-
-    def _generate_bc_kernel(self, func_obj):
-        """Generate one boundary-condition kernel from a Function object.
-
-        The scalar BC symbols (``bc_idx``, ``time``, ``distance``) are
-        registered so they print as their JS parameter names — the
-        underlying SymPy symbols (``bc_idx``, ``t``, ``dX``) do not all
-        match the parameter names produced by ``ARG_MAPPING``.
-        """
-        scalar_map = {}
-        for key, param_name in (
-            ("idx", "bc_idx"),
-            ("time", self.ARG_MAPPING.get("time", "time")),
-            ("distance", self.ARG_MAPPING.get("distance", "dX")),
-        ):
-            if func_obj.args.contains(key):
-                scalar_map[func_obj.args[key]] = param_name
-        self.symbol_maps.append(scalar_map)
-        try:
-            shape, expr = get_nested_shape(func_obj.definition)
-            body = self.convert_expression_body(expr, shape)
-            args_str = self._generate_js_args(func_obj)
-            return self.wrap_function_signature(
-                func_obj.name, args_str, body, shape
-            )
-        finally:
-            self.symbol_maps.pop()
-
-    # ── Piecewise printing (nested ternary) ──────────
-
-    def _print_Piecewise(self, expr):
-        """Nested Piecewise → a chained JS ternary.
-
-        The top-level vector Piecewise (a boundary-condition dispatch)
-        is handled by ``_print_piecewise_structure``; this prints a
-        scalar Piecewise appearing *inside* an expression — e.g. a
-        piecewise-linear Q(t) interpolation.
-        """
-        args = list(expr.args)
-        last = args[-1]
-        if last.cond is True or last.cond == sp.true:
-            result = f"({self._print(last.expr)})"
-            rest = args[:-1]
-        else:
-            result = "0.0"
-            rest = args
-        for pair in reversed(rest):
-            cond = self.doprint(pair.cond)
-            val = self._print(pair.expr)
-            result = f"(({cond}) ? ({val}) : ({result}))"
-        return result
-
-    # ── Pow printing (JS uses ** or Math.pow) ────────
+    # ── Pow printing (JS uses ** or Math.pow) ────────────────────────
 
     def _print_Pow(self, expr):
         """Print power expressions using Math.pow / Math.sqrt / inline multiply."""
@@ -203,7 +97,7 @@ class GenericJsBase(GenericCppBase):
             return f"Math.pow({b}, {n})"
         return f"Math.pow({b}, {self._print(exp)})"
 
-    # ── No includes / struct wrappers for JS ─────────
+    # ── No includes / struct wrappers for JS ─────────────────────────
 
     def get_includes(self):
         """No includes needed for JS."""
@@ -220,12 +114,11 @@ class GenericJsBase(GenericCppBase):
 
 
 class JsModel(GenericJsBase):
-    """Generate JavaScript Model2D functions from a Zoomy symbolic model.
+    """Generate JavaScript Model2D kernels from a Zoomy symbolic model.
 
     Produces standalone JS functions for ``flux``, ``source``,
-    ``eigenvalues``, ``source_jacobian_wrt_variables``, etc.
-    Each function takes flat arrays (Q, Qaux, p, n) and returns
-    a Float64Array result.
+    ``eigenvalues``, etc.  Each takes the model's flat argument arrays
+    plus a trailing ``res`` out-parameter the caller owns.
     """
 
     # Functions to generate (in order). Skipped if definition is None/zero.
@@ -255,65 +148,30 @@ class JsModel(GenericJsBase):
         self.register_map("p", model._parameter_symbols.values())
 
     def generate(self):
-        """Generate all JS functions as a single code string.
+        """Generate all JS kernels as a single code string."""
+        blocks = [self._generate_metadata()]
 
-        Returns
-        -------
-        str
-            JavaScript code containing function declarations for each
-            registered model function that has a non-trivial definition.
-        """
-        blocks = []
-        blocks.append(self._generate_metadata())
-
-        func_dict = self.model.functions.as_dict() if hasattr(self.model.functions, 'as_dict') else dict(self.model.functions.items())
+        func_dict = (
+            self.model.functions.as_dict()
+            if hasattr(self.model.functions, "as_dict")
+            else dict(self.model.functions.items())
+        )
         for name in self.KERNEL_NAMES:
             if name not in func_dict:
                 continue
             func_obj = func_dict[name]
-            if func_obj.definition is None:
-                continue
-            # Skip trivially-zero definitions
             defn = func_obj.definition
+            if defn is None:
+                continue
             if hasattr(defn, "is_zero_matrix") and defn.is_zero_matrix:
                 continue
-            blocks.append(self._generate_kernel(name, func_obj))
+            kernel = self._generate_kernel(name, func_obj)
+            if kernel is not None:
+                blocks.append(kernel)
 
         return "\n\n".join(blocks)
 
-    def generate_model2d_object(self):
-        """Generate a JS object literal implementing the Model2D interface.
-
-        The object wraps the generated functions and adds metadata
-        (nVars, parameter defaults).
-        """
-        funcs = self.generate()
-        param_values = [
-            float(v) for v in self.model.parameters.values()
-        ]
-        param_names = list(self.model.parameters.keys())
-
-        obj = f"""// Auto-generated Model2D from {self.model.__class__.__name__}
-// nVars={self.n_dof_q}, nAux={self.n_dof_qaux}, nParams={self.n_parameters}
-// Parameters: {dict(zip(param_names, param_values))}
-
-{funcs}
-
-const generatedModel = {{
-  nVars: {self.n_dof_q},
-  nAux: {self.n_dof_qaux},
-  parameterDefaults: [{', '.join(str(v) for v in param_values)}],
-  parameterNames: {param_names},
-  flux: flux,
-  source: typeof source !== 'undefined' ? source : null,
-  eigenvalues: typeof eigenvalues !== 'undefined' ? eigenvalues : null,
-  sourceJacobian: typeof source_jacobian_wrt_variables !== 'undefined' ? source_jacobian_wrt_variables : null,
-  quasilinearMatrix: typeof quasilinear_matrix !== 'undefined' ? quasilinear_matrix : null,
-}};
-"""
-        return obj
-
-    # ── Internal ─────────────────────────────────────
+    # ── Internal ─────────────────────────────────────────────────────
 
     def _generate_metadata(self):
         """Generate a JS comment block with model metadata."""
@@ -323,8 +181,10 @@ const generatedModel = {{
             f"// Generated JS model: {self.model.__class__.__name__}",
             f"// Dimension: {self.model.dimension}",
             f"// Variables ({self.n_dof_q}): {list(self.model.variables.keys())}",
-            f"// Aux variables ({self.n_dof_qaux}): {list(self.model.aux_variables.keys())}",
-            f"// Parameters ({self.n_parameters}): {dict(zip(param_names, param_vals))}",
+            f"// Aux variables ({self.n_dof_qaux}): "
+            f"{list(self.model.aux_variables.keys())}",
+            f"// Parameters ({self.n_parameters}): "
+            f"{dict(zip(param_names, param_vals))}",
         ]
         return "\n".join(lines)
 
@@ -339,8 +199,8 @@ class JsNumerics(GenericJsBase):
 
     Produces ``numerical_flux`` (and ``numerical_fluctuations`` /
     ``local_max_abs_eigenvalue``) as standalone JS functions taking the
-    per-face ``Q_minus`` / ``Q_plus`` states and returning a
-    ``Float64Array``.  Mirrors
+    per-face ``Q_minus`` / ``Q_plus`` states plus a trailing ``res``
+    out-parameter.  Mirrors
     :class:`zoomy_core.transformation.generic_c.GenericCppNumerics`.
     """
 
@@ -373,5 +233,7 @@ class JsNumerics(GenericJsBase):
         for name, func_obj in self.numerics.functions.items():
             if func_obj.definition is None:
                 continue
-            blocks.append(self._generate_kernel(name, func_obj))
+            kernel = self._generate_kernel(name, func_obj)
+            if kernel is not None:
+                blocks.append(kernel)
         return "\n\n".join(blocks)

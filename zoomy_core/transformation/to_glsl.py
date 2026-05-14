@@ -3,15 +3,16 @@
 SymPy → GLSL ES 3.00 (WebGL2) code printer for generating kernels from
 any Zoomy symbolic model.
 
-Subclasses :class:`GenericCppBase` to reuse the Zoomy symbol-mapping,
-CSE pipeline and expression-printing machinery; only the
-language-specific output formatting is overridden.
+Subclasses :class:`OutParamCodePrinter` — generated kernels return
+``void`` and write their result through a trailing ``out float res[N]``
+parameter, so the body generation, Piecewise handling and kernel/BC
+wrapping are shared with the JS printer.  Only the GLSL-specific output
+formatting lives here.
 
 Two GLSL ES 3.00 facts shape the output:
 
-* **No array return types.**  Generated kernels return ``void`` and
-  write their result through an ``out float res[N]`` parameter.  The
-  result is laid out row-major in the natural shape of the symbolic
+* **No array return types.**  Kernels write through ``out float res[N]``.
+  The result is laid out row-major in the natural shape of the symbolic
   definition (e.g. ``flux`` is ``(n_variables, dimension)`` →
   ``res[var * dimension + dim]``).
 * **No implicit int→float conversion.**  Every numeric literal is
@@ -25,18 +26,11 @@ Usage::
     print(GlslModel(model).generate())
 """
 
-import itertools
-import textwrap
-
 import sympy as sp
 from sympy.core.relational import Relational
 from sympy.logic.boolalg import BooleanFunction
 
-from zoomy_core.transformation.generic_c import (
-    GenericCppBase,
-    flatten_index,
-    get_nested_shape,
-)
+from zoomy_core.transformation.generic_c import OutParamCodePrinter
 
 
 # =========================================================================
@@ -44,21 +38,19 @@ from zoomy_core.transformation.generic_c import (
 # =========================================================================
 
 
-class GenericGlslBase(GenericCppBase):
-    """GLSL ES 3.00 code printer extending :class:`GenericCppBase`.
+class GenericGlslBase(OutParamCodePrinter):
+    """GLSL ES 3.00 code printer.
 
-    Inherits symbol-map registration, CSE, ``_expand_vector_conditionals``,
-    ``_optimize_array_calls`` etc.  Overrides the output formatting to
-    emit valid GLSL ES 3.00 with ``out``-parameter result passing.
+    Inherits the out-parameter body generation, Piecewise handling and
+    kernel / boundary-condition wrapping from
+    :class:`OutParamCodePrinter`; overrides the GLSL-specific output:
+    static types, a bare math namespace, explicit float literals and
+    ``out float res[N]`` result parameters.
     """
 
     math_namespace = ""
     real_type = "float"
     gpu_enabled = False
-
-    # ``parameters`` is the BoundaryCondition Function's key for the
-    # model parameter vector; map it onto the same ``p`` accessor.
-    ARG_MAPPING = {**GenericCppBase.ARG_MAPPING, "parameters": "p"}
 
     # Symbols compared inside relational expressions print as plain ints
     # while this flag is set (see ``_print_Relational``).
@@ -82,6 +74,18 @@ class GenericGlslBase(GenericCppBase):
         ),
     }
 
+    # ── CSE temp typing (GLSL is strictly typed) ─────────────────────
+
+    def _temp_decl(self, lhs, rhs):
+        """A CSE temp may capture a boolean condition (the predicate of a
+        ``conditional``); GLSL needs it declared ``bool``, not ``float``."""
+        kw = (
+            "bool"
+            if isinstance(rhs, (Relational, BooleanFunction))
+            else "float"
+        )
+        return f"{kw} {self.doprint(lhs)} = {self.doprint(rhs)};"
+
     # ── Numeric literals (GLSL has no implicit int→float) ────────────
 
     def _print_Integer(self, expr):
@@ -100,30 +104,6 @@ class GenericGlslBase(GenericCppBase):
         if "." not in s and "e" not in s and "E" not in s:
             s += ".0"
         return s
-
-    def _print_Piecewise(self, expr):
-        """Nested *scalar* Piecewise → a chained GLSL ternary.
-
-        (The top-level vector Piecewise — a boundary-condition dispatch
-        — is handled separately by :meth:`_print_piecewise_structure`;
-        this prints a scalar Piecewise that appears *inside* an
-        expression, e.g. a piecewise-linear Q(t) interpolation.)
-        """
-        args = list(expr.args)
-        last = args[-1]
-        if last.cond is True or last.cond == sp.true:
-            result = f"({self._print(last.expr)})"
-            rest = args[:-1]
-        else:
-            # Exhaustive-but-no-literal-True chains (e.g. the time
-            # interpolation) — the fallback is never reached.
-            result = "0.0"
-            rest = args
-        for pair in reversed(rest):
-            cond = self.doprint(pair.cond)
-            val = self._print(pair.expr)
-            result = f"(({cond}) ? ({val}) : ({result}))"
-        return result
 
     def _print_Relational(self, expr):
         """Print a comparison, choosing int vs float literal context."""
@@ -161,127 +141,7 @@ class GenericGlslBase(GenericCppBase):
             return f"(1.0 / ({denom}))"
         return f"pow({b}, {self._print(exp)})"
 
-    # ── Array / type formatting ──────────────────────────────────────
-
-    def get_array_type(self, shape):
-        """GLSL array type string, e.g. ``float[6]``."""
-        total = 1
-        for s in shape:
-            total *= s
-        return f"float[{total}]"
-
-    def get_array_declaration(self, target_name, shape, init_zero=False):
-        """Declare a local GLSL array."""
-        total = 1
-        for s in shape:
-            total *= s
-        if init_zero:
-            zeros = ", ".join(["0.0"] * total)
-            return f"float {target_name}[{total}] = float[{total}]({zeros});"
-        return f"float {target_name}[{total}];"
-
-    def format_array_initialization(self, sym_name, elements):
-        """Initialize a local GLSL array from CSE-optimized values."""
-        n = len(elements)
-        init = ", ".join(self.doprint(e) for e in elements)
-        return f"float {sym_name}[{n}] = float[{n}]({init});"
-
-    def format_accessor(self, var_name, index):
-        """Format accessor."""
-        return f"{var_name}[{index}]"
-
-    def format_assignment(self, target_name, indices, value, shape):
-        """Format assignment."""
-        idx = flatten_index(indices, shape)
-        return f"{target_name}[{idx}] = {value};"
-
-    # ── Body generation (out-parameter, no return) ───────────────────
-
-    def convert_expression_body(self, expr, shape, target="res"):
-        """Convert an expression into a GLSL body that writes ``target``.
-
-        ``target`` is the function's ``out float target[N]`` parameter —
-        the body assigns into it directly; there is no local declaration
-        and no ``return``.
-        """
-        if isinstance(expr, sp.Piecewise):
-            return self._print_piecewise_structure(expr, shape, target)
-
-        flat_expr = (
-            list(sp.flatten(expr))
-            if hasattr(expr, "__iter__") and not isinstance(expr, sp.Matrix)
-            else list(expr)
-            if isinstance(expr, sp.Matrix)
-            else [expr]
-        )
-        call_defs, optim_exprs = self._optimize_array_calls(flat_expr)
-        if call_defs:
-            raise NotImplementedError(
-                "to_glsl: nested array-valued function calls are not supported"
-            )
-
-        total = 1
-        for s in shape:
-            total *= s
-        lines = []
-        if optim_exprs:
-            temps, simplified = sp.cse(optim_exprs, symbols=sp.numbered_symbols("t"))
-            for lhs, rhs in temps:
-                # A CSE temp may capture a boolean condition (e.g. the
-                # predicate of a `conditional`); GLSL is strictly typed,
-                # so declare it `bool` rather than `float`.
-                kw = (
-                    "bool"
-                    if isinstance(rhs, (Relational, BooleanFunction))
-                    else "float"
-                )
-                lines.append(f"{kw} {self.doprint(lhs)} = {self.doprint(rhs)};")
-            result_array = sp.Array(simplified).reshape(*shape)
-            for indices in itertools.product(*[range(s) for s in shape]):
-                val = self.doprint(result_array[indices])
-                lines.append(self.format_assignment(target, indices, val, shape))
-        else:
-            for i in range(total):
-                lines.append(f"{target}[{i}] = 0.0;")
-        return "\n".join("    " + ln for ln in lines)
-
-    def _print_piecewise_structure(self, expr, shape, target):
-        """Internal helper `_print_piecewise_structure`.
-
-        Emits an if / else-if chain assigning into ``target``.  ``target``
-        is zero-initialised first so any fall-through (a Piecewise with no
-        final ``True`` branch, e.g. a boundary-condition dispatch) is
-        well-defined.
-        """
-        total = 1
-        for s in shape:
-            total *= s
-        lines = [f"    {target}[{i}] = 0.0;" for i in range(total)]
-        for i, arg in enumerate(expr.args):
-            val, cond = (
-                (arg.expr, arg.cond) if hasattr(arg, "expr") else (arg[0], arg[1])
-            )
-            if cond is True or cond == sp.true:
-                if i == 0:
-                    return self.convert_expression_body(val, shape, target)
-                lines.append("    } else {")
-            elif i == 0:
-                lines.append(f"    if ({self.doprint(cond)}) {{")
-            else:
-                lines.append(f"    }} else if ({self.doprint(cond)}) {{")
-            lines.append(
-                textwrap.indent(
-                    self.convert_expression_body(val, shape, target), "    "
-                )
-            )
-        lines.append("    }")
-        return "\n".join(lines)
-
-    # ── Function wrapping ────────────────────────────────────────────
-
-    def wrap_function_signature(self, name, args_str, body_str, shape):
-        """Wrap a GLSL body in a ``void`` function declaration."""
-        return f"void {name}({args_str}) {{\n{body_str}\n}}"
+    # ── Argument formatting ──────────────────────────────────────────
 
     @staticmethod
     def _is_array_arg(obj):
@@ -304,7 +164,7 @@ class GenericGlslBase(GenericCppBase):
         except TypeError:
             return 1
 
-    def _generate_glsl_args(self, func_obj, shape):
+    def _generate_args(self, func_obj, shape):
         """GLSL parameter list for a Function object, with the trailing
         ``out float res[N]`` result parameter appended.
 
@@ -326,89 +186,12 @@ class GenericGlslBase(GenericCppBase):
                 parts.append(f"float {name}[{length}]")
             else:
                 parts.append(f"float {name}")
-        total = 1
-        for s in shape:
-            total *= s
-        parts.append(f"out float res[{total}]")
+        parts.append(f"out float res[{self._shape_size(shape)}]")
         return ", ".join(parts)
 
-    # ── Kernel generation ────────────────────────────────────────────
-
-    @staticmethod
-    def _shape_size(shape):
-        """Total number of components for a (possibly nested) shape."""
-        total = 1
-        for s in shape:
-            total *= s
-        return total
-
-    def _generate_kernel(self, name, func_obj):
-        """Generate one GLSL function from a Function object.
-
-        Returns ``None`` for a zero-size result (GLSL forbids
-        ``out float res[0]``); the caller skips it.
-        """
-        expr = func_obj.definition
-        expr = self._expand_vector_conditionals(expr)
-        if isinstance(expr, (list, tuple)):
-            expr = self._flatten_ragged_list(expr)
-            expr = sp.Array(expr)
-        shape, expr = get_nested_shape(expr)
-        if self._shape_size(shape) == 0:
-            return None
-        body = self.convert_expression_body(expr, shape)
-        args_str = self._generate_glsl_args(func_obj, shape)
-        return self.wrap_function_signature(name, args_str, body, shape)
-
-    # ── Boundary conditions ──────────────────────────────────────────
-
-    def generate_boundary_conditions(self):
-        """Generate the model's boundary-condition dispatch kernels.
-
-        Emits ``boundary_conditions`` and ``aux_boundary_conditions`` —
-        each a Piecewise over the integer ``bc_idx`` selecting the
-        per-tag ghost/face state.  ``bc_idx`` is zero-initialised
-        fall-through (see :meth:`_print_piecewise_structure`).
-        """
-        blocks = []
-        for attr in ("_boundary_conditions", "_aux_boundary_conditions"):
-            func_obj = getattr(self.model, attr, None)
-            if func_obj is None:
-                continue
-            kernel = self._generate_bc_kernel(func_obj)
-            if kernel is not None:
-                blocks.append(kernel)
-        return "\n\n".join(blocks)
-
-    def _generate_bc_kernel(self, func_obj):
-        """Generate one boundary-condition kernel from a Function object.
-
-        Unlike :meth:`_generate_kernel` this does *not* run
-        ``_expand_vector_conditionals`` — the BC definition is already a
-        Piecewise of vector branches.  The scalar BC symbols (``bc_idx``,
-        ``time``, ``distance``) are registered so they print as their
-        GLSL parameter names.
-        """
-        scalar_map = {}
-        for key, param_name in (
-            ("idx", "bc_idx"),
-            ("time", self.ARG_MAPPING.get("time", "time")),
-            ("distance", self.ARG_MAPPING.get("distance", "dX")),
-        ):
-            if func_obj.args.contains(key):
-                scalar_map[func_obj.args[key]] = param_name
-        self.symbol_maps.append(scalar_map)
-        try:
-            shape, expr = get_nested_shape(func_obj.definition)
-            if self._shape_size(shape) == 0:
-                return None
-            body = self.convert_expression_body(expr, shape)
-            args_str = self._generate_glsl_args(func_obj, shape)
-            return self.wrap_function_signature(
-                func_obj.name, args_str, body, shape
-            )
-        finally:
-            self.symbol_maps.pop()
+    def wrap_function_signature(self, name, args_str, body_str, shape):
+        """Wrap a GLSL body in a ``void`` function declaration."""
+        return f"void {name}({args_str}) {{\n{body_str}\n}}"
 
     # ── No includes / struct wrappers for GLSL ───────────────────────
 

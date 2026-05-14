@@ -88,11 +88,13 @@ def _node_check(js: str):
     return proc.returncode == 0, proc.stdout + proc.stderr
 
 
-def _node_call(js: str, func: str, args: list) -> np.ndarray:
-    """Define ``js``, call ``func(*args)`` in node, return the result array."""
+def _node_call(js: str, func: str, args: list, res_size: int) -> np.ndarray:
+    """Define ``js``, call the out-parameter kernel ``func`` in node, and
+    return the result it wrote into the caller-owned ``res`` array."""
     driver = (
         f"\nconst __args = JSON.parse(process.argv[2]);"
-        f"\nconst __res = {func}(...__args);"
+        f"\nconst __res = new Float64Array({res_size});"
+        f"\n{func}(...__args, __res);"
         f"\nconsole.log(JSON.stringify(Array.from(__res)));\n"
     )
     with tempfile.TemporaryDirectory() as d:
@@ -154,7 +156,9 @@ def test_js_model_flux_matches_numpy(dim):
     aux = np.zeros(m.n_aux_variables)
     q = np.array([1.7, 0.6, -0.25][: dim + 1])
     expect = np.asarray(mrt.flux(q, aux, p), dtype=float).ravel()
-    got = _node_call(js, "flux", [q.tolist(), aux.tolist(), p.tolist()])
+    got = _node_call(
+        js, "flux", [q.tolist(), aux.tolist(), p.tolist()], expect.size
+    )
     np.testing.assert_allclose(got, expect, rtol=1e-10, atol=1e-12)
 
 
@@ -183,5 +187,6 @@ def test_js_numerical_flux_matches_numpy(dim, scheme):
         "numerical_flux",
         [qL.tolist(), qR.tolist(), aux.tolist(), aux.tolist(),
          p.tolist(), n.tolist()],
+        expect.size,
     )
     np.testing.assert_allclose(got, expect, rtol=1e-9, atol=1e-9)
