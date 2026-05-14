@@ -30,6 +30,8 @@ from typing import Any, Dict, List, Optional
 
 import sympy as sp
 
+from zoomy_core.misc.misc import Zstruct
+
 
 def _iter_indices(shape):
     if not shape:
@@ -61,6 +63,21 @@ class SystemModel:
     which state entry equation ``r`` updates; for square systems the
     default is the identity map ``[0, 1, …, n_state-1]``.
 
+    Every operator the system needs is a **stored field**, frozen at
+    construction — there are no derived-on-demand methods.  Alongside
+    the five primaries (flux, P, NCP, source, mass matrix) the system
+    carries the derived operators ``quasilinear_matrix``,
+    ``source_jacobian`` and ``eigenvalues``, plus the ``normal``
+    symbols and the parameter Zstructs.  ``quasilinear_matrix`` and
+    ``source_jacobian`` are cheap derivatives — ``__post_init__``
+    computes them from the primaries when not supplied, and any
+    in-place operation refreshes them via
+    :meth:`refresh_derived_operators`.  ``eigenvalues`` is the one
+    operator that may be expensive (a symbolic spectral derivation) or
+    deliberately skipped — :meth:`from_model` simply carries over
+    whatever ``Model.eigenvalues()`` produced, and ``None`` means
+    "skipped" (numerical-eigenvalue mode).
+
     Shape contract:
 
     * ``flux``                  — ``(n_eq, n_dim)``
@@ -68,18 +85,34 @@ class SystemModel:
     * ``nonconservative_matrix``— ``(n_eq, n_state, n_dim)``
     * ``source``                — ``(n_eq, 1)``
     * ``mass_matrix``           — ``(n_eq, n_state)``
+    * ``quasilinear_matrix``    — ``(n_eq, n_state, n_dim)``
+    * ``source_jacobian``       — ``(n_eq, n_state)``
+    * ``eigenvalues``           — ``(n_eq, 1)`` or ``None`` if skipped
+
+    ``parameters`` is a Zstruct mapping parameter name → symbol (the
+    symbolic side the operators reference); ``parameter_values`` maps
+    name → numeric default.  ``normal`` is a Zstruct of the face-normal
+    component symbols ``n0, n1, …``.
     """
 
     time: sp.Symbol
     space: List[sp.Symbol]
     state: List[Any]
     aux_state: List[Any]
-    parameters: Dict[Any, Any]
+    parameters: Zstruct                      # name -> Symbol
     flux: sp.Matrix
     hydrostatic_pressure: sp.Matrix
     nonconservative_matrix: Any              # sp.MutableDenseNDimArray
     source: sp.Matrix
     mass_matrix: sp.Matrix
+    # Derived operators — frozen alongside the primaries.  ``None`` ⇒
+    # ``__post_init__`` computes quasilinear_matrix / source_jacobian
+    # from the primaries; ``eigenvalues`` stays ``None`` when skipped.
+    quasilinear_matrix: Any = None           # sp.MutableDenseNDimArray
+    source_jacobian: Optional[sp.Matrix] = None
+    eigenvalues: Optional[sp.Matrix] = None
+    normal: Optional[Zstruct] = None
+    parameter_values: Optional[Zstruct] = None   # name -> numeric default
     equation_to_state_index: Optional[List[int]] = None
     boundary_conditions: Optional[Any] = None
     history: List[Dict[str, str]] = field(default_factory=list)
@@ -87,6 +120,18 @@ class SystemModel:
     def __post_init__(self):
         if self.equation_to_state_index is None:
             self.equation_to_state_index = list(range(self.n_equations))
+        if self.normal is None:
+            self.normal = Zstruct(
+                **{f"n{d}": sp.Symbol(f"n{d}", real=True)
+                   for d in range(self.n_dim)}
+            )
+            self.normal._symbolic_name = "n"
+        if self.parameter_values is None:
+            self.parameter_values = Zstruct()
+        if self.quasilinear_matrix is None:
+            self.quasilinear_matrix = self._compute_quasilinear_matrix()
+        if self.source_jacobian is None:
+            self.source_jacobian = self._compute_source_jacobian()
 
     # ── Shape accessors ────────────────────────────────────────────────
 
@@ -108,9 +153,9 @@ class SystemModel:
         return (self.n_equations == self.n_state
                 and self.equation_to_state_index == list(range(self.n_state)))
 
-    # ── Operator-API methods (mirror Model) ─────────────────────────────
+    # ── Derived-operator computation ────────────────────────────────────
 
-    def quasilinear_matrix(self):
+    def _compute_quasilinear_matrix(self):
         """``∂F/∂Q + ∂P/∂Q + B`` — shape ``(n_eq, n_state, n_dim)``."""
         n_eq = self.n_equations
         n_st = self.n_state
@@ -125,7 +170,7 @@ class SystemModel:
                     Q[i, j, k] = djF + djP + self.nonconservative_matrix[i, j, k]
         return Q
 
-    def source_jacobian_wrt_state(self):
+    def _compute_source_jacobian(self):
         """``∂S/∂Q`` — shape ``(n_eq, n_state)``."""
         n_eq = self.n_equations
         n_st = self.n_state
@@ -134,6 +179,33 @@ class SystemModel:
             for j in range(n_st):
                 out[i, j] = sp.diff(self.source[i, 0], self.state[j])
         return out
+
+    def _compute_eigenvalues(self):
+        """Eigenvalues of the normal-projected quasilinear matrix —
+        ``(n_eq, 1)``.  This is the (potentially expensive) symbolic
+        spectral derivation; callers decide when to pay it."""
+        n_eq = self.n_equations
+        n = list(self.normal.values())
+        A = sp.zeros(n_eq, n_eq)
+        for k in range(self.n_dim):
+            for i in range(n_eq):
+                for j in range(n_eq):
+                    A[i, j] += n[k] * self.quasilinear_matrix[i, j, k]
+        lam = sp.Symbol("lam")
+        evs = sp.solve(A.charpoly(lam), lam)
+        return sp.Matrix(n_eq, 1, lambda i, _j: sp.simplify(evs[i]))
+
+    def refresh_derived_operators(self, *, eigenvalues: bool = False):
+        """Recompute ``quasilinear_matrix`` and ``source_jacobian`` from
+        the (possibly just-mutated) primary operators, keeping the
+        derived operators consistent.  ``eigenvalues=True`` also
+        re-derives the spectrum — only request it when an operation
+        genuinely changes the system's characteristic structure and the
+        spectrum was not skipped."""
+        self.quasilinear_matrix = self._compute_quasilinear_matrix()
+        self.source_jacobian = self._compute_source_jacobian()
+        if eigenvalues and self.eigenvalues is not None:
+            self.eigenvalues = self._compute_eigenvalues()
 
     # ── apply / row view ───────────────────────────────────────────────
 
@@ -169,11 +241,19 @@ class SystemModel:
         state = [model.variables[k] for k in model.variables.keys()]
         aux_state = [model.aux_variables[k]
                      for k in model.aux_variables.keys()]
-        parameters: Dict[Any, Any] = {}
-        for k in model._parameter_symbols.keys():
-            sym = model._parameter_symbols[k]
-            if hasattr(model.parameters, k):
-                parameters[sym] = getattr(model.parameters, k)
+        parameters = Zstruct(
+            **{k: model._parameter_symbols[k]
+               for k in model._parameter_symbols.keys()}
+        )
+        parameters._symbolic_name = "p"
+        parameter_values = Zstruct(
+            **{k: getattr(model.parameters, k, 0.0)
+               for k in model._parameter_symbols.keys()}
+        )
+        normal = Zstruct(
+            **{k: model.normal[k] for k in model.normal.keys()}
+        )
+        normal._symbolic_name = "n"
 
         n_eq = model.n_variables
 
@@ -234,6 +314,16 @@ class SystemModel:
         equation_names = getattr(model, "equation_names", None)
         bcs = getattr(model, "_boundary_conditions", None)
 
+        # Eigenvalues — carry over whatever ``Model.eigenvalues()``
+        # produced.  In numerical-eigenvalue mode the model deliberately
+        # skips the spectral derivation, so the SystemModel records
+        # ``None`` ("skipped") rather than a zero placeholder.
+        eigenvalues = None
+        if getattr(model, "eigenvalue_mode", "symbolic") != "numerical":
+            ev_def = model.functions["eigenvalues"].definition
+            if ev_def is not None:
+                eigenvalues = _to_matrix(ev_def, n_eq, 1)
+
         sm = cls(
             time=time_sym,
             space=space,
@@ -245,6 +335,9 @@ class SystemModel:
             nonconservative_matrix=B,
             source=S_mat,
             mass_matrix=M_mat,
+            eigenvalues=eigenvalues,
+            normal=normal,
+            parameter_values=parameter_values,
             boundary_conditions=bcs,
         )
         if equation_names is not None:
@@ -489,7 +582,7 @@ class SystemModel:
                 entry["target_kind"] = "unknown"
             registry.append(entry)
 
-        # ── Apply substitutions to every matrix. ──────────────────
+        # ── Apply substitutions to every primary matrix. ──────────
         self.flux = self.flux.xreplace(sub_dict)
         self.hydrostatic_pressure = self.hydrostatic_pressure.xreplace(
             sub_dict)
@@ -500,6 +593,14 @@ class SystemModel:
         for idx in _product(*[range(s) for s in B.shape]):
             new_B[idx] = B[idx].xreplace(sub_dict)
         self.nonconservative_matrix = new_B
+
+        # Keep the derived operators consistent: recompute
+        # quasilinear_matrix / source_jacobian from the substituted
+        # primaries, and push the substitution through eigenvalues
+        # (cheap — avoids re-paying the spectral derivation).
+        self.refresh_derived_operators(eigenvalues=False)
+        if self.eigenvalues is not None:
+            self.eigenvalues = self.eigenvalues.xreplace(sub_dict)
 
         self.aux_state = list(self.aux_state) + new_syms
         self.aux_registry = registry
@@ -599,6 +700,10 @@ class SystemModel:
             new_B[idx] = B[idx].xreplace(sub_dict)
         self.nonconservative_matrix = new_B
 
+        self.refresh_derived_operators(eigenvalues=False)
+        if self.eigenvalues is not None:
+            self.eigenvalues = self.eigenvalues.xreplace(sub_dict)
+
         self.aux_state = list(self.aux_state) + list(name_to_sym.values())
         self.aux_function_map = aux_function_map
         self.history.append({
@@ -686,6 +791,10 @@ class SystemModel:
         for idx in product(*[range(s) for s in shape]):
             new_B[idx] = B[idx].xreplace(derivative_subs)
         self.nonconservative_matrix = new_B
+
+        self.refresh_derived_operators(eigenvalues=False)
+        if self.eigenvalues is not None:
+            self.eigenvalues = self.eigenvalues.xreplace(derivative_subs)
 
         # Extend aux_state with the new derivative Symbols.
         self.aux_state = list(self.aux_state) + list(
@@ -796,6 +905,9 @@ class SystemModel:
         self.nonconservative_matrix = new_B
         self.source = new_S
         self.mass_matrix = new_M
+        # A change of variables alters the characteristic structure, so
+        # re-derive the derived operators (spectrum included).
+        self.refresh_derived_operators(eigenvalues=True)
         self.history.append({
             "name": "change_state_variables",
             "description": (
@@ -910,11 +1022,14 @@ class SystemModelDescription:
             f"{sm.n_dim} spatial dimension{'s' if sm.n_dim != 1 else ''}",
             f"**State:** {', '.join(str(s) for s in sm.state)}",
         ]
-        if sm.parameters:
+        if sm.parameters.length():
             parts.append(
                 "**Parameters:** "
-                + ", ".join(f"${sp.latex(s)} = {v}$"
-                            for s, v in sm.parameters.items())
+                + ", ".join(
+                    f"${sp.latex(sm.parameters[k])} = "
+                    f"{getattr(sm.parameter_values, k, '?')}$"
+                    for k in sm.parameters.keys()
+                )
             )
         if sm.history:
             parts.append(
@@ -984,6 +1099,8 @@ class InvertMassMatrix:
                     new_B[i, j, k] = slab[i, j]
         sm.nonconservative_matrix = new_B
         sm.mass_matrix = sp.eye(n)
+        # M⁻¹ changes the quasilinear matrix, hence the spectrum.
+        sm.refresh_derived_operators(eigenvalues=True)
 
 
 __all__ = [
