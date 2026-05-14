@@ -141,7 +141,7 @@ class GenericJsBase(GenericCppBase):
             ("time", self.ARG_MAPPING.get("time", "time")),
             ("distance", self.ARG_MAPPING.get("distance", "dX")),
         ):
-            if key in func_obj.args:
+            if func_obj.args.contains(key):
                 scalar_map[func_obj.args[key]] = param_name
         self.symbol_maps.append(scalar_map)
         try:
@@ -153,6 +153,30 @@ class GenericJsBase(GenericCppBase):
             )
         finally:
             self.symbol_maps.pop()
+
+    # ── Piecewise printing (nested ternary) ──────────
+
+    def _print_Piecewise(self, expr):
+        """Nested Piecewise → a chained JS ternary.
+
+        The top-level vector Piecewise (a boundary-condition dispatch)
+        is handled by ``_print_piecewise_structure``; this prints a
+        scalar Piecewise appearing *inside* an expression — e.g. a
+        piecewise-linear Q(t) interpolation.
+        """
+        args = list(expr.args)
+        last = args[-1]
+        if last.cond is True or last.cond == sp.true:
+            result = f"({self._print(last.expr)})"
+            rest = args[:-1]
+        else:
+            result = "0.0"
+            rest = args
+        for pair in reversed(rest):
+            cond = self.doprint(pair.cond)
+            val = self._print(pair.expr)
+            result = f"(({cond}) ? ({val}) : ({result}))"
+        return result
 
     # ── Pow printing (JS uses ** or Math.pow) ────────
 

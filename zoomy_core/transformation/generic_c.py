@@ -208,6 +208,12 @@ class GenericCppBase(CXX11CodePrinter):
 
         def replace_logic(node):
             """Replace logic."""
+            # Piecewise is a control structure, not a model-function
+            # call — never extract it (its ExprCondPair args otherwise
+            # look array-valued and get mangled).  It is printed inline
+            # as a nested conditional by the language printer.
+            if isinstance(node, sp.Piecewise):
+                return node
             if isinstance(node, sp.Indexed):
                 base = node.base
                 label = base.label if hasattr(base, "label") else base

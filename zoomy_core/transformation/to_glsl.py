@@ -101,6 +101,30 @@ class GenericGlslBase(GenericCppBase):
             s += ".0"
         return s
 
+    def _print_Piecewise(self, expr):
+        """Nested *scalar* Piecewise → a chained GLSL ternary.
+
+        (The top-level vector Piecewise — a boundary-condition dispatch
+        — is handled separately by :meth:`_print_piecewise_structure`;
+        this prints a scalar Piecewise that appears *inside* an
+        expression, e.g. a piecewise-linear Q(t) interpolation.)
+        """
+        args = list(expr.args)
+        last = args[-1]
+        if last.cond is True or last.cond == sp.true:
+            result = f"({self._print(last.expr)})"
+            rest = args[:-1]
+        else:
+            # Exhaustive-but-no-literal-True chains (e.g. the time
+            # interpolation) — the fallback is never reached.
+            result = "0.0"
+            rest = args
+        for pair in reversed(rest):
+            cond = self.doprint(pair.cond)
+            val = self._print(pair.expr)
+            result = f"(({cond}) ? ({val}) : ({result}))"
+        return result
+
     def _print_Relational(self, expr):
         """Print a comparison, choosing int vs float literal context."""
         int_ctx = bool(getattr(expr.lhs, "is_integer", False)) and bool(
@@ -371,7 +395,7 @@ class GenericGlslBase(GenericCppBase):
             ("time", self.ARG_MAPPING.get("time", "time")),
             ("distance", self.ARG_MAPPING.get("distance", "dX")),
         ):
-            if key in func_obj.args:
+            if func_obj.args.contains(key):
                 scalar_map[func_obj.args[key]] = param_name
         self.symbol_maps.append(scalar_map)
         try:
