@@ -139,30 +139,95 @@ class Extrapolation(BoundaryCondition):
 
 
 class InflowOutflow(BoundaryCondition):
-    """InflowOutflow. (class)."""
+    """Inflow / outflow boundary — prescribe selected state fields,
+    extrapolate the rest.
+
+    ``prescribe_fields`` maps a **state index** to a *spec*.  A spec is
+    either a bare value (scalar or symbolic expression — the field is
+    replaced by it) or a ``dict`` carrying a ``"mode"`` key:
+
+    * ``{"mode": "replace", "value": v}`` — ``Q_out[k] = v``.
+    * ``{"mode": "inlet_outlet", "value": v}`` — OpenFOAM ``inletOutlet``
+      style: the field takes ``v`` where the interior is inflowing
+      (``Q[k] >= 0``) and keeps the interior value otherwise (so
+      backflow is never overridden):
+      ``Q_out[k] = conditional(Q[k] >= 0, v, Q[k])``.  The index ``k``
+      is assumed to be a momentum component whose positive direction
+      points into the domain.
+    * ``{"mode": "blend", "target": t, "weight": w}`` — a *soft* inflow:
+      ``Q_out[k] = Q[k] + max(0, t - Q[k]) * w``.  ``w = 0`` means "no
+      inflow" (the field stays at its interior value); ``w = 1`` pulls
+      it fully to ``t``.
+
+    Every ``value`` / ``target`` / ``weight`` is a scalar or a symbolic
+    expression — typically built by the codegen driver from model
+    parameters (e.g. a piecewise-linear Q(t) timeline interpolated over
+    a fixed block of timeline parameters).  The BC plugs the
+    expressions in; it never builds them and it never reads data.
+    """
+
     prescribe_fields = param.Dict(default={})
+
+    @staticmethod
+    def _coerce(v):
+        """Symbolic expressions and numbers pass through unchanged; a
+        legacy eval-able string spec is evaluated."""
+        if isinstance(v, sympy.Basic):
+            return v
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return float(eval(v))
+
+    def _symbolic_field(self, k, spec, Q):
+        """Symbolic ghost value for prescribed state index ``k``."""
+        from zoomy_core.model.kernel_functions import conditional
+
+        if not isinstance(spec, dict):
+            return self._coerce(spec)
+        mode = spec.get("mode", "replace")
+        if mode == "replace":
+            return self._coerce(spec["value"])
+        if mode == "inlet_outlet":
+            v = self._coerce(spec["value"])
+            return conditional(sympy.GreaterThan(Q[k], 0), v, Q[k])
+        if mode == "blend":
+            target = self._coerce(spec["target"])
+            weight = self._coerce(spec["weight"])
+            return Q[k] + sympy.Max(0, target - Q[k]) * weight
+        raise ValueError(
+            f"InflowOutflow: unknown prescribe mode {mode!r} "
+            f"(expected 'replace', 'inlet_outlet' or 'blend')"
+        )
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
         """Compute boundary condition."""
         Qout = ZArray(Q)
-        for k, v in self.prescribe_fields.items():
-            try:
-                val = float(v)
-            except (ValueError, TypeError):
-                val = eval(v)
-            Qout[k] = val
+        for k, spec in self.prescribe_fields.items():
+            Qout[k] = self._symbolic_field(k, spec, Q)
         return Qout
 
-
     def face_value(self, Q_inner, Qaux_inner, normal, d_face, time, parameters):
-        """InflowOutflow: prescribe selected fields, rest from interior."""
+        """InflowOutflow (numpy path): prescribe selected fields, rest
+        from the interior.  Supports constant ``replace`` specs only —
+        the symbolic ``inlet_outlet`` / ``blend`` modes and
+        parameter-valued prescriptions flow through the codegen path
+        (``compute_boundary_condition``)."""
         Q_out = np.asarray(Q_inner, dtype=float).copy()
-        for k, v in self.prescribe_fields.items():
+        for k, spec in self.prescribe_fields.items():
+            if isinstance(spec, dict):
+                if spec.get("mode", "replace") != "replace":
+                    raise NotImplementedError(
+                        "InflowOutflow.face_value supports only constant "
+                        "'replace' specs; use the codegen path "
+                        f"(compute_boundary_condition) for mode "
+                        f"{spec.get('mode')!r}."
+                    )
+                spec = spec["value"]
             try:
-                val = float(v)
+                Q_out[k] = float(spec)
             except (ValueError, TypeError):
-                val = float(eval(v))
-            Q_out[k] = val
+                Q_out[k] = float(eval(spec))
         return Q_out
 
 
