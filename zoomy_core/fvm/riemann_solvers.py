@@ -15,7 +15,7 @@ import sympy as sp
 from zoomy_core.misc.misc import ZArray, Zstruct
 from zoomy_core.model.basefunction import SymbolicRegistrar
 from zoomy_core.model.basemodel import Model
-from zoomy_core.model.kernel_functions import max_wavespeed
+from zoomy_core.model.kernel_functions import conditional, max_wavespeed
 from zoomy_core.transformation.to_numpy import NumpyRuntimeSymbolic
 
 
@@ -341,6 +341,161 @@ class Rusanov(Numerics):
         )
         Id = self.get_viscosity_identity_flux()
         return 0.5 * ((FL + PL) @ n + (FR + PR) @ n) - 0.5 * s_max * Id @ (qR - qL)
+
+
+class HLL(Numerics):
+    """HLL (Harten-Lax-van-Leer) approximate Riemann solver.
+
+    Model-agnostic: needs only ``model.flux()``,
+    ``model.hydrostatic_pressure()`` and wave-speed bounds.  In
+    ``eigenvalue_mode == "symbolic"`` the bounds are the Davis estimates
+    — min / max over the eigenvalues of *both* face states.  Otherwise
+    it falls back to ``± local_max_abs_eigenvalue``, i.e. HLL collapses
+    to local Lax-Friedrichs (a valid, more diffusive HLL).
+
+    The numerical flux is a single closed-form (branch-free) SymPy
+    expression — clamping the wave speeds with ``Min(s_L, 0)`` /
+    ``Max(s_R, 0)`` recovers the upwind branches without ``Piecewise``,
+    so it codegens cleanly to every backend.
+    """
+
+    name = param.String(default="HLLV2")
+
+    def numerical_flux(self):
+        """Numerical flux."""
+        return self._compute_flux(
+            self.variables_minus,
+            self.variables_plus,
+            self.aux_variables_minus,
+            self.aux_variables_plus,
+            self.parameters,
+            self.normal,
+        )
+
+    def wave_speed_bounds(self, qL, qR, auxL, auxR, p, n):
+        """Return ``(s_L, s_R)`` — slowest / fastest signal speeds at the face."""
+        if getattr(self.model, "eigenvalue_mode", "symbolic") == "numerical":
+            a = sp.Max(
+                self.local_max_abs_eigenvalue(qL, auxL, p, n),
+                self.local_max_abs_eigenvalue(qR, auxR, p, n),
+            )
+            return -a, a
+        eig = list(self._model_eval("eigenvalues", qL, auxL, p, n))
+        eig += list(self._model_eval("eigenvalues", qR, auxR, p, n))
+        return sp.Min(*eig), sp.Max(*eig)
+
+    def _physical_flux_n(self, q, aux, p, n):
+        """Normal-projected physical flux ``(F + P) @ n`` for a single state."""
+        F = self._model_eval("flux", q, aux, p)
+        P = self._model_eval("hydrostatic_pressure", q, aux, p)
+        return (F + P) @ n
+
+    def _state_jump(self, qL, qR):
+        """``qR - qL`` with stationary fields (bed in conservative state) zeroed."""
+        dq = ZArray(qR) - ZArray(qL)
+        b = self._field_handles.get("b")
+        if b is not None and b.container == "q":
+            dq[b.index] = sp.Integer(0)
+        return dq
+
+    def _compute_flux(self, qL, qR, auxL, auxR, p, n):
+        """Internal helper `_compute_flux`."""
+        FLn = self._physical_flux_n(qL, auxL, p, n)
+        FRn = self._physical_flux_n(qR, auxR, p, n)
+        sL, sR = self.wave_speed_bounds(qL, qR, auxL, auxR, p, n)
+        sLm = sp.Min(sL, sp.Integer(0))
+        sRp = sp.Max(sR, sp.Integer(0))
+        eps = self._eps_symbol()
+        inv = 1 / (sRp - sLm + eps)
+        dq = self._state_jump(qL, qR)
+        return (sRp * FLn - sLm * FRn + sLm * sRp * dq) * inv
+
+
+class HLLC(HLL):
+    """HLLC approximate Riemann solver for the free-surface family.
+
+    Restores the contact / shear wave that HLL smears.  Requires a depth
+    field ``h`` (resolved via :meth:`Numerics.find_field`); the momentum
+    block is the first ``model.dimension`` depth-scaled Q rows.  Any
+    further depth-scaled rows (higher moments) are advected by the
+    contact wave; non-scaled rows (e.g. bed in conservative state) pass
+    through unchanged.  Models without an ``h`` field should use
+    :class:`HLL` instead.
+
+    Region selection (``F_L | F_L* | F_R* | F_R``) uses the opaque
+    ``conditional`` primitive, so it codegens to ``np.where`` / ternary
+    expressions on every backend.
+    """
+
+    name = param.String(default="HLLCV2")
+
+    @property
+    def h_field(self):
+        """Depth :class:`FieldHandle` — raises ``KeyError`` if the model
+        has no ``h`` field (such models should use :class:`HLL`)."""
+        return self.find_field("h")
+
+    def _normal_velocity(self, q, aux, n, mom_idx):
+        """Internal helper `_normal_velocity`."""
+        h = self.h_field.access(q, aux)
+        eps = self._eps_symbol()
+        return sum(q[k] * n[d] for d, k in enumerate(mom_idx)) / (h + eps)
+
+    def _star_state(self, q, aux, h, un, s_side, s_star, n, mom_idx):
+        """HLLC star state on one side of the contact wave."""
+        eps = self._eps_symbol()
+        h_star = h * (s_side - un) / (s_side - s_star + eps)
+        out = ZArray(q)
+        if self.h_field.container == "q":
+            out[self.h_field.index] = h_star
+        # Momentum block: tangential part advected, normal part -> h* s*.
+        for d, k in enumerate(mom_idx):
+            u_k = q[k] / (h + eps)
+            u_tan_k = u_k - un * n[d]
+            out[k] = h_star * (u_tan_k + s_star * n[d])
+        # Remaining depth-scaled rows (higher moments): advected, scale with depth.
+        for k in self._scaled_q_indices:
+            if k in mom_idx:
+                continue
+            out[k] = q[k] * h_star / (h + eps)
+        return out
+
+    def _compute_flux(self, qL, qR, auxL, auxR, p, n):
+        """Internal helper `_compute_flux`."""
+        FLn = self._physical_flux_n(qL, auxL, p, n)
+        FRn = self._physical_flux_n(qR, auxR, p, n)
+        sL, sR = self.wave_speed_bounds(qL, qR, auxL, auxR, p, n)
+
+        dim = self.model.dimension
+        mom_idx = list(self._scaled_q_indices)[:dim]
+        eps = self._eps_symbol()
+
+        hL = self.h_field.access(qL, auxL)
+        hR = self.h_field.access(qR, auxR)
+        unL = self._normal_velocity(qL, auxL, n, mom_idx)
+        unR = self._normal_velocity(qR, auxR, n, mom_idx)
+
+        # Contact-wave speed (depth-weighted HLL middle state).
+        num = sL * hR * (unR - sR) - sR * hL * (unL - sL)
+        den = hR * (unR - sR) - hL * (unL - sL)
+        s_star = num / (den + eps)
+
+        QLs = self._star_state(qL, auxL, hL, unL, sL, s_star, n, mom_idx)
+        QRs = self._star_state(qR, auxR, hR, unR, sR, s_star, n, mom_idx)
+
+        FLs = FLn + sL * (QLs - ZArray(qL))
+        FRs = FRn + sR * (QRs - ZArray(qR))
+
+        flux = conditional(
+            sL >= 0,
+            FLn,
+            conditional(
+                s_star >= 0,
+                FLs,
+                conditional(sR > 0, FRs, FRn),
+            ),
+        )
+        return ZArray(flux)
 
 
 class PositiveRusanov(Rusanov):
