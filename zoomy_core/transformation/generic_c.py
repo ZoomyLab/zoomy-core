@@ -683,12 +683,12 @@ class GenericCppNumerics(GenericCppBase):
         """Initialize the instance."""
         super().__init__(*args, **kwargs)
         self.numerics = numerics
-        self.model = numerics.model
+        self.model = numerics.model               # a SystemModel
         self.gpu_enabled = gpu_enabled
-        self.n_dof_q = self.model.n_variables
-        self.n_dof_qaux = self.model.n_aux_variables
-        self.register_map("Q", self.model.variables.values())
-        self.register_map("Qaux", self.model.aux_variables.values())
+        self.n_dof_q = self.model.n_equations
+        self.n_dof_qaux = len(self.model.aux_state)
+        self.register_map("Q", self.model.state)
+        self.register_map("Qaux", self.model.aux_state)
         self.register_map("n", self.model.normal.values())
         self.register_map("Q_minus", numerics.variables_minus)
         self.register_map("Q_plus", numerics.variables_plus)

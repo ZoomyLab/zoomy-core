@@ -324,12 +324,12 @@ class JsNumerics(GenericJsBase):
         """Initialize with a Zoomy Numerics instance."""
         super().__init__()
         self.numerics = numerics
-        self.model = numerics.model
-        self.n_dof_q = self.model.n_variables
-        self.n_dof_qaux = self.model.n_aux_variables
+        self.model = numerics.model               # a SystemModel
+        self.n_dof_q = self.model.n_equations
+        self.n_dof_qaux = len(self.model.aux_state)
 
-        self.register_map("Q", self.model.variables.values())
-        self.register_map("Qaux", self.model.aux_variables.values())
+        self.register_map("Q", self.model.state)
+        self.register_map("Qaux", self.model.aux_state)
         self.register_map("n", self.model.normal.values())
         self.register_map("Q_minus", numerics.variables_minus)
         self.register_map("Q_plus", numerics.variables_plus)
@@ -338,7 +338,7 @@ class JsNumerics(GenericJsBase):
         self.register_map("flux_minus", numerics.flux_minus)
         self.register_map("flux_plus", numerics.flux_plus)
         self.register_map("source_term", numerics.source_term)
-        self.register_map("p", self.model._parameter_symbols.values())
+        self.register_map("p", self.model.parameters.values())
 
     def generate(self):
         """Generate all numerics kernels as a single JS code string."""

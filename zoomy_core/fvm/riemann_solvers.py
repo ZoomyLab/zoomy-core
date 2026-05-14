@@ -2,8 +2,8 @@
 
 Every index-dependent class (``PositiveRusanov``, ``NonconservativeRusanov``,
 ``PositiveNonconservativeRusanov``, …) auto-locates the named fields
-``h`` and ``b`` (and ``hinv`` when present) in ``model.variables`` /
-``model.aux_variables`` via :class:`FieldHandle` so the same Riemann
+``h`` and ``b`` (and ``hinv`` when present) in ``model.state`` /
+``model.aux_state`` via :class:`FieldHandle` so the same Riemann
 code path works whether bathymetry is part of the conservative state
 (legacy SWE) or lives in ``Qaux`` (chain-DAE convention).
 """
@@ -14,8 +14,8 @@ import sympy as sp
 
 from zoomy_core.misc.misc import ZArray, Zstruct
 from zoomy_core.model.basefunction import SymbolicRegistrar
-from zoomy_core.model.basemodel import Model
 from zoomy_core.model.kernel_functions import conditional, max_wavespeed
+from zoomy_core.model.models.system_model import SystemModel
 from zoomy_core.transformation.to_numpy import NumpyRuntimeSymbolic
 
 
@@ -78,39 +78,62 @@ class FieldHandle:
 
 
 class Numerics(param.Parameterized, SymbolicRegistrar):
-    """Numerics. (class).
+    """Symbolic numerics over a :class:`SystemModel`.
+
+    The numerics consumes a :class:`SystemModel` — the frozen
+    operator-form snapshot of a derivation.  A :class:`Model` passed to
+    the constructor is normalised once via
+    :meth:`SystemModel.from_model`; everything internal reads the
+    SystemModel's stored operators (``flux``, ``hydrostatic_pressure``,
+    ``eigenvalues``, ``nonconservative_matrix``, ``quasilinear_matrix``)
+    and its ``state`` / ``aux_state`` / ``parameters`` / ``normal``.
 
     Subclasses that depend on the location of named fields (``h``,
-    ``b``, ``hinv``, …) call :meth:`find_field` at the top of their
-    own ``__init__`` to obtain a :class:`FieldHandle` — the search
-    walks state then aux automatically, so the same numerics works
-    whether bathymetry is in ``Q`` (legacy SWE) or in ``Qaux``
-    (chain-DAE)."""
+    ``b``, ``hinv``, …) call :meth:`find_field` to obtain a
+    :class:`FieldHandle` — the search walks state then aux
+    automatically, so the same numerics works whether bathymetry is in
+    the state or in ``aux_state``."""
 
     name = param.String(default="NumericsV2")
-    model = param.ClassSelector(class_=Model, is_instance=True)
+    model = param.Parameter(
+        default=None,
+        doc="The SystemModel the numerics operates on (a Model is "
+            "normalised via SystemModel.from_model in __init__).",
+    )
 
     scaled_q_indices = param.List(default=None, allow_None=True)
 
     def __init__(self, model, **params):
-        """Initialize the instance."""
-        super().__init__(model=model, **params)
+        """Initialize the instance.
+
+        ``model`` may be a :class:`SystemModel` (used directly) or a
+        :class:`Model` (normalised once via
+        :meth:`SystemModel.from_model`).
+        """
+        sm = (model if isinstance(model, SystemModel)
+              else SystemModel.from_model(model))
+        super().__init__(model=sm, **params)
         self.functions, self.call = Zstruct(), Zstruct()
 
-        self.variables = ZArray(self.model.variables.get_list())
-        self.aux_variables = ZArray(self.model.aux_variables.get_list())
-        # Use symbols for symbolic derivation (not the numeric values in model.parameters)
-        self.parameters = ZArray(self.model._parameter_symbols.get_list())
-        self.normal = ZArray(self.model.normal.get_list())
+        self.n_variables = self.model.n_equations
+        self.n_aux_variables = len(self.model.aux_state)
 
-        self.variables_minus = self._create_v("Q_minus", self.model.n_variables)
-        self.variables_plus = self._create_v("Q_plus", self.model.n_variables)
-        self.aux_variables_minus = self._create_v("Qaux_minus", self.model.n_aux_variables)
-        self.aux_variables_plus = self._create_v("Qaux_plus", self.model.n_aux_variables)
+        self.variables = ZArray(list(self.model.state))
+        self.aux_variables = ZArray(list(self.model.aux_state))
+        # Parameter / normal symbols (used in symbolic derivation).
+        self.parameters = ZArray(list(self.model.parameters.values()))
+        self.normal = ZArray(list(self.model.normal.values()))
 
-        self.flux_minus = self._create_v("flux_minus", self.model.n_variables)
-        self.flux_plus = self._create_v("flux_plus", self.model.n_variables)
-        self.source_term = self._create_v("source_term", self.model.n_variables)
+        self.variables_minus = self._create_v("Q_minus", self.n_variables)
+        self.variables_plus = self._create_v("Q_plus", self.n_variables)
+        self.aux_variables_minus = self._create_v(
+            "Qaux_minus", self.n_aux_variables)
+        self.aux_variables_plus = self._create_v(
+            "Qaux_plus", self.n_aux_variables)
+
+        self.flux_minus = self._create_v("flux_minus", self.n_variables)
+        self.flux_plus = self._create_v("flux_plus", self.n_variables)
+        self.source_term = self._create_v("source_term", self.n_variables)
 
         # Auto-locate the standard named fields (``h``, ``b``, ``hinv``)
         # if present.  Subclasses can call ``find_field`` to register
@@ -120,7 +143,8 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
             h = self.find_field(name, required=False)
             if h is not None:
                 self._field_handles[name] = h
-        self._scaled_q_indices = self._resolve_scaled_q_indices(self.scaled_q_indices)
+        self._scaled_q_indices = self._resolve_scaled_q_indices(
+            self.scaled_q_indices)
 
         self._initialize_functions()
 
@@ -129,8 +153,8 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
     def find_field(self, name, *, required=True):
         """Return a :class:`FieldHandle` for the named field.
 
-        Searches ``self.model.variables`` (Q) first, then
-        ``self.model.aux_variables`` (Qaux).  Caches the result in
+        Searches ``self.model.state`` (Q) first, then
+        ``self.model.aux_state`` (Qaux).  Caches the result in
         ``self._field_handles[name]`` so repeat lookups are free.
 
         Parameters
@@ -143,7 +167,7 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         cache = getattr(self, "_field_handles", None) or {}
         if name in cache:
             return cache[name]
-        state_list = self.model.variables.get_list()
+        state_list = list(self.model.state)
         state_names = [str(s) for s in state_list]
         if name in state_names:
             i = state_names.index(name)
@@ -153,7 +177,7 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
                             state=self.variables[i])
             cache[name] = h
             return h
-        aux_list = self.model.aux_variables.get_list()
+        aux_list = list(self.model.aux_state)
         aux_names = [str(s) for s in aux_list]
         if name in aux_names:
             i = aux_names.index(name)
@@ -165,8 +189,8 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
             return h
         if required:
             raise KeyError(
-                f"Field {name!r} not found in model.variables "
-                f"({state_names}) nor model.aux_variables ({aux_names})"
+                f"Field {name!r} not found in model.state "
+                f"({state_names}) nor model.aux_state ({aux_names})"
             )
         return None
 
@@ -186,7 +210,7 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         if scaled_q_indices is not None:
             cleaned = [int(i) for i in scaled_q_indices]
             for i in cleaned:
-                if i < 0 or i >= self.model.n_variables:
+                if i < 0 or i >= self.n_variables:
                     raise IndexError(
                         f"scaled_q_indices contains out-of-bounds index {i}."
                     )
@@ -197,13 +221,13 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
             h = self._field_handles.get(name)
             if h is not None and h.container == "q":
                 excluded.add(h.index)
-        return [i for i in range(self.model.n_variables) if i not in excluded]
+        return [i for i in range(self.n_variables) if i not in excluded]
 
     def _eps_symbol(self):
         """Internal helper `_eps_symbol`."""
-        # Use the symbolic eps from _parameter_symbols (not the numeric value)
-        if hasattr(self.model._parameter_symbols, "contains") and self.model._parameter_symbols.contains("eps"):
-            return self.model._parameter_symbols.eps
+        # Symbolic eps parameter if the model declares one.
+        if self.model.parameters.contains("eps"):
+            return self.model.parameters.eps
         return sp.Float(1e-12)
 
     def _initialize_functions(self):
@@ -248,18 +272,25 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
             return self.local_max_eigenvalue_definition()
         return max_wavespeed(*list(Q), *list(Qaux), *list(p), *list(n))
 
-    def _model_eval(self, function_name, Q, Qaux, p, n=None):
-        """Internal helper `_model_eval`."""
-        definition = self.model.functions[function_name].definition
+    def _model_eval(self, operator_name, Q, Qaux, p, n=None):
+        """Evaluate a SystemModel operator at a given state.
+
+        ``operator_name`` is the SystemModel attribute name — ``flux``,
+        ``hydrostatic_pressure``, ``eigenvalues``,
+        ``nonconservative_matrix`` or ``quasilinear_matrix``.  Returns
+        the operator with ``state`` / ``aux_state`` / ``parameters`` /
+        ``normal`` symbols substituted by the supplied values.
+        """
+        definition = getattr(self.model, operator_name)
         sub_map = {}
-        for sym, val in zip(self.model.variables.get_list(), list(Q)):
+        for sym, val in zip(self.model.state, list(Q)):
             sub_map[sym] = val
-        for sym, val in zip(self.model.aux_variables.get_list(), list(Qaux)):
+        for sym, val in zip(self.model.aux_state, list(Qaux)):
             sub_map[sym] = val
-        for sym, val in zip(self.model._parameter_symbols.get_list(), list(p)):
+        for sym, val in zip(self.model.parameters.values(), list(p)):
             sub_map[sym] = val
         if n is not None:
-            for sym, val in zip(self.model.normal.get_list(), list(n)):
+            for sym, val in zip(self.model.normal.values(), list(n)):
                 sub_map[sym] = val
 
         if hasattr(definition, "subs"):
@@ -286,12 +317,12 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
 
     def numerical_flux(self):
         """Numerical flux."""
-        zeros = [sp.Integer(0)] * self.model.n_variables
+        zeros = [sp.Integer(0)] * self.n_variables
         return ZArray(zeros)
 
     def numerical_fluctuations(self):
         """Numerical fluctuations."""
-        zeros = ZArray.zeros(self.model.n_variables)
+        zeros = ZArray.zeros(self.n_variables)
         return ZArray([zeros, zeros])
 
 
@@ -301,7 +332,7 @@ class Rusanov(Numerics):
 
     def get_viscosity_identity_flux(self):
         """Get viscosity identity flux."""
-        n = self.model.n_variables
+        n = self.n_variables
         Id = ZArray.zeros(n, n)
         for i in range(n):
             Id[i, i] = 1
@@ -315,7 +346,7 @@ class Rusanov(Numerics):
     def get_viscosity_identity_fluctuations(self):
         # Conservative Rusanov variants do not use fluctuation viscosity.
         """Get viscosity identity fluctuations."""
-        n = self.model.n_variables
+        n = self.n_variables
         return ZArray.zeros(n, n)
 
     def numerical_flux(self):
@@ -346,12 +377,14 @@ class Rusanov(Numerics):
 class HLL(Numerics):
     """HLL (Harten-Lax-van-Leer) approximate Riemann solver.
 
-    Model-agnostic: needs only ``model.flux()``,
-    ``model.hydrostatic_pressure()`` and wave-speed bounds.  In
-    ``eigenvalue_mode == "symbolic"`` the bounds are the Davis estimates
-    — min / max over the eigenvalues of *both* face states.  Otherwise
-    it falls back to ``± local_max_abs_eigenvalue``, i.e. HLL collapses
-    to local Lax-Friedrichs (a valid, more diffusive HLL).
+    Model-agnostic: needs only the SystemModel's ``flux``,
+    ``hydrostatic_pressure`` and ``eigenvalues`` operators.  When the
+    SystemModel carries a symbolic spectrum the wave-speed bounds are
+    the Davis estimates — min / max over the eigenvalues of *both* face
+    states.  When ``eigenvalues`` is ``None`` (the model skipped the
+    spectral derivation) it falls back to ``± local_max_abs_eigenvalue``,
+    i.e. HLL collapses to local Lax-Friedrichs (a valid, more diffusive
+    HLL).
 
     The numerical flux is a single closed-form (branch-free) SymPy
     expression — clamping the wave speeds with ``Min(s_L, 0)`` /
@@ -374,14 +407,14 @@ class HLL(Numerics):
 
     def wave_speed_bounds(self, qL, qR, auxL, auxR, p, n):
         """Return ``(s_L, s_R)`` — slowest / fastest signal speeds at the face."""
-        if getattr(self.model, "eigenvalue_mode", "symbolic") == "numerical":
+        if self.model.eigenvalues is None:
             a = sp.Max(
                 self.local_max_abs_eigenvalue(qL, auxL, p, n),
                 self.local_max_abs_eigenvalue(qR, auxR, p, n),
             )
             return -a, a
-        eig = list(self._model_eval("eigenvalues", qL, auxL, p, n))
-        eig += list(self._model_eval("eigenvalues", qR, auxR, p, n))
+        eig = list(sp.flatten(self._model_eval("eigenvalues", qL, auxL, p, n)))
+        eig += list(sp.flatten(self._model_eval("eigenvalues", qR, auxR, p, n)))
         return sp.Min(*eig), sp.Max(*eig)
 
     def _physical_flux_n(self, q, aux, p, n):
@@ -466,7 +499,7 @@ class HLLC(HLL):
         FRn = self._physical_flux_n(qR, auxR, p, n)
         sL, sR = self.wave_speed_bounds(qL, qR, auxL, auxR, p, n)
 
-        dim = self.model.dimension
+        dim = self.model.n_dim
         mom_idx = list(self._scaled_q_indices)[:dim]
         eps = self._eps_symbol()
 
@@ -622,12 +655,12 @@ class NonconservativeRusanov(Rusanov):
         # numerical_fluctuations to avoid double counting in flux + fluctuation
         # updates.
         """Get viscosity identity flux."""
-        n = self.model.n_variables
+        n = self.n_variables
         return ZArray.zeros(n, n)
 
     def get_viscosity_identity_fluctuations(self):
         """Get viscosity identity fluctuations."""
-        n = self.model.n_variables
+        n = self.n_variables
         Id = ZArray.zeros(n, n)
         for i in range(n):
             Id[i, i] = 1
@@ -658,7 +691,7 @@ class NonconservativeRusanov(Rusanov):
 
         dQ = qR - qL
         dAux = auxR - auxL
-        n_vars = self.model.n_variables
+        n_vars = self.n_variables
         dim = len(n)
 
         A_int = ZArray.zeros(n_vars, n_vars)
@@ -712,7 +745,7 @@ class QuasilinearRusanov(NonconservativeRusanov):
 
     def numerical_flux(self):
         """Numerical flux."""
-        zeros = [sp.Integer(0)] * self.model.n_variables
+        zeros = [sp.Integer(0)] * self.n_variables
         return ZArray(zeros)
 
     def _call_model_matrix(self):
@@ -726,7 +759,7 @@ class PositiveQuasilinearRusanov(PositiveRusanov, QuasilinearRusanov):
 
     def numerical_flux(self):
         """Numerical flux."""
-        zeros = [sp.Integer(0)] * self.model.n_variables
+        zeros = [sp.Integer(0)] * self.n_variables
         return ZArray(zeros)
 
     def get_path_integral_states(self):
