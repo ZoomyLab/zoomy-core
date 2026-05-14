@@ -161,7 +161,9 @@ class JsModel(GenericJsBase):
         self.register_map("n", model.normal.values())
         if hasattr(model, "position"):
             self.register_map("X", model.position.values())
-        self.register_map("p", model.parameters.values())
+        # Map the *symbolic* parameters; ``model.parameters`` holds the
+        # numeric values, which would never match a symbol in an expr.
+        self.register_map("p", model._parameter_symbols.values())
 
     def generate(self):
         """Generate all JS functions as a single code string.
