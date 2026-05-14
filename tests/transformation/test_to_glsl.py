@@ -17,8 +17,14 @@ from sympy import Matrix, sqrt
 
 from zoomy_core.misc.misc import ZArray
 from zoomy_core.model.basemodel import Model
+from zoomy_core.model.boundary_conditions import (
+    BoundaryConditions,
+    Extrapolation,
+    Wall,
+)
 from zoomy_core.model.models.advection_model import ScalarAdvection
-from zoomy_core.transformation.to_glsl import GlslModel
+from zoomy_core.fvm.riemann_solvers import HLL, HLLC
+from zoomy_core.transformation.to_glsl import GlslModel, GlslNumerics
 
 _GLSLANG = shutil.which("glslangValidator")
 requires_glslang = pytest.mark.skipif(
@@ -135,3 +141,43 @@ def test_integer_literals_are_floats(swe_glsl):
     assert ok
     # 0.5 * g * h**2 in the flux -> the 0.5 must survive as a float.
     assert "0.5" in swe_glsl or "(1.0 / 2.0)" in swe_glsl
+
+
+def _swe_with_bcs(dim):
+    """MiniSWE with a Wall + Extrapolation boundary set."""
+    momentum = [[1, 2]] if dim == 2 else [[1]]
+    bcs = BoundaryConditions(
+        [
+            Wall(tag="left", momentum_field_indices=momentum),
+            Extrapolation(tag="right"),
+        ]
+    )
+    return MiniSWE(dimension=dim, boundary_conditions=bcs)
+
+
+@requires_glslang
+@pytest.mark.parametrize("dim", [1, 2])
+@pytest.mark.parametrize("scheme", [HLL, HLLC])
+def test_numerics_glsl_compiles(dim, scheme):
+    """HLL / HLLC numerical-flux kernels compile as GLSL ES 3.00."""
+    numerics = scheme(_swe_with_bcs(dim))
+    glsl = GlslNumerics(numerics).generate()
+    assert "void numerical_flux(" in glsl
+    assert "out float res[" in glsl
+    ok, output = _glslang_validate(glsl)
+    assert ok, f"glslangValidator rejected {scheme.__name__} {dim}D GLSL:\n{output}"
+
+
+@requires_glslang
+@pytest.mark.parametrize("dim", [1, 2])
+def test_boundary_condition_glsl_compiles(dim):
+    """Wall + zero-Neumann BC dispatch kernels compile as GLSL ES 3.00.
+
+    Exercises the Piecewise path (if/else-if over the integer
+    ``bc_idx``) and the int-vs-float literal context in comparisons.
+    """
+    glsl = GlslModel(_swe_with_bcs(dim)).generate_boundary_conditions()
+    assert "void boundary_conditions(" in glsl
+    assert "int bc_idx" in glsl
+    ok, output = _glslang_validate(glsl)
+    assert ok, f"glslangValidator rejected BC GLSL ({dim}D):\n{output}"
