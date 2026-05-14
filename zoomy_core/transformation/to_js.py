@@ -39,6 +39,10 @@ class GenericJsBase(GenericCppBase):
     real_type = "const"
     gpu_enabled = False
 
+    # ``parameters`` is the BoundaryCondition Function's key for the
+    # model parameter vector; map it onto the same ``p`` accessor.
+    ARG_MAPPING = {**GenericCppBase.ARG_MAPPING, "parameters": "p"}
+
     c_functions = {
         "conditional": lambda p, c, t, f: (
             f"(({p.doprint(c)}) ? ({p.doprint(t)}) : ({p.doprint(f)}))"
@@ -85,9 +89,70 @@ class GenericJsBase(GenericCppBase):
         """Generate JS function parameter list from a Function object."""
         parts = []
         for key, val in func_obj.args.items():
-            js_name = self.ARG_MAPPING.get(key, key)
-            parts.append(js_name)
+            if key == "idx":
+                # Boundary-condition dispatch index.
+                parts.append("bc_idx")
+            else:
+                parts.append(self.ARG_MAPPING.get(key, key))
         return ", ".join(parts)
+
+    # ── Kernel generation ────────────────────────────────────────────
+
+    def _generate_kernel(self, name, func_obj):
+        """Generate one JS function from a Function object."""
+        expr = func_obj.definition
+        expr = self._expand_vector_conditionals(expr)
+        if isinstance(expr, (list, tuple)):
+            expr = self._flatten_ragged_list(expr)
+            expr = sp.Array(expr)
+        shape, expr = get_nested_shape(expr)
+        body = self.convert_expression_body(expr, shape)
+        args_str = self._generate_js_args(func_obj)
+        return self.wrap_function_signature(name, args_str, body, shape)
+
+    # ── Boundary conditions ──────────────────────────────────────────
+
+    def generate_boundary_conditions(self):
+        """Generate the model's boundary-condition dispatch kernels.
+
+        Emits ``boundary_conditions`` and ``aux_boundary_conditions`` —
+        each a Piecewise over the integer ``bc_idx`` selecting the
+        per-tag ghost/face state.
+        """
+        blocks = []
+        for attr in ("_boundary_conditions", "_aux_boundary_conditions"):
+            func_obj = getattr(self.model, attr, None)
+            if func_obj is None:
+                continue
+            blocks.append(self._generate_bc_kernel(func_obj))
+        return "\n\n".join(blocks)
+
+    def _generate_bc_kernel(self, func_obj):
+        """Generate one boundary-condition kernel from a Function object.
+
+        The scalar BC symbols (``bc_idx``, ``time``, ``distance``) are
+        registered so they print as their JS parameter names — the
+        underlying SymPy symbols (``bc_idx``, ``t``, ``dX``) do not all
+        match the parameter names produced by ``ARG_MAPPING``.
+        """
+        scalar_map = {}
+        for key, param_name in (
+            ("idx", "bc_idx"),
+            ("time", self.ARG_MAPPING.get("time", "time")),
+            ("distance", self.ARG_MAPPING.get("distance", "dX")),
+        ):
+            if key in func_obj.args:
+                scalar_map[func_obj.args[key]] = param_name
+        self.symbol_maps.append(scalar_map)
+        try:
+            shape, expr = get_nested_shape(func_obj.definition)
+            body = self.convert_expression_body(expr, shape)
+            args_str = self._generate_js_args(func_obj)
+            return self.wrap_function_signature(
+                func_obj.name, args_str, body, shape
+            )
+        finally:
+            self.symbol_maps.pop()
 
     # ── Pow printing (JS uses ** or Math.pow) ────────
 
@@ -239,14 +304,50 @@ const generatedModel = {{
         ]
         return "\n".join(lines)
 
-    def _generate_kernel(self, name, func_obj):
-        """Generate one JS function from a Function object."""
-        expr = func_obj.definition
-        expr = self._expand_vector_conditionals(expr)
-        if isinstance(expr, (list, tuple)):
-            expr = self._flatten_ragged_list(expr)
-            expr = sp.Array(expr)
-        shape, expr = get_nested_shape(expr)
-        body = self.convert_expression_body(expr, shape)
-        args_str = self._generate_js_args(func_obj)
-        return self.wrap_function_signature(name, args_str, body, shape)
+
+# =========================================================================
+#  3. JS NUMERICS GENERATOR
+# =========================================================================
+
+
+class JsNumerics(GenericJsBase):
+    """Generate JavaScript kernels from a Zoomy symbolic ``Numerics``.
+
+    Produces ``numerical_flux`` (and ``numerical_fluctuations`` /
+    ``local_max_abs_eigenvalue``) as standalone JS functions taking the
+    per-face ``Q_minus`` / ``Q_plus`` states and returning a
+    ``Float64Array``.  Mirrors
+    :class:`zoomy_core.transformation.generic_c.GenericCppNumerics`.
+    """
+
+    def __init__(self, numerics):
+        """Initialize with a Zoomy Numerics instance."""
+        super().__init__()
+        self.numerics = numerics
+        self.model = numerics.model
+        self.n_dof_q = self.model.n_variables
+        self.n_dof_qaux = self.model.n_aux_variables
+
+        self.register_map("Q", self.model.variables.values())
+        self.register_map("Qaux", self.model.aux_variables.values())
+        self.register_map("n", self.model.normal.values())
+        self.register_map("Q_minus", numerics.variables_minus)
+        self.register_map("Q_plus", numerics.variables_plus)
+        self.register_map("Qaux_minus", numerics.aux_variables_minus)
+        self.register_map("Qaux_plus", numerics.aux_variables_plus)
+        self.register_map("flux_minus", numerics.flux_minus)
+        self.register_map("flux_plus", numerics.flux_plus)
+        self.register_map("source_term", numerics.source_term)
+        self.register_map("p", self.model._parameter_symbols.values())
+
+    def generate(self):
+        """Generate all numerics kernels as a single JS code string."""
+        blocks = [
+            f"// Generated JS numerics: {self.numerics.__class__.__name__}",
+            f"// nVars = {self.n_dof_q}",
+        ]
+        for name, func_obj in self.numerics.functions.items():
+            if func_obj.definition is None:
+                continue
+            blocks.append(self._generate_kernel(name, func_obj))
+        return "\n\n".join(blocks)
