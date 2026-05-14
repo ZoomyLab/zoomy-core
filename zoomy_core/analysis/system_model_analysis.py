@@ -79,7 +79,8 @@ def linearise_system_model(
         space=list(sm.space),
         state=list(sm.state),
         aux_state=list(sm.aux_state),
-        parameters=dict(sm.parameters),
+        parameters=sm.parameters,
+        parameter_values=sm.parameter_values,
         flux=_sub(sm.flux),
         hydrostatic_pressure=_sub(sm.hydrostatic_pressure),
         nonconservative_matrix=_sub(sm.nonconservative_matrix),
@@ -144,14 +145,14 @@ def plane_wave_dispersion(
     # then substitute the base state into the result.
     n_eq = sm.n_equations
     n_st = sm.n_state
-    qm_sym = sm.quasilinear_matrix()
+    qm_sym = sm.quasilinear_matrix
     M_x = sp.Matrix(
         n_eq,
         n_st,
         lambda i, j: sp.simplify(qm_sym[i, j, axis].xreplace(sub)),
     )
 
-    src_jac_sym = sm.source_jacobian_wrt_state()
+    src_jac_sym = sm.source_jacobian
     M_0 = sp.Matrix(
         n_eq,
         n_st,

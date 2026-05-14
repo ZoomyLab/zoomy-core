@@ -302,8 +302,8 @@ def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
     t = sm_parent.time
     coords = list(sm_parent.space)
     x = coords[0]
-    params = dict(sm_parent.parameters)
-    g_param = next((s for s in params if str(s) == "g"), None)
+    g_param = (sm_parent.parameters.g
+               if sm_parent.parameters.contains("g") else None)
 
     # State Symbols and coordinate-dependent Functions for tag classifier.
     state_syms = list(state)
@@ -420,7 +420,8 @@ def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
         space=coords,
         state=state_syms,
         aux_state=[],
-        parameters=params,
+        parameters=sm_parent.parameters,
+        parameter_values=sm_parent.parameter_values,
         flux=F,
         hydrostatic_pressure=P,
         nonconservative_matrix=B,

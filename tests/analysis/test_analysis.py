@@ -24,6 +24,7 @@ from zoomy_core.analysis import (
     is_hyperbolic_at,
     sample_hyperbolicity,
 )
+from zoomy_core.misc.misc import Zstruct
 from zoomy_core.model.models.system_model import SystemModel
 
 
@@ -39,7 +40,8 @@ def _swe(g_sym=None):
         space=[x],
         state=[h, u],
         aux_state=[],
-        parameters={g: 9.81},
+        parameters=Zstruct(g=g),
+        parameter_values=Zstruct(g=9.81),
         flux=sp.Matrix([[h * u], [h * u**2 + g * h**2 / 2]]),
         hydrostatic_pressure=sp.zeros(2, 1),
         nonconservative_matrix=sp.MutableDenseNDimArray.zeros(2, 2, 1),
@@ -62,7 +64,7 @@ def test_linear_advection_dispersion():
         space=[x],
         state=[u],
         aux_state=[],
-        parameters={},
+        parameters=Zstruct(),
         flux=sp.Matrix([[c * u]]),
         hydrostatic_pressure=sp.zeros(1, 1),
         nonconservative_matrix=sp.MutableDenseNDimArray.zeros(1, 1, 1),
@@ -92,7 +94,7 @@ def test_first_order_wave_equation_dispersion():
         space=[x],
         state=[u, v],
         aux_state=[],
-        parameters={},
+        parameters=Zstruct(),
         flux=sp.Matrix([[v], [c**2 * u]]),
         hydrostatic_pressure=sp.zeros(2, 1),
         nonconservative_matrix=sp.MutableDenseNDimArray.zeros(2, 2, 1),

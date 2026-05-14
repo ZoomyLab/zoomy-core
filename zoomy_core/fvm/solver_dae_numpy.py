@@ -150,10 +150,9 @@ class DAESolver(Solver):
         self.dyn_mask = np.tile(self.dyn_mask_cell, nc)
 
         # Cache scalars used per-cell inside the Rusanov flux loop.
-        try:
-            g_param = next(s for s in sm.parameters if str(s) == "g")
-            self._g_cached = float(sm.parameters[g_param])
-        except StopIteration:
+        if sm.parameters.contains("g"):
+            self._g_cached = float(sm.parameter_values.g)
+        else:
             self._g_cached = 9.81
         self._u_idx_cached = None
         for i, s in enumerate(sm.state):
@@ -307,7 +306,7 @@ class DAESolver(Solver):
 
     def _parameters_array(self):
         return np.array(
-            [float(self.sm.parameters[s]) for s in self.sm.parameters],
+            [float(v) for v in self.sm.parameter_values.values()],
             dtype=float,
         )
 

@@ -292,8 +292,8 @@ class NumpyRuntimeModel:
         rt.dimension = sm.n_dim
         rt.n_variables = sm.n_equations
         rt.n_aux_variables = len(sm.aux_state)
-        rt.n_parameters = len(sm.parameters)
-        rt.parameters = np.array(list(sm.parameters.values()),
+        rt.n_parameters = sm.parameters.length()
+        rt.parameters = np.array(list(sm.parameter_values.values()),
                                  dtype=float)
         rt.module = dict(cls.module) if module is None else dict(module)
         rt.printer = cls.printer if printer is None else printer
@@ -307,7 +307,7 @@ class NumpyRuntimeModel:
         # the Model-based runtime.
         Q_syms = list(sm.state)
         Qaux_syms = list(sm.aux_state)
-        p_syms = list(sm.parameters.keys())
+        p_syms = list(sm.parameters.values())
         all_args = (Q_syms, Qaux_syms, p_syms)
 
         def _flatten(args):
