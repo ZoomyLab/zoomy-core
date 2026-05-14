@@ -29,6 +29,8 @@ import itertools
 import textwrap
 
 import sympy as sp
+from sympy.core.relational import Relational
+from sympy.logic.boolalg import BooleanFunction
 
 from zoomy_core.transformation.generic_c import (
     GenericCppBase,
@@ -53,6 +55,10 @@ class GenericGlslBase(GenericCppBase):
     math_namespace = ""
     real_type = "float"
     gpu_enabled = False
+
+    # ``parameters`` is the BoundaryCondition Function's key for the
+    # model parameter vector; map it onto the same ``p`` accessor.
+    ARG_MAPPING = {**GenericCppBase.ARG_MAPPING, "parameters": "p"}
 
     # Symbols compared inside relational expressions print as plain ints
     # while this flag is set (see ``_print_Relational``).
@@ -197,7 +203,15 @@ class GenericGlslBase(GenericCppBase):
         if optim_exprs:
             temps, simplified = sp.cse(optim_exprs, symbols=sp.numbered_symbols("t"))
             for lhs, rhs in temps:
-                lines.append(f"float {self.doprint(lhs)} = {self.doprint(rhs)};")
+                # A CSE temp may capture a boolean condition (e.g. the
+                # predicate of a `conditional`); GLSL is strictly typed,
+                # so declare it `bool` rather than `float`.
+                kw = (
+                    "bool"
+                    if isinstance(rhs, (Relational, BooleanFunction))
+                    else "float"
+                )
+                lines.append(f"{kw} {self.doprint(lhs)} = {self.doprint(rhs)};")
             result_array = sp.Array(simplified).reshape(*shape)
             for indices in itertools.product(*[range(s) for s in shape]):
                 val = self.doprint(result_array[indices])
@@ -294,6 +308,84 @@ class GenericGlslBase(GenericCppBase):
         parts.append(f"out float res[{total}]")
         return ", ".join(parts)
 
+    # ── Kernel generation ────────────────────────────────────────────
+
+    @staticmethod
+    def _shape_size(shape):
+        """Total number of components for a (possibly nested) shape."""
+        total = 1
+        for s in shape:
+            total *= s
+        return total
+
+    def _generate_kernel(self, name, func_obj):
+        """Generate one GLSL function from a Function object.
+
+        Returns ``None`` for a zero-size result (GLSL forbids
+        ``out float res[0]``); the caller skips it.
+        """
+        expr = func_obj.definition
+        expr = self._expand_vector_conditionals(expr)
+        if isinstance(expr, (list, tuple)):
+            expr = self._flatten_ragged_list(expr)
+            expr = sp.Array(expr)
+        shape, expr = get_nested_shape(expr)
+        if self._shape_size(shape) == 0:
+            return None
+        body = self.convert_expression_body(expr, shape)
+        args_str = self._generate_glsl_args(func_obj, shape)
+        return self.wrap_function_signature(name, args_str, body, shape)
+
+    # ── Boundary conditions ──────────────────────────────────────────
+
+    def generate_boundary_conditions(self):
+        """Generate the model's boundary-condition dispatch kernels.
+
+        Emits ``boundary_conditions`` and ``aux_boundary_conditions`` —
+        each a Piecewise over the integer ``bc_idx`` selecting the
+        per-tag ghost/face state.  ``bc_idx`` is zero-initialised
+        fall-through (see :meth:`_print_piecewise_structure`).
+        """
+        blocks = []
+        for attr in ("_boundary_conditions", "_aux_boundary_conditions"):
+            func_obj = getattr(self.model, attr, None)
+            if func_obj is None:
+                continue
+            kernel = self._generate_bc_kernel(func_obj)
+            if kernel is not None:
+                blocks.append(kernel)
+        return "\n\n".join(blocks)
+
+    def _generate_bc_kernel(self, func_obj):
+        """Generate one boundary-condition kernel from a Function object.
+
+        Unlike :meth:`_generate_kernel` this does *not* run
+        ``_expand_vector_conditionals`` — the BC definition is already a
+        Piecewise of vector branches.  The scalar BC symbols (``bc_idx``,
+        ``time``, ``distance``) are registered so they print as their
+        GLSL parameter names.
+        """
+        scalar_map = {}
+        for key, param_name in (
+            ("idx", "bc_idx"),
+            ("time", self.ARG_MAPPING.get("time", "time")),
+            ("distance", self.ARG_MAPPING.get("distance", "dX")),
+        ):
+            if key in func_obj.args:
+                scalar_map[func_obj.args[key]] = param_name
+        self.symbol_maps.append(scalar_map)
+        try:
+            shape, expr = get_nested_shape(func_obj.definition)
+            if self._shape_size(shape) == 0:
+                return None
+            body = self.convert_expression_body(expr, shape)
+            args_str = self._generate_glsl_args(func_obj, shape)
+            return self.wrap_function_signature(
+                func_obj.name, args_str, body, shape
+            )
+        finally:
+            self.symbol_maps.pop()
+
     # ── No includes / struct wrappers for GLSL ───────────────────────
 
     def get_includes(self):
@@ -364,7 +456,9 @@ class GlslModel(GenericGlslBase):
                 continue
             if hasattr(defn, "is_zero_matrix") and defn.is_zero_matrix:
                 continue
-            blocks.append(self._generate_kernel(name, func_obj))
+            kernel = self._generate_kernel(name, func_obj)
+            if kernel is not None:
+                blocks.append(kernel)
 
         return "\n\n".join(blocks)
 
@@ -385,14 +479,53 @@ class GlslModel(GenericGlslBase):
         ]
         return "\n".join(lines)
 
-    def _generate_kernel(self, name, func_obj):
-        """Generate one GLSL function from a Function object."""
-        expr = func_obj.definition
-        expr = self._expand_vector_conditionals(expr)
-        if isinstance(expr, (list, tuple)):
-            expr = self._flatten_ragged_list(expr)
-            expr = sp.Array(expr)
-        shape, expr = get_nested_shape(expr)
-        body = self.convert_expression_body(expr, shape)
-        args_str = self._generate_glsl_args(func_obj, shape)
-        return self.wrap_function_signature(name, args_str, body, shape)
+
+# =========================================================================
+#  3. GLSL NUMERICS GENERATOR
+# =========================================================================
+
+
+class GlslNumerics(GenericGlslBase):
+    """Generate GLSL ES 3.00 kernels from a Zoomy symbolic ``Numerics``.
+
+    Produces ``numerical_flux`` (and ``numerical_fluctuations`` /
+    ``local_max_abs_eigenvalue``) as ``void`` functions taking the
+    per-face ``Q_minus`` / ``Q_plus`` states plus an
+    ``out float res[N]`` result.  Mirrors
+    :class:`zoomy_core.transformation.generic_c.GenericCppNumerics`.
+    """
+
+    def __init__(self, numerics):
+        """Initialize with a Zoomy Numerics instance."""
+        super().__init__()
+        self.numerics = numerics
+        self.model = numerics.model
+        self.n_dof_q = self.model.n_variables
+        self.n_dof_qaux = self.model.n_aux_variables
+
+        self.register_map("Q", self.model.variables.values())
+        self.register_map("Qaux", self.model.aux_variables.values())
+        self.register_map("n", self.model.normal.values())
+        self.register_map("Q_minus", numerics.variables_minus)
+        self.register_map("Q_plus", numerics.variables_plus)
+        self.register_map("Qaux_minus", numerics.aux_variables_minus)
+        self.register_map("Qaux_plus", numerics.aux_variables_plus)
+        self.register_map("flux_minus", numerics.flux_minus)
+        self.register_map("flux_plus", numerics.flux_plus)
+        self.register_map("source_term", numerics.source_term)
+        self.register_map("p", self.model._parameter_symbols.values())
+
+    def generate(self):
+        """Generate all numerics kernels as a single GLSL code string."""
+        blocks = [
+            f"// Generated GLSL ES 3.00 numerics: "
+            f"{self.numerics.__class__.__name__}",
+            f"// n_dof_q = {self.n_dof_q}",
+        ]
+        for name, func_obj in self.numerics.functions.items():
+            if func_obj.definition is None:
+                continue
+            kernel = self._generate_kernel(name, func_obj)
+            if kernel is not None:
+                blocks.append(kernel)
+        return "\n\n".join(blocks)
