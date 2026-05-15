@@ -105,24 +105,37 @@ def build_pressure_elliptic_block(
 
     h_fn = _to_fn(name_to_sym["h"])
 
-    # Discover U_0..U_M and W_0..W_{N_w-1} by name (Symbol → Function).
-    coeffs_u = []
-    k = 0
-    while f"U_{k}" in name_to_sym:
-        coeffs_u.append(_to_fn(name_to_sym[f"U_{k}"]))
-        k += 1
-    M_M = len(coeffs_u) - 1
-    if M_M < 0:
-        raise ValueError("SystemModel has no U_k state entries.")
+    # Discover momentum-mode state entries by name.  Supports both
+    # primitive form (``U_k``, ``W_k``) and conservative form
+    # (``q_Uk``, ``q_Wk``) — the splitter is agnostic, picks whichever
+    # naming the SystemModel uses.  Pressure modes are excluded
+    # explicitly (``pressure_vars`` is passed by the caller).
+    def _collect(prefixes):
+        out = []
+        k = 0
+        while True:
+            for pref in prefixes:
+                key = f"{pref}{k}"
+                if key in name_to_sym:
+                    out.append(_to_fn(name_to_sym[key]))
+                    break
+            else:
+                break
+            k += 1
+        return out
 
-    coeffs_w = []
-    k = 0
-    while f"W_{k}" in name_to_sym:
-        coeffs_w.append(_to_fn(name_to_sym[f"W_{k}"]))
-        k += 1
+    coeffs_u = _collect(("U_", "q_U"))
+    coeffs_w = _collect(("W_", "q_W"))
+    M_M = len(coeffs_u) - 1
     N_w_active = len(coeffs_w)
+    if M_M < 0:
+        raise ValueError(
+            "SystemModel has no U_k / q_Uk state entries."
+        )
     if N_w_active < 1:
-        raise ValueError("SystemModel has no W_k state entries.")
+        raise ValueError(
+            "SystemModel has no W_k / q_Wk state entries."
+        )
 
     # Pressure Functions in residual form.
     pressure_funcs = [_to_fn(p) for p in pressure_vars]
@@ -487,18 +500,30 @@ def split_for_pressure(sm, pressure_vars, dt, *, bottom=None):
     pred_eq_names = []
     pred_eq_residuals = []
     pred_e2s_index = []
+    def _state_for_equation(eq_name):
+        """Resolve the state slot updated by an equation row.  Tries
+        primitive-form names first (``U_k`` / ``W_k`` / ``h``), then
+        conservative-form (``q_Uk`` / ``q_Wk`` / ``h``).  Returns the
+        first match in ``state_names`` or ``None``."""
+        if eq_name == "mass":
+            return "h"
+        if eq_name.startswith("xmom_j"):
+            k = eq_name[len("xmom_j"):]
+            for cand in (f"U_{k}", f"q_U{k}"):
+                if cand in state_names:
+                    return cand
+        if eq_name.startswith("zmom_j"):
+            k = eq_name[len("zmom_j"):]
+            for cand in (f"W_{k}", f"q_W{k}"):
+                if cand in state_names:
+                    return cand
+        return None
+
     for name in sm.equation_names:
         if name.startswith("cont_j"):
             continue
-        if name == "mass":
-            target = "h"
-        elif name.startswith("xmom_j"):
-            target = f"U_{name[len('xmom_j'):]}"
-        elif name.startswith("zmom_j"):
-            target = f"W_{name[len('zmom_j'):]}"
-        else:
-            continue
-        if target not in state_names:
+        target = _state_for_equation(name)
+        if target is None:
             continue
         eq_pred = sp.expand(residuals[name])
         pred_eq_names.append(name)
@@ -549,19 +574,25 @@ def split_for_pressure(sm, pressure_vars, dt, *, bottom=None):
     corr_e2s_index = []
     update_exprs = []
     update_names = []  # for SM_corr.equation_names — diagnostic only
+    def _state_index_for(prefixes_and_k):
+        for pref, k in prefixes_and_k:
+            cand = f"{pref}{k}"
+            if cand in state_names:
+                return state_names.index(cand), cand
+        return None, None
     for k in range(M_M + 1):
-        target = f"U_{k}"
-        if target not in state_names:
+        idx, _ = _state_index_for([("U_", k), ("q_U", k)])
+        if idx is None:
             continue
         update_exprs.append(sp.expand(block["U_corr"][k]))
-        corr_e2s_index.append(state_names.index(target))
+        corr_e2s_index.append(idx)
         update_names.append(f"corr_U_{k}")
     for k in range(N_w_active):
-        target = f"W_{k}"
-        if target not in state_names:
+        idx, _ = _state_index_for([("W_", k), ("q_W", k)])
+        if idx is None:
             continue
         update_exprs.append(sp.expand(block["W_corr"][k]))
-        corr_e2s_index.append(state_names.index(target))
+        corr_e2s_index.append(idx)
         update_names.append(f"corr_W_{k}")
 
     # Map state Functions back to state Symbols — the SystemModel

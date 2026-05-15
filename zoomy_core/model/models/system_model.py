@@ -1044,12 +1044,17 @@ class SystemModel:
         self.nonconservative_matrix = new_B
         self.source = new_S
         self.mass_matrix = new_M
+        # Push the transform through the secondary fields too so they
+        # reference the new state, not the old: ``update_variables``
+        # (per-cell state remap), ``state_update`` (Chorin corrector's
+        # explicit update), and ``eigenvalues`` (preserved under
+        # invertible change-of-vars — xreplace, don't re-solve).
+        if self.update_variables is not None:
+            self.update_variables = self.update_variables.xreplace(full_transform)
+        if self.state_update is not None:
+            self.state_update = self.state_update.xreplace(full_transform)
         # Re-derive the quasilinear matrix + source jacobian from the new
-        # primaries.  Eigenvalues are preserved under invertible change of
-        # variables — push the transform through the existing expressions
-        # (a re-solve via charpoly is unreliable on rank-deficient DAE
-        # quasilinear matrices, where ``sp.solve`` deduplicates and drops
-        # multiplicities).
+        # primaries.
         self.refresh_derived_operators(eigenvalues=False)
         if self.eigenvalues is not None:
             self.eigenvalues = self.eigenvalues.xreplace(full_transform)
