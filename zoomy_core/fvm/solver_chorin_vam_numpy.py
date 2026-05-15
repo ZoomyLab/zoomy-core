@@ -31,6 +31,13 @@ import sympy as sp
 
 from zoomy_core.fvm.solver_numpy import Solver
 from zoomy_core.fvm import timestepping
+from zoomy_core.fvm.imex_ark import (
+    ExplicitButcherTableau,
+    explicit_rk_step,
+    euler,
+    ssprk2,
+    ssprk3,
+)
 from zoomy_core.mesh import ensure_lsq_mesh
 from zoomy_core.model.models.system_model import SystemModel
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
@@ -54,8 +61,10 @@ class ChorinSplitVAMSolver(Solver):
     time_end = param.Number(default=0.1, bounds=(0, None),
                             doc="Simulation end time")
     method = param.Selector(default="ssprk2",
-                            objects=["euler", "ssprk2"],
-                            doc="Predictor explicit time-integration scheme")
+                            objects=["euler", "ssprk2", "ssprk3"],
+                            doc="Predictor explicit time-integration scheme. "
+                                "Consumes the corresponding Butcher tableau "
+                                "from zoomy_core.fvm.imex_ark.")
     compute_dt = param.Parameter(
         default=None,
         doc="Adaptive-timestep callable; defaults to "
@@ -244,20 +253,67 @@ class ChorinSplitVAMSolver(Solver):
     # Time stepping
     # ------------------------------------------------------------------
 
+    def update_aux_variables(self):
+        """Refresh derivative-aux rows (h_x, P_k_x, P_k_xx, …) by LSQ
+        on the current ``Q``.  Function-aux rows (``b`` topography)
+        are left as-is — the user sets them once at IC time and they
+        stay static through the simulation.
+
+        Uses ``sm_pred``'s registry as the canonical full-state aux
+        registry — its auto-scan picks up every derivative the chain
+        DAE needs.  Pressure-mode derivatives ``P_k_x``, ``P_k_xx``
+        are on ``sm_press``'s registry; we walk that one too.
+        """
+        Q = self._sim_Q
+        Qaux = self._sim_Qaux
+        nc = Q.shape[1]
+        n_cells = self._sim_n_cells
+        mesh = self._sim_mesh
+        u_full = np.zeros(n_cells)
+
+        seen_rows = set()
+        for sm in (self.sm_pred, self.sm_press, self.sm_corr):
+            registry = getattr(sm, "aux_registry", None) or []
+            for entry in registry:
+                if entry["kind"] != "derivative":
+                    continue
+                row = entry["row"]
+                if row in seen_rows or row >= Qaux.shape[0]:
+                    continue
+                seen_rows.add(row)
+                mi = entry["multi_index"]
+                tk = entry["target_kind"]
+                if tk == "state":
+                    u_full[:nc] = Q[entry["state_index"], :]
+                elif tk == "function":
+                    u_full[:nc] = Qaux[entry["function_row"], :]
+                else:
+                    continue
+                u_full[nc:] = 0.0
+                d = mesh.compute_derivatives(
+                    u_full, degree=max(mi),
+                    derivatives_multi_index=[mi],
+                )
+                Qaux[row, :] = d[:nc, 0]
+        self._sim_Qaux = Qaux
+
     def step(self, dt):
         """One Chorin step: predictor → pressure → corrector.
 
-        This is the minimum-viable wiring — predictor uses a crude
-        central-flux Euler step (no Riemann solver, naive BCs); pressure
-        uses ``scipy.optimize.fsolve`` on the lambdified elliptic
-        residual (linear ⇒ converges in 1–2 Newton steps); corrector
-        applies ``state_update`` in place.  Order-of-accuracy work
-        (SSP-RK2 predictor with MUSCL, matrix-free GMRES pressure,
-        well-balancing) layers on top of this.
+        Predictor: Butcher-RK on SM_pred (tableau selected via
+        ``method``); central-flux divergence + source.  Pressure:
+        ``scipy.optimize.fsolve`` on the elliptic residual (linear
+        in P ⇒ converges in 1–2 Newton iterations).  Corrector:
+        single lambdify call to ``state_update`` + atomic in-place
+        assignment.  Each substep refreshes Qaux derivative rows so
+        downstream substeps see up-to-date stencils.
         """
         self._step_predictor(dt)
+        self.update_aux_variables()
         self._step_pressure(dt)
+        self.update_aux_variables()
         self._step_corrector(dt)
+        self.update_aux_variables()
         self._sim_time += dt
 
     def _params_with_dt(self, base, dt):
@@ -273,36 +329,60 @@ class ChorinSplitVAMSolver(Solver):
         out[-1] = float(dt)
         return out
 
-    def _step_predictor(self, dt):
-        """Crude explicit Euler on SM_pred — central flux divergence
-        + source.  Boundary cells: zero-gradient (copy interior)."""
+    def _predictor_tableau(self) -> ExplicitButcherTableau:
+        """Resolve the Butcher tableau for the explicit predictor by
+        the ``method`` param.  The same registry is shared across
+        substeps that want a Butcher-driven explicit integrator."""
+        return {
+            "euler":  euler(),
+            "ssprk2": ssprk2(),
+            "ssprk3": ssprk3(),
+        }[self.method]
+
+    def _predictor_rhs(self, Q_full):
+        """RHS for the predictor stage: returns a full-shape
+        ``(n_state, nc)`` array with the time-derivative of the
+        predictor's evolution rows; non-evolution rows are zero
+        (predictor doesn't touch them).
+
+        Crude central-flux divergence + source.  Boundary faces use
+        zero-gradient ghosts.  Order-of-accuracy work — well-balanced
+        η = h+b reconstruction, MUSCL limiting, proper Riemann solver
+        — layers on top of this once the wiring is verified.
+        """
         rt = self.rt_pred
-        Q = self._sim_Q
-        Qaux = self._sim_Qaux
-        p = self._params_pred
         nc = self._sim_nc
         dx = float(self._sim_mesh.cell_volumes[0])
+        Qaux = self._sim_Qaux
+        p = self._params_pred
 
-        # flux: shape (n_eq=5, n_dim=1, nc) after vectorised lambdify.
-        F = np.asarray(rt.flux(Q, Qaux, p), dtype=float)
+        F = np.asarray(rt.flux(Q_full, Qaux, p), dtype=float)
         if F.ndim == 3:
-            F1d = F[:, 0, :]               # (5, nc) — 1-D slab
+            F1d = F[:, 0, :]
         else:
             F1d = F
-        # Central-difference flux divergence with zero-gradient ghosts.
         F_left  = np.concatenate([F1d[:, :1], F1d[:, :-1]], axis=1)
         F_right = np.concatenate([F1d[:, 1:], F1d[:, -1:]], axis=1)
         F_div   = (F_right - F_left) / (2.0 * dx)
 
-        # source: shape (n_eq, nc)
-        S = np.asarray(rt.source(Q, Qaux, p), dtype=float)
+        S = np.asarray(rt.source(Q_full, Qaux, p), dtype=float)
         if S.ndim == 1:
             S = S[:, None] * np.ones((1, nc))
 
-        # Euler update on the predictor's state slots.
-        e2s = self._pred_state_idx
-        Q[e2s, :] = Q[e2s, :] + dt * (-F_div + S)
-        self._sim_Q = Q
+        dQ = np.zeros_like(Q_full)
+        dQ[self._pred_state_idx, :] = -F_div + S
+        return dQ
+
+    def _step_predictor(self, dt):
+        """Explicit Butcher-RK step on the predictor substep."""
+        table = self._predictor_tableau()
+        Q_new = explicit_rk_step(
+            self._sim_time, self._sim_Q, dt, table,
+            lambda t, Q_in: self._predictor_rhs(Q_in),
+        )
+        # Predictor only writes to its e2s slots; the RHS is zero on
+        # the other rows, so non-e2s entries are unchanged by construction.
+        self._sim_Q = Q_new
 
     def _step_pressure(self, dt):
         """Solve the algebraic elliptic block ``R(P; Q, Qaux, dt) = 0``
