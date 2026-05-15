@@ -372,6 +372,11 @@ class NumpyRuntimeModel:
                   _column_to_rank1(sm.update_variables), std_sig)
         _register("eigenvalues", _column_to_rank1(sm.eigenvalues), eig_sig)
         _register("diffusive_flux", sm.diffusive_flux, diff_sig)
+        # ``state_update``: explicit-update operator for split substeps
+        # (e.g. Chorin corrector).  Returns a rank-1 array of length
+        # ``len(equation_to_state_index)``: the new values for those
+        # state slots.  Same broadcast pattern as ``source``.
+        _register("state_update", sm.state_update, std_sig)
 
         # ``∂S/∂Q`` is exposed under both names — the Model-based
         # runtime calls it ``source_jacobian_wrt_variables``.

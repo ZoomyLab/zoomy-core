@@ -616,6 +616,8 @@ class SystemModel:
         matrices = [self.flux, self.hydrostatic_pressure,
                     self.nonconservative_matrix, self.source,
                     self.mass_matrix]
+        if self.state_update is not None:
+            matrices.append(self.state_update)
 
         # ── Pass 1: collect Function atoms (excl. state). ───────────
         function_atoms = {}     # name → [atoms]
@@ -712,16 +714,18 @@ class SystemModel:
             registry.append(entry)
 
         # ── Apply substitutions to every primary matrix. ──────────
+        # All operator fields are ZArray (or None); ZArray.xreplace
+        # is element-wise and handles non-sympy entries (e.g. Python
+        # int 0 from a zero-initialised array) gracefully.
         self.flux = self.flux.xreplace(sub_dict)
         self.hydrostatic_pressure = self.hydrostatic_pressure.xreplace(
             sub_dict)
         self.source = self.source.xreplace(sub_dict)
         self.mass_matrix = self.mass_matrix.xreplace(sub_dict)
-        B = self.nonconservative_matrix
-        new_B = sp.MutableDenseNDimArray.zeros(*B.shape)
-        for idx in _product(*[range(s) for s in B.shape]):
-            new_B[idx] = B[idx].xreplace(sub_dict)
-        self.nonconservative_matrix = new_B
+        self.nonconservative_matrix = self.nonconservative_matrix.xreplace(
+            sub_dict)
+        if self.state_update is not None:
+            self.state_update = self.state_update.xreplace(sub_dict)
 
         # Keep the derived operators consistent: recompute
         # quasilinear_matrix / source_jacobian from the substituted

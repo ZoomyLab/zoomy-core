@@ -136,14 +136,29 @@ class ChorinSplitVAMSolver(Solver):
         # ``\Delta t`` (LaTeX-friendly), but Python lambdify reads the
         # backslash as a line-continuation and chokes.  Rename to a
         # Python-safe ``_dt`` throughout SM_press / SM_corr operators
-        # before building runtimes.
+        # before building runtimes.  Also register ``_dt`` as a
+        # parameter on each affected sub-system so the lambdify
+        # signature carries it explicitly (we bind a numeric value
+        # per substep at runtime).
         if self._dt_symbol is not None:
-            dt_safe = sp.Symbol("_dt", positive=True)
+            # Use ``dt`` (no leading underscore — ``Zstruct._filter_dict``
+            # hides ``_``-prefixed keys, which would silently drop the
+            # parameter from the lambdify signature).
+            dt_safe = sp.Symbol("dt", positive=True)
             self._dt_symbol_safe = dt_safe
             self.sm_press = _substitute_dt(self.sm_press, self._dt_symbol,
                                            dt_safe)
             self.sm_corr = _substitute_dt(self.sm_corr, self._dt_symbol,
                                           dt_safe)
+            from zoomy_core.misc.misc import Zstruct
+            for sm in (self.sm_press, self.sm_corr):
+                if not sm.parameters.contains("dt"):
+                    new_params = Zstruct(**sm.parameters.as_dict())
+                    new_params["dt"] = dt_safe
+                    sm.parameters = new_params
+                    new_pvals = Zstruct(**sm.parameter_values.as_dict())
+                    new_pvals["dt"] = 0.0   # placeholder; set per step
+                    sm.parameter_values = new_pvals
         else:
             self._dt_symbol_safe = None
 
@@ -224,6 +239,115 @@ class ChorinSplitVAMSolver(Solver):
         """Convenience: the predictor sub-system is the canonical
         carrier of the full state."""
         return self.sm_pred
+
+    # ------------------------------------------------------------------
+    # Time stepping
+    # ------------------------------------------------------------------
+
+    def step(self, dt):
+        """One Chorin step: predictor → pressure → corrector.
+
+        This is the minimum-viable wiring — predictor uses a crude
+        central-flux Euler step (no Riemann solver, naive BCs); pressure
+        uses ``scipy.optimize.fsolve`` on the lambdified elliptic
+        residual (linear ⇒ converges in 1–2 Newton steps); corrector
+        applies ``state_update`` in place.  Order-of-accuracy work
+        (SSP-RK2 predictor with MUSCL, matrix-free GMRES pressure,
+        well-balancing) layers on top of this.
+        """
+        self._step_predictor(dt)
+        self._step_pressure(dt)
+        self._step_corrector(dt)
+        self._sim_time += dt
+
+    def _params_with_dt(self, base, dt):
+        """Return a copy of ``base`` with the last entry (``_dt``)
+        replaced by the numeric ``dt``.
+
+        ``_dt`` is appended to each dt-dependent subsystem's
+        ``parameter_values`` Zstruct in ``setup_simulation`` with a
+        placeholder 0.0; per substep we splice in the real dt before
+        invoking the runtime.  This keeps the lambdified arg count
+        constant (= len(parameter_values))."""
+        out = base.copy()
+        out[-1] = float(dt)
+        return out
+
+    def _step_predictor(self, dt):
+        """Crude explicit Euler on SM_pred — central flux divergence
+        + source.  Boundary cells: zero-gradient (copy interior)."""
+        rt = self.rt_pred
+        Q = self._sim_Q
+        Qaux = self._sim_Qaux
+        p = self._params_pred
+        nc = self._sim_nc
+        dx = float(self._sim_mesh.cell_volumes[0])
+
+        # flux: shape (n_eq=5, n_dim=1, nc) after vectorised lambdify.
+        F = np.asarray(rt.flux(Q, Qaux, p), dtype=float)
+        if F.ndim == 3:
+            F1d = F[:, 0, :]               # (5, nc) — 1-D slab
+        else:
+            F1d = F
+        # Central-difference flux divergence with zero-gradient ghosts.
+        F_left  = np.concatenate([F1d[:, :1], F1d[:, :-1]], axis=1)
+        F_right = np.concatenate([F1d[:, 1:], F1d[:, -1:]], axis=1)
+        F_div   = (F_right - F_left) / (2.0 * dx)
+
+        # source: shape (n_eq, nc)
+        S = np.asarray(rt.source(Q, Qaux, p), dtype=float)
+        if S.ndim == 1:
+            S = S[:, None] * np.ones((1, nc))
+
+        # Euler update on the predictor's state slots.
+        e2s = self._pred_state_idx
+        Q[e2s, :] = Q[e2s, :] + dt * (-F_div + S)
+        self._sim_Q = Q
+
+    def _step_pressure(self, dt):
+        """Solve the algebraic elliptic block ``R(P; Q, Qaux, dt) = 0``
+        for ``Q[press_e2s]`` via scipy.optimize.fsolve.  R is linear
+        in P → Newton converges in 1–2 iterations from any start."""
+        from scipy.optimize import fsolve
+        rt = self.rt_press
+        Q = self._sim_Q
+        Qaux = self._sim_Qaux
+        nc = self._sim_nc
+        p_full = self._params_with_dt(self._params_press_base, dt)
+        e2s = self._press_state_idx
+        nP = len(e2s)
+
+        def residual_of_P(p_vec):
+            Q_try = Q.copy()
+            Q_try[e2s, :] = p_vec.reshape(nP, nc)
+            # SM_press carries the elliptic residual in its ``source``
+            # field (after auto-tagging).  Returns (nP, nc).
+            R = np.asarray(rt.source(Q_try, Qaux, p_full), dtype=float)
+            if R.ndim == 1:
+                R = R[:, None] * np.ones((1, nc))
+            return R.ravel()
+
+        p0 = Q[e2s, :].ravel()              # warm-start from current P
+        p_new, _, info, msg = fsolve(
+            residual_of_P, p0, full_output=True,
+            xtol=self.pressure_tol, maxfev=self.pressure_maxit,
+        )
+        Q[e2s, :] = p_new.reshape(nP, nc)
+        self._sim_Q = Q
+
+    def _step_corrector(self, dt):
+        """Apply ``Q[corr_e2s] ← state_update(Q, Qaux, p, dt)`` in place.
+        Read-then-write is atomic per row: Python evaluates the RHS
+        callable fully before assigning to the LHS slice."""
+        rt = self.rt_corr
+        Q = self._sim_Q
+        Qaux = self._sim_Qaux
+        p_full = self._params_with_dt(self._params_corr_base, dt)
+        e2s = self._corr_state_idx
+
+        new_vals = np.asarray(rt.state_update(Q, Qaux, p_full), dtype=float)
+        Q[e2s, :] = new_vals
+        self._sim_Q = Q
 
     def _detect_dt_symbol(self) -> Optional[sp.Symbol]:
         """Locate the symbolic time-step common to SM_press / SM_corr.
