@@ -1,24 +1,21 @@
 """Chorin projection split for the VAM chain DAE (numpy backend).
 
-Consumes the three rectangular SystemModels produced by
+Consumes the three sub-system models produced by
 :func:`zoomy_core.model.splitter.split_for_pressure`:
 
 * ``SM_pred``  — explicit predictor.  Evolution rows (mass + xmom_jk +
-  zmom_jk) with the pressure modes frozen at the current step.  Solved
-  with an SSP-RK explicit time stepper on the Rusanov + non-conservative
-  flux machinery; no Newton, no Jacobian.
-* ``SM_press`` — algebraic elliptic block on the pressure modes
-  (``elliptic_jk`` rows).  Linear in ``(P_k, ∂_x P_k, ∂_xx P_k)``;
-  assembled into a sparse matrix using the LSQ derivative operators
-  and solved per step.
+  zmom_jk) with the pressure modes implicitly frozen at the current
+  step (read straight from ``Q[pressure_idx]``).  Solved with
+  :class:`HyperbolicSolver`'s Rusanov + non-conservative path-integral
+  + indexed-BC flux machinery — same path the SWE/SME solvers use.
+  Mass-conservative by construction.
+* ``SM_press`` — algebraic elliptic block on the pressure modes.
+  Linear in ``(P_k, ∂_x P_k, ∂_xx P_k)``; solved via
+  ``scipy.optimize.fsolve`` on the lambdified residual (converges in
+  1–2 Newton iterations).  Matrix-free GMRES is the next refinement.
 * ``SM_corr``  — closed-form algebraic corrector on the velocity modes
-  (``corr_U_k``, ``corr_W_k``).  Evaluated element-wise — no solve.
-
-The split is the structural fix for the order-2 ill-conditioning of
-the monolithic :class:`DAESolver`: the hyperbolic transport block is
-well-conditioned and explicit; the elliptic pressure block becomes a
-linear solve with proper preconditioning; the corrector is closed
-form.  Newton iteration disappears entirely.
+  via the ``state_update`` field.  Single lambdify call + in-place
+  assignment, no solve.
 """
 from __future__ import annotations
 
@@ -29,65 +26,162 @@ import numpy as np
 import param
 import sympy as sp
 
-from zoomy_core.fvm.solver_numpy import Solver
-from zoomy_core.fvm import timestepping
-from zoomy_core.fvm.imex_ark import (
-    ExplicitButcherTableau,
-    explicit_rk_step,
-    euler,
-    ssprk2,
-    ssprk3,
-)
+from zoomy_core.fvm.solver_numpy import HyperbolicSolver
 from zoomy_core.mesh import ensure_lsq_mesh
-from zoomy_core.model.models.system_model import SystemModel
+from zoomy_core.model.models.system_model import SystemModel, _to_zarray
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
 from zoomy_core.misc.logger_config import logger
+from zoomy_core.misc.misc import Zstruct, ZArray
 
 
 _EMPTY_AUX = np.empty(0, dtype=float)
 
 
-class ChorinSplitVAMSolver(Solver):
+def _pad_to_square(sm: SystemModel) -> SystemModel:
+    """Return a square SystemModel whose operators have ``n_state`` rows.
+
+    Used by :class:`ChorinSplitVAMSolver` to make a rectangular sub-
+    system consumable by :class:`HyperbolicSolver`'s flux machinery
+    (which assumes ``n_equations == n_state``).  Rows at state indices
+    *not* in ``sm.equation_to_state_index`` get all-zero operators
+    (flux / source / NCP / etc.) — they contribute zero RHS to the RK,
+    so the corresponding state slots stay frozen through the predictor
+    substep.  This is precisely the Chorin semantics: predictor doesn't
+    touch pressure modes.
+    """
+    n_eq = sm.n_equations
+    n_st = sm.n_state
+    if n_eq == n_st:
+        return sm
+
+    e2s = list(sm.equation_to_state_index)
+    n_dim = sm.n_dim
+
+    # Map: dest_state_row → src_eq_row.  Missing states get None.
+    src_of_dest = {state_i: src_i for src_i, state_i in enumerate(e2s)}
+
+    def _pad_rank2(arr, n_cols):
+        """``(n_eq, n_cols)`` → ``(n_st, n_cols)`` ZArray with zero rows
+        at missing dest indices.  ``arr`` may be ZArray or sp.Matrix."""
+        if arr is None:
+            return None
+        out_rows = []
+        for state_i in range(n_st):
+            if state_i in src_of_dest:
+                src = src_of_dest[state_i]
+                row = [sp.sympify(arr[src, j]) for j in range(n_cols)]
+            else:
+                row = [sp.S.Zero] * n_cols
+            out_rows.append(row)
+        return ZArray(out_rows, shape=(n_st, n_cols))
+
+    def _pad_rank1(arr):
+        """``(n_eq,)`` → ``(n_st,)`` ZArray with zeros at missing indices."""
+        if arr is None:
+            return None
+        out = []
+        for state_i in range(n_st):
+            if state_i in src_of_dest:
+                src = src_of_dest[state_i]
+                # arr may be rank-1 or rank-2 (n_eq, 1) — handle both.
+                if len(arr.shape) == 1:
+                    out.append(sp.sympify(arr[src]))
+                else:
+                    out.append(sp.sympify(arr[src, 0]))
+            else:
+                out.append(sp.S.Zero)
+        return ZArray(out, shape=(n_st,))
+
+    def _pad_rank3(arr):
+        """``(n_eq, n_st_cols, n_dim)`` → ``(n_st, n_st_cols, n_dim)``."""
+        if arr is None:
+            return None
+        n_st_cols = arr.shape[1]
+        out = []
+        for state_i in range(n_st):
+            row = []
+            if state_i in src_of_dest:
+                src = src_of_dest[state_i]
+                for j in range(n_st_cols):
+                    inner = [sp.sympify(arr[src, j, d]) for d in range(n_dim)]
+                    row.append(inner)
+            else:
+                for j in range(n_st_cols):
+                    row.append([sp.S.Zero] * n_dim)
+            out.append(row)
+        return ZArray(out, shape=(n_st, n_st_cols, n_dim))
+
+    # Pad each operator.  Source can be rank-1 (post-refactor) or (n_eq,1).
+    new_flux = _pad_rank2(sm.flux, n_dim)
+    new_P    = _pad_rank2(sm.hydrostatic_pressure, n_dim)
+    new_B    = _pad_rank3(sm.nonconservative_matrix)
+    new_S    = (_pad_rank2(sm.source, sm.source.shape[1])
+                if len(sm.source.shape) == 2
+                else _pad_rank1(sm.source))
+    new_M    = _pad_rank2(sm.mass_matrix, n_st)
+    new_E    = _pad_rank1(sm.eigenvalues) if sm.eigenvalues is not None else None
+
+    sm_square = SystemModel(
+        time=sm.time,
+        space=list(sm.space),
+        state=list(sm.state),
+        aux_state=list(sm.aux_state),
+        parameters=sm.parameters,
+        parameter_values=sm.parameter_values,
+        flux=new_flux,
+        hydrostatic_pressure=new_P,
+        nonconservative_matrix=new_B,
+        source=new_S,
+        mass_matrix=new_M,
+        eigenvalues=new_E,
+        equation_to_state_index=list(range(n_st)),
+        boundary_conditions=sm.boundary_conditions,
+        aux_boundary_conditions=sm.aux_boundary_conditions,
+        boundary_gradients=sm.boundary_gradients,
+        initial_conditions=sm.initial_conditions,
+        aux_initial_conditions=sm.aux_initial_conditions,
+        update_variables=sm.update_variables,
+    )
+    sm_square.aux_registry = list(getattr(sm, "aux_registry", []) or [])
+    sm_square.equation_names = (
+        [sm.equation_names[src_of_dest[i]] if i in src_of_dest
+         else f"_pad_{i}"
+         for i in range(n_st)]
+        if getattr(sm, "equation_names", None) is not None
+        else None
+    )
+    sm_square.history = list(sm.history) + [{
+        "name": "pad_to_square",
+        "description": (
+            f"padded {n_eq} → {n_st} rows; "
+            f"zero ops at state indices "
+            f"{[i for i in range(n_st) if i not in src_of_dest]}"
+        ),
+    }]
+    return sm_square
+
+
+class ChorinSplitVAMSolver(HyperbolicSolver):
     """Chorin projection split for the VAM chain DAE.
 
-    Consumes three pre-built sub-system models.  The splitter
-    (:func:`split_for_pressure`) is the factory; the solver is
-    downstream and ignorant of ``pressure_vars`` / ``dt`` / ``bottom``
-    — every piece of metadata it needs (which state indices to update,
-    which rows are elliptic) is carried on the sub-systems themselves
-    via ``equation_to_state_index`` and ``equation_names``.
+    Consumes three pre-built sub-system models from
+    :func:`split_for_pressure`.  Inherits :class:`HyperbolicSolver` so
+    the predictor substep uses the same Rusanov flux + indexed-BC +
+    well-balanced reconstruction machinery as every other hyperbolic
+    solver in the codebase — mass-conservative by construction.
+
+    The pressure projection and corrector substeps are Chorin-specific
+    and don't duplicate any existing infrastructure (the
+    ``state_update`` field on SystemModel + matrix-free linear solve
+    are the new primitives this class introduces).
     """
 
-    time_end = param.Number(default=0.1, bounds=(0, None),
-                            doc="Simulation end time")
-    method = param.Selector(default="ssprk2",
-                            objects=["euler", "ssprk2", "ssprk3"],
-                            doc="Predictor explicit time-integration scheme. "
-                                "Consumes the corresponding Butcher tableau "
-                                "from zoomy_core.fvm.imex_ark.")
-    compute_dt = param.Parameter(
-        default=None,
-        doc="Adaptive-timestep callable; defaults to "
-            "``timestepping.adaptive(CFL=0.3)``")
-    reconstruction_order = param.Integer(
-        default=2, bounds=(1, 2),
-        doc="Spatial reconstruction order for the predictor: "
-            "1 = piecewise-constant, 2 = MUSCL with η = h+b "
-            "surface reconstruction.")
-    limiter = param.Selector(
-        default="venkatakrishnan",
-        objects=["venkatakrishnan", "barth_jespersen", "minmod"],
-        doc="Slope limiter for MUSCL reconstruction")
     pressure_tol = param.Number(
         default=1e-10, bounds=(0, None),
         doc="Linear-solver tolerance for the elliptic pressure block")
     pressure_maxit = param.Integer(
         default=500, bounds=(1, None),
         doc="Maximum iterations for the elliptic pressure solve")
-    h_index = param.Integer(
-        default=0, bounds=(0, None),
-        doc="State index of the water-depth-like variable used for "
-            "max-eigenvalue / CFL estimation.")
 
     def __init__(self, sm_pred, sm_press, sm_corr, **kwargs):
         if not isinstance(sm_pred, SystemModel):
@@ -100,16 +194,11 @@ class ChorinSplitVAMSolver(Solver):
         self.sm_pred = sm_pred
         self.sm_press = sm_press
         self.sm_corr = sm_corr
-        # The full chain state lives on all three sub-systems; pick one.
         self.state = list(sm_pred.state)
         self.n_state = sm_pred.n_state
 
-        # Detect the symbolic time-step.  The splitter bakes ``dt`` into
-        # SM_press and SM_corr (via ``U_corr = U_tilde - (dt/h)·T_u``);
-        # SM_pred does not depend on it.
         self._dt_symbol = self._detect_dt_symbol()
 
-        # Sanity: the three sub-systems must agree on the state vector.
         for name, sm in (("press", sm_press), ("corr", sm_corr)):
             if [str(s) for s in sm.state] != [str(s) for s in sm_pred.state]:
                 raise ValueError(
@@ -121,72 +210,51 @@ class ChorinSplitVAMSolver(Solver):
     # Setup
     # ------------------------------------------------------------------
 
-    def setup_simulation(self, mesh):
-        """Build runtimes for the three sub-systems and pre-allocate
-        Q / Qaux.  Topography injection / IC overrides happen on the
-        caller's side (see ``test_vam_topography_dae.py`` for the
-        pattern)."""
-        t0 = _time.time()
-        # All three sub-systems share the chain-DAE aux registry through
-        # their parent — promote the mesh to an LSQMesh of the right
-        # degree (degree 2 by default for the order-2 predictor).
-        lsq_degree = 2 if self.reconstruction_order == 2 else 1
-        # ``ensure_lsq_mesh`` looks for ``aux_registry`` on its second
-        # argument; SM_pred carries the full registry.
-        mesh = ensure_lsq_mesh(mesh, self.sm_pred, lsq_degree=lsq_degree)
-        # Each sub-system carries the parent's indexed BC kernel
-        # (propagated through ``_build_subsystem``); periodic-BC
-        # resolution still needs the original ``BoundaryConditions``
-        # object, which lives on the parent model — callers that need
-        # periodic boundaries must hand in an already-resolved
-        # ``LSQMesh``.
+    def setup_simulation(self, mesh, write_output=False):
+        """Set up the Chorin solver:
 
-        # Normalise the dt Symbol: the splitter convention is
-        # ``\Delta t`` (LaTeX-friendly), but Python lambdify reads the
-        # backslash as a line-continuation and chokes.  Rename to a
-        # Python-safe ``_dt`` throughout SM_press / SM_corr operators
-        # before building runtimes.  Also register ``_dt`` as a
-        # parameter on each affected sub-system so the lambdify
-        # signature carries it explicitly (we bind a numeric value
-        # per substep at runtime).
+        1. Pad ``SM_pred`` to square so :class:`HyperbolicSolver` can
+           drive it (the parent assumes ``n_equations == n_state``).
+        2. Hand the padded predictor to the parent's
+           ``setup_simulation`` — this builds the proper Rusanov flux
+           operator, indexed-BC kernel, source operator, max-eigenvalue
+           callable on the predictor SystemModel.
+        3. Rename ``\\Delta t`` → ``dt`` in ``SM_press`` / ``SM_corr``
+           (Python-safe Symbol), register as a parameter, build their
+           runtimes via ``NumpyRuntimeModel.from_system_model``.
+        """
+        t0 = _time.time()
+
+        # 1. Pad SM_pred to square and let the parent set up the
+        #    predictor's flux machinery.
+        sm_pred_square = _pad_to_square(self.sm_pred)
+        self._sm_pred_square = sm_pred_square
+        super().setup_simulation(mesh, sm_pred_square, write_output=write_output)
+
+        # 2. dt rename + parameter registration on the dt-dependent subsystems.
         if self._dt_symbol is not None:
-            # Use ``dt`` (no leading underscore — ``Zstruct._filter_dict``
-            # hides ``_``-prefixed keys, which would silently drop the
-            # parameter from the lambdify signature).
             dt_safe = sp.Symbol("dt", positive=True)
             self._dt_symbol_safe = dt_safe
             self.sm_press = _substitute_dt(self.sm_press, self._dt_symbol,
                                            dt_safe)
             self.sm_corr = _substitute_dt(self.sm_corr, self._dt_symbol,
                                           dt_safe)
-            from zoomy_core.misc.misc import Zstruct
             for sm in (self.sm_press, self.sm_corr):
                 if not sm.parameters.contains("dt"):
                     new_params = Zstruct(**sm.parameters.as_dict())
                     new_params["dt"] = dt_safe
                     sm.parameters = new_params
                     new_pvals = Zstruct(**sm.parameter_values.as_dict())
-                    new_pvals["dt"] = 0.0   # placeholder; set per step
+                    new_pvals["dt"] = 0.0
                     sm.parameter_values = new_pvals
         else:
             self._dt_symbol_safe = None
 
-        nc = mesh.n_inner_cells
-        n_cells = mesh.n_cells
-        n_vars = self.n_state
-
-        # Build a runtime for each sub-system.  ``_dt`` is a free Symbol
-        # in SM_press / SM_corr — we bind it via a transient
-        # ``parameter_values`` extension at step time (see ``_bind_dt``).
-        self.rt_pred = NumpyRuntimeModel.from_system_model(self.sm_pred)
+        # 3. Build pressure + corrector runtimes (predictor runtime
+        #    lives on ``self._sim_model`` from parent setup).
         self.rt_press = NumpyRuntimeModel.from_system_model(self.sm_press)
-        self.rt_corr = NumpyRuntimeModel.from_system_model(self.sm_corr)
+        self.rt_corr  = NumpyRuntimeModel.from_system_model(self.sm_corr)
 
-        # Parameter arrays for each runtime (pulled from each SM's
-        # parameter_values).  ``dt`` is appended at step time.
-        self._params_pred = np.array(
-            list(self.sm_pred.parameter_values.values()), dtype=float,
-        )
         self._params_press_base = np.array(
             list(self.sm_press.parameter_values.values()), dtype=float,
         )
@@ -194,29 +262,7 @@ class ChorinSplitVAMSolver(Solver):
             list(self.sm_corr.parameter_values.values()), dtype=float,
         )
 
-        # Allocate state arrays.  ``Q`` carries the full 7-state shared
-        # across the three sub-systems.
-        Q = np.zeros((n_vars, nc), dtype=float)
-
-        # Each sub-system has its own ``aux_state`` from its independent
-        # auto-scan.  For the first cut we allocate the largest aux row
-        # count and let each runtime index into the shared array; a
-        # later refactor can unify the aux pool.
-        n_aux = max(
-            len(self.sm_pred.aux_state),
-            len(self.sm_press.aux_state),
-            len(self.sm_corr.aux_state),
-        )
-        Qaux = np.zeros((n_aux, nc), dtype=float)
-
-        self._sim_mesh = mesh
-        self._sim_Q = Q
-        self._sim_Qaux = Qaux
-        self._sim_time = 0.0
-        self._sim_nc = nc
-        self._sim_n_cells = n_cells
-
-        # State-index slices for the three stages.
+        # State-index slices.
         self._pred_state_idx = np.asarray(
             self.sm_pred.equation_to_state_index, dtype=int)
         self._press_state_idx = np.asarray(
@@ -224,63 +270,83 @@ class ChorinSplitVAMSolver(Solver):
         self._corr_state_idx = np.asarray(
             self.sm_corr.equation_to_state_index, dtype=int)
 
+        # 4. Per-subsystem aux pools.  Each sub-system has its own
+        #    ``aux_state`` ordering (auto-scan picks up different
+        #    atoms in different orders), so a single shared ``Qaux``
+        #    breaks the row indexing — we maintain three arrays in
+        #    lock-step via ``update_aux_variables``.  The predictor's
+        #    Qaux is the parent's ``_sim_Qaux``.
+        nc = self.nc
+        self.Qaux_press = np.zeros(
+            (len(self.sm_press.aux_state), nc), dtype=float)
+        self.Qaux_corr = np.zeros(
+            (len(self.sm_corr.aux_state), nc), dtype=float)
+
         logger.info(
-            "ChorinSplitVAMSolver setup: %d state, %d aux, %d cells "
-            "(pred → %s, press → %s, corr → %s) in %.2fs",
-            n_vars, n_aux, nc,
+            "ChorinSplitVAMSolver setup: pred → %s, press → %s, corr → %s "
+            "in %.2fs",
             self._pred_state_idx.tolist(),
             self._press_state_idx.tolist(),
             self._corr_state_idx.tolist(),
             _time.time() - t0,
         )
-        return Q
+        return self._sim_Q
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Conveniences
     # ------------------------------------------------------------------
 
     @property
     def nc(self):
-        return self._sim_nc
+        return self._sim_mesh.n_inner_cells
 
     @property
-    def sm(self):
-        """Convenience: the predictor sub-system is the canonical
-        carrier of the full state."""
-        return self.sm_pred
+    def Q(self):
+        return self._sim_Q
+
+    @property
+    def Qaux(self):
+        return self._sim_Qaux
 
     # ------------------------------------------------------------------
     # Time stepping
     # ------------------------------------------------------------------
 
-    def update_aux_variables(self):
-        """Refresh derivative-aux rows (h_x, P_k_x, P_k_xx, …) by LSQ
-        on the current ``Q``.  Function-aux rows (``b`` topography)
-        are left as-is — the user sets them once at IC time and they
-        stay static through the simulation.
+    def _aux_pool_for(self, sm):
+        """Return the (Qaux array, registry) for a given sub-system."""
+        if sm is self.sm_pred:
+            return self._sim_Qaux, sm.aux_registry or []
+        if sm is self.sm_press:
+            return self.Qaux_press, sm.aux_registry or []
+        if sm is self.sm_corr:
+            return self.Qaux_corr, sm.aux_registry or []
+        raise ValueError(f"Unknown sub-system {sm}")
 
-        Uses ``sm_pred``'s registry as the canonical full-state aux
-        registry — its auto-scan picks up every derivative the chain
-        DAE needs.  Pressure-mode derivatives ``P_k_x``, ``P_k_xx``
-        are on ``sm_press``'s registry; we walk that one too.
+    def update_aux_variables(self):
+        """Refresh derivative-aux rows by LSQ in each sub-system's
+        ``Qaux`` pool.  Each sub-system has its own ``aux_state``
+        ordering (auto-scan ordering depends on which atoms appear
+        in that sub-system's operators) — we walk all three
+        registries and fill each one's Qaux array independently.
+
+        Function-aux rows (``b`` topography) are left untouched —
+        the user sets them once via :meth:`set_function_aux` and they
+        stay static through the simulation.
         """
         Q = self._sim_Q
-        Qaux = self._sim_Qaux
         nc = Q.shape[1]
-        n_cells = self._sim_n_cells
+        n_cells = self._sim_mesh.n_cells
         mesh = self._sim_mesh
         u_full = np.zeros(n_cells)
 
-        seen_rows = set()
         for sm in (self.sm_pred, self.sm_press, self.sm_corr):
-            registry = getattr(sm, "aux_registry", None) or []
+            Qaux, registry = self._aux_pool_for(sm)
             for entry in registry:
                 if entry["kind"] != "derivative":
                     continue
                 row = entry["row"]
-                if row in seen_rows or row >= Qaux.shape[0]:
+                if row >= Qaux.shape[0]:
                     continue
-                seen_rows.add(row)
                 mi = entry["multi_index"]
                 tk = entry["target_kind"]
                 if tk == "state":
@@ -295,104 +361,63 @@ class ChorinSplitVAMSolver(Solver):
                     derivatives_multi_index=[mi],
                 )
                 Qaux[row, :] = d[:nc, 0]
-        self._sim_Qaux = Qaux
+
+    def set_function_aux(self, name, values):
+        """Set a function-aux row (e.g. static topography ``b``) on
+        every sub-system's Qaux pool at its own row index.  Use this
+        once at IC time to inject bathymetry; ``update_aux_variables``
+        then refreshes the derived rows (``b_x``, ``b_xx``, …) from it.
+        """
+        for sm in (self.sm_pred, self.sm_press, self.sm_corr):
+            Qaux, registry = self._aux_pool_for(sm)
+            for entry in registry:
+                if entry["kind"] == "function" and entry["name"] == name:
+                    Qaux[entry["row"], :] = values
+                    break
 
     def step(self, dt):
         """One Chorin step: predictor → pressure → corrector.
 
-        Predictor: Butcher-RK on SM_pred (tableau selected via
-        ``method``); central-flux divergence + source.  Pressure:
-        ``scipy.optimize.fsolve`` on the elliptic residual (linear
-        in P ⇒ converges in 1–2 Newton iterations).  Corrector:
-        single lambdify call to ``state_update`` + atomic in-place
-        assignment.  Each substep refreshes Qaux derivative rows so
-        downstream substeps see up-to-date stencils.
+        Predictor: inherited :class:`HyperbolicSolver.step` — proper
+        Rusanov + NCP + indexed-BC.  Mass-conservative.
+
+        Pressure: scipy.optimize.fsolve on the lambdified elliptic
+        residual (linear in P ⇒ 1–2 Newton iters from warm start).
+
+        Corrector: one lambdify call to ``state_update`` + atomic
+        in-place assignment.  Read-then-write is safe — Python
+        evaluates the RHS fully before assigning to the LHS slice.
         """
-        self._step_predictor(dt)
+        super().step(dt)              # predictor: parent's RK + flux + source
         self.update_aux_variables()
         self._step_pressure(dt)
         self.update_aux_variables()
         self._step_corrector(dt)
         self.update_aux_variables()
+        # Parent's step advances self._sim_time internally? Check.
+        # HyperbolicSolver.step doesn't update self._sim_time — that's
+        # done in run_simulation.  Our step is the user-facing entry
+        # point, so we track time here.
         self._sim_time += dt
 
     def _params_with_dt(self, base, dt):
-        """Return a copy of ``base`` with the last entry (``_dt``)
-        replaced by the numeric ``dt``.
-
-        ``_dt`` is appended to each dt-dependent subsystem's
-        ``parameter_values`` Zstruct in ``setup_simulation`` with a
-        placeholder 0.0; per substep we splice in the real dt before
-        invoking the runtime.  This keeps the lambdified arg count
-        constant (= len(parameter_values))."""
+        """Splice numeric dt into the last slot of a parameter array
+        (where ``dt`` lives by our setup_simulation convention)."""
         out = base.copy()
         out[-1] = float(dt)
         return out
 
-    def _predictor_tableau(self) -> ExplicitButcherTableau:
-        """Resolve the Butcher tableau for the explicit predictor by
-        the ``method`` param.  The same registry is shared across
-        substeps that want a Butcher-driven explicit integrator."""
-        return {
-            "euler":  euler(),
-            "ssprk2": ssprk2(),
-            "ssprk3": ssprk3(),
-        }[self.method]
-
-    def _predictor_rhs(self, Q_full):
-        """RHS for the predictor stage: returns a full-shape
-        ``(n_state, nc)`` array with the time-derivative of the
-        predictor's evolution rows; non-evolution rows are zero
-        (predictor doesn't touch them).
-
-        Crude central-flux divergence + source.  Boundary faces use
-        zero-gradient ghosts.  Order-of-accuracy work — well-balanced
-        η = h+b reconstruction, MUSCL limiting, proper Riemann solver
-        — layers on top of this once the wiring is verified.
-        """
-        rt = self.rt_pred
-        nc = self._sim_nc
-        dx = float(self._sim_mesh.cell_volumes[0])
-        Qaux = self._sim_Qaux
-        p = self._params_pred
-
-        F = np.asarray(rt.flux(Q_full, Qaux, p), dtype=float)
-        if F.ndim == 3:
-            F1d = F[:, 0, :]
-        else:
-            F1d = F
-        F_left  = np.concatenate([F1d[:, :1], F1d[:, :-1]], axis=1)
-        F_right = np.concatenate([F1d[:, 1:], F1d[:, -1:]], axis=1)
-        F_div   = (F_right - F_left) / (2.0 * dx)
-
-        S = np.asarray(rt.source(Q_full, Qaux, p), dtype=float)
-        if S.ndim == 1:
-            S = S[:, None] * np.ones((1, nc))
-
-        dQ = np.zeros_like(Q_full)
-        dQ[self._pred_state_idx, :] = -F_div + S
-        return dQ
-
-    def _step_predictor(self, dt):
-        """Explicit Butcher-RK step on the predictor substep."""
-        table = self._predictor_tableau()
-        Q_new = explicit_rk_step(
-            self._sim_time, self._sim_Q, dt, table,
-            lambda t, Q_in: self._predictor_rhs(Q_in),
-        )
-        # Predictor only writes to its e2s slots; the RHS is zero on
-        # the other rows, so non-e2s entries are unchanged by construction.
-        self._sim_Q = Q_new
-
     def _step_pressure(self, dt):
-        """Solve the algebraic elliptic block ``R(P; Q, Qaux, dt) = 0``
-        for ``Q[press_e2s]`` via scipy.optimize.fsolve.  R is linear
-        in P → Newton converges in 1–2 iterations from any start."""
+        """Solve ``R(P; Q, Qaux_press, dt) = 0`` for ``Q[press_e2s]``.
+
+        ``SM_press.source`` carries the elliptic residual (auto-tagged
+        as source by the splitter).  Linear in P ⇒ fsolve converges
+        in 1–2 Newton iters from any warm start."""
         from scipy.optimize import fsolve
         rt = self.rt_press
         Q = self._sim_Q
-        Qaux = self._sim_Qaux
-        nc = self._sim_nc
+        Qaux = self.Qaux_press         # SM_press has its own aux pool
+        nc = self.nc
         p_full = self._params_with_dt(self._params_press_base, dt)
         e2s = self._press_state_idx
         nP = len(e2s)
@@ -400,14 +425,12 @@ class ChorinSplitVAMSolver(Solver):
         def residual_of_P(p_vec):
             Q_try = Q.copy()
             Q_try[e2s, :] = p_vec.reshape(nP, nc)
-            # SM_press carries the elliptic residual in its ``source``
-            # field (after auto-tagging).  Returns (nP, nc).
             R = np.asarray(rt.source(Q_try, Qaux, p_full), dtype=float)
             if R.ndim == 1:
                 R = R[:, None] * np.ones((1, nc))
             return R.ravel()
 
-        p0 = Q[e2s, :].ravel()              # warm-start from current P
+        p0 = Q[e2s, :].ravel()
         p_new, _, info, msg = fsolve(
             residual_of_P, p0, full_output=True,
             xtol=self.pressure_tol, maxfev=self.pressure_maxit,
@@ -416,12 +439,10 @@ class ChorinSplitVAMSolver(Solver):
         self._sim_Q = Q
 
     def _step_corrector(self, dt):
-        """Apply ``Q[corr_e2s] ← state_update(Q, Qaux, p, dt)`` in place.
-        Read-then-write is atomic per row: Python evaluates the RHS
-        callable fully before assigning to the LHS slice."""
+        """``Q[corr_e2s] ← state_update(Q, Qaux_corr, p, dt)`` in place."""
         rt = self.rt_corr
         Q = self._sim_Q
-        Qaux = self._sim_Qaux
+        Qaux = self.Qaux_corr           # SM_corr's own aux pool
         p_full = self._params_with_dt(self._params_corr_base, dt)
         e2s = self._corr_state_idx
 
@@ -430,13 +451,7 @@ class ChorinSplitVAMSolver(Solver):
         self._sim_Q = Q
 
     def _detect_dt_symbol(self) -> Optional[sp.Symbol]:
-        """Locate the symbolic time-step common to SM_press / SM_corr.
-
-        The splitter bakes a free Symbol named ``dt``, ``Delta t``, or
-        ``\\Delta t`` (sympy LaTeX form) into the elliptic and
-        corrector operators.  Returns the Symbol, or ``None`` when the
-        two sub-systems are dt-free (degenerate case, e.g. testing).
-        """
+        """Locate the symbolic time-step common to SM_press / SM_corr."""
         candidates = set()
         for sm in (self.sm_press, self.sm_corr):
             for atom in sm.source.free_symbols | sm.flux.free_symbols:
@@ -458,21 +473,17 @@ class ChorinSplitVAMSolver(Solver):
 
 
 def _substitute_dt(sm, old_sym, new_sym):
-    """Rename the dt Symbol throughout a sub-system's operator tensors.
+    """Rename a Symbol throughout a sub-system's operator tensors.
 
-    The Chorin splitter bakes a free Symbol named ``\\Delta t`` into
-    ``SM_press`` / ``SM_corr``.  That LaTeX-flavoured name is sympy-
-    correct but breaks Python lambdify (the backslash reads as a line
-    continuation).  Substitute it for a Python-safe identifier
-    everywhere it appears in the symbolic operators before lambdifying.
+    Used to convert the splitter's ``\\Delta t`` placeholder into the
+    Python-safe ``dt`` Symbol before lambdify (the backslash is a line
+    continuation in Python source).  Element-wise xreplace via ZArray.
     """
-    from zoomy_core.model.models.system_model import _to_zarray
     sub = {old_sym: new_sym}
     def _xrepl(tensor):
         if tensor is None:
             return None
-        zarr = _to_zarray(tensor)
-        return zarr.xreplace(sub)
+        return _to_zarray(tensor).xreplace(sub)
     sm.flux                   = _xrepl(sm.flux)
     sm.hydrostatic_pressure   = _xrepl(sm.hydrostatic_pressure)
     sm.source                 = _xrepl(sm.source)
@@ -482,15 +493,6 @@ def _substitute_dt(sm, old_sym, new_sym):
     sm.eigenvalues            = _xrepl(sm.eigenvalues)
     sm.state_update           = _xrepl(sm.state_update)
     return sm
-
-
-def _ndarray_iter(shape):
-    if not shape:
-        yield ()
-        return
-    for i in range(shape[0]):
-        for rest in _ndarray_iter(shape[1:]):
-            yield (i,) + rest
 
 
 __all__ = ["ChorinSplitVAMSolver"]
