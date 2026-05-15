@@ -321,6 +321,52 @@ class SystemModel:
         if eigenvalues and self.eigenvalues is not None:
             self.eigenvalues = self._compute_eigenvalues()
 
+    def assert_diagonal_mass_matrix(self):
+        """Consistency check: verify ``mass_matrix`` is diagonal on
+        every evolution row and zero on every algebraic row.
+
+        - Evolution row ``i`` (with ``equation_to_state_index[i] = j``):
+          must have ``M[i, k] = 0`` for every ``k != j``, and
+          ``M[i, j] != 0``.
+        - Algebraic row ``i``: ``M[i, :] = 0``.
+
+        Raises ``ValueError`` with a precise location report on
+        violation.  Run this **after** ``change_state_variables`` to
+        confirm the variable choice produces a clean diagonal mass
+        matrix — otherwise the variable map is wrong for the system
+        at hand.
+
+        Once this passes, ``InvertMassMatrix`` is a trivial per-row
+        division by the diagonal entry; downstream consumers see
+        ``M = I`` on evolution rows.
+        """
+        n_eq = self.n_equations
+        n_st = self.n_state
+        e2s = list(self.equation_to_state_index)
+        offenders = []
+        for i in range(n_eq):
+            diag_col = e2s[i]
+            for k in range(n_st):
+                if k == diag_col:
+                    continue
+                entry = sp.simplify(self.mass_matrix[i, k])
+                if entry != 0:
+                    offenders.append((i, k, entry))
+        if offenders:
+            msg_lines = [
+                "Mass matrix is not diagonal on evolution rows:",
+            ]
+            for (i, k, entry) in offenders:
+                msg_lines.append(
+                    f"  M[row={i}, state_col={k}={self.state[k]}] = {entry}"
+                )
+            msg_lines.append(
+                "Pick a state-variable transformation in "
+                "``change_state_variables`` that diagonalises M, or "
+                "address the system structurally."
+            )
+            raise ValueError("\n".join(msg_lines))
+
     # ── apply / row view ───────────────────────────────────────────────
 
     def apply(self, operation, *, name: Optional[str] = None,
@@ -1201,56 +1247,88 @@ class SystemModelDescription:
 # ── System-level operations ───────────────────────────────────────────
 
 class InvertMassMatrix:
-    """System-level op: left-multiply the system by ``M⁻¹``.
+    """System-level op: left-multiply each evolution row by ``1/M_ii``.
 
-    Verifies the mass matrix is constant (no state / aux-state atoms),
-    inverts symbolically, and applies ``M⁻¹`` to ``flux``,
-    ``hydrostatic_pressure``, ``source``, and each per-direction slab
-    of ``nonconservative_matrix``.  Sets ``mass_matrix`` to identity.
+    Operates on a SystemModel whose mass matrix is **diagonal** on
+    every evolution row (with arbitrary state-dependent diagonal
+    entries) and zero on every algebraic row.  Use
+    :meth:`SystemModel.assert_diagonal_mass_matrix` first to verify
+    this precondition.
+
+    Per evolution row ``i`` (with ``equation_to_state_index[i] = j``):
+    divide ``flux[i, :]``, ``hydrostatic_pressure[i, :]``,
+    ``source[i, 0]``, and ``nonconservative_matrix[i, :, :]`` by the
+    diagonal entry ``M[i, j]``.  Set ``M[i, j] = 1``.
+
+    Diagonal entries may be state- or aux-dependent — the division is
+    symbolic and produces a ``1/M_ii`` factor in the resulting
+    operators (which gets lambdified per-cell at runtime).
     """
 
     name = "invert_mass_matrix"
-    description = "Left-multiply by M⁻¹ to reach canonical ∂_t Q form."
+    description = (
+        "Divide each evolution row by its diagonal mass entry to reach "
+        "canonical ∂_t Q form."
+    )
 
     def __call__(self, sm: SystemModel):
-        if not sm.is_square:
-            raise ValueError(
-                "InvertMassMatrix: requires a square system "
-                f"(n_eq == n_state); got n_eq={sm.n_equations}, "
-                f"n_state={sm.n_state}, "
-                f"equation_to_state_index={sm.equation_to_state_index}."
-            )
-        state_atoms = set(sm.state) | set(sm.aux_state)
-        if state_atoms and sm.mass_matrix.has(*state_atoms):
-            raise ValueError(
-                "InvertMassMatrix: mass_matrix has state-dependent "
-                "entries — non-constant mass matrices are unsupported.\n"
-                f"Mass matrix:\n{sm.mass_matrix}"
-            )
+        # Precondition: mass matrix is diagonal on evolution rows.
+        sm.assert_diagonal_mass_matrix()
 
-        if sm.mass_matrix == sp.eye(sm.n_equations):
-            return
+        n_eq = sm.n_equations
+        n_st = sm.n_state
+        n_dim = sm.n_dim
+        e2s = list(sm.equation_to_state_index)
 
-        M_inv = sm.mass_matrix.inv()
-        sm.flux = M_inv * sm.flux
-        sm.hydrostatic_pressure = M_inv * sm.hydrostatic_pressure
-        sm.source = M_inv * sm.source
+        # Mutable working copies of the operator tensors.
+        M = sp.Matrix(sm.mass_matrix.tolist())
+        F = sp.Matrix(sm.flux.tolist())
+        P = sp.Matrix(sm.hydrostatic_pressure.tolist())
+        S = sp.Matrix(sm.source.tolist())
+        B = sp.MutableDenseNDimArray(
+            sm.nonconservative_matrix.tolist(),
+            shape=tuple(sm.nonconservative_matrix.shape),
+        )
 
-        n = sm.n_equations
-        d = sm.n_dim
-        new_B = sp.MutableDenseNDimArray.zeros(n, n, d)
-        for k in range(d):
-            slab = sp.Matrix(n, n,
-                             lambda i, j, _k=k:
-                                 sm.nonconservative_matrix[i, j, _k])
-            slab = M_inv * slab
-            for i in range(n):
-                for j in range(n):
-                    new_B[i, j, k] = slab[i, j]
-        sm.nonconservative_matrix = new_B
-        sm.mass_matrix = sp.eye(n)
-        # M⁻¹ changes the quasilinear matrix, hence the spectrum.
-        sm.refresh_derived_operators(eigenvalues=True)
+        n_flux_cols = F.shape[1]
+        n_P_cols = P.shape[1]
+        n_S_cols = S.shape[1]
+
+        normalised = []
+        for i in range(n_eq):
+            diag = sp.simplify(M[i, e2s[i]])
+            if diag == 0:
+                # Algebraic row — nothing to invert.
+                continue
+            if diag == 1:
+                continue
+            inv = 1 / diag
+            for k in range(n_flux_cols):
+                F[i, k] = sp.simplify(F[i, k] * inv)
+            for k in range(n_P_cols):
+                P[i, k] = sp.simplify(P[i, k] * inv)
+            for k in range(n_S_cols):
+                S[i, k] = sp.simplify(S[i, k] * inv)
+            for k in range(n_st):
+                for d in range(n_dim):
+                    B[i, k, d] = sp.simplify(B[i, k, d] * inv)
+            M[i, e2s[i]] = sp.S.One
+            normalised.append(i)
+
+        sm.mass_matrix = _to_zarray(M)
+        sm.flux = _to_zarray(F)
+        sm.hydrostatic_pressure = _to_zarray(P)
+        sm.source = _to_zarray(S)
+        sm.nonconservative_matrix = _to_zarray(B)
+        # Derived operators depend on the primaries; refresh.
+        sm.refresh_derived_operators(eigenvalues=False)
+        sm.history.append({
+            "name": self.name,
+            "description": (
+                f"divided evolution rows {normalised} by their diagonal "
+                f"mass entries"
+            ),
+        })
 
 
 __all__ = [
