@@ -28,6 +28,8 @@ from typing import Sequence
 
 import sympy as sp
 
+from zoomy_core.model.models.system_model import SystemModel
+
 
 # ---------------------------------------------------------------------------
 # Internal: pull row residuals from a SystemModel via reconstruct_residuals.
@@ -140,16 +142,12 @@ def build_pressure_elliptic_block(
             "Could not locate bottom topography 'b' in residuals."
         )
 
-    # Predictor-stage placeholders.
-    U_tilde = [sp.Function(f"U_{k}_tilde", real=True)(t, x)
-               for k in range(M_M + 1)]
-    W_tilde = [sp.Function(f"W_{k}_tilde", real=True)(t, x)
-               for k in range(N_w_active)]
-
     def mu(j):
         return sp.Rational(1, 2 * j + 1)
 
-    # Per-conserved-variable pressure sources.
+    # Per-momentum-row pressure sources T_k(P).  ``_extract_pressure_T``
+    # walks the row residual for pressure-dependent atoms.  Unified
+    # treatment — U and W rows go through the same machinery.
     T_u = [
         _extract_pressure_T(residuals, f"xmom_j{k}", pressure_funcs, mu(k))
         for k in range(M_M + 1)
@@ -159,12 +157,18 @@ def build_pressure_elliptic_block(
         for k in range(N_w_active)
     ]
 
-    # Corrector update in primitive form:
-    #   U_k^(corr) = U_k_tilde - (dt / h) * T_uk(P)
-    #   W_k^(corr) = W_k_tilde - (dt / h) * T_wk(P)
-    U_corr = [U_tilde[k] - (dt / h_fn) * T_u[k] for k in range(M_M + 1)]
-    W_corr = [W_tilde[k] - (dt / h_fn) * T_w[k] for k in range(N_w_active)]
+    # Corrector update — written in state Functions, no tilde rename.
+    # The runtime semantics (``U_k`` here refers to the predictor's
+    # tilde value at substep time, since the pressure stage runs after
+    # the predictor has written to ``Q[U_k]``) lives in execution order,
+    # not symbol identity.
+    U_corr = [coeffs_u[k] - (dt / h_fn) * T_u[k] for k in range(M_M + 1)]
+    W_corr = [coeffs_w[k] - (dt / h_fn) * T_w[k] for k in range(N_w_active)]
 
+    # Elliptic block: substitute U_k → U_k - (dt/h)·T_u_k(P) (and
+    # similarly W_k) into every algebraic continuity row.  Sympy's
+    # ``.subs`` is single-pass: the substituted-in expression's U_k
+    # remains the state Function, not a tilde alias.
     repl = {coeffs_u[k]: U_corr[k] for k in range(M_M + 1)}
     repl.update({coeffs_w[k]: W_corr[k] for k in range(N_w_active)})
 
@@ -173,18 +177,12 @@ def build_pressure_elliptic_block(
         if name.startswith("cont_j"):
             j = int(name[len("cont_j"):])
             # ``.doit()`` distributes the compound ``Derivative`` atoms
-            # introduced by the corrector substitution
-            # (``U_k → U_k_tilde − (dt/h)·T_u[k]``) down to atomic
-            # derivatives of P / h / b / U_tilde.  Without it the
-            # downstream auto-scan would route a whole compound
-            # expression as a single bogus aux symbol.
+            # introduced by the substitution down to atomic derivatives.
             substituted = sp.expand(eq.subs(repl).doit())
             elliptic_rows[j] = substituted
 
     return {
         "rows": elliptic_rows,
-        "U_tilde": U_tilde,
-        "W_tilde": W_tilde,
         "T_u": T_u,
         "T_w": T_w,
         "U_corr": U_corr,
@@ -481,15 +479,11 @@ def split_for_pressure(sm, pressure_vars, dt, *, bottom=None):
     # the Function-form residuals.
     pressure_funcs = block["pressure_vars"]
 
-    # Placeholder Functions for stage-aux (previous-stage outputs).
-    Q_n = [sp.Function(f"Q_n_{n}", real=True)(t, x) for n in state_names]
-    Q_star = [sp.Function(f"Q_star_{n}", real=True)(t, x) for n in state_names]
-    P_new = [sp.Function(f"P_new_{p.func.__name__}", real=True)(t, x)
-             for p in pressure_funcs]
-
     # ── SM_pred ──────────────────────────────────────────────────────────
-    pred_p_freeze = {p: Q_n[pressure_indices[i]]
-                     for i, p in enumerate(pressure_funcs)}
+    # No pred_p_freeze rename — the predictor reads pressure straight
+    # from the state Functions, and at runtime ``Q[pressure_indices]``
+    # holds the start-of-step pressure (the predictor's substep does
+    # not write there, so it stays at P^n implicitly).
     pred_eq_names = []
     pred_eq_residuals = []
     pred_e2s_index = []
@@ -506,8 +500,7 @@ def split_for_pressure(sm, pressure_vars, dt, *, bottom=None):
             continue
         if target not in state_names:
             continue
-        eq = residuals[name]
-        eq_pred = sp.expand(eq.subs(pred_p_freeze))
+        eq_pred = sp.expand(residuals[name])
         pred_eq_names.append(name)
         pred_eq_residuals.append(eq_pred)
         pred_e2s_index.append(state_names.index(target))
@@ -544,49 +537,77 @@ def split_for_pressure(sm, pressure_vars, dt, *, bottom=None):
     )
 
     # ── SM_corr ──────────────────────────────────────────────────────────
-    corr_eq_names = []
-    corr_eq_residuals = []
-    corr_e2s_index = []
+    # Explicit-update operator: ``Q[corr_idx] ← state_update(Q, Qaux, p, dt)``.
+    # The expression for each updated slot is the closed-form
+    # ``coeffs_u[k] - (dt/h)·T_u_k(P)`` (and W analogue) in pure state
+    # Functions — no P_new rename, no tilde rename.  The "tilde" /
+    # "new-pressure" semantics live in execution order: at SM_corr
+    # apply time ``Q[1:5]`` holds the predictor output and ``Q[5:6]``
+    # holds the new pressure.
     M_M = len(block["U_corr"]) - 1
     N_w_active = len(block["W_corr"])
-
+    corr_e2s_index = []
+    update_exprs = []
+    update_names = []  # for SM_corr.equation_names — diagnostic only
     for k in range(M_M + 1):
         target = f"U_{k}"
         if target not in state_names:
             continue
-        U_k_fn = sp.Function(target, real=True)(t, x)
-        U_corr_expr = block["U_corr"][k]
-        for i_p, p in enumerate(pressure_funcs):
-            U_corr_expr = U_corr_expr.subs(p, P_new[i_p])
-        residual = sp.expand(U_k_fn - U_corr_expr)
-        corr_eq_names.append(f"corr_U_{k}")
-        corr_eq_residuals.append(residual)
+        update_exprs.append(sp.expand(block["U_corr"][k]))
         corr_e2s_index.append(state_names.index(target))
+        update_names.append(f"corr_U_{k}")
     for k in range(N_w_active):
         target = f"W_{k}"
         if target not in state_names:
             continue
-        W_k_fn = sp.Function(target, real=True)(t, x)
-        W_corr_expr = block["W_corr"][k]
-        for i_p, p in enumerate(pressure_funcs):
-            W_corr_expr = W_corr_expr.subs(p, P_new[i_p])
-        residual = sp.expand(W_k_fn - W_corr_expr)
-        corr_eq_names.append(f"corr_W_{k}")
-        corr_eq_residuals.append(residual)
+        update_exprs.append(sp.expand(block["W_corr"][k]))
         corr_e2s_index.append(state_names.index(target))
+        update_names.append(f"corr_W_{k}")
 
-    SM_corr = _build_subsystem(
-        eq_names=corr_eq_names,
-        eq_residuals=corr_eq_residuals,
-        sm_parent=sm,
-        state=state,
-        equation_to_state_index=corr_e2s_index,
-        history_entry={
-            "name": "split_for_pressure[corr]",
-            "description": f"corrector: {len(corr_eq_names)} algebraic rows "
-                           f"updating {[state_names[i] for i in corr_e2s_index]}",
-        },
+    # Map state Functions back to state Symbols — the SystemModel
+    # convention: operators are in Symbol form.
+    state_funcs = [sp.Function(str(s), real=True)(t, *coords) for s in state]
+    func_to_sym = dict(zip(state_funcs, state))
+    update_exprs_sym = [e.xreplace(func_to_sym) for e in update_exprs]
+
+    # Build SM_corr with zero residual fields + ``state_update`` set.
+    # ``_build_subsystem`` autotags an empty residual list to all-zero
+    # operators; the state_update field then carries the explicit
+    # update.
+    n_eq = len(corr_e2s_index)
+    n_dim = sm.n_dim
+    n_st = sm.n_state
+    SM_corr = SystemModel(
+        time=sm.time,
+        space=list(sm.space),
+        state=list(state),
+        aux_state=[],
+        parameters=sm.parameters,
+        parameter_values=sm.parameter_values,
+        flux=sp.zeros(n_eq, n_dim),
+        hydrostatic_pressure=sp.zeros(n_eq, n_dim),
+        nonconservative_matrix=sp.MutableDenseNDimArray.zeros(n_eq, n_st, n_dim),
+        source=sp.zeros(n_eq, 1),
+        mass_matrix=sp.zeros(n_eq, n_st),
+        equation_to_state_index=list(corr_e2s_index),
+        state_update=sp.Array(update_exprs_sym),
+        boundary_conditions=sm.boundary_conditions,
+        aux_boundary_conditions=sm.aux_boundary_conditions,
+        boundary_gradients=sm.boundary_gradients,
+        initial_conditions=sm.initial_conditions,
+        aux_initial_conditions=sm.aux_initial_conditions,
+        update_variables=sm.update_variables,
     )
+    SM_corr.equation_names = list(update_names)
+    SM_corr.expose_aux_atoms()
+    SM_corr.history.append({
+        "name": "split_for_pressure[corr]",
+        "description": (
+            f"corrector: explicit update on "
+            f"{[state_names[i] for i in corr_e2s_index]} "
+            f"via state_update field"
+        ),
+    })
 
     return SplitForPressureResult(
         SM_pred=SM_pred,

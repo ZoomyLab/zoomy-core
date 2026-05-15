@@ -254,7 +254,7 @@ class ChorinSplitVAMSolver(Solver):
 
 
 def _substitute_dt(sm, old_sym, new_sym):
-    """Rename the dt Symbol throughout a sub-system's operator matrices.
+    """Rename the dt Symbol throughout a sub-system's operator tensors.
 
     The Chorin splitter bakes a free Symbol named ``\\Delta t`` into
     ``SM_press`` / ``SM_corr``.  That LaTeX-flavoured name is sympy-
@@ -262,19 +262,21 @@ def _substitute_dt(sm, old_sym, new_sym):
     continuation).  Substitute it for a Python-safe identifier
     everywhere it appears in the symbolic operators before lambdifying.
     """
+    from zoomy_core.model.models.system_model import _to_zarray
     sub = {old_sym: new_sym}
-    sm.flux = sm.flux.xreplace(sub)
-    sm.hydrostatic_pressure = sm.hydrostatic_pressure.xreplace(sub)
-    sm.source = sm.source.xreplace(sub)
-    sm.mass_matrix = sm.mass_matrix.xreplace(sub)
-    B = sm.nonconservative_matrix
-    new_B = sp.MutableDenseNDimArray.zeros(*B.shape)
-    for idx in _ndarray_iter(B.shape):
-        new_B[idx] = B[idx].xreplace(sub)
-    sm.nonconservative_matrix = new_B
+    def _xrepl(tensor):
+        if tensor is None:
+            return None
+        zarr = _to_zarray(tensor)
+        return zarr.xreplace(sub)
+    sm.flux                   = _xrepl(sm.flux)
+    sm.hydrostatic_pressure   = _xrepl(sm.hydrostatic_pressure)
+    sm.source                 = _xrepl(sm.source)
+    sm.mass_matrix            = _xrepl(sm.mass_matrix)
+    sm.nonconservative_matrix = _xrepl(sm.nonconservative_matrix)
     sm.refresh_derived_operators(eigenvalues=False)
-    if sm.eigenvalues is not None:
-        sm.eigenvalues = sm.eigenvalues.xreplace(sub)
+    sm.eigenvalues            = _xrepl(sm.eigenvalues)
+    sm.state_update           = _xrepl(sm.state_update)
     return sm
 
 
