@@ -30,7 +30,25 @@ from typing import Any, Dict, List, Optional
 
 import sympy as sp
 
-from zoomy_core.misc.misc import Zstruct
+from zoomy_core.misc.misc import Zstruct, ZArray
+
+
+def _to_zarray(obj):
+    """Coerce a sympy Matrix / NDimArray / list into ``ZArray``.
+
+    Accepts ``None`` (returns None) and existing ``ZArray`` (returns
+    as-is).  Shape is preserved exactly — column vectors stay
+    ``(n, 1)`` Matrix → ``(n, 1)`` ZArray.  Construction sites are
+    responsible for choosing the rank they want; this normaliser
+    just unifies the storage type.
+    """
+    if obj is None or isinstance(obj, ZArray):
+        return obj
+    if isinstance(obj, sp.MatrixBase):
+        return ZArray(obj.tolist(), shape=tuple(obj.shape))
+    if isinstance(obj, sp.NDimArray):
+        return ZArray(obj.tolist(), shape=tuple(obj.shape))
+    return ZArray(obj)
 
 
 def _iter_indices(shape):
@@ -100,17 +118,25 @@ class SystemModel:
     state: List[Any]
     aux_state: List[Any]
     parameters: Zstruct                      # name -> Symbol
-    flux: sp.Matrix
-    hydrostatic_pressure: sp.Matrix
-    nonconservative_matrix: Any              # sp.MutableDenseNDimArray
-    source: sp.Matrix
-    mass_matrix: sp.Matrix
+    # Every operator tensor is a :class:`ZArray` — the project's
+    # unified symbolic tensor type.  ZArray inherits from
+    # :class:`sp.MutableDenseNDimArray`, so it is a drop-in for any
+    # sympy NDimArray consumer (lambdify, xreplace, atoms, etc.) while
+    # carrying our matrix-algebra extensions (``@``, ``+``, ``-`` with
+    # lists / Zstructs).  Eigenvalue computation (the one place that
+    # genuinely needs ``sp.Matrix``) wraps via ``zarray.tomatrix()`` →
+    # ``M.eigenvals()`` → ``ZArray(...)``.
+    flux: ZArray                             # (n_eq, n_dim)
+    hydrostatic_pressure: ZArray             # (n_eq, n_dim)
+    nonconservative_matrix: ZArray           # (n_eq, n_state, n_dim)
+    source: ZArray                           # (n_eq,)
+    mass_matrix: ZArray                      # (n_eq, n_state)
     # Derived operators — frozen alongside the primaries.  ``None`` ⇒
     # ``__post_init__`` computes quasilinear_matrix / source_jacobian
     # from the primaries; ``eigenvalues`` stays ``None`` when skipped.
-    quasilinear_matrix: Any = None           # sp.MutableDenseNDimArray
-    source_jacobian: Optional[sp.Matrix] = None
-    eigenvalues: Optional[sp.Matrix] = None
+    quasilinear_matrix: Optional[ZArray] = None    # (n_eq, n_state, n_dim)
+    source_jacobian: Optional[ZArray] = None       # (n_eq, n_state)
+    eigenvalues: Optional[ZArray] = None           # (n_eq,)
     normal: Optional[Zstruct] = None
     parameter_values: Optional[Zstruct] = None   # name -> numeric default
     equation_to_state_index: Optional[List[int]] = None
@@ -135,11 +161,30 @@ class SystemModel:
     # the ``(n_eq, n_dim)`` diffusive flux ``F_diff(Q, ∇Q)`` — carried
     # for the numerics to consume (it does not enter the operator-form
     # residual ``M·∂_t Q + ∇·F + ∇·P + B·∇Q − S``).
-    update_variables: Optional[sp.Matrix] = None
-    diffusive_flux: Optional[sp.Matrix] = None
+    update_variables: Optional[ZArray] = None        # (n_eq,)
+    diffusive_flux: Optional[ZArray] = None           # (n_eq, n_dim)
+    # ``state_update``: rank-1 ZArray of length ``len(equation_to_state_index)``
+    # encoding an explicit-update operator ``Q[e2s] ← state_update(Q, Qaux, p, dt)``.
+    # When set, the solver dispatches this substep as in-place assignment
+    # rather than residual semantics (mass_matrix is implicitly zero).
+    state_update: Optional[ZArray] = None
     history: List[Dict[str, str]] = field(default_factory=list)
 
     def __post_init__(self):
+        # Normalise every operator tensor field to ZArray.  Construction
+        # sites that still produce sympy types are wrapped transparently.
+        self.flux                   = _to_zarray(self.flux)
+        self.hydrostatic_pressure   = _to_zarray(self.hydrostatic_pressure)
+        self.nonconservative_matrix = _to_zarray(self.nonconservative_matrix)
+        self.source                 = _to_zarray(self.source)
+        self.mass_matrix            = _to_zarray(self.mass_matrix)
+        self.quasilinear_matrix     = _to_zarray(self.quasilinear_matrix)
+        self.source_jacobian        = _to_zarray(self.source_jacobian)
+        self.eigenvalues            = _to_zarray(self.eigenvalues)
+        self.update_variables       = _to_zarray(self.update_variables)
+        self.diffusive_flux         = _to_zarray(self.diffusive_flux)
+        self.state_update           = _to_zarray(self.state_update)
+
         if self.equation_to_state_index is None:
             self.equation_to_state_index = list(range(self.n_equations))
         if self.normal is None:
@@ -151,9 +196,9 @@ class SystemModel:
         if self.parameter_values is None:
             self.parameter_values = Zstruct()
         if self.quasilinear_matrix is None:
-            self.quasilinear_matrix = self._compute_quasilinear_matrix()
+            self.quasilinear_matrix = _to_zarray(self._compute_quasilinear_matrix())
         if self.source_jacobian is None:
-            self.source_jacobian = self._compute_source_jacobian()
+            self.source_jacobian = _to_zarray(self._compute_source_jacobian())
 
     # ── Shape accessors ────────────────────────────────────────────────
 
@@ -957,12 +1002,15 @@ class SystemModel:
             for j, new_s in enumerate(new_state):
                 J[i, j] = sp.diff(T_i, new_s)
 
-        # Substitute T into operators.
-        new_flux = sp.expand(self.flux.xreplace(full_transform))
-        new_P = sp.expand(self.hydrostatic_pressure.xreplace(full_transform))
-        new_S = sp.expand(self.source.xreplace(full_transform))
+        # Substitute T into operators.  ZArray.xreplace returns ZArray;
+        # ZArray.expand applies sp.expand element-wise.
+        new_flux = self.flux.xreplace(full_transform).expand()
+        new_P    = self.hydrostatic_pressure.xreplace(full_transform).expand()
+        new_S    = self.source.xreplace(full_transform).expand()
 
-        # NCP: B_new[i, k, d] = Σ_j B_old[i, j, d](T) · J[j, k]
+        # NCP: B_new[i, k, d] = Σ_j B_old[i, j, d](T) · J[j, k].  Per-d
+        # slab is a Matrix-multiply; convert each slab through sp.Matrix
+        # for the multiply and wrap back at the end.
         n_eq = self.n_equations
         n_dim = self.n_dim
         new_B = sp.MutableDenseNDimArray.zeros(n_eq, n, n_dim)
@@ -978,10 +1026,13 @@ class SystemModel:
             for i in range(n_eq):
                 for k in range(n):
                     new_B[i, k, d] = B_slab_new[i, k]
+        new_B = _to_zarray(new_B)
 
-        # Mass matrix: M_new = M_old(T) · J
-        M_old_sub = self.mass_matrix.xreplace(full_transform)
-        new_M = sp.expand(M_old_sub * J)
+        # Mass matrix: M_new = M_old(T) · J.  Same Matrix-multiply
+        # pattern — ZArray.xreplace → sp.Matrix for multiply → ZArray.
+        M_old_M = sp.Matrix(self.mass_matrix.tolist())
+        M_old_sub = M_old_M.xreplace(full_transform)
+        new_M = _to_zarray(sp.expand(M_old_sub * J))
 
         self.state = list(new_state)
         self.flux = new_flux
@@ -989,9 +1040,15 @@ class SystemModel:
         self.nonconservative_matrix = new_B
         self.source = new_S
         self.mass_matrix = new_M
-        # A change of variables alters the characteristic structure, so
-        # re-derive the derived operators (spectrum included).
-        self.refresh_derived_operators(eigenvalues=True)
+        # Re-derive the quasilinear matrix + source jacobian from the new
+        # primaries.  Eigenvalues are preserved under invertible change of
+        # variables — push the transform through the existing expressions
+        # (a re-solve via charpoly is unreliable on rank-deficient DAE
+        # quasilinear matrices, where ``sp.solve`` deduplicates and drops
+        # multiplicities).
+        self.refresh_derived_operators(eigenvalues=False)
+        if self.eigenvalues is not None:
+            self.eigenvalues = self.eigenvalues.xreplace(full_transform)
         self.history.append({
             "name": "change_state_variables",
             "description": (
