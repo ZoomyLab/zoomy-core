@@ -24,6 +24,7 @@ import zoomy_core.fvm.ode as ode
 import zoomy_core.fvm.timestepping as timestepping
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel, NumpyRuntimeSymbolic
 from zoomy_core.mesh import ensure_lsq_mesh
+from zoomy_core.model.models.system_model import SystemModel
 from zoomy_core.fvm.riemann_solvers import (
     PositiveNonconservativeRusanov,
     NonconservativeRusanov,
@@ -45,8 +46,17 @@ def _var_index(model, name, fallback=None):
 
 
 def _param_value(model, name, default=None):
-    if hasattr(model.parameters, "contains") and model.parameters.contains(name):
-        return float(getattr(model.parameters, name))
+    # SystemModel keeps numeric values in ``parameter_values`` (``parameters``
+    # holds Symbols); a Model keeps values in ``parameters``.
+    pv = getattr(model, "parameter_values", None)
+    if pv is not None and hasattr(pv, "contains") and pv.contains(name):
+        return float(getattr(pv, name))
+    params = getattr(model, "parameters", None)
+    if params is not None and hasattr(params, "contains") and params.contains(name):
+        try:
+            return float(getattr(params, name))
+        except (TypeError, ValueError):
+            return default
     return default
 
 
@@ -63,22 +73,25 @@ def _detect_scaled_q_indices(model):
 
 # -- Boundary condition helpers ------------------------------------------------
 
-def _compute_bf_face_gradients(Q, Qaux, bf_values, bc_objects, bf_cells, bf_fidx,
-                               d_face, normals_arr, n_bf, n_vars, has_aux,
-                               time, parameters):
-    """Compute per-variable face-normal gradients at boundary faces.
+def _compute_bf_face_gradients(Q, Qaux, bc_indices, bc_grad_fn, bf_cells,
+                               bf_fidx, d_face, normals_arr, face_centers,
+                               n_bf, n_vars, has_aux, time, parameters):
+    """Compute per-variable boundary face-normal gradients via the
+    indexed ``boundary_gradients(bc_idx, time, position, distance, Q,
+    Qaux, p, normal)`` kernel.
 
-    Returns dict {var_index: ndarray(n_bf,)} for use by DiffusionOperatorV2.
-    """
+    Returns dict ``{var_index: ndarray(n_bf,)}`` for use by
+    ``DiffusionOperatorV2``."""
     bf_grads = {v: np.zeros(n_bf) for v in range(n_vars)}
     for i_bf in range(n_bf):
         q_inner = Q[:, bf_cells[i_bf]]
-        q_face = bf_values[:, i_bf]
         qaux_inner = Qaux[:, bf_cells[i_bf]] if has_aux else np.array([])
-        normal = normals_arr[:, bf_fidx[i_bf]]
-        fg = bc_objects[i_bf].face_gradient(
-            q_inner, q_face, qaux_inner, normal,
-            d_face[i_bf], time, parameters,
+        fidx = bf_fidx[i_bf]
+        normal = normals_arr[:, fidx]
+        position = face_centers[fidx, :]
+        fg = bc_grad_fn(
+            bc_indices[i_bf], time, position, d_face[i_bf],
+            q_inner, qaux_inner, parameters, normal,
         )
         for v in range(n_vars):
             bf_grads[v][i_bf] = fg[v]
@@ -110,25 +123,40 @@ class Solver(param.Parameterized):
         return Q, Qaux
 
     def create_runtime(self, Q, Qaux, mesh, model):
-        if hasattr(mesh, "resolve_periodic_bcs"):
-            mesh.resolve_periodic_bcs(model.boundary_conditions)
+        """Build the numpy runtime from a :class:`SystemModel`.
+
+        Contract: ``model`` is a :class:`SystemModel` — the
+        self-contained numerical model.  Every ``setup_simulation``
+        normalises its input to a SystemModel before reaching here.
+        The runtime comes from
+        :meth:`NumpyRuntimeModel.from_system_model`; the numeric
+        parameter array from ``parameter_values``.  Numerical
+        regularisation, if wanted, is a separate
+        ``SystemModel → SystemModel`` pass applied *before* this point.
+        """
         Q, Qaux = np.asarray(Q), np.asarray(Qaux)
-        # Convert parameters Zstruct → numeric array at the symbolic→numeric boundary
-        parameters = np.array(list(model.parameters.values()), dtype=float)
-        from zoomy_core.kernel import Kernel
-        kernel = Kernel(model)
-        kernel.regularize(model)
-        self._kernel = kernel  # store for numerics regularization
-        runtime_model = NumpyRuntimeModel(model, kernel=kernel)
+        parameters = np.array(
+            list(model.parameter_values.values()), dtype=float)
+        runtime_model = NumpyRuntimeModel.from_system_model(model)
         return Q, Qaux, parameters, mesh, runtime_model
 
     def update_q(self, Q, Qaux, mesh, model, parameters):
-        """Apply model.update_variables (h clamp, momentum ramp) at each cell."""
+        """Apply ``model.update_variables`` (h-clamp, momentum ramp) at
+        each cell.
+
+        ``update_variables`` is carried through the SystemModel and
+        exposed on the runtime — the identity for models with no
+        per-cell transform.  It is ``None`` only for SystemModels
+        assembled directly without one (e.g. split sub-systems); then
+        this is a genuine no-op, not a legacy fallback."""
+        update = getattr(model, "update_variables", None)
+        if update is None:
+            return Q
         n_vars = Q.shape[0]
         for c in range(Q.shape[1]):
             aux = Qaux[:, c] if Qaux.shape[0] > 0 else _EMPTY_AUX
             Q[:, c] = np.asarray(
-                model.update_variables(Q[:, c], aux, parameters), dtype=float,
+                update(Q[:, c], aux, parameters), dtype=float,
             ).ravel()[:n_vars]
         return Q
 
@@ -239,10 +267,9 @@ class HyperbolicSolver(Solver):
         n_aux = symbolic_model.n_aux_variables
         n_params = symbolic_model.n_parameters
         dim = symbolic_model.dimension
-        kernel = getattr(self, '_kernel', None)
 
         if eig_mode != "numerical":
-            rt = NumpyRuntimeModel(symbolic_model, kernel=kernel)
+            rt = NumpyRuntimeModel.from_system_model(symbolic_model)
             compiled_eig = rt.eigenvalues
             def max_ws(*args):
                 Q = np.array(args[:n_vars])
@@ -253,7 +280,7 @@ class HyperbolicSolver(Solver):
                 return float(np.max(np.abs(evs)))
             return max_ws
 
-        rt = NumpyRuntimeModel(symbolic_model, kernel=kernel)
+        rt = NumpyRuntimeModel.from_system_model(symbolic_model)
         ql_fn = rt.quasilinear_matrix
         keys = list(symbolic_model.variables.keys())
         fi_h = keys.index("h") if "h" in keys else None
@@ -340,15 +367,14 @@ class HyperbolicSolver(Solver):
         return NonconservativeRusanov(symbolic_model)
 
     def _build_diffusion_operators(self, mesh, symbolic_model, dim, n_vars):
-        """Build DiffusionOperatorV2 for each variable (if model has diffusion)."""
-        if not hasattr(symbolic_model, 'diffusive_flux'):
-            return None
-        sym_dflux = symbolic_model.diffusive_flux()
-        is_zero = hasattr(sym_dflux, 'tolist') and all(
-            e == 0 for row in sym_dflux.tolist()
-            for e in (row if isinstance(row, list) else [row])
-        )
-        if is_zero:
+        """Build DiffusionOperatorV2 per variable when the SystemModel
+        carries a non-zero ``diffusive_flux`` and positive viscosity.
+
+        ``diffusive_flux`` is a stored SystemModel field (an
+        ``(n_eq, n_dim)`` matrix), not a method — carried over from the
+        Model by ``from_model``."""
+        sym_dflux = getattr(symbolic_model, 'diffusive_flux', None)
+        if sym_dflux is None or sym_dflux.is_zero_matrix:
             return None
         from zoomy_core.fvm.reconstruction import DiffusionOperatorV2
         nu_val = _param_value(symbolic_model, "nu", default=0.0)
@@ -410,21 +436,17 @@ class HyperbolicSolver(Solver):
         fv_int = face_volumes[interior_faces]
         fv_bnd = face_volumes[boundary_faces]
 
-        # Build BC object list per boundary face + precompute d_face
+        # Per-boundary-face indices into the indexed BC function +
+        # precompute d_face.  No Python BC-object list — the BC is
+        # ``runtime_model.boundary_conditions(bc_idx, time, position,
+        # distance, Q_cell, Qaux_cell, parameters, normal) → q_face``.
         n_bf = mesh.n_boundary_faces
-        # boundary_face_cells may be remapped for periodic BCs (opposite cell).
-        # This is what feeds into face_value() — correct for periodic.
         bf_cells = mesh.boundary_face_cells
         bf_fidx = mesh.boundary_face_face_indices
-        bcs_obj = getattr(symbolic_model, 'boundary_conditions', None)
-        bc_objects = []
-        if bcs_obj is not None and hasattr(bcs_obj, 'boundary_conditions_list'):
-            for i_bf in range(n_bf):
-                bc_func_idx = mesh.boundary_face_function_numbers[i_bf]
-                bc_objects.append(bcs_obj.boundary_conditions_list[bc_func_idx])
-        else:
-            from zoomy_core.model.boundary_conditions import Extrapolation
-            bc_objects = [Extrapolation() for _ in range(n_bf)]
+        bc_indices = np.asarray(
+            mesh.boundary_face_function_numbers[:n_bf], dtype=int)
+        bc_fn = model.boundary_conditions
+        face_centers = mesh.face_centers
 
         d_face = np.array([
             np.linalg.norm(
@@ -433,8 +455,11 @@ class HyperbolicSolver(Solver):
             for i in range(n_bf)
         ]) if n_bf > 0 else np.array([])
 
-        # Store BC metadata for IMEX access
-        self._bc_objects = bc_objects
+        # Store BC metadata for IMEX access — both kernels live on the
+        # runtime; diffusion path uses the gradient one.
+        self._bc_indices = bc_indices
+        self._bc_fn = bc_fn
+        self._bc_grad_fn = model.boundary_gradients
         self._bf_cells = bf_cells
         self._bf_fidx = bf_fidx
         self._d_face = d_face
@@ -443,27 +468,31 @@ class HyperbolicSolver(Solver):
         def flux_operator(dt, time, Q, Qaux, parameters, dQ):
             dQ = np.zeros((n_vars, nc))
 
-            # 1. Compute boundary face values via BC.face_value (cell-center values)
+            # 1. Compute boundary face values via the indexed BC kernel.
             bf_values = np.zeros((n_vars, n_bf))
             for i_bf in range(n_bf):
                 q_inner = Q[:, bf_cells[i_bf]]
                 qaux_inner = Qaux[:, bf_cells[i_bf]] if has_aux else _EMPTY_AUX
-                normal = normals_arr[:, bf_fidx[i_bf]]
-                bf_values[:, i_bf] = bc_objects[i_bf].face_value(
-                    q_inner, qaux_inner, normal, d_face[i_bf], time, parameters
+                fidx = bf_fidx[i_bf]
+                normal = normals_arr[:, fidx]
+                position = face_centers[fidx, :]
+                bf_values[:, i_bf] = bc_fn(
+                    bc_indices[i_bf], time, position, d_face[i_bf],
+                    q_inner, qaux_inner, parameters, normal,
                 )
 
             # 2. Reconstruct (uses bf_values for limiter bounds + Q_R placeholder)
             Q_L, Q_R = reconstruct(Q, bf_values)
 
-            # 3. Override Q_R at boundary faces with face_value(Q_L)
-            #    Q_L = reconstructed interior state (face_cells[0] = inner cell)
+            # 3. Override Q_R at boundary faces with BC(Q_L).
             for i_bf in range(n_bf):
                 fidx = bf_fidx[i_bf]
                 qaux_inner = Qaux[:, bf_cells[i_bf]] if has_aux else _EMPTY_AUX
                 normal = normals_arr[:, fidx]
-                Q_R[:, fidx] = bc_objects[i_bf].face_value(
-                    Q_L[:, fidx], qaux_inner, normal, d_face[i_bf], time, parameters
+                position = face_centers[fidx, :]
+                Q_R[:, fidx] = bc_fn(
+                    bc_indices[i_bf], time, position, d_face[i_bf],
+                    Q_L[:, fidx], qaux_inner, parameters, normal,
                 )
 
             # 4a. Interior face loop — both cells are valid inner cells
@@ -516,8 +545,9 @@ class HyperbolicSolver(Solver):
             # 5. Explicit diffusion with boundary contributions
             if self._diffusion_ops is not None and self._diffusion_in_flux:
                 bf_grads = _compute_bf_face_gradients(
-                    Q, Qaux, bf_values, bc_objects, bf_cells, bf_fidx,
-                    d_face, normals_arr, n_bf, n_vars, has_aux, time, parameters,
+                    Q, Qaux, bc_indices, self._bc_grad_fn, bf_cells, bf_fidx,
+                    d_face, normals_arr, face_centers, n_bf, n_vars, has_aux,
+                    time, parameters,
                 )
                 for v, diff_op in self._diffusion_ops.items():
                     dQ[v, :] += diff_op.explicit_with_bc(Q[v, :], bf_grads[v])
@@ -541,8 +571,23 @@ class HyperbolicSolver(Solver):
     # -- Setup / Step / Run / Solve ------------------------------------
 
     def setup_simulation(self, mesh, model, write_output=True):
-        """Build all operators once. Stores simulation state on self."""
+        """Build all operators once. Stores simulation state on self.
+
+        ``model`` may be a :class:`Model` or a :class:`SystemModel`;
+        it is normalised once to a SystemModel — the self-contained
+        numerical model every downstream method consumes.
+        """
         mesh = ensure_lsq_mesh(mesh, model)
+        # Periodic-BC topology resolution needs the ``BoundaryConditions``
+        # object (it iterates ``.boundary_conditions_list`` for tagged
+        # periodic pairs).  Done here, *before* normalising to a
+        # SystemModel — the SystemModel only carries the indexed BC
+        # function, not the object.
+        if hasattr(mesh, "resolve_periodic_bcs") and not isinstance(model, SystemModel):
+            mesh.resolve_periodic_bcs(model.boundary_conditions)
+        if not isinstance(model, SystemModel):
+            model = SystemModel.from_model(model)
+        self.sm = model
         Q, Qaux = self.initialize(mesh, model)
         Q, Qaux, parameters, mesh, model = self.create_runtime(Q, Qaux, mesh, model)
         Qaux = self.update_qaux(Q, Qaux, Q, Qaux, mesh, model, parameters, 0.0, 1.0)

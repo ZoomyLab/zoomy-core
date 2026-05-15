@@ -257,7 +257,11 @@ class Model(param.Parameterized, SymbolicRegistrar):
 
         # --- Boundary Conditions Setup ---
 
-        # 1. Main Boundary Conditions
+        # 1. Main Boundary Conditions — value + face-normal gradient.
+        # Both are built as indexed ``Piecewise`` ``Function`` kernels
+        # so the runtime can call them as
+        # ``rt.boundary_conditions(bc_idx, …)`` /
+        # ``rt.boundary_gradients(bc_idx, …)`` per boundary face.
         self._boundary_conditions = (
             self.boundary_conditions.get_boundary_condition_function(
                 self.time,
@@ -268,6 +272,18 @@ class Model(param.Parameterized, SymbolicRegistrar):
                 self._parameter_symbols,
                 self.normal,
                 function_name="boundary_conditions",
+            )
+        )
+        self._boundary_gradients = (
+            self.boundary_conditions.get_boundary_gradient_function(
+                self.time,
+                self.position,
+                self.distance,
+                self.variables,
+                self.aux_variables,
+                self._parameter_symbols,
+                self.normal,
+                function_name="boundary_gradients",
             )
         )
 

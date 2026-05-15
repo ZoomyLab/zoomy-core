@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 import param
+from scipy.sparse import lil_matrix, csr_matrix
 
 from zoomy_core.mesh.base_mesh import BaseMesh
 from zoomy_core.mesh.fvm_mesh import FVMMesh
@@ -93,6 +94,63 @@ class LSQMesh(FVMMesh):
             out[i, :] = (sf * (A_loc.T @ delta_u))[indices]
 
         return out
+
+    def derivative_operator(self, multi_index) -> csr_matrix:
+        """Sparse-matrix realisation of the LSQ derivative stencil.
+
+        Returns a ``(n_inner_cells, n_inner_cells)`` sparse matrix
+        ``D`` such that ``D @ u`` equals the cell-wise estimate of the
+        derivative ``∂^multi_index u`` — the *same* quantity
+        :meth:`compute_derivatives` produces for that ``multi_index``,
+        but as an explicit **linear operator**.
+
+        ``compute_derivatives`` applies the stencil to a *known* field;
+        ``derivative_operator`` exposes the stencil itself, for
+        assembling implicit / elliptic systems where the field is the
+        unknown (e.g. the Chorin pressure-projection ``A·P = rhs``,
+        where ``∂_xx P`` must enter the matrix, not be evaluated).
+
+        Per cell ``i`` the stencil is
+        ``deriv[i] = Σ_j w_j·(u[nbr_j] − u[i])`` with
+        ``w_j = sf[idx]·A_loc[j, idx]`` — so
+        ``D[i, nbr_j] += w_j`` and ``D[i, i] -= w_j``.
+
+        Parameters
+        ----------
+        multi_index : tuple[int]
+            Spatial-derivative orders per axis, e.g. ``(1,)`` for
+            ``∂_x`` or ``(2,)`` for ``∂_xx`` in 1D — the same
+            convention as :meth:`compute_derivatives` and the
+            ``aux_registry`` ``multi_index`` field.
+
+        Raises
+        ------
+        ValueError
+            If ``multi_index`` is not in the mesh's monomial set —
+            i.e. the mesh was built with too low an ``lsq_degree``.
+        """
+        multi_index = tuple(int(o) for o in multi_index)
+        idx = int(find_derivative_indices(
+            self._lsq_monomial_multi_index, [multi_index])[0])
+        if idx < 0:
+            raise ValueError(
+                f"multi_index {multi_index} is not in the LSQ monomial "
+                f"set {self._lsq_monomial_multi_index} — rebuild the "
+                f"mesh with a higher lsq_degree."
+            )
+        A_glob = self._lsq_gradQ
+        neighbors = self._lsq_neighbors
+        sf = self._lsq_scale_factors
+        nc = self.n_inner_cells
+        D = lil_matrix((nc, nc), dtype=float)
+        for i in range(nc):
+            w = sf[idx] * A_glob[i][:, idx]          # stencil weights
+            for j, n in enumerate(neighbors[i]):
+                if n >= nc:
+                    continue
+                D[i, n] += w[j]
+                D[i, i] -= w[j]
+        return csr_matrix(D)
 
     @classmethod
     def from_fvm(cls, fvm: FVMMesh, lsq_degree: int = 1) -> "LSQMesh":

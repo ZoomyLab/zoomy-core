@@ -172,7 +172,13 @@ def build_pressure_elliptic_block(
     for name, eq in residuals.items():
         if name.startswith("cont_j"):
             j = int(name[len("cont_j"):])
-            substituted = sp.expand(eq.subs(repl))
+            # ``.doit()`` distributes the compound ``Derivative`` atoms
+            # introduced by the corrector substitution
+            # (``U_k → U_k_tilde − (dt/h)·T_u[k]``) down to atomic
+            # derivatives of P / h / b / U_tilde.  Without it the
+            # downstream auto-scan would route a whole compound
+            # expression as a single bogus aux symbol.
+            substituted = sp.expand(eq.subs(repl).doit())
             elliptic_rows[j] = substituted
 
     return {
@@ -428,7 +434,27 @@ def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
         source=S_mat,
         mass_matrix=M_mat,
         equation_to_state_index=list(equation_to_state_index),
+        # Indexed BC kernels carry across unchanged — the sub-system
+        # shares the parent's state Symbols, so the parent's
+        # ``boundary_conditions(idx, ..., Q, Qaux, p, normal) → Q_face``
+        # Function still resolves against the same Q layout.  Without
+        # this propagation the runtime build (which lambdifies these
+        # Functions unconditionally — "prefer breaking over silent
+        # skip") would fail.
+        boundary_conditions=sm_parent.boundary_conditions,
+        aux_boundary_conditions=sm_parent.aux_boundary_conditions,
+        boundary_gradients=sm_parent.boundary_gradients,
+        initial_conditions=sm_parent.initial_conditions,
+        aux_initial_conditions=sm_parent.aux_initial_conditions,
+        update_variables=sm_parent.update_variables,
     )
+    # Auto-scan: route every non-state Function / Derivative atom in
+    # this sub-system's operators into ``aux_state`` + ``aux_registry``
+    # — the same machinery ``SystemModel.from_model`` runs on the
+    # monolithic chain.  So the predictor carries ``b`` / ``b_x`` /
+    # ``h_x``, the pressure stage carries the pressure derivatives
+    # ``P_l_x`` / ``P_l_x_x``, etc.
+    sm.expose_aux_atoms()
     sm.equation_names = list(eq_names)
     sm.history.append(history_entry)
     return sm

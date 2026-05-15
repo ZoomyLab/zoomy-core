@@ -52,7 +52,37 @@ _EMPTY_AUX = np.empty(0, dtype=float)
 
 
 class DAESolver(Solver):
-    """Index-1 DAE-PDE solver with IMEX-RK time stepping."""
+    """Index-1 DAE-PDE solver with IMEX-RK time stepping.
+
+    Order-2 status (2026-05-14)
+    ---------------------------
+    At ``reconstruction_order=1`` this solver is the validated
+    *correctness reference* for the VAM chain: lake-at-rest is
+    preserved to machine precision and a perturbation propagates with
+    bounded mass loss.
+
+    At ``reconstruction_order=2`` the *spatial scheme* is also correct
+    — lake-at-rest over a bump is well-balanced to ~1e-14 (the η = h+b
+    ``SurfaceReconstruction`` + the cell-interior non-conservative
+    integral telescope exactly), and the slope limiter is frozen
+    through the Newton iteration so ``f_I`` is a smooth function of the
+    stage unknown.  But the *time integration* does not converge: the
+    monolithic IMEX-ARK stage Jacobian is ill-conditioned (cond ~1e7),
+    concentrated in the algebraic pressure-constraint rows.  At that
+    conditioning the finite-difference Jacobian (step ~1e-7) is
+    unreliable, so the stage Newton degrades from quadratic to slow
+    *linear* convergence and does not reach ``newton_tol`` within
+    ``newton_maxit``.
+
+    This is structural, not a bug: the monolithic DAE couples a
+    well-conditioned hyperbolic evolution block and an ill-conditioned
+    elliptic pressure-constraint block into a single FD Jacobian.  The
+    fix is the Chorin / projection split — an *explicit* hyperbolic
+    predictor (where the order-2 reconstruction lives, no Jacobian
+    needed) plus a *separate linear* elliptic pressure solve (which can
+    be preconditioned properly).  The split solver is the supported
+    home for order 2; this class stays the order-1 reference.
+    """
 
     time_end = param.Number(default=0.1, bounds=(0, None),
                             doc="Simulation end time")
@@ -75,6 +105,39 @@ class DAESolver(Solver):
     nc_integration_order = param.Integer(default=3, bounds=(1, 8),
                             doc="Gauss-Legendre quadrature order for "
                                 "the non-conservative path integral")
+    reconstruction_order = param.Integer(default=1, bounds=(1, 2),
+                            doc="Spatial reconstruction order.  "
+                                "1 (default) = piecewise-constant "
+                                "cell-centre states; 2 = LSQ-MUSCL "
+                                "slope-limited face reconstruction with "
+                                "the surface-elevation (η = h+b) trick "
+                                "for well-balancing.\n\n"
+                                "ORDER 2 IS NOT PRODUCTION-READY with "
+                                "this monolithic implicit DAE solver — "
+                                "see the class docstring 'Order-2 "
+                                "status' note.  At order 2 the spatial "
+                                "scheme is correct (well-balancing is "
+                                "exact to machine precision via the "
+                                "η = h+b SurfaceReconstruction + the "
+                                "cell-interior non-conservative "
+                                "integral, and the limiter is frozen "
+                                "through the Newton iteration so f_I is "
+                                "smooth), but the IMEX-ARK stage Newton "
+                                "stalls: the monolithic stage Jacobian "
+                                "is ill-conditioned (~1e7), so the "
+                                "finite-difference Jacobian is "
+                                "unreliable and Newton degrades to slow "
+                                "linear convergence (see the note).  "
+                                "Order 1 is the supported default; "
+                                "order 2 is the explicit-predictor "
+                                "path under the Chorin-split solver.")
+    limiter = param.Selector(default="venkatakrishnan",
+                            objects=["venkatakrishnan", "barth_jespersen",
+                                     "minmod", "van_albada"],
+                            doc="Slope limiter for the order-2 MUSCL "
+                                "reconstruction.  ``van_albada`` is the "
+                                "smooth, strictly-bounded variant (no "
+                                "min(1,·) clamp).")
     well_balanced = param.Boolean(default=True,
                             doc="If True, apply Audusse-Bristeau-Klein "
                                 "hydrostatic reconstruction (h_L*, h_R* "
@@ -124,6 +187,21 @@ class DAESolver(Solver):
         self.rt = NumpyRuntimeModel.from_system_model(sm)
         self.tab = ars232() if self.method == "ars232" else ars343()
 
+        # Spatial reconstruction.  Order 2 → LSQ-MUSCL slope-limited
+        # face states; order 1 → piecewise-constant cell-centre.
+        from zoomy_core.fvm.reconstruction import (
+            ConstantReconstructionV2, LSQMUSCLReconstruction,
+            SurfaceReconstruction,
+        )
+        if self.reconstruction_order >= 2:
+            self._reconstruct = LSQMUSCLReconstruction(
+                mesh, mesh.dimension, limiter=self.limiter,
+            )
+        else:
+            self._reconstruct = ConstantReconstructionV2(
+                mesh, mesh.dimension,
+            )
+
         nc = mesh.n_inner_cells
         n_state = sm.n_state
         dim = mesh.dimension
@@ -166,6 +244,52 @@ class DAESolver(Solver):
         # bathymetry lives (Q-state for legacy SWE, Qaux for chain DAE).
         self._h_loc = self._find_field_location("h")
         self._b_loc = self._find_field_location("b")
+
+        # Well-balanced reconstruction wrapper.  When ``h`` is a state
+        # variable and ``b`` is located (state or Qaux),
+        # ``SurfaceReconstruction`` reconstructs the surface elevation
+        # η = h + b (constant at lake-at-rest → the limiter sees a flat
+        # field) and recovers h = η − b per side.  The h/b indices come
+        # from the single field resolution above — the wrapper never
+        # searches.
+        self._surface_recon = None
+        if (self.well_balanced and self._h_loc is not None
+                and self._h_loc[0] == "state"
+                and self._b_loc is not None):
+            self._surface_recon = SurfaceReconstruction(
+                self._reconstruct,
+                h_index=self._h_loc[1],
+                b_index=self._b_loc[1],
+                b_in_state=(self._b_loc[0] == "state"),
+            )
+        # The reconstruction object that exposes ``_limited_grad`` after
+        # each call — consumed by the cell-interior non-conservative
+        # integral in ``_residual``.
+        self._active_recon = (self._surface_recon
+                              if self._surface_recon is not None
+                              else self._reconstruct)
+        # Frozen limiter coefficients — set per step / per projection.
+        self._frozen_phi = None
+
+        # Symbolic Riemann numerics → numpy runtime.  The face-loop
+        # below consumes the *printed* PositiveNonconservativeRusanov
+        # (hydrostatic reconstruction + Rusanov flux + NC path-integral
+        # fluctuations + pressure-jump) — no hand-rolled Riemann logic.
+        # ``scaled_q_indices=[]``: the chain state is primitive
+        # (h, U_k, W_k, P_k), so HR does not depth-rescale any rows.
+        from zoomy_core.fvm.riemann_solvers import (
+            PositiveNonconservativeRusanov,
+        )
+        from zoomy_core.transformation.to_numpy import NumpyRuntimeSymbolic
+        numerics = PositiveNonconservativeRusanov(
+            sm, scaled_q_indices=[],
+            integration_order=self.nc_integration_order,
+        )
+        numerics_module = dict(NumpyRuntimeModel.module)
+        numerics_module["max_wavespeed"] = self._make_max_wavespeed()
+        self.numerics_rt = NumpyRuntimeSymbolic(
+            numerics, module=numerics_module,
+        )
 
         # IC from model.
         Q = np.zeros((n_state, nc))
@@ -268,24 +392,19 @@ class DAESolver(Solver):
     # ------------------------------------------------------------------
 
     def _setup_bc(self, mesh, model):
-        """Resolve per-boundary-face BC objects from
-        ``model.boundary_conditions``.  Defaults to ``Extrapolation``
-        if none configured."""
-        from zoomy_core.model.boundary_conditions import Extrapolation
+        """Cache per-boundary-face BC indices.
+
+        The runtime exposes the indexed BC kernel as
+        ``self.rt.boundary_conditions(bc_idx, time, position, distance,
+        Q_cell, Qaux_cell, parameters, normal) → q_face``.  Per face the
+        only state needed is ``bc_idx = mesh.boundary_face_function_
+        numbers[i]``; no Python BC-object list."""
         n_bf = mesh.n_boundary_faces
         self._n_bf = n_bf
         self._bf_cells = mesh.boundary_face_cells
         self._bf_fidx = mesh.boundary_face_face_indices
-        bcs_obj = getattr(model, "boundary_conditions", None)
-        bcs_list = (getattr(bcs_obj, "boundary_conditions_list", None)
-                    if bcs_obj is not None else None)
-        if bcs_list:
-            self._bc_objects = [
-                bcs_list[mesh.boundary_face_function_numbers[i]]
-                for i in range(n_bf)
-            ]
-        else:
-            self._bc_objects = [Extrapolation() for _ in range(n_bf)]
+        self._bc_indices = np.asarray(
+            mesh.boundary_face_function_numbers[:n_bf], dtype=int)
         if n_bf > 0:
             dim = mesh.dimension
             self._d_face = np.array([
@@ -323,46 +442,83 @@ class DAESolver(Solver):
             return ("aux", aux_names.index(name))
         return None
 
-    @staticmethod
-    def _read_field(loc, q, qaux):
-        return q[loc[1]] if loc[0] == "state" else qaux[loc[1]]
+    # ------------------------------------------------------------------
+    # Reconstruction support: boundary-face values + frozen limiter
+    # ------------------------------------------------------------------
 
-    @staticmethod
-    def _write_field(loc, q, qaux, value):
-        if loc[0] == "state":
-            q[loc[1]] = value
-        else:
-            qaux[loc[1]] = value
+    def _boundary_face_values(self, Q, Qaux, time, p):
+        """BC-provided cell-centre values at every boundary face,
+        shape ``(n_state, n_boundary_faces)`` — feed the reconstruction
+        for limiter bounds and the boundary ``Q_R`` placeholder."""
+        mesh = self._sim_mesh
+        dim = self.dim
+        bc_fn = self.rt.boundary_conditions
+        bf_Q = np.zeros((self.n_state, self._n_bf))
+        for i_bf in range(self._n_bf):
+            c_in = int(self._bf_cells[i_bf])
+            f_idx = int(self._bf_fidx[i_bf])
+            normal = mesh.face_normals[:dim, f_idx]
+            position = mesh.face_centers[f_idx, :]
+            bf_Q[:, i_bf] = bc_fn(
+                self._bc_indices[i_bf], time, position,
+                self._d_face[i_bf], Q[:, c_in], Qaux[:, c_in], p, normal,
+            )
+        return bf_Q
 
-    def _hydrostatic_reconstruction(self, Q_L, Qaux_L, Q_R, Qaux_R):
-        """Audusse-Bristeau-Klein reconstruction.  Returns the
-        ``*``-state versions of (Q_L, Qaux_L, Q_R, Qaux_R) with ``h``
-        and ``b`` slots updated.  If ``h`` or ``b`` isn't located in
-        the model, returns the inputs unchanged."""
-        if (self._h_loc is None or self._b_loc is None
-                or not self.well_balanced):
-            return Q_L, Qaux_L, Q_R, Qaux_R
-        bL = self._read_field(self._b_loc, Q_L, Qaux_L)
-        bR = self._read_field(self._b_loc, Q_R, Qaux_R)
-        hL = self._read_field(self._h_loc, Q_L, Qaux_L)
-        hR = self._read_field(self._h_loc, Q_R, Qaux_R)
-        b_star = max(bL, bR)
-        hL_star = max(0.0, hL + bL - b_star)
-        hR_star = max(0.0, hR + bR - b_star)
-        # Copies so we don't mutate the caller's arrays.
-        Q_Ls = np.array(Q_L, copy=True)
-        Q_Rs = np.array(Q_R, copy=True)
-        Qaux_Ls = np.array(Qaux_L, copy=True)
-        Qaux_Rs = np.array(Qaux_R, copy=True)
-        self._write_field(self._h_loc, Q_Ls, Qaux_Ls, hL_star)
-        self._write_field(self._h_loc, Q_Rs, Qaux_Rs, hR_star)
-        self._write_field(self._b_loc, Q_Ls, Qaux_Ls, b_star)
-        self._write_field(self._b_loc, Q_Rs, Qaux_Rs, b_star)
-        # The chain state is primitive (U_k, W_k, …) so no depth-
-        # rescaling of conservative momenta is needed; if a future
-        # model uses conservative state, add hu_k → (h_star/h_eff)·hu_k
-        # here.
-        return Q_Ls, Qaux_Ls, Q_Rs, Qaux_Rs
+    def _compute_frozen_phi(self, Q, Qaux, time):
+        """Slope-limiter coefficients computed once from a lagged state
+        and held fixed through the implicit-Newton iteration.
+
+        The LSQ gradient is linear in ``Q`` (smooth); the limiter φ is
+        the non-smooth part — its kinks (neighbour min/max, sign
+        branch, per-cell face-min) otherwise poison the
+        finite-difference Jacobian.  Freezing φ — exactly as ``Qaux``
+        is lagged — makes ``f_I`` a smooth function of the Newton
+        unknown.  Returns ``None`` at first order (no limiter)."""
+        if self.reconstruction_order < 2:
+            return None
+        p = self._parameters_array()
+        bf_Q = self._boundary_face_values(Q, Qaux, time, p)
+        if self._surface_recon is not None:
+            return self._surface_recon.compute_phi(Q, Qaux, bf_Q)
+        return self._reconstruct.compute_phi(Q, bf_Q)
+
+    def _make_max_wavespeed(self):
+        """Build the numpy implementation of the ``max_wavespeed``
+        kernel that the printed symbolic numerics calls.
+
+        The symbolic ``Numerics`` emits an *opaque* ``max_wavespeed``
+        placeholder precisely so the implementation is a solver choice
+        (analytical formula vs numerical eigensolve).  This is the
+        analytical Saint-Venant bound ``√((u·n)² + δ²) + √(g·√(h²+δ²))``
+        — a *smooth* surrogate for ``|u·n| + √(g·h)`` so the
+        finite-difference Jacobian stays well-behaved at ``u = 0`` /
+        ``h → 0``.  Signature matches the placeholder's argument order:
+        ``(*Q, *Qaux, *parameters, *normal)`` as flat scalars."""
+        sm = self.sm
+        n_eq = sm.n_equations
+        n_aux = len(sm.aux_state)
+        n_param = sm.parameters.length()
+        dim = sm.n_dim
+        h_in_state = (self._h_loc is not None
+                      and self._h_loc[0] == "state")
+        h_idx = self._h_loc[1] if self._h_loc is not None else 0
+        vel_idx = [i for i, s in enumerate(sm.state)
+                   if str(s) in {"U_0", "V_0", "u", "v"}]
+        g_val = self._g_cached
+        d2 = 1e-12
+
+        def max_wavespeed(*args):
+            Q = args[0:n_eq]
+            Qaux = args[n_eq:n_eq + n_aux]
+            nrm = args[n_eq + n_aux + n_param:
+                       n_eq + n_aux + n_param + dim]
+            h = Q[h_idx] if h_in_state else Qaux[h_idx]
+            un = sum(Q[vi] * nrm[d] for d, vi in enumerate(vel_idx))
+            c = np.sqrt(g_val * np.sqrt(h * h + d2))
+            return np.sqrt(un * un + d2) + c
+
+        return max_wavespeed
 
     # ------------------------------------------------------------------
     # Residual assembly (Rusanov flux + NC fluctuations + source)
@@ -392,117 +548,123 @@ class DAESolver(Solver):
                 self.rt.source(Q[:, c], Qaux[:, c], p), dtype=float,
             ).ravel()
 
-        # Boundary-face Q and Qaux.
+        # Boundary-face cell-centre BC values (feed the reconstruction
+        # for limiter bounds + Q_R placeholder).
         n_bf = self._n_bf
-        bf_Q = np.zeros((n_state, n_bf))
-        bf_Qaux = np.zeros((self.n_aux_total, n_bf))
+        bf_Q = self._boundary_face_values(Q, Qaux, time, p)
+
+        # Spatial reconstruction: per-face left / right state.  Order 1
+        # → cell-centre constant; order 2 → LSQ-MUSCL slope-limited.
+        # Q_L_all, Q_R_all are (n_state, n_faces).
+        #
+        # When well-balanced, ``self._surface_recon`` reconstructs the
+        # surface elevation η = h + b (constant at lake-at-rest → the
+        # limiter sees a flat field) together with b, recovers
+        # h = η − b on each side, and returns the per-side reconstructed
+        # bathymetry b_L_all / b_R_all (None otherwise) for the per-face
+        # Qaux below.  The L/R bathymetry is kept per-side (no
+        # averaging) — exact order-≥2 telescoping additionally needs the
+        # cell-interior non-conservative integral.
+        # Frozen limiter coefficients (computed once per step from the
+        # lagged state) keep the reconstruction — and hence ``f_I`` —
+        # smooth in the Newton unknown.
+        frozen_phi = getattr(self, "_frozen_phi", None)
+        if self._surface_recon is not None:
+            Q_L_all, Q_R_all, b_L_all, b_R_all = self._surface_recon(
+                Q, Qaux, bf_Q, phi=frozen_phi,
+            )
+        else:
+            Q_L_all, Q_R_all = self._reconstruct(Q, bf_Q, phi=frozen_phi)
+            b_L_all = b_R_all = None
+
+        # Override Q_R at boundary faces with the BC applied to the
+        # reconstructed interior face state.
+        bc_fn = self.rt.boundary_conditions
         for i_bf in range(n_bf):
             c_in = int(self._bf_cells[i_bf])
             f_idx = int(self._bf_fidx[i_bf])
             normal = mesh.face_normals[:dim, f_idx]
-            bf_Q[:, i_bf] = self._bc_objects[i_bf].face_value(
-                Q[:, c_in], Qaux[:, c_in], normal,
-                self._d_face[i_bf], time, p,
+            position = mesh.face_centers[f_idx, :]
+            Q_R_all[:, f_idx] = bc_fn(
+                self._bc_indices[i_bf], time, position,
+                self._d_face[i_bf], Q_L_all[:, f_idx], Qaux[:, c_in],
+                p, normal,
             )
-            bf_Qaux[:, i_bf] = Qaux[:, c_in]
 
-        # Face loop: Rusanov flux + NC fluctuations.
+        # Face loop: printed PositiveNonconservativeRusanov numerics.
         cv = mesh.cell_volumes
         R = np.copy(Sv)
-        xi_nodes, wi_nodes = np.polynomial.legendre.leggauss(
-            self.nc_integration_order,
-        )
-        xi_nodes = 0.5 * (xi_nodes + 1)
-        wi_nodes = 0.5 * wi_nodes
 
+        # Cell-interior non-conservative integral (path-conservative,
+        # order ≥ 2):  ∫_cell B(Q_i(x))·∂_x Q_i(x) dx ≈ B(Q_i)·s_i
+        # with the limited reconstruction slope s_i (the |cell| factor
+        # cancels the per-unit-volume residual normalisation).  The
+        # face fluctuations below carry only the inter-cell jump part;
+        # this term is the intra-cell smooth part that the order-1
+        # scheme omits exactly (zero slope ⇒ this loop is skipped).
+        # ``B`` is the printed Model operator and the slope comes from
+        # the reconstruction — a quadrature of existing building blocks.
+        grad = getattr(self._active_recon, "_limited_grad", None)
+        if grad is not None and grad.any():
+            for c in range(nc):
+                B_c = np.asarray(
+                    self.rt.nonconservative_matrix(
+                        Q[:, c], Qaux[:, c], p),
+                    dtype=float,
+                )
+                if B_c.ndim == 2 and dim == 1:
+                    B_c = B_c[..., None]
+                for d_ax in range(dim):
+                    R[:, c] -= B_c[:, :, d_ax] @ grad[:, d_ax, c]
+
+        # Per-face flux + fluctuations from the printed symbolic
+        # numerics: hydrostatic reconstruction, Rusanov conservative
+        # flux, NC path-integral fluctuations and the pressure-jump all
+        # live inside PositiveNonconservativeRusanov — the solver only
+        # passes reconstructed face states and scatters into cells.
+        nflux = self.numerics_rt.numerical_flux
+        nfluct = self.numerics_rt.numerical_fluctuations
         for f in range(mesh.n_faces):
             cA = int(mesh.face_cells[0, f])
             cB = int(mesh.face_cells[1, f])
             normal = mesh.face_normals[:dim, f]
             area = float(mesh.face_volumes[f])
 
+            # Reconstructed face states.  Qaux stays cell-centred except
+            # for the bathymetry row, which carries the per-side
+            # surface-reconstructed b_L / b_R when SurfaceReconstruction
+            # is active (so the printed hydrostatic reconstruction sees
+            # a consistent ``h_face + b_face``).
+            Q_L = Q_L_all[:, f]
+            Q_R = Q_R_all[:, f]
             if f in self._bf_face_to_idx:
                 i_bf = self._bf_face_to_idx[f]
                 c_in = int(self._bf_cells[i_bf])
-                Q_L = Q[:, c_in]
                 Qaux_L = Qaux[:, c_in]
-                Q_R = bf_Q[:, i_bf]
-                Qaux_R = bf_Qaux[:, i_bf]
+                Qaux_R = Qaux[:, c_in]
                 inner_is_A = (c_in == cA)
             else:
-                Q_L = Q[:, cA]
                 Qaux_L = Qaux[:, cA]
-                Q_R = Q[:, cB]
                 Qaux_R = Qaux[:, cB]
                 inner_is_A = True
+            if (b_L_all is not None and self._b_loc is not None
+                    and self._b_loc[0] == "aux"):
+                b_row = self._b_loc[1]
+                Qaux_L = Qaux_L.copy()
+                Qaux_R = Qaux_R.copy()
+                Qaux_L[b_row] = b_L_all[f]
+                Qaux_R[b_row] = b_R_all[f]
 
-            # Hydrostatic reconstruction (well-balanced): rewrite h,b
-            # on both sides so dissipation across the bump vanishes at
-            # lake-at-rest.  At zero topography this is a no-op.
-            Q_Ls, Qaux_Ls, Q_Rs, Qaux_Rs = (
-                self._hydrostatic_reconstruction(
-                    Q_L, Qaux_L, Q_R, Qaux_R,
-                )
+            num_flux = np.asarray(
+                nflux(Q_L, Q_R, Qaux_L, Qaux_R, p, normal),
+                dtype=float,
+            ).ravel()
+            fluct = np.asarray(
+                nfluct(Q_L, Q_R, Qaux_L, Qaux_R, p, normal),
+                dtype=float,
             )
-
-            # Rusanov conservative flux F + P on the *-states.
-            FL = (np.asarray(self.rt.flux(Q_Ls, Qaux_Ls, p), dtype=float)
-                  .reshape(n_state, dim)
-                  + np.asarray(self.rt.hydrostatic_pressure(
-                      Q_Ls, Qaux_Ls, p), dtype=float).reshape(n_state, dim))
-            FR = (np.asarray(self.rt.flux(Q_Rs, Qaux_Rs, p), dtype=float)
-                  .reshape(n_state, dim)
-                  + np.asarray(self.rt.hydrostatic_pressure(
-                      Q_Rs, Qaux_Rs, p), dtype=float).reshape(n_state, dim))
-            s_L = self._cell_max_eigenvalue(Q_Ls)
-            s_R = self._cell_max_eigenvalue(Q_Rs)
-            s_max = max(s_L, s_R)
-            num_flux = (0.5 * (FL + FR) @ normal
-                        - 0.5 * s_max * (Q_Rs - Q_Ls))
-
-            # NC path-integral fluctuations on the *-states.
-            dQ = Q_Rs - Q_Ls
-            dAux = Qaux_Rs - Qaux_Ls
-            A_n = np.zeros((n_state, n_state))
-            for xi, wi in zip(xi_nodes, wi_nodes):
-                Q_path = Q_Ls + xi * dQ
-                Qaux_path = Qaux_Ls + xi * dAux
-                B_path = np.asarray(
-                    self.rt.nonconservative_matrix(Q_path, Qaux_path, p),
-                    dtype=float,
-                )
-                if B_path.ndim == 2 and dim == 1:
-                    B_path = B_path[..., None]
-                for d_ax in range(dim):
-                    A_n += wi * B_path[:, :, d_ax] * normal[d_ax]
-            adv = A_n @ dQ
-            diss = s_max * dQ.copy()
-            diss[0] = 0.0
-            Dp = 0.5 * (adv + diss)
-            Dm = 0.5 * (adv - diss)
-
-            # Pressure-jump correction (well-balanced reconstruction):
-            # add ``(P_raw − P_star)·n`` from the *-state mismatch so
-            # cell A sees ``Dm + (P_L_raw − P_L_*)·n`` and cell B sees
-            # ``Dp + (P_R_* − P_R_raw)·n``.
-            if (self.well_balanced and self._h_loc is not None
-                    and self._b_loc is not None):
-                P_L_raw = np.asarray(
-                    self.rt.hydrostatic_pressure(Q_L, Qaux_L, p),
-                    dtype=float).reshape(n_state, dim)
-                P_R_raw = np.asarray(
-                    self.rt.hydrostatic_pressure(Q_R, Qaux_R, p),
-                    dtype=float).reshape(n_state, dim)
-                P_L_star = np.asarray(
-                    self.rt.hydrostatic_pressure(Q_Ls, Qaux_Ls, p),
-                    dtype=float).reshape(n_state, dim)
-                P_R_star = np.asarray(
-                    self.rt.hydrostatic_pressure(Q_Rs, Qaux_Rs, p),
-                    dtype=float).reshape(n_state, dim)
-                Dm_jump = (P_L_raw - P_L_star) @ normal
-                Dp_jump = (P_R_star - P_R_raw) @ normal
-                Dm = Dm + Dm_jump
-                Dp = Dp + Dp_jump
+            Dp = fluct[0].ravel()
+            Dm = fluct[1].ravel()
 
             if f in self._bf_face_to_idx:
                 c_in = cA if inner_is_A else cB
@@ -513,15 +675,6 @@ class DAESolver(Solver):
                 R[:, cB] += (num_flux - Dp) * area / cv[cB]
 
         return R
-
-    def _cell_max_eigenvalue(self, Q_cell):
-        """Scalar max wave-speed estimate at a single cell, used inside
-        the face-flux loop for Rusanov dissipation."""
-        h = max(float(Q_cell[self.h_index]), 1e-6)
-        c = np.sqrt(self._g_cached * h)
-        if self._u_idx_cached is not None:
-            return abs(float(Q_cell[self._u_idx_cached])) + c
-        return c
 
     def _build_max_eigenvalue_callable(self):
         """``(Q, Qaux, parameters) → max|λ|`` callable for adaptive dt:
@@ -690,6 +843,10 @@ class DAESolver(Solver):
         IMEX-ARK Newton (which uses a more conservative update) do
         the projection.
         """
+        # Freeze the limiter for the projection Newton too (same reason
+        # as in ``step``: a smooth ``f_I`` keeps the FD Jacobian sane).
+        self._frozen_phi = self._compute_frozen_phi(
+            Q, self._sim_Qaux, time)
         Y0 = self._Q_to_Y(Q)
         Y = Y0.copy()
         nc = self.nc
@@ -735,10 +892,14 @@ class DAESolver(Solver):
 
         Convention: refresh ``self._sim_Qaux`` via ``update_qaux``
         once per step (lagged through the Newton iteration), apply
-        ``update_q`` to the new state after.
+        ``update_q`` to the new state after.  The slope-limiter
+        coefficients are frozen the same way — computed once from the
+        lagged state so ``f_I`` stays smooth in the Newton unknown.
         """
         Q_old = self._sim_Q.copy()
         Qaux_old = self._sim_Qaux.copy()
+        self._frozen_phi = self._compute_frozen_phi(
+            Q_old, Qaux_old, self._sim_time)
         Y = self._Q_to_Y(Q_old)
         Y_new = imex_ark_step(
             self._sim_time, Y, dt, self.tab,

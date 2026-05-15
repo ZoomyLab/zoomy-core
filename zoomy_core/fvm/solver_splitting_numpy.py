@@ -22,6 +22,7 @@ from scipy.sparse.linalg import LinearOperator, gmres
 from zoomy_core.fvm.solver_imex_numpy import IMEXSolver, IMEXStats
 from zoomy_core.fvm.solver_numpy import _build_free_surface_numerics, _EMPTY_AUX
 from zoomy_core.mesh import ensure_lsq_mesh
+from zoomy_core.model.models.system_model import SystemModel
 from zoomy_core.mesh.lsq_reconstruction import find_derivative_indices
 import zoomy_core.fvm.ode as ode
 import zoomy_core.misc.io as io
@@ -59,6 +60,15 @@ class SplittingSolver(IMEXSolver):
         """Build all operators including Poisson infrastructure."""
         t0 = time.time()
         mesh = ensure_lsq_mesh(mesh, model, lsq_degree=2)
+        # Periodic-BC topology resolution needs the ``BoundaryConditions``
+        # object — done before the SystemModel normalisation.
+        if hasattr(mesh, "resolve_periodic_bcs") and not isinstance(model, SystemModel):
+            mesh.resolve_periodic_bcs(model.boundary_conditions)
+        # Normalise to a SystemModel — the self-contained numerical
+        # model every downstream method consumes.
+        if not isinstance(model, SystemModel):
+            model = SystemModel.from_model(model)
+        self.sm = model
         dim = model.dimension
         Q, Qaux = self.initialize(mesh, model)
         Q, Qaux, parameters, mesh, model_rt = self.create_runtime(Q, Qaux, mesh, model)
@@ -231,7 +241,9 @@ class SplittingSolver(IMEXSolver):
         cell_vol = self._sim_cell_vol
         face_normals = mesh.face_normals[:dim, :]
         interior_faces = self._sim_interior_faces
-        bc_objects = self._bc_objects
+        bc_fn = self._bc_fn
+        bc_indices = self._bc_indices
+        face_centers = mesh.face_centers
         bf_cells = self._bf_cells
         bf_fidx = self._bf_fidx
         d_face = self._d_face
@@ -255,16 +267,18 @@ class SplittingSolver(IMEXSolver):
                     lap[a] += lap_contrib / cell_vol[a]
                     lap[b] -= lap_contrib / cell_vol[b]
 
-            # Boundary faces — evaluate BC inline at each face
+            # Boundary faces — evaluate BC inline at each face via the
+            # indexed kernel.
             for i_bf in range(n_bf):
                 f = bf_fidx[i_bf]
                 inner = bf_cells[i_bf]
                 q_inner = Q_star[:, inner]
                 qaux_inner = Qaux[:, inner] if has_aux else _EMPTY_AUX
                 normal = face_normals[:, f]
-                q_face = bc_objects[i_bf].face_value(
-                    q_inner, qaux_inner, normal, d_face[i_bf],
-                    time_now, parameters,
+                position = face_centers[f, :]
+                q_face = bc_fn(
+                    bc_indices[i_bf], time_now, position, d_face[i_bf],
+                    q_inner, qaux_inner, parameters, normal,
                 )
                 u_face = q_face[k]
                 diff = u_face - u_d[inner]
@@ -292,7 +306,10 @@ class SplittingSolver(IMEXSolver):
         face_volumes = self._sim_face_volumes
         cell_vol = self._sim_cell_vol
         interior_faces = self._sim_interior_faces
-        bc_objects = self._bc_objects
+        bc_fn = self._bc_fn
+        bc_indices = self._bc_indices
+        mesh = self._sim_mesh
+        face_centers = mesh.face_centers
         bf_cells = self._bf_cells
         bf_fidx = self._bf_fidx
         d_face = self._d_face
@@ -317,8 +334,10 @@ class SplittingSolver(IMEXSolver):
             q_inner = Q_star[:, inner]
             qaux_inner = Qaux[:, inner] if has_aux else _EMPTY_AUX
             n = face_normals[:, f]
-            q_face = bc_objects[i_bf].face_value(
-                q_inner, qaux_inner, n, d_face[i_bf], time_now, parameters,
+            position = face_centers[f, :]
+            q_face = bc_fn(
+                bc_indices[i_bf], time_now, position, d_face[i_bf],
+                q_inner, qaux_inner, parameters, n,
             )
             u_face = np.asarray(q_face)[vel_idx]
             flux_div = float(np.dot(u_face, n))
