@@ -72,12 +72,17 @@ class ZArray(MutableDenseNDimArray):
         return super().__new__(cls, flat_list, final_shape, **kwargs)
 
     def _to_array(self, other):
+        # sympy MatrixBase must go through ``.tolist()`` — ``.values()``
+        # returns a flat list which would strip the (rows, cols) shape
+        # and break shape-matched element-wise operations.
+        if isinstance(other, sp.MatrixBase):
+            return sp.Array(other.tolist())
+        if hasattr(other, "tolist"):
+            return sp.Array(other.tolist())
         if hasattr(other, "values"):
             return sp.Array(list(other.values()))
         if isinstance(other, (list, tuple)):
             return sp.Array(other)
-        if hasattr(other, "tolist"):
-            return sp.Array(other.tolist())
         return other
 
     def __matmul__(self, other):
@@ -219,12 +224,12 @@ class ZArray(MutableDenseNDimArray):
     def subs(self, *args, **kwargs):
         """
         Substitutes expressions within the ZArray.
-        Supports SymPy's standard subs API: 
+        Supports SymPy's standard subs API:
         .subs(old, new), .subs({old: new}), or .subs([(old, new)])
         """
         # 1. Store the shape
         current_shape = self.shape
-        
+
         # 2 & 3. Flatten implicitly (using _array) and substitute for each item
         new_elements = []
         for item in self._array:
@@ -232,9 +237,72 @@ class ZArray(MutableDenseNDimArray):
                 new_elements.append(item.subs(*args, **kwargs))
             else:
                 new_elements.append(item)
-                
+
         # 4 & 5. Restore the shape and return a new ZArray
         return ZArray(new_elements, shape=current_shape)
+
+    def xreplace(self, rule):
+        """Element-wise xreplace — sympy's fast pattern-free substitution.
+
+        ZArray inherits from ``MutableDenseNDimArray`` which does not
+        define ``xreplace``; we apply it per-element and rebuild.
+        """
+        current_shape = self.shape
+        new_elements = []
+        for item in self._array:
+            if hasattr(item, "xreplace"):
+                new_elements.append(item.xreplace(rule))
+            else:
+                new_elements.append(item)
+        return ZArray(new_elements, shape=current_shape)
+
+    def doit(self, **kwargs):
+        """Element-wise ``.doit()`` — evaluates unevaluated Derivative
+        / Integral / Function calls.  Same pattern as ``xreplace``."""
+        current_shape = self.shape
+        new_elements = []
+        for item in self._array:
+            if hasattr(item, "doit"):
+                new_elements.append(item.doit(**kwargs))
+            else:
+                new_elements.append(item)
+        return ZArray(new_elements, shape=current_shape)
+
+    def expand(self, **kwargs):
+        """Element-wise ``sp.expand``."""
+        current_shape = self.shape
+        new_elements = [sp.expand(item, **kwargs) if hasattr(item, "expand")
+                        else item for item in self._array]
+        return ZArray(new_elements, shape=current_shape)
+
+    def diff(self, *args, **kwargs):
+        """Element-wise differentiation — returns a ZArray of the same shape."""
+        current_shape = self.shape
+        new_elements = [sp.diff(item, *args, **kwargs) for item in self._array]
+        return ZArray(new_elements, shape=current_shape)
+
+    @property
+    def is_zero_matrix(self):
+        """All entries are symbolically zero.  Mirrors
+        ``sp.MatrixBase.is_zero_matrix`` so consumers that branch on
+        zero operators (e.g. splitter's algebraic-row detection)
+        work uniformly."""
+        return all(item == 0 for item in self._array)
+
+    def __eq__(self, other):
+        """Element-wise equality.  Cross-type comparison with sympy
+        ``MatrixBase`` works via shared ``.tolist()`` representation
+        (both produce nested lists of sympy expressions).  Falls back
+        to the inherited NDimArray equality for ZArray-to-ZArray."""
+        if isinstance(other, sp.MatrixBase):
+            try:
+                return self.tolist() == other.tolist()
+            except Exception:
+                return NotImplemented
+        return super().__eq__(other)
+
+    def __hash__(self):
+        return super().__hash__()
 
     @property
     def flat(self):
