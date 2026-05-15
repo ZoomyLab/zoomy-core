@@ -38,10 +38,24 @@ class BoundaryCondition(param.Parameterized):
     tag = param.String(default="bc")
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
-        """Compute ghost cell value (legacy interface)."""
+        """Symbolic builder for the boundary *value* — used by
+        :meth:`BoundaryConditions.get_boundary_condition_function` to
+        assemble the indexed ``Piecewise`` BC kernel."""
         raise NotImplementedError(
             "BoundaryCondition is a virtual class. Use one of its derived classes!"
         )
+
+    def compute_boundary_gradient(self, time, X, dX, Q, Qaux, parameters, normal):
+        """Symbolic builder for the boundary *normal-direction gradient*
+        ``∂Q/∂n`` at the face — used by
+        :meth:`BoundaryConditions.get_boundary_gradient_function` to
+        assemble the indexed ``Piecewise`` boundary-gradient kernel
+        (consumed by the diffusion path).
+
+        Default: zero Neumann.  Subclasses override when a non-zero
+        gradient is part of the BC (e.g. prescribed-flux Robin BCs)."""
+        n_vars = len(Q.get_list()) if hasattr(Q, "get_list") else len(Q)
+        return ZArray.zeros(n_vars)
 
     def face_state(self, Q_face, Qaux_face, normal, parameters):
         """Compute the boundary-side Riemann state from the reconstructed face value.
@@ -629,6 +643,9 @@ class BoundaryConditions(param.Parameterized):
         self._boundary_functions = [
             bc.compute_boundary_condition for bc in self.boundary_conditions_list
         ]
+        self._boundary_gradient_functions = [
+            bc.compute_boundary_gradient for bc in self.boundary_conditions_list
+        ]
         self._boundary_tags = [bc.tag for bc in self.boundary_conditions_list]
 
     @property
@@ -690,3 +707,59 @@ class BoundaryConditions(param.Parameterized):
             definition=bc_func_expr,
         )
         return func
+
+    def get_boundary_gradient_function(
+        self,
+        time,
+        X,
+        dX,
+        Q,
+        Qaux,
+        parameters,
+        normal,
+        function_name="boundary_gradients",
+    ):
+        """Indexed symbolic kernel for the boundary face-normal gradient
+        ``∂Q/∂n``.
+
+        Same shape and contract as
+        :meth:`get_boundary_condition_function`: a ``Function`` whose
+        first argument is the BC index, with a ``Piecewise`` body
+        dispatching to each BC subclass's
+        :meth:`BoundaryCondition.compute_boundary_gradient`.  The
+        default per BC is zero Neumann (matches ``Extrapolation``'s
+        gradient); subclasses override when a non-zero gradient is
+        part of the BC."""
+        bc_idx = sympy.Symbol("bc_idx", integer=True)
+
+        if not self._boundary_gradient_functions:
+            grad_expr = ZArray.zeros(len(Q.get_list()))
+        else:
+            conditions = []
+            for i, func in enumerate(self._boundary_gradient_functions):
+                res = func(
+                    time,
+                    X.get_list(),
+                    dX,
+                    Q.get_list(),
+                    Qaux.get_list(),
+                    parameters.get_list(),
+                    normal.get_list(),
+                )
+                conditions.append((res, sympy.Eq(bc_idx, i)))
+            grad_expr = sympy.Piecewise(*conditions)
+
+        return Function(
+            name=function_name,
+            args=Zstruct(
+                idx=bc_idx,
+                time=time,
+                position=X,
+                distance=dX,
+                variables=Q,
+                aux_variables=Qaux,
+                parameters=parameters,
+                normal=normal,
+            ),
+            definition=grad_expr,
+        )

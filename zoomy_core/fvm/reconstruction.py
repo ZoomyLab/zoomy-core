@@ -304,7 +304,7 @@ class ConstantReconstructionV2:
         self._iInner_bnd = mesh.face_cells[0, mesh.boundary_face_face_indices].copy()
         self._n_faces = mesh.n_faces
 
-    def __call__(self, Q, bf_face_values=None):
+    def __call__(self, Q, bf_face_values=None, phi=None):
         """Reconstruct face states.
 
         Parameters
@@ -312,6 +312,9 @@ class ConstantReconstructionV2:
         Q : ndarray, shape (n_vars, n_inner_cells)
         bf_face_values : ndarray, shape (n_vars, n_boundary_faces)
             BC-provided boundary face values.
+        phi : ignored
+            Accepted for interface parity with the MUSCL classes;
+            piecewise-constant reconstruction has no limiter.
 
         Returns (Q_L, Q_R) each (n_vars, n_faces).
         """
@@ -328,7 +331,14 @@ class ConstantReconstructionV2:
         if bf_face_values is not None:
             Q_R[:, self._boundary_faces] = bf_face_values
 
+        # Piecewise-constant → zero slope: no cell-interior gradient.
+        self._limited_grad = None
         return Q_L, Q_R
+
+    def compute_phi(self, Q, bf_face_values=None):
+        """No limiter — piecewise-constant reconstruction.  Returns
+        ``None`` (interface parity with the MUSCL classes)."""
+        return None
 
 
 class LSQMUSCLReconstruction:
@@ -405,7 +415,7 @@ class LSQMUSCLReconstruction:
         h = cell_vols ** (1.0 / max(dim, 1))
         self._eps_v2 = h ** 2
 
-    def __call__(self, Q, bf_face_values):
+    def __call__(self, Q, bf_face_values, phi=None):
         """Reconstruct face states.
 
         Parameters
@@ -413,14 +423,37 @@ class LSQMUSCLReconstruction:
         Q : ndarray, shape (n_vars, n_inner_cells)
         bf_face_values : ndarray, shape (n_vars, n_boundary_faces)
             BC-provided boundary face values (for limiter bounds and Q_R at boundary).
+        phi : ndarray, shape (n_vars, n_inner_cells), optional
+            Pre-computed limiter coefficients.  When supplied the
+            limiter is *frozen* — only the (smooth, linear-in-Q) LSQ
+            gradient is recomputed — so the reconstruction is an
+            affine, hence smooth, function of ``Q``.  This lets an
+            implicit solver call it inside a Newton iteration with a
+            clean finite-difference Jacobian.  When ``None`` (default)
+            φ is computed from ``Q``.
 
         Returns (Q_L, Q_R) each (n_vars, n_faces).
         Q_R at boundary faces is set to bf_face_values (placeholder; overwritten
         by face_value(Q_L) in the flux operator).
         """
         n_vars = Q.shape[0]
-        grads, phi = self._compute_limited_gradients(Q, n_vars, bf_face_values)
+        grads = self._compute_gradients(Q, n_vars)
+        if phi is None:
+            phi = self._compute_phi(Q, n_vars, bf_face_values, grads)
+        # Limited cell-centre gradient (n_vars, dim, nc) — consumed by
+        # the solver's cell-interior non-conservative integral.
+        self._limited_grad = phi[:, None, :] * grads
         return self._reconstruct(Q, grads, phi, bf_face_values)
+
+    def compute_phi(self, Q, bf_face_values):
+        """Limiter coefficients φ (n_vars, nc) for the given state.
+
+        Exposed so a caller can compute φ once — e.g. from a lagged
+        state — and pass it back into :meth:`__call__` to freeze the
+        limiter through an implicit-solver Newton iteration."""
+        n_vars = Q.shape[0]
+        grads = self._compute_gradients(Q, n_vars)
+        return self._compute_phi(Q, n_vars, bf_face_values, grads)
 
     # ── LSQ gradient ────────────────────────────────────────────────
 
@@ -589,27 +622,77 @@ class LSQMUSCLReconstruction:
 
         return np.clip(phi, 0.0, 1.0)
 
+    def _limit_va(self, u, grad, u_min, u_max):
+        """Van Albada limiter — smooth, strictly bounded φ ∈ [0, 1).
+
+        Per-face candidate ``(r² + r) / (r² + r + 1)`` with
+        ``r = headroom / reconstructed-increment`` (always ≥ 0 in both
+        the positive and negative branches).  This is a smooth,
+        monotone, strictly-bounded rational function — unlike the
+        Venkatakrishnan / Barth-Jespersen candidates it needs **no**
+        ``min(1, ·)`` clamp, so the implicit-Newton finite-difference
+        Jacobian stays well-behaved.  (The per-cell ``min`` over faces
+        remains; the dominant non-smoothness — the unit clamp — is
+        what this removes.)
+        """
+        nc = self._nc
+        phi = np.ones(nc)
+        eps = 1e-30
+
+        dA_int, dB_int = self._face_deltas_interior(grad)
+        dA_bnd = self._face_deltas_boundary(grad)
+
+        def _apply_va(cell_ids, deltas):
+            uc = u[cell_ids]
+            pos = deltas > eps
+            neg = deltas < -eps
+            cand = np.ones(len(deltas))
+            if pos.any():
+                r = (u_max[cell_ids[pos]] - uc[pos]) / deltas[pos]
+                cand[pos] = (r * r + r) / (r * r + r + 1.0)
+            if neg.any():
+                r = (u_min[cell_ids[neg]] - uc[neg]) / deltas[neg]
+                cand[neg] = (r * r + r) / (r * r + r + 1.0)
+            np.minimum.at(phi, cell_ids, cand)
+
+        _apply_va(self._iA_int, dA_int)
+        _apply_va(self._iB_int, dB_int)
+        _apply_va(self._iInner_bnd, dA_bnd)
+
+        return np.clip(phi, 0.0, 1.0)
+
     # ── Core pipeline ───────────────────────────────────────────────
 
-    def _compute_limited_gradients(self, Q, n_vars, bf_face_values):
-        """LSQ gradient + slope limiter for all variables."""
+    def _compute_gradients(self, Q, n_vars):
+        """Raw LSQ cell-centre gradients (n_vars, dim, nc) — a fixed
+        linear stencil, hence smooth (C∞) in ``Q``."""
+        grads = np.zeros((n_vars, self.dim, self._nc))
+        for v in range(n_vars):
+            grads[v] = self._lsq_gradient(Q[v, :])
+        return grads
+
+    def _compute_phi(self, Q, n_vars, bf_face_values, grads):
+        """Slope-limiter coefficients φ (n_vars, nc) — the non-smooth
+        part of the reconstruction (neighbour min/max, sign branch,
+        per-cell face-min)."""
         _limiter_map = {
             "barth_jespersen": self._limit_bj,
             "venkatakrishnan": self._limit_vk,
             "minmod": self._limit_minmod,
+            "van_albada": self._limit_va,
         }
         limiter_fn = _limiter_map[self._limiter_type]
-
-        nc = self._nc
-        grads = np.zeros((n_vars, self.dim, nc))
-        phi = np.ones((n_vars, nc))
-
+        phi = np.ones((n_vars, self._nc))
         for v in range(n_vars):
             u = Q[v, :]
-            grads[v] = self._lsq_gradient(u)
             u_min, u_max = self._neighbor_bounds(u, bf_face_values[v, :])
             phi[v] = limiter_fn(u, grads[v], u_min, u_max)
+        return phi
 
+    def _compute_limited_gradients(self, Q, n_vars, bf_face_values):
+        """LSQ gradient + slope limiter for all variables."""
+        grads = self._compute_gradients(Q, n_vars)
+        phi = self._compute_phi(Q, n_vars, bf_face_values, grads)
         return grads, phi
 
     def _reconstruct(self, Q, grads, phi, bf_face_values):
@@ -667,6 +750,147 @@ class FreeSurfaceLSQMUSCL(LSQMUSCLReconstruction):
         np.maximum(Q_L[self._h_idx, :], 0.0, out=Q_L[self._h_idx, :])
         np.maximum(Q_R[self._h_idx, :], 0.0, out=Q_R[self._h_idx, :])
         return Q_L, Q_R
+
+
+class SurfaceReconstruction:
+    """Well-balanced reconstruction in surface-elevation variables.
+
+    Wraps a base reconstruction (``ConstantReconstructionV2`` or
+    ``LSQMUSCLReconstruction``).  Instead of reconstructing the water
+    depth ``h`` directly, it reconstructs the free-surface elevation
+    ``η = h + b`` together with the bathymetry ``b``, then recovers the
+    per-side face depth ``h = η − b``.
+
+    At lake-at-rest ``η`` is constant, so the limiter sees a flat field,
+    produces a zero slope, and ``h = η − b`` is recovered with the full
+    un-clipped ``b`` variation — which is what keeps the limiter
+    well-balanced.  For piecewise-constant reconstruction the whole
+    transform is an exact no-op.
+
+    The depth / bathymetry locations are resolved **once** by the caller
+    (the symbolic ``Numerics.find_field`` → ``FieldHandle``, or the
+    solver's numpy analogue) and passed in here as plain indices — this
+    class never searches for them, so there is a single source of truth
+    for "which row is h, which field is b".
+
+    Note: reconstructing ``η`` makes the *limiter* well-balanced, but at
+    order ≥ 2 the flux + NCP discretization still needs the cell-interior
+    non-conservative integral to telescope exactly.
+
+    Parameters
+    ----------
+    base : reconstruction instance
+        Underlying ``ConstantReconstructionV2`` or
+        ``LSQMUSCLReconstruction``.
+    h_index : int
+        Row of the water depth in ``Q``.
+    b_index : int
+        Index of the bathymetry — a row of ``Q`` when ``b_in_state``,
+        else a row of ``Qaux``.
+    b_in_state : bool
+        ``True`` when ``b`` lives in the conservative state.
+    """
+
+    def __init__(self, base, h_index, b_index, b_in_state):
+        self.base = base
+        self.h_index = int(h_index)
+        self.b_index = int(b_index)
+        self.b_in_state = bool(b_in_state)
+
+    def _extend(self, Q, Qaux, bf_Q):
+        """Build the extended arrays the base reconstruction operates
+        on: ``η = h + b`` in the depth slot, plus (when ``b`` lives in
+        ``Qaux``) an appended ``b`` row.  Returns ``(Q_ext, bf_ext)``."""
+        h_idx = self.h_index
+        n_state = Q.shape[0]
+        n_bf = bf_Q.shape[1]
+        if self.b_in_state:
+            b_idx = self.b_index
+            b_cells = Q[b_idx, :]
+            Q_ext = Q.copy()
+            Q_ext[h_idx, :] = Q[h_idx, :] + b_cells          # η in h-slot
+            bf_ext = bf_Q.copy()
+            bf_ext[h_idx, :] = bf_Q[h_idx, :] + bf_Q[b_idx, :]
+        else:
+            b_cells = Qaux[self.b_index, :]
+            i_inner = self.base._iInner_bnd
+            Q_ext = np.vstack([Q, b_cells[None, :]])
+            Q_ext[h_idx, :] = Q[h_idx, :] + b_cells          # η in h-slot
+            bf_ext = np.zeros((n_state + 1, n_bf))
+            bf_ext[:n_state, :] = bf_Q
+            bf_ext[h_idx, :] = bf_Q[h_idx, :] + b_cells[i_inner]
+            bf_ext[n_state, :] = b_cells[i_inner]
+        return Q_ext, bf_ext
+
+    def compute_phi(self, Q, Qaux, bf_Q):
+        """Limiter coefficients of the extended (η-in-depth-slot) array
+        — for freezing the limiter through an implicit Newton
+        iteration.  ``None`` when the base reconstruction has no
+        limiter."""
+        Q_ext, bf_ext = self._extend(Q, Qaux, bf_Q)
+        return self.base.compute_phi(Q_ext, bf_ext)
+
+    def __call__(self, Q, Qaux, bf_Q, phi=None):
+        """Reconstruct face states in surface-elevation variables.
+
+        Parameters
+        ----------
+        Q : ndarray, shape (n_state, n_inner_cells)
+        Qaux : ndarray, shape (n_aux, n_inner_cells)
+        bf_Q : ndarray, shape (n_state, n_boundary_faces)
+            BC-provided cell-centre values at boundary faces.
+        phi : ndarray, optional
+            Pre-computed limiter coefficients of the *extended* array
+            (see :meth:`compute_phi`).  When supplied the limiter is
+            frozen — passed straight through to the base reconstruction
+            — so the result is a smooth function of ``Q``.
+
+        Returns
+        -------
+        Q_L, Q_R : ndarray, shape (n_state, n_faces)
+            Face states with the depth row holding the recovered ``h``.
+        b_L, b_R : ndarray, shape (n_faces,)
+            Per-side reconstructed bathymetry — the caller writes these
+            into the per-face ``Qaux`` (or they already sit in ``Q_L`` /
+            ``Q_R`` when ``b_in_state``) so the hydrostatic
+            reconstruction sees a consistent ``h + b``.
+        """
+        h_idx = self.h_index
+        n_state = Q.shape[0]
+        Q_ext, bf_ext = self._extend(Q, Qaux, bf_Q)
+        QE_L, QE_R = self.base(Q_ext, bf_ext, phi=phi)
+
+        if self.b_in_state:
+            b_L = QE_L[self.b_index, :]
+            b_R = QE_R[self.b_index, :]
+            Q_L = QE_L.copy()
+            Q_R = QE_R.copy()
+        else:
+            b_L = QE_L[n_state, :]
+            b_R = QE_R[n_state, :]
+            Q_L = QE_L[:n_state, :].copy()
+            Q_R = QE_R[:n_state, :].copy()
+
+        Q_L[h_idx, :] = QE_L[h_idx, :] - b_L                 # h = η − b
+        Q_R[h_idx, :] = QE_R[h_idx, :] - b_R
+
+        # Limited gradient of the *actual* state Q.  The base
+        # reconstructed the extended (η-in-depth-slot) array, so the
+        # depth slope is recovered as ∂_x h = ∂_x η − ∂_x b.
+        g_ext = self.base._limited_grad
+        if g_ext is None:
+            self._limited_grad = None
+        elif self.b_in_state:
+            grad_Q = g_ext.copy()
+            grad_Q[h_idx, :, :] = (
+                g_ext[h_idx, :, :] - g_ext[self.b_index, :, :])
+            self._limited_grad = grad_Q
+        else:
+            grad_Q = g_ext[:n_state, :, :].copy()
+            grad_Q[h_idx, :, :] = g_ext[h_idx, :, :] - g_ext[n_state, :, :]
+            self._limited_grad = grad_Q
+
+        return Q_L, Q_R, b_L, b_R
 
 
 # ── Diffusion operators ──────────────────────────────────────────────────────

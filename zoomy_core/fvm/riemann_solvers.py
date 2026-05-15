@@ -293,7 +293,14 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
             for sym, val in zip(self.model.normal.values(), list(n)):
                 sub_map[sym] = val
 
-        if hasattr(definition, "subs"):
+        if isinstance(definition, sp.NDimArray):
+            # ``NDimArray`` exposes ``subs`` only on the *immutable*
+            # variant; ``SystemModel`` stores the nonconservative /
+            # quasilinear tensors as mutable arrays, so normalise to
+            # immutable before substituting (otherwise the state
+            # symbols leak through unsubstituted).
+            out = sp.ImmutableDenseNDimArray(definition).subs(sub_map)
+        elif hasattr(definition, "subs"):
             out = definition.subs(sub_map)
         else:
             out = definition
@@ -543,12 +550,28 @@ class PositiveRusanov(Rusanov):
 
     name = param.String(default="PositiveRusanovV2")
 
-    def __init__(self, model, **params):
-        super().__init__(model=model, **params)
-        # Cache the field handles for tight access in the reconstruction.
-        self.h_field = self.find_field("h")
-        self.b_field = self.find_field("b")
-        self.hinv_field = self.find_field("hinv", required=False)
+    # Field handles are exposed as lazy properties (not set in
+    # ``__init__``): ``Numerics.__init__`` eagerly builds the symbolic
+    # ``numerical_flux`` — which calls ``hydrostatic_reconstruction`` —
+    # *before* a subclass ``__init__`` body runs past
+    # ``super().__init__()``.  Resolving on first access hits the
+    # ``_field_handles`` cache that ``Numerics.__init__`` already
+    # populates.  (Same pattern as :attr:`HLLC.h_field`.)
+
+    @property
+    def h_field(self):
+        """Depth :class:`FieldHandle`."""
+        return self.find_field("h")
+
+    @property
+    def b_field(self):
+        """Bathymetry :class:`FieldHandle`."""
+        return self.find_field("b")
+
+    @property
+    def hinv_field(self):
+        """Optional ``1/h`` :class:`FieldHandle` (``None`` if absent)."""
+        return self.find_field("hinv", required=False)
 
     def hydrostatic_reconstruction(self, qL, qR, auxL, auxR):
         """Hydrostatic reconstruction."""

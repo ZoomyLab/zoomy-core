@@ -114,7 +114,29 @@ class SystemModel:
     normal: Optional[Zstruct] = None
     parameter_values: Optional[Zstruct] = None   # name -> numeric default
     equation_to_state_index: Optional[List[int]] = None
+    # ``boundary_conditions`` / ``aux_boundary_conditions`` are the
+    # *indexed symbolic BC functions* (``Function`` objects with
+    # ``Piecewise(…, Eq(idx,i))`` definition).  The runtime
+    # (``from_system_model``) lambdifies them; solvers call
+    # ``runtime.boundary_conditions(bc_idx, time, position, distance,
+    # Q, Qaux, p, normal)`` per face.
+    # ``boundary_gradients`` is the parallel kernel for the
+    # face-normal gradient ``∂Q/∂n`` — consumed by the diffusion path.
     boundary_conditions: Optional[Any] = None
+    aux_boundary_conditions: Optional[Any] = None
+    boundary_gradients: Optional[Any] = None
+    # Application-logic carried over from the source Model so the
+    # SystemModel is the self-contained numerical model a solver
+    # consumes — no Model needed alongside it.
+    initial_conditions: Optional[Any] = None
+    aux_initial_conditions: Optional[Any] = None
+    # ``update_variables``: per-cell state transform (h-clamp etc.) — an
+    # ``(n_eq, 1)`` expression in ``(Q, Qaux, p)``.  ``diffusive_flux``:
+    # the ``(n_eq, n_dim)`` diffusive flux ``F_diff(Q, ∇Q)`` — carried
+    # for the numerics to consume (it does not enter the operator-form
+    # residual ``M·∂_t Q + ∇·F + ∇·P + B·∇Q − S``).
+    update_variables: Optional[sp.Matrix] = None
+    diffusive_flux: Optional[sp.Matrix] = None
     history: List[Dict[str, str]] = field(default_factory=list)
 
     def __post_init__(self):
@@ -146,6 +168,53 @@ class SystemModel:
     @property
     def n_dim(self) -> int:
         return len(self.space)
+
+    # ── Model-compatible facade ───────────────────────────────────────
+    # So a solver can consume a SystemModel exactly where it used to
+    # consume a Model — same accessor surface, SystemModel internals.
+
+    @property
+    def n_variables(self) -> int:
+        return self.n_equations
+
+    @property
+    def n_aux_variables(self) -> int:
+        return len(self.aux_state)
+
+    @property
+    def n_parameters(self) -> int:
+        return self.parameters.length()
+
+    @property
+    def dimension(self) -> int:
+        return self.n_dim
+
+    @property
+    def variables(self) -> Zstruct:
+        """Zstruct view ``name → state Symbol`` (mirrors ``Model.variables``)."""
+        v = Zstruct(**{str(s): s for s in self.state})
+        v._symbolic_name = "Q"
+        return v
+
+    @property
+    def aux_variables(self) -> Zstruct:
+        """Zstruct view ``name → aux Symbol`` (mirrors ``Model.aux_variables``)."""
+        v = Zstruct(**{str(s): s for s in self.aux_state})
+        v._symbolic_name = "Qaux"
+        return v
+
+    @property
+    def _parameter_symbols(self) -> Zstruct:
+        """Alias of ``parameters`` (name → Symbol) for Model-API parity."""
+        return self.parameters
+
+    @property
+    def eigenvalue_mode(self) -> str:
+        """``"symbolic"`` when a symbolic spectrum was carried over,
+        ``"numerical"`` when it was skipped (``eigenvalues is None``) —
+        mirrors ``Model.eigenvalue_mode`` so a solver's wavespeed build
+        branches the same way."""
+        return "numerical" if self.eigenvalues is None else "symbolic"
 
     @property
     def is_square(self) -> bool:
@@ -312,7 +381,15 @@ class SystemModel:
             M_mat = sp.eye(n_eq)
 
         equation_names = getattr(model, "equation_names", None)
-        bcs = getattr(model, "_boundary_conditions", None)
+        # Carry the *indexed symbolic BC function* ``_boundary_conditions``
+        # — a ``Function(name="boundary_conditions",
+        #              args=(idx, time, position, distance, Q, Qaux, p, normal),
+        #              definition=Piecewise((res_i, Eq(idx, i)), …))``.
+        # This is the representation a SystemModel-driven runtime
+        # lambdifies and the solver flux operators call per face.
+        bcs = model._boundary_conditions
+        aux_bcs = model._aux_boundary_conditions
+        bgrads = model._boundary_gradients
 
         # Eigenvalues — carry over whatever ``Model.eigenvalues()``
         # produced.  In numerical-eigenvalue mode the model deliberately
@@ -339,6 +416,13 @@ class SystemModel:
             normal=normal,
             parameter_values=parameter_values,
             boundary_conditions=bcs,
+            aux_boundary_conditions=aux_bcs,
+            boundary_gradients=bgrads,
+            initial_conditions=getattr(model, "initial_conditions", None),
+            aux_initial_conditions=getattr(
+                model, "aux_initial_conditions", None),
+            update_variables=_to_matrix(model.update_variables(), n_eq, 1),
+            diffusive_flux=_to_matrix(model.diffusive_flux(), n_eq, dim),
         )
         if equation_names is not None:
             sm.equation_names = list(equation_names)

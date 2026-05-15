@@ -5,6 +5,8 @@ import sympy as sp
 import numpy as np
 
 from zoomy_core.misc.custom_types import FArray
+from zoomy_core.misc.misc import Zstruct
+from zoomy_core.model.basefunction import Function
 from zoomy_core.model.basemodel import Model
 
 
@@ -251,16 +253,21 @@ class NumpyRuntimeModel:
         for name, function_obj in model.functions.items():
             self.runtime_functions[name] = self._lambdify_function(function_obj, modules)
 
-        # Boundary condition wrappers are currently kept as separate members
-        # on the symbolic model and are not part of model.functions.
-        if hasattr(model, "_boundary_conditions"):
-            self.runtime_functions["boundary_conditions"] = self._lambdify_function(
-                model._boundary_conditions, modules
-            )
-        if hasattr(model, "_aux_boundary_conditions"):
-            self.runtime_functions["aux_boundary_conditions"] = self._lambdify_function(
-                model._aux_boundary_conditions, modules
-            )
+        # Boundary condition wrappers are kept as separate members on the
+        # symbolic model and are not part of model.functions.  They are
+        # *required* — if the model has no ``_boundary_conditions`` /
+        # ``_aux_boundary_conditions`` / ``_boundary_gradients``, the
+        # access fails loudly (per the zoomy "prefer breaking over silent
+        # skip" rule).
+        self.runtime_functions["boundary_conditions"] = self._lambdify_function(
+            model._boundary_conditions, modules
+        )
+        self.runtime_functions["aux_boundary_conditions"] = self._lambdify_function(
+            model._aux_boundary_conditions, modules
+        )
+        self.runtime_functions["boundary_gradients"] = self._lambdify_function(
+            model._boundary_gradients, modules
+        )
 
         # Keep attribute-style access for existing solver code paths.
         for name, function in self.runtime_functions.items():
@@ -287,7 +294,10 @@ class NumpyRuntimeModel:
         scratch).
         """
         rt = cls.__new__(cls)
-        rt.model = None
+        # The SystemModel *is* the symbolic model for this runtime —
+        # solvers unwrap it via ``_get_symbolic_model`` to build their
+        # operators.
+        rt.model = sm
         rt.name = "SystemModelRuntime"
         rt.dimension = sm.n_dim
         rt.n_variables = sm.n_equations
@@ -302,61 +312,119 @@ class NumpyRuntimeModel:
         if rt.printer:
             modules.append(rt.printer)
 
-        # Lambdify each stored matrix into a runtime callable.  The
-        # signature is ``(Q, Qaux, p)`` — matching the convention of
-        # the Model-based runtime.
-        Q_syms = list(sm.state)
-        Qaux_syms = list(sm.aux_state)
-        p_syms = list(sm.parameters.values())
-        all_args = (Q_syms, Qaux_syms, p_syms)
+        # Every operator is lambdified through ``_lambdify_function`` so
+        # ``_vectorize_expression`` is applied first — that wraps every
+        # constant entry in ``zeros_like(anchor)`` / ``c·ones_like(anchor)``
+        # so the runtime broadcasts cleanly when called with full-grid
+        # arrays (Q shape ``(n_vars, n_cells)`` → matrix output
+        # ``(n_eq, n_state, n_cells)``).  Without this, IMEX
+        # implicit-source / source-jacobian calls (and any vectorised
+        # full-grid pattern) collapse to 2-D and break.
+        #
+        # Operator signatures (kwarg keys feed
+        # ``_collect_vector_symbols``: ``variables`` / ``aux_variables``
+        # / ``normal`` / ``position`` are the *vector* groups whose
+        # symbols anchor the broadcast).
+        Q_struct = sm.variables          # Zstruct of state Symbols
+        Qaux_struct = sm.aux_variables   # Zstruct of aux Symbols
+        p_struct = sm.parameters         # Zstruct of parameter Symbols
+        n_struct = sm.normal             # Zstruct of normal Symbols
+        gradQ_struct = Zstruct(**{
+            f"dQ_{str(s)}_d{d}": sp.Symbol(f"dQ_{str(s)}_d{d}", real=True)
+            for s in sm.state for d in range(sm.n_dim)
+        })
 
-        def _flatten(args):
-            out = []
-            for a in args:
-                out.extend(a)
-            return out
-
-        flat_args = _flatten(all_args)
+        std_sig = Zstruct(variables=Q_struct, aux_variables=Qaux_struct,
+                          parameters=p_struct)
+        eig_sig = Zstruct(variables=Q_struct, aux_variables=Qaux_struct,
+                          parameters=p_struct, normal=n_struct)
+        diff_sig = Zstruct(variables=Q_struct, aux_variables=Qaux_struct,
+                           gradient_variables=gradQ_struct,
+                           parameters=p_struct)
 
         rt.runtime_functions = {}
-        for name, mat in [
-            ("flux", sm.flux),
-            ("hydrostatic_pressure", sm.hydrostatic_pressure),
-            ("source", sm.source),
-            ("mass_matrix", sm.mass_matrix),
-        ]:
-            compiled = sp.lambdify(flat_args, mat, modules=modules,
-                                   cse=True)
 
-            def _make(_compiled):
-                def _runtime(Q, Qaux, p):
-                    return np.asarray(
-                        _compiled(*Q, *Qaux, *p), dtype=float)
-                return _runtime
-            rt.runtime_functions[name] = _make(compiled)
+        def _register(name, definition, signature):
+            """Synthesize a ``Function`` and route through
+            ``_lambdify_function`` so vectorisation is applied."""
+            if definition is None:
+                return
+            fn = Function(name=name, args=signature, definition=definition)
+            rt.runtime_functions[name] = rt._lambdify_function(fn, modules)
             setattr(rt, name, rt.runtime_functions[name])
 
-        # NCP — convert NDimArray to a sympy MutableDenseNDimArray and
-        # lambdify per-axis.
+        def _column_to_rank1(mat):
+            """``(n, 1)`` Matrix → rank-1 ``sp.Array(n)``.  ``_to_matrix``
+            in ``from_model`` coerces column-like ZArrays to ``(n, 1)``;
+            consumers (IMEX ``S[:, c]``, the source operator broadcast
+            pattern) expect rank-1 → ``(n_eq, n_cells)`` after
+            vectorisation, not 3-D ``(n_eq, 1, n_cells)``."""
+            if mat is None:
+                return None
+            return sp.Array([mat[i, 0] for i in range(mat.shape[0])])
+
+        _register("flux", sm.flux, std_sig)
+        _register("hydrostatic_pressure", sm.hydrostatic_pressure, std_sig)
+        _register("source", _column_to_rank1(sm.source), std_sig)
+        _register("mass_matrix", sm.mass_matrix, std_sig)
+        _register("source_jacobian", sm.source_jacobian, std_sig)
+        _register("update_variables",
+                  _column_to_rank1(sm.update_variables), std_sig)
+        _register("eigenvalues", _column_to_rank1(sm.eigenvalues), eig_sig)
+        _register("diffusive_flux", sm.diffusive_flux, diff_sig)
+
+        # ``∂S/∂Q`` is exposed under both names — the Model-based
+        # runtime calls it ``source_jacobian_wrt_variables``.
+        if "source_jacobian" in rt.runtime_functions:
+            rt.source_jacobian_wrt_variables = (
+                rt.runtime_functions["source_jacobian"])
+
+        # NDimArray operators (NCP, quasilinear) — per-axis slab as a
+        # Matrix, each routed through ``_lambdify_function`` (so each
+        # slab is vectorised), then ``np.stack`` along the last axis.
         n_dim = sm.n_dim
         n_eq = sm.n_equations
-        ncp_compiled = []
-        for d in range(n_dim):
-            slab = sp.Matrix(
-                n_eq, n_eq,
-                lambda i, j, _d=d: sm.nonconservative_matrix[i, j, _d],
-            )
-            ncp_compiled.append(
-                sp.lambdify(flat_args, slab, modules=modules, cse=True)
-            )
+        n_st = sm.n_state
 
-        def _ncp(Q, Qaux, p):
-            slabs = [np.asarray(c(*Q, *Qaux, *p), dtype=float)
-                     for c in ncp_compiled]
-            return np.stack(slabs, axis=-1)
+        def _register_ndarray(name, arr, n_cols):
+            slab_fns = []
+            for d in range(n_dim):
+                slab = sp.Matrix(
+                    n_eq, n_cols,
+                    lambda i, j, _d=d: arr[i, j, _d],
+                )
+                fn = Function(name=f"{name}__d{d}", args=std_sig,
+                              definition=slab)
+                slab_fns.append(rt._lambdify_function(fn, modules))
 
-        rt.runtime_functions["nonconservative_matrix"] = _ncp
-        rt.nonconservative_matrix = _ncp
+            def _runtime(Q, Qaux, p, _slab_fns=slab_fns):
+                slabs = [np.asarray(f(Q, Qaux, p), dtype=float)
+                         for f in _slab_fns]
+                return np.stack(slabs, axis=-1)
+            rt.runtime_functions[name] = _runtime
+            setattr(rt, name, _runtime)
+
+        _register_ndarray("nonconservative_matrix",
+                          sm.nonconservative_matrix, n_eq)
+        _register_ndarray("quasilinear_matrix",
+                          sm.quasilinear_matrix, n_st)
+
+        # Indexed boundary-condition kernels — lambdified via
+        # ``_lambdify_function`` so the per-face call is
+        # ``rt.boundary_conditions(bc_idx, time, position, distance,
+        # Q_cell, Qaux_cell, parameters, normal) → q_face``.  The
+        # SystemModel must carry both (per the zoomy rule: prefer
+        # breaking over silent skip).
+        rt.runtime_functions["boundary_conditions"] = rt._lambdify_function(
+            sm.boundary_conditions, modules)
+        rt.boundary_conditions = rt.runtime_functions["boundary_conditions"]
+        rt.runtime_functions["aux_boundary_conditions"] = rt._lambdify_function(
+            sm.aux_boundary_conditions, modules)
+        rt.aux_boundary_conditions = rt.runtime_functions[
+            "aux_boundary_conditions"]
+        rt.runtime_functions["boundary_gradients"] = rt._lambdify_function(
+            sm.boundary_gradients, modules)
+        rt.boundary_gradients = rt.runtime_functions["boundary_gradients"]
 
         return rt
 

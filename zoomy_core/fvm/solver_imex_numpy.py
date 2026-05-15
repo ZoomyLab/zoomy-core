@@ -230,20 +230,26 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
         has_aux = Qaux.shape[0] > 0
         normals_arr = self._sim_mesh.face_normals[:self._sim_mesh.dimension, :]
 
-        # Compute face values for face_gradient
+        # Compute face values via the indexed BC kernel for face_gradient
+        bc_fn = self._bc_fn
+        bc_indices = self._bc_indices
+        face_centers = self._sim_mesh.face_centers
         bf_values = np.zeros((n_vars, self._n_bf))
         for i_bf in range(self._n_bf):
             q_inner = Qexp[:, self._bf_cells[i_bf]]
             qaux_inner = Qaux[:, self._bf_cells[i_bf]] if has_aux else np.array([])
-            normal = normals_arr[:, self._bf_fidx[i_bf]]
-            bf_values[:, i_bf] = self._bc_objects[i_bf].face_value(
-                q_inner, qaux_inner, normal, self._d_face[i_bf],
-                time_now, self._sim_parameters,
+            fidx = self._bf_fidx[i_bf]
+            normal = normals_arr[:, fidx]
+            position = face_centers[fidx, :]
+            bf_values[:, i_bf] = bc_fn(
+                bc_indices[i_bf], time_now, position, self._d_face[i_bf],
+                q_inner, qaux_inner, self._sim_parameters, normal,
             )
 
         bf_grads = _compute_bf_face_gradients(
-            Qexp, Qaux, bf_values, self._bc_objects, self._bf_cells,
-            self._bf_fidx, self._d_face, normals_arr, self._n_bf,
+            Qexp, Qaux, self._bc_indices, self._bc_grad_fn,
+            self._bf_cells, self._bf_fidx, self._d_face, normals_arr,
+            self._sim_mesh.face_centers, self._n_bf,
             n_vars, has_aux, time_now, self._sim_parameters,
         )
 
