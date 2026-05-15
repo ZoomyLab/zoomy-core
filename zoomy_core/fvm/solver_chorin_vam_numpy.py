@@ -282,6 +282,27 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         self.Qaux_corr = np.zeros(
             (len(self.sm_corr.aux_state), nc), dtype=float)
 
+        # 5. Matrix-free pressure solver: identify which SM_press
+        #    derivative-aux entries depend on the pressure modes
+        #    being solved for.  These get recomputed via LSQ stencils
+        #    on the current Krylov iterate during every matvec
+        #    application — that's what makes the operator linear in P
+        #    (the lambdified symbolic residual reads aux for ``P_x``,
+        #    ``P_xx`` rather than embedding the LSQ stencil in the
+        #    symbolic flow).
+        self._press_state_idx_set = set(int(i) for i in self._press_state_idx)
+        self._press_aux_recompute = []
+        for entry in (self.sm_press.aux_registry or []):
+            if (entry["kind"] != "derivative"
+                    or entry.get("target_kind") != "state"
+                    or entry.get("state_index") not in self._press_state_idx_set):
+                continue
+            self._press_aux_recompute.append({
+                "row":         entry["row"],
+                "state_index": entry["state_index"],
+                "multi_index": entry["multi_index"],
+            })
+
         logger.info(
             "ChorinSplitVAMSolver setup: pred → %s, press → %s, corr → %s "
             "in %.2fs",
@@ -408,35 +429,103 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         return out
 
     def _step_pressure(self, dt):
-        """Solve ``R(P; Q, Qaux_press, dt) = 0`` for ``Q[press_e2s]``.
+        """Solve the linear elliptic block for ``Q[press_e2s]``.
 
-        ``SM_press.source`` carries the elliptic residual (auto-tagged
-        as source by the splitter).  Linear in P ⇒ fsolve converges
-        in 1–2 Newton iters from any warm start."""
-        from scipy.optimize import fsolve
-        rt = self.rt_press
-        Q = self._sim_Q
-        Qaux = self.Qaux_press         # SM_press has its own aux pool
-        nc = self.nc
+        Matrix-free GMRES.  The operator ``A·P`` is evaluated per
+        Krylov iteration by:
+
+        1. Stuffing the iterate ``p_vec`` into ``Q_try[press_e2s]``.
+        2. **Recomputing the P-dependent aux entries** (``P_0_x``,
+           ``P_1_x``, ``P_0_xx``, ``P_1_xx``) via LSQ stencils on
+           ``p_vec`` — the bug fix vs. fsolve-with-frozen-aux.  The
+           non-P-dependent aux entries (``h``, ``b``, ``h_x``, etc.)
+           stay frozen at the start-of-step values.
+        3. Evaluating ``rt.source(Q_try, Qaux_try, p_full)`` — the
+           lambdified elliptic residual.
+
+        ``b = R(P=0)`` once per step gives the data forcing; then
+        ``A·P = R(P) − b`` is the linear operator.  GMRES warm-starts
+        from the previous-step pressure.  No matrix assembled — same
+        pattern jax-jits cleanly via ``jax.scipy.sparse.linalg.gmres``.
+        """
+        from scipy.sparse.linalg import LinearOperator, gmres
+        rt    = self.rt_press
+        Q     = self._sim_Q
+        Qaux0 = self.Qaux_press
+        nc    = self.nc
+        mesh  = self._sim_mesh
+        n_cells = mesh.n_cells
         p_full = self._params_with_dt(self._params_press_base, dt)
-        e2s = self._press_state_idx
-        nP = len(e2s)
+        e2s   = self._press_state_idx
+        nP    = len(e2s)
+        N     = nP * nc
 
-        def residual_of_P(p_vec):
+        # Map state index → local pressure index (e.g. 5 → 0, 6 → 1).
+        local_of_state = {int(s): k for k, s in enumerate(e2s)}
+
+        def _refresh_pressure_aux(p_mat, Qaux_work):
+            """LSQ-recompute the P-dependent derivative-aux rows from
+            the current iterate ``p_mat`` (shape ``(nP, nc)``).  In-
+            place on ``Qaux_work``."""
+            u_full = np.zeros(n_cells)
+            for entry in self._press_aux_recompute:
+                state_i = entry["state_index"]
+                k = local_of_state[state_i]
+                u_full[:nc] = p_mat[k, :]
+                u_full[nc:] = 0.0
+                mi = entry["multi_index"]
+                d = mesh.compute_derivatives(
+                    u_full, degree=max(mi),
+                    derivatives_multi_index=[mi],
+                )
+                Qaux_work[entry["row"], :] = d[:nc, 0]
+
+        def _residual(p_vec):
+            p_mat = p_vec.reshape(nP, nc)
             Q_try = Q.copy()
-            Q_try[e2s, :] = p_vec.reshape(nP, nc)
-            R = np.asarray(rt.source(Q_try, Qaux, p_full), dtype=float)
+            Q_try[e2s, :] = p_mat
+            Qaux_work = Qaux0.copy()
+            _refresh_pressure_aux(p_mat, Qaux_work)
+            R = np.asarray(rt.source(Q_try, Qaux_work, p_full), dtype=float)
             if R.ndim == 1:
                 R = R[:, None] * np.ones((1, nc))
             return R.ravel()
 
-        p0 = Q[e2s, :].ravel()
-        p_new, _, info, msg = fsolve(
-            residual_of_P, p0, full_output=True,
-            xtol=self.pressure_tol, maxfev=self.pressure_maxit,
+        # Data forcing: ``b = R(P = 0)``.  Pure data — no P enters.
+        b = _residual(np.zeros(N))
+
+        # Early exit on near-zero forcing (e.g. exact lake-at-rest):
+        # GMRES with only ``rtol`` set chases ``rtol·‖b‖`` which is
+        # unreachable when ‖b‖ ~ machine epsilon, so it hits maxiter
+        # and returns garbage.  Skip the solve and return P = warm-start
+        # (which is the correct answer for ‖b‖ ≈ 0).
+        b_norm = float(np.linalg.norm(b))
+        if b_norm < self.pressure_tol:
+            self._sim_Q = Q              # Q[e2s] unchanged (still p0)
+            return
+
+        # Linear operator: ``A·P = R(P) − b``.  Pure matvec callable.
+        def apply_A(p_vec):
+            return _residual(p_vec) - b
+
+        A = LinearOperator((N, N), matvec=apply_A, dtype=float)
+        p0 = Q[e2s, :].ravel()                      # warm start
+        p_new, info = gmres(
+            A, -b, x0=p0,
+            rtol=self.pressure_tol,
+            atol=self.pressure_tol,    # absolute floor — survives tiny ‖b‖
+            maxiter=self.pressure_maxit,
         )
+        if info != 0:
+            logger.warning(
+                "Chorin pressure GMRES did not fully converge "
+                "(info=%d, ‖b‖=%.3e)", info, b_norm,
+            )
         Q[e2s, :] = p_new.reshape(nP, nc)
         self._sim_Q = Q
+        # Reflect the solved pressure into Qaux_press derivative rows
+        # (so the corrector reads consistent ∂_x P, ∂_xx P).
+        _refresh_pressure_aux(p_new.reshape(nP, nc), self.Qaux_press)
 
     def _step_corrector(self, dt):
         """``Q[corr_e2s] ← state_update(Q, Qaux_corr, p, dt)`` in place."""
