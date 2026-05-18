@@ -839,10 +839,10 @@ class GenericCppModel(GenericCppBase):
         return "\n".join(lines)
 
     def _detect_has_diffusion(self):
-        """Check whether the model's diffusive_flux is non-trivial (not all zeros)."""
-        if "diffusive_flux" not in self.model.functions.keys():
+        """Check whether the model's diffusion_matrix is non-trivial (not all zeros)."""
+        if "diffusion_matrix" not in self.model.functions.keys():
             return False
-        expr = self.model.functions.diffusive_flux.definition
+        expr = self.model.functions.diffusion_matrix.definition
         # Flatten the expression and check if every element is zero
         if hasattr(expr, "__iter__"):
             return not all(sp.simplify(e) == 0 for e in sp.flatten(expr))

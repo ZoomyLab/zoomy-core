@@ -2,7 +2,10 @@
 
 import sympy as sp
 import ufl
-from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
+from zoomy_core.transformation.to_numpy import (
+    NumpyRuntimeModel,
+    NumpyRuntimeSymbolic,
+)
 
 
 def _ufl_conditional(condition, true_val, false_val):
@@ -70,8 +73,58 @@ class UFLRuntimeModel(NumpyRuntimeModel):
             ncols = shape[-1]
             return sp.ImmutableDenseMatrix(nrows, ncols, flat)
 
+    @staticmethod
+    def _distribute_piecewise_over_array(expr):
+        """Pull ``Piecewise(NDimArray, …)`` out into an NDimArray of
+        scalar ``Piecewise`` expressions.
+
+        SymPy's ``PythonCodePrinter`` (which lambdify falls back to when
+        no explicit printer is passed) does not know how to serialise an
+        ``ImmutableDenseNDimArray`` *inside* a ``Piecewise`` branch.
+        The fix is to swap the nesting: if every branch is an
+        ``NDimArray`` of the same shape, return an ``Array`` of length
+        ``n`` where each entry is the element-wise ``Piecewise``.
+
+        Then :meth:`_array_to_matrix` (called from
+        :meth:`_vectorize_expression`) turns the resulting flat array
+        into the appropriate ``_ZoomyVector`` / ``ImmutableDenseMatrix``
+        wrapper for the UFL module dict to lower.
+        """
+        from sympy.tensor.array.dense_ndim_array import (
+            ImmutableDenseNDimArray,
+        )
+
+        if not isinstance(expr, sp.Piecewise):
+            return expr
+
+        branches = []
+        for branch in expr.args:
+            e, c = branch.expr, branch.cond
+            if not isinstance(e, (ImmutableDenseNDimArray, sp.Array)):
+                # mixed shape — bail and let the default printer try.
+                return expr
+            branches.append((list(sp.Array(e)._array), c))
+
+        if not branches:
+            return expr
+
+        # All branches must agree on length.
+        n = len(branches[0][0])
+        if not all(len(b[0]) == n for b in branches):
+            return expr
+
+        shape = tuple(int(s) for s in sp.Array(expr.args[0].expr).shape)
+        flat = []
+        for i in range(n):
+            per_branch = [(b[0][i], b[1]) for b in branches]
+            flat.append(sp.Piecewise(*per_branch))
+        return sp.Array(flat, shape)
+
     def _vectorize_expression(self, expr, signature):
-        """Override: vectorise, then convert Array -> Matrix for lambdify."""
+        """Override: distribute any top-level ``Piecewise`` over its
+        ``NDimArray`` branches, vectorise, then convert Array → Matrix
+        for lambdify."""
+        expr = self._distribute_piecewise_over_array(expr)
         result = super()._vectorize_expression(expr, signature)
 
         from sympy.tensor.array.dense_ndim_array import ImmutableDenseNDimArray
@@ -98,8 +151,13 @@ class UFLRuntimeModel(NumpyRuntimeModel):
         # --- Elementary arithmetic ---
         "Abs": abs,
         "sign": ufl.sign,
-        "Min": ufl.min_value,
-        "Max": ufl.max_value,
+        # SymPy's ``Min`` / ``Max`` accept N arguments; ``ufl.min_value`` /
+        # ``ufl.max_value`` are strictly binary.  Reduce N-ary calls to a
+        # pairwise chain so any arity lambdifies cleanly.
+        "Min": lambda *a: (a[0] if len(a) == 1
+                           else __import__("functools").reduce(ufl.min_value, a)),
+        "Max": lambda *a: (a[0] if len(a) == 1
+                           else __import__("functools").reduce(ufl.max_value, a)),
         # --- Powers and roots ---
         "sqrt": ufl.sqrt,
         "exp": ufl.exp,
@@ -140,11 +198,34 @@ class UFLRuntimeModel(NumpyRuntimeModel):
         "tr": ufl.tr,
         # --- Python builtins (SymPy may emit these) ---
         "abs": abs,
-        "min": ufl.min_value,
-        "max": ufl.max_value,
+        "min": lambda *a: (a[0] if len(a) == 1
+                           else __import__("functools").reduce(ufl.min_value, a)),
+        "max": lambda *a: (a[0] if len(a) == 1
+                           else __import__("functools").reduce(ufl.max_value, a)),
         "sqrt": ufl.sqrt,
         "sum": lambda x: ufl.Constant(sum(x)) if isinstance(x, (list, tuple)) else x,
         # --- Array / matrix serialisation ---
         "_ZoomyVector": lambda *args: ufl.as_vector(list(args)),
         "ImmutableDenseMatrix": lambda data: ufl.as_tensor(data),
     }
+
+
+class UFLRuntimeSymbolic(UFLRuntimeModel, NumpyRuntimeSymbolic):
+    """UFL runtime for symbolic registrars (e.g. :class:`Numerics`).
+
+    The Firedrake counterpart to :class:`NumpyRuntimeSymbolic`.  It
+    walks ``symbolic_obj.functions`` and lambdifies each registered
+    symbolic function (``numerical_flux``, ``numerical_fluctuations``,
+    ``local_max_abs_eigenvalue``, …) through the UFL module dict, so
+    calling, e.g., ``runtime.numerical_flux(qL, qR, auxL, auxR, p, n)``
+    returns a UFL expression suitable for direct assembly in a
+    Firedrake form.
+
+    The MRO is ``UFLRuntimeSymbolic → UFLRuntimeModel →
+    NumpyRuntimeSymbolic → NumpyRuntimeModel``; ``__init__`` is
+    inherited from ``NumpyRuntimeSymbolic`` (no other class defines
+    one), and ``module`` / ``printer`` /
+    ``_vectorize_expression`` / ``_lambdify_function`` come from
+    ``UFLRuntimeModel``.
+    """
+    pass

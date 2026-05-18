@@ -24,24 +24,46 @@ def constant(dt=0.1):
     return compute_dt
 
 
-def adaptive(CFL=0.9, nu=0.0):
+def adaptive(CFL=0.9, nu=0.0, dimension=2, degree=0):
     """Adaptive CFL-based timestep.
+
+    Uses the classical hyperbolic / parabolic limits with the spatial
+    dimension and DG polynomial degree factored *into the denominator*
+    so the ``CFL`` knob is a single safety factor ∈ (0, 1]:
+
+    .. math::
+
+        \\Delta t_\\text{conv} &\\le \\mathrm{CFL} \\;
+            \\frac{2\\,r_\\text{in}}{d \\, (2k+1) \\, |\\lambda|_\\text{max}}, \\\\
+        \\Delta t_\\text{diff} &\\le \\mathrm{CFL} \\;
+            \\frac{(2\\,r_\\text{in})^2}{2 \\, d \\, \\nu}.
+
+    Here ``r_in`` is the cell inradius (so ``2·r_in`` is the conservative
+    "diameter"), ``d`` the spatial dimension, ``k`` the DG polynomial
+    degree (use ``0`` for FV).  The hyperbolic CFL constant ``1/(2k+1)``
+    is the SSP-RK(k+1,k+1) stability limit (Cockburn & Shu, 1991);
+    the spatial dimension contributes the ``1/d`` factor in 2D/3D.
 
     Parameters
     ----------
-    CFL : float
-        Convective CFL number.
+    CFL : float in (0, 1]
+        Safety factor on top of the theoretical limit (default 0.9).
     nu : float
-        Diffusivity for diffusive CFL condition.
-        If > 0, also enforces dt < CFL * dx^2 / (2 * nu).
+        Scalar viscosity for the parabolic CFL (default 0 → skip).
+    dimension : int
+        Spatial dimension of the mesh (default 2).
+    degree : int
+        DG polynomial degree (default 0 for FV).
     """
+    deg_fac = float(2 * degree + 1)
+    dim_fac = float(dimension)
+
     def compute_dt(Q, Qaux, parameters, min_inradius, compute_max_abs_eigenvalue):
         ev_abs_max = compute_max_abs_eigenvalue(Q, Qaux, parameters)
-        dt_conv = (CFL * 2 * min_inradius / ev_abs_max).min()
+        h = 2.0 * min_inradius                                # conservative cell size
+        dt_conv = (CFL * h / (dim_fac * deg_fac * ev_abs_max)).min()
         if nu > 0:
-            # Diffusive CFL: dt < CFL * dx^2 / (2*nu)
-            dx = 2 * min_inradius  # characteristic cell size
-            dt_diff = CFL * dx**2 / (2 * nu)
+            dt_diff = CFL * h ** 2 / (2.0 * dim_fac * nu)
             return _safe_minimum(dt_conv, dt_diff)
         return dt_conv
     return compute_dt

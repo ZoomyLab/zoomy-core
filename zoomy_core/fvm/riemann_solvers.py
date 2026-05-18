@@ -316,11 +316,19 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         backend = backend.lower()
         if backend == "numpy":
             return NumpyRuntimeSymbolic(self)
+        if backend == "ufl":
+            from zoomy_core.transformation.to_ufl import UFLRuntimeSymbolic
+            return UFLRuntimeSymbolic(self)
         raise ValueError(f"Unsupported runtime backend '{backend}'.")
 
     def to_runtime_numpy(self):
         """To runtime numpy."""
         return self.to_runtime("numpy")
+
+    def to_runtime_ufl(self):
+        """Lambdify all registered symbolic functions through the UFL
+        module dict — for use by Firedrake-based backends."""
+        return self.to_runtime("ufl")
 
     def numerical_flux(self):
         """Numerical flux."""
@@ -746,6 +754,59 @@ class NonconservativeRusanov(Rusanov):
         Dm_matrix = 0.5 * (term_advection - term_dissipation)
 
         return ZArray([Dp_matrix, Dm_matrix])
+
+
+class PositiveHLL(HLL):
+    """HLL with Audusse-Bristeau-Klein hydrostatic reconstruction.
+
+    Mirrors :class:`PositiveRusanov` but uses the sharper HLL
+    two-wave numerical flux underneath instead of LF/Rusanov
+    dissipation.  Recommended for free-surface dam-break / wet-dry
+    simulations: the hydrostatic reconstruction enforces
+    ``h_face ≥ 0`` (positivity), and HLL captures the rarefaction /
+    shock fronts more accurately than Rusanov on the same mesh.
+
+    Reconstruction (same as PositiveRusanov, Audusse-Bristeau-Klein):
+    ``b* = max(b_L, b_R)``,  ``h_L* = max(0, h_L + b_L − b*)``,
+    momentum scaled by ``h_L* / max(h_L, eps)``.
+
+    The depth field ``h``, bathymetry ``b`` and (optional) ``1/h``
+    inverse are resolved through :meth:`Numerics.find_field` — the
+    same flux code works whether bathymetry is part of the
+    conservative state or carried in ``Qaux``.
+    """
+
+    name = param.String(default="PositiveHLLV2")
+
+    @property
+    def h_field(self):
+        return self.find_field("h")
+
+    @property
+    def b_field(self):
+        return self.find_field("b")
+
+    @property
+    def hinv_field(self):
+        return self.find_field("hinv", required=False)
+
+    # Reuse the hydrostatic reconstruction from PositiveRusanov by
+    # composition (don't multiply-inherit through Rusanov's flux).
+    hydrostatic_reconstruction = PositiveRusanov.hydrostatic_reconstruction
+
+    def numerical_flux(self):
+        """HLL flux evaluated on the hydrostatically-reconstructed
+        face states — positivity-preserving and well-balanced under
+        the lake-at-rest steady state."""
+        qLs, qRs, qauxL, qauxR = self.hydrostatic_reconstruction(
+            self.variables_minus,
+            self.variables_plus,
+            self.aux_variables_minus,
+            self.aux_variables_plus,
+        )
+        return self._compute_flux(
+            qLs, qRs, qauxL, qauxR, self.parameters, self.normal,
+        )
 
 
 class PositiveNonconservativeRusanov(PositiveRusanov, NonconservativeRusanov):

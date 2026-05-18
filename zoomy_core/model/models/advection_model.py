@@ -73,18 +73,21 @@ class ScalarAdvectionDiffusion(Model):
             F[0, d] = a_syms[d] * u
         return ZArray(F)
 
-    def diffusive_flux(self):
-        """F_diff = -ν * ∇u. Shape (1, dim)."""
+    def diffusion_matrix(self):
+        """Isotropic Fickian diffusion: ``A[0, 0, d, d] = ν``.
+
+        Shape ``(1, 1, dim, dim)``.  Together with the operator-form
+        contraction ``F_diff[i, d] = Σ_{j, e} A[i, j, d, e] · ∂_e Q[j]``
+        this gives ``F_diff[0, d] = ν · ∂_d u`` and the PDE residual
+        contribution ``-ν · Δu`` — i.e. classical advection-diffusion.
+        """
         p = self._parameter_symbols
-        gQ = self.gradient_variables
         dim = self.dimension
         nu = p.nu
-        F = Matrix.zeros(1, dim)
-        # gradient_variables is flat: [du_d0, du_d1, ...]
-        grad_keys = list(gQ.keys())
+        A = sp.MutableDenseNDimArray.zeros(1, 1, dim, dim)
         for d in range(dim):
-            F[0, d] = -nu * gQ[grad_keys[d]]
-        return ZArray(F)
+            A[0, 0, d, d] = nu
+        return ZArray(A)
 
     def eigenvalues(self):
         p = self._parameter_symbols

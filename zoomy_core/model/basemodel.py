@@ -195,7 +195,13 @@ class Model(param.Parameterized, SymbolicRegistrar):
 
         ic_sig = Zstruct(position=self.position, p=self._parameter_symbols)
 
-        # Gradient symbols for diffusive_flux: gradQ[var, dim]
+        # Gradient symbols — still produced for code-generation backends
+        # (generic_c / amrex) that carry ``∇Q`` as an LDG-style explicit
+        # auxiliary field.  The standard operator API
+        # (``diffusion_matrix``, ``flux``, ``source``, …) is purely a
+        # function of ``(Q, Qaux, p)``; derivatives that diffusion
+        # depends on enter via ``Qaux`` (auto-exposed by
+        # :meth:`SystemModel.expose_aux_atoms`).
         grad_syms = []
         for v in self.variables.keys():
             for d in range(self.dimension):
@@ -205,16 +211,12 @@ class Model(param.Parameterized, SymbolicRegistrar):
         )
         self.gradient_variables._symbolic_name = "gradQ"
 
-        diff_sig = Zstruct(
-            variables=self.variables,
-            aux_variables=self.aux_variables,
-            gradient_variables=self.gradient_variables,
-            p=self._parameter_symbols,
-        )
-
         regs = [
             ("flux", self.flux, std_sig),
-            ("diffusive_flux", self.diffusive_flux, diff_sig),
+            ("diffusion_matrix", self.diffusion_matrix, std_sig),
+            ("diffusion_matrix_explicit",
+             self.diffusion_matrix_explicit, std_sig),
+            ("source_explicit", self.source_explicit, std_sig),
             ("dflux", self.dflux, std_sig),
             ("hydrostatic_pressure", self.hydrostatic_pressure, std_sig),
             ("nonconservative_matrix", self.nonconservative_matrix, std_sig),
@@ -343,13 +345,44 @@ class Model(param.Parameterized, SymbolicRegistrar):
         """Flux."""
         return ZArray.zeros(self.n_variables, self.dimension)
 
-    def diffusive_flux(self):
-        """Diffusive flux F_diff(Q, ∇Q). Shape (n_variables, dimension).
+    def diffusion_matrix(self):
+        """Diffusion matrix A(Q, Qaux, p) — **implicit treatment**.
 
-        Evaluated at faces using reconstructed gradients.
-        Default: zero (no diffusion).
+        Shape ``(n_variables, n_variables, dimension, dimension)``.
+
+        Defines the diffusive flux structurally via
+        ``F_diff[i, d] = Σ_{j, e} A[i, j, d, e] · ∂_e Q[j]``; the PDE
+        residual contributes ``-∇·(A:∇Q)``.  ``A`` is a pure ``(Q,
+        Qaux, p)`` expression — derivatives enter only via ``Qaux``,
+        exposed automatically by :meth:`SystemModel.expose_aux_atoms`.
+
+        IMEX-capable backends evaluate this slot at ``Qnp1`` inside the
+        source step (no parabolic CFL).  Override
+        :meth:`diffusion_matrix_explicit` instead for explicit
+        treatment.  Default: zero tensor (no diffusion).
         """
-        return ZArray.zeros(self.n_variables, self.dimension)
+        return ZArray.zeros(
+            self.n_variables, self.n_variables,
+            self.dimension, self.dimension,
+        )
+
+    def diffusion_matrix_explicit(self):
+        """Diffusion matrix A(Q, Qaux, p) — **explicit treatment**.
+
+        Same shape and contraction contract as :meth:`diffusion_matrix`.
+        IMEX-capable backends evaluate this slot at ``Qn`` inside the
+        convective step (Forward-Euler-equivalent; subject to the
+        parabolic CFL ``dt ≤ h²/(2ν)``).  Default: zero tensor.
+
+        A SystemModel may declare *both* implicit and explicit
+        diffusion contributions; the solver adds each at the
+        appropriate stage.  Explicit-only backends compound:
+        ``A_total = A_implicit + A_explicit``.
+        """
+        return ZArray.zeros(
+            self.n_variables, self.n_variables,
+            self.dimension, self.dimension,
+        )
 
     def dflux(self):
         """Dflux (legacy)."""
@@ -364,7 +397,21 @@ class Model(param.Parameterized, SymbolicRegistrar):
         return ZArray.zeros(self.n_variables, self.n_variables, self.dimension)
 
     def source(self):
-        """Source."""
+        """Source — **implicit treatment** (Manning friction,
+        reactions, stiff body forces).  Rank-1 ``ZArray`` of length
+        ``n_variables``.  IMEX-capable backends fold this into the
+        source-step Newton residual at ``Qnp1``.  Default: zero."""
+        return ZArray.zeros(self.n_variables)
+
+    def source_explicit(self):
+        """Source — **explicit treatment** (non-stiff body forces,
+        gravity, prescribed momentum sources).  Rank-1 ``ZArray`` of
+        length ``n_variables``.  IMEX-capable backends fold this into
+        the convective step at ``Qn`` (Forward-Euler).  Default: zero.
+
+        A model may declare both ``source`` and ``source_explicit``;
+        the solver adds each at the appropriate stage.  Explicit-only
+        backends compound: ``S_total = S_implicit + S_explicit``."""
         return ZArray.zeros(self.n_variables)
 
     def residual(self):
