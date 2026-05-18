@@ -157,12 +157,36 @@ class SystemModel:
     initial_conditions: Optional[Any] = None
     aux_initial_conditions: Optional[Any] = None
     # ``update_variables``: per-cell state transform (h-clamp etc.) — an
-    # ``(n_eq, 1)`` expression in ``(Q, Qaux, p)``.  ``diffusive_flux``:
-    # the ``(n_eq, n_dim)`` diffusive flux ``F_diff(Q, ∇Q)`` — carried
-    # for the numerics to consume (it does not enter the operator-form
-    # residual ``M·∂_t Q + ∇·F + ∇·P + B·∇Q − S``).
+    # ``(n_eq, 1)`` expression in ``(Q, Qaux, p)``.
+    #
+    # Two-slot IMEX operator design — solvers route by treatment:
+    #
+    # - ``source``                — implicit (default).  Added to the
+    #   source-step Newton residual at ``Qnp1``; appropriate for stiff
+    #   friction / reaction.
+    # - ``source_explicit``       — explicit.  Added to the convective
+    #   step at ``Qn``; appropriate for body forces / gravity / cheap
+    #   non-stiff RHS.
+    # - ``diffusion_matrix``      — implicit (default).  IP-DG/TPFA
+    #   evaluated at ``Qnp1`` inside the source step.  No parabolic CFL.
+    # - ``diffusion_matrix_explicit`` — explicit.  IP-DG/TPFA evaluated
+    #   at ``Qn`` inside the convective step.  Subject to
+    #   ``dt ≤ h²/(2ν)`` on top of the hyperbolic CFL.
+    #
+    # The constitutive tensor ``A(Q, Qaux, p)`` has shape
+    # ``(n_eq, n_state, n_dim, n_dim)``; the diffusive flux is recovered
+    # downstream as ``F_diff[i, d] = Σ_{j, e} A[i, j, d, e] · ∂_e Q[j]``,
+    # and the residual contributes ``-∇·(A:∇Q)``.  Derivatives enter
+    # ``A`` only via ``Qaux`` (auto-derived as needed) so ``A`` itself
+    # is a pure ``(Q, Qaux, p)`` expression — same call convention as
+    # every other operator.
+    #
+    # Backends that support only one treatment (e.g. explicit-only FV)
+    # may *compound* the two: ``F_total = F_explicit + F_implicit``.
     update_variables: Optional[ZArray] = None        # (n_eq,)
-    diffusive_flux: Optional[ZArray] = None           # (n_eq, n_dim)
+    diffusion_matrix: Optional[ZArray] = None         # (n_eq, n_state, n_dim, n_dim) — implicit
+    diffusion_matrix_explicit: Optional[ZArray] = None  # (n_eq, n_state, n_dim, n_dim) — explicit
+    source_explicit: Optional[ZArray] = None          # (n_eq,) — explicit
     # ``state_update``: rank-1 ZArray of length ``len(equation_to_state_index)``
     # encoding an explicit-update operator ``Q[e2s] ← state_update(Q, Qaux, p, dt)``.
     # When set, the solver dispatches this substep as in-place assignment
@@ -181,9 +205,11 @@ class SystemModel:
         self.quasilinear_matrix     = _to_zarray(self.quasilinear_matrix)
         self.source_jacobian        = _to_zarray(self.source_jacobian)
         self.eigenvalues            = _to_zarray(self.eigenvalues)
-        self.update_variables       = _to_zarray(self.update_variables)
-        self.diffusive_flux         = _to_zarray(self.diffusive_flux)
-        self.state_update           = _to_zarray(self.state_update)
+        self.update_variables           = _to_zarray(self.update_variables)
+        self.diffusion_matrix           = _to_zarray(self.diffusion_matrix)
+        self.diffusion_matrix_explicit  = _to_zarray(self.diffusion_matrix_explicit)
+        self.source_explicit            = _to_zarray(self.source_explicit)
+        self.state_update               = _to_zarray(self.state_update)
 
         if self.equation_to_state_index is None:
             self.equation_to_state_index = list(range(self.n_equations))
@@ -460,8 +486,31 @@ class SystemModel:
         else:
             B = sp.MutableDenseNDimArray(ncp_z)
 
+        def _extract_A(name):
+            """Pull a rank-4 ``(n_eq, n_state, n_dim, n_dim)`` ZArray
+            from ``model.<name>()`` if the model defines it; otherwise
+            return an explicit zero tensor of that shape."""
+            if hasattr(model, name) and callable(getattr(model, name)):
+                A_z = getattr(model, name)()
+                if hasattr(A_z, "todense"):
+                    return sp.MutableDenseNDimArray(A_z.todense())
+                if hasattr(A_z, "tolist"):
+                    return sp.MutableDenseNDimArray(A_z.tolist())
+                return sp.MutableDenseNDimArray(A_z)
+            return sp.MutableDenseNDimArray.zeros(n_eq, n_eq, dim, dim)
+
+        A_diff_impl = _extract_A("diffusion_matrix")
+        A_diff_expl = _extract_A("diffusion_matrix_explicit")
+
         S_z = model.source()
         S_mat = _to_matrix(S_z, n_eq, 1)
+        # Explicit source slot — defaults to zero when the model does
+        # not opt in by overriding ``source_explicit()``.
+        if (hasattr(model, "source_explicit")
+                and callable(model.source_explicit)):
+            S_expl_mat = _to_matrix(model.source_explicit(), n_eq, 1)
+        else:
+            S_expl_mat = sp.zeros(n_eq, 1)
 
         # Mass matrix: prefer ``model.mass_matrix()`` if the model
         # exposes one (chain-derived models do); otherwise default to
@@ -513,7 +562,9 @@ class SystemModel:
             aux_initial_conditions=getattr(
                 model, "aux_initial_conditions", None),
             update_variables=_to_matrix(model.update_variables(), n_eq, 1),
-            diffusive_flux=_to_matrix(model.diffusive_flux(), n_eq, dim),
+            diffusion_matrix=A_diff_impl,
+            diffusion_matrix_explicit=A_diff_expl,
+            source_explicit=S_expl_mat,
         )
         if equation_names is not None:
             sm.equation_names = list(equation_names)
@@ -665,11 +716,18 @@ class SystemModel:
         if self.state_update is not None:
             matrices.append(self.state_update)
 
-        # ── Pass 1: collect Function atoms (excl. state). ───────────
+        # ── Pass 1: collect *user-defined* Function atoms (excl. state).
+        # ``atoms(sp.Function)`` matches every Function subclass — including
+        # built-ins like ``Piecewise``, ``Min``, ``Max``, ``conditional``.
+        # Those should stay inline; only undefined / user-named function
+        # atoms (e.g. topography ``b(t, x, y)`` declared via
+        # ``sp.Function("b")``) are candidates for promotion to aux state.
+        # Filter via ``sp.AppliedUndef`` which is precisely "user-defined
+        # function application".
         function_atoms = {}     # name → [atoms]
         for M in matrices:
             for entry in _iter_entries(M):
-                for atom in sp.sympify(entry).atoms(sp.Function):
+                for atom in sp.sympify(entry).atoms(sp.core.function.AppliedUndef):
                     name = atom.func.__name__
                     if name in state_names:
                         continue
@@ -1117,6 +1175,10 @@ class SystemModel:
         })
         return self
 
+    def remove_non_diagonal_h(self, **kwargs):
+        """Convenience wrapper around :class:`RemoveNonDiagonalH`."""
+        return RemoveNonDiagonalH()(self, **kwargs)
+
     # ── describe ──────────────────────────────────────────────────────
 
     def describe(self, full: bool = False) -> "SystemModelDescription":
@@ -1246,6 +1308,179 @@ class SystemModelDescription:
 
 # ── System-level operations ───────────────────────────────────────────
 
+class RemoveNonDiagonalH:
+    """System-level op: substitute the mass equation into every row
+    whose mass-matrix ``h``-column entry is non-zero, pushing the
+    ``M[i, h] · ∂_t h`` term into the NCP matrix ``B`` and the source
+    ``S``.  Leaves ``M[i, k]`` untouched for ``k != h``.
+
+    Motivation.  The Galerkin chain for free-surface models produces
+    j ≥ 1 momentum rows that carry a state-dependent ``∂_t h``
+    cross-term — e.g. ``M[xmom_j1, h] = (q_U1 − q_U0)/h`` in the
+    conservative state of VAM(1, 2, 2).  The cross-term reflects the
+    test function's time-dependence through ``ζ = (z − b)/h`` and is
+    genuine, not a bug.  Substituting the mass equation
+    ``∂_t h = −∂_x F[m, :] − ∂_x P[m, :] − Σ_k B[m, k, :] ∂_x Q_k +
+    S[m]`` into each affected row pushes the term out of the
+    time-derivative slot, where state-dependent ``M`` would otherwise
+    silently mislead explicit solvers that assume ``M = I``.
+
+    Scope.  This op clears only the ``h`` column of ``M``.  Other
+    diagonal / off-diagonal entries are left intact — normalising
+    state-dependent diagonal entries (e.g. ``M[xmom_j1, U_1] = h/3`` in
+    primitive form) is the job of an extended
+    :class:`InvertMassMatrix`, not this pass.
+
+    Preconditions.  The mass row ``m`` (auto-detected, or supplied via
+    ``mass_equation_index``) must satisfy ``M[m, h] = 1`` and
+    ``M[m, k] = 0`` for ``k != h``.  Other rows may have arbitrary
+    ``M[i, h]`` content.
+
+    Post-conditions.  ``M[i, h_state_index] = 0`` for every previously
+    affected row ``i``.  Per affected row, ``B`` and ``S`` are updated
+    so the residual is exact modulo the mass equation:
+
+    ``B[i, k, d] ← B[i, k, d] − M_old[i, h] · (∂F[m, d]/∂Q_k
+                                                + ∂P[m, d]/∂Q_k
+                                                + B[m, k, d])``
+
+    ``S[i] ← S[i] − M_old[i, h] · S[m]``
+
+    The mass row ``m`` itself is never modified.
+    """
+
+    name = "remove_non_diagonal_h"
+    description = (
+        "Substitute mass equation into rows with non-zero ∂_t h "
+        "coupling; clear M[i, h] for those rows."
+    )
+
+    def __call__(self, sm: "SystemModel", *, h_state_index=None,
+                 mass_equation_index=None):
+        n_eq = sm.n_equations
+        n_st = sm.n_state
+        n_dim = sm.n_dim
+
+        if h_state_index is None:
+            h_state_index = self._find_h_state_index(sm)
+        if mass_equation_index is None:
+            mass_equation_index = self._find_mass_row(sm, h_state_index)
+
+        h_col = h_state_index
+        m = mass_equation_index
+
+        # Precondition: M[m, :] is e_{h_col}.
+        M_mh = sp.simplify(sm.mass_matrix[m, h_col])
+        if M_mh != 1:
+            raise ValueError(
+                f"RemoveNonDiagonalH: mass row {m} has M[{m}, {h_col}] = "
+                f"{M_mh}, expected 1.  Supply mass_equation_index "
+                f"explicitly or normalise the mass row first."
+            )
+        for k in range(n_st):
+            if k == h_col:
+                continue
+            entry = sp.simplify(sm.mass_matrix[m, k])
+            if entry != 0:
+                raise ValueError(
+                    f"RemoveNonDiagonalH: mass row {m} is not pure: "
+                    f"M[{m}, {k}] = {entry}, expected 0."
+                )
+
+        M = sp.Matrix(sm.mass_matrix.tolist())
+        S = sp.Matrix(sm.source.tolist())
+        B = sp.MutableDenseNDimArray(
+            sm.nonconservative_matrix.tolist(),
+            shape=tuple(sm.nonconservative_matrix.shape),
+        )
+
+        # Pre-compute mass-row spatial pieces.
+        mass_F = [sm.flux[m, d] for d in range(n_dim)]
+        mass_P = [sm.hydrostatic_pressure[m, d] for d in range(n_dim)]
+        # ∂F[m, d]/∂Q_k and ∂P[m, d]/∂Q_k for every (k, d).
+        dFmd_dk = [
+            [sp.diff(mass_F[d], sm.state[k]) for d in range(n_dim)]
+            for k in range(n_st)
+        ]
+        dPmd_dk = [
+            [sp.diff(mass_P[d], sm.state[k]) for d in range(n_dim)]
+            for k in range(n_st)
+        ]
+        mass_B = [
+            [sm.nonconservative_matrix[m, k, d] for d in range(n_dim)]
+            for k in range(n_st)
+        ]
+        mass_S = sm.source[m, 0]
+
+        affected = []
+        for i in range(n_eq):
+            if i == m:
+                continue
+            coeff = sp.simplify(M[i, h_col])
+            if coeff == 0:
+                continue
+            affected.append(i)
+            for k in range(n_st):
+                for d in range(n_dim):
+                    B[i, k, d] = sp.expand(
+                        B[i, k, d]
+                        - coeff * (dFmd_dk[k][d]
+                                   + dPmd_dk[k][d]
+                                   + mass_B[k][d])
+                    )
+            S[i, 0] = sp.expand(S[i, 0] - coeff * mass_S)
+            M[i, h_col] = sp.S.Zero
+
+        sm.mass_matrix = _to_zarray(M)
+        sm.nonconservative_matrix = _to_zarray(B)
+        sm.source = _to_zarray(S)
+        sm.refresh_derived_operators(eigenvalues=False)
+        sm.history.append({
+            "name": self.name,
+            "description": (
+                f"substituted mass equation (row {m}) into rows "
+                f"{affected}; cleared M[:, {h_col}] on those rows"
+            ),
+        })
+        return sm
+
+    @staticmethod
+    def _find_h_state_index(sm: "SystemModel") -> int:
+        for i, s in enumerate(sm.state):
+            if getattr(s, "name", None) == "h":
+                return i
+        raise ValueError(
+            "RemoveNonDiagonalH: no state entry named 'h' found; "
+            "pass h_state_index explicitly."
+        )
+
+    @staticmethod
+    def _find_mass_row(sm: "SystemModel", h_col: int) -> int:
+        """Find the row m with M[m, h_col] = 1 and M[m, k] = 0 elsewhere."""
+        candidates = []
+        for i in range(sm.n_equations):
+            entry = sp.simplify(sm.mass_matrix[i, h_col])
+            if entry != 1:
+                continue
+            others_zero = all(
+                sp.simplify(sm.mass_matrix[i, k]) == 0
+                for k in range(sm.n_state) if k != h_col
+            )
+            if others_zero:
+                candidates.append(i)
+        if not candidates:
+            raise ValueError(
+                f"RemoveNonDiagonalH: no row found with M[i, {h_col}] = 1 "
+                f"and zero elsewhere; pass mass_equation_index explicitly."
+            )
+        if len(candidates) > 1:
+            raise ValueError(
+                f"RemoveNonDiagonalH: multiple candidate mass rows "
+                f"{candidates}; pass mass_equation_index explicitly."
+            )
+        return candidates[0]
+
+
 class InvertMassMatrix:
     """System-level op: left-multiply each evolution row by ``1/M_ii``.
 
@@ -1336,4 +1571,5 @@ __all__ = [
     "SystemModelRow",
     "SystemModelDescription",
     "InvertMassMatrix",
+    "RemoveNonDiagonalH",
 ]

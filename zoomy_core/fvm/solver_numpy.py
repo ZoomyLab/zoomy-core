@@ -16,6 +16,7 @@ from time import time as gettime
 
 import numpy as np
 import param
+import sympy as sp
 
 from zoomy_core.misc.logger_config import logger
 import zoomy_core.misc.io as io
@@ -238,7 +239,7 @@ class HyperbolicSolver(Solver):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         if self.compute_dt is None:
-            self.compute_dt = timestepping.adaptive(CFL=0.45)
+            self.compute_dt = timestepping.adaptive(CFL=0.9)
         defaults = Settings.default()
         defaults.output.update(Zstruct(snapshots=10))
         defaults.update(self.settings)
@@ -368,13 +369,19 @@ class HyperbolicSolver(Solver):
 
     def _build_diffusion_operators(self, mesh, symbolic_model, dim, n_vars):
         """Build DiffusionOperatorV2 per variable when the SystemModel
-        carries a non-zero ``diffusive_flux`` and positive viscosity.
+        carries a non-zero ``diffusion_matrix`` and positive viscosity.
 
-        ``diffusive_flux`` is a stored SystemModel field (an
-        ``(n_eq, n_dim)`` matrix), not a method — carried over from the
-        Model by ``from_model``."""
-        sym_dflux = getattr(symbolic_model, 'diffusive_flux', None)
-        if sym_dflux is None or sym_dflux.is_zero_matrix:
+        ``diffusion_matrix`` is a stored SystemModel field — a rank-4
+        tensor ``A(Q, Qaux, p)`` of shape ``(n_eq, n_state, n_dim, n_dim)``
+        carried over from the Model by ``from_model``.  The numpy
+        diffusion backend is the (legacy) scalar-viscosity path; it
+        triggers when ``A`` has any symbolic non-zero entry and the
+        model exposes a positive ``nu`` parameter."""
+        sym_A = getattr(symbolic_model, 'diffusion_matrix', None)
+        if sym_A is None:
+            return None
+        # Rank-4 NDimArray: scan every entry for a non-zero atom.
+        if all(sp.simplify(e) == 0 for e in sp.flatten(sym_A)):
             return None
         from zoomy_core.fvm.reconstruction import DiffusionOperatorV2
         nu_val = _param_value(symbolic_model, "nu", default=0.0)
@@ -558,8 +565,23 @@ class HyperbolicSolver(Solver):
     # -- Source operator -----------------------------------------------
 
     def get_compute_source(self, mesh, model):
+        """Compound source operator: evaluates both the implicit
+        ``source`` slot and the explicit ``source_explicit`` slot at
+        the current state and sums them.
+
+        This backend is explicit-only (FE/SSP-RK), so the IMEX split
+        a Firedrake backend respects is collapsed here — *all* source
+        contributions go to the RHS evaluated at the current state.
+        Backends that genuinely support IMEX (e.g. Firedrake) keep
+        ``source`` in the source-step Newton and ``source_explicit``
+        in the convective step.
+        """
+        has_explicit = hasattr(model, "source_explicit")
+
         def compute_source(dt, Q, Qaux, parameters, dQ):
             dQ = model.source(Q[:, :], Qaux[:, :], parameters)
+            if has_explicit:
+                dQ = dQ + model.source_explicit(Q[:, :], Qaux[:, :], parameters)
             return dQ
         return compute_source
 

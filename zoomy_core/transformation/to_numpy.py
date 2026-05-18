@@ -329,18 +329,11 @@ class NumpyRuntimeModel:
         Qaux_struct = sm.aux_variables   # Zstruct of aux Symbols
         p_struct = sm.parameters         # Zstruct of parameter Symbols
         n_struct = sm.normal             # Zstruct of normal Symbols
-        gradQ_struct = Zstruct(**{
-            f"dQ_{str(s)}_d{d}": sp.Symbol(f"dQ_{str(s)}_d{d}", real=True)
-            for s in sm.state for d in range(sm.n_dim)
-        })
 
         std_sig = Zstruct(variables=Q_struct, aux_variables=Qaux_struct,
                           parameters=p_struct)
         eig_sig = Zstruct(variables=Q_struct, aux_variables=Qaux_struct,
                           parameters=p_struct, normal=n_struct)
-        diff_sig = Zstruct(variables=Q_struct, aux_variables=Qaux_struct,
-                           gradient_variables=gradQ_struct,
-                           parameters=p_struct)
 
         rt.runtime_functions = {}
 
@@ -366,12 +359,13 @@ class NumpyRuntimeModel:
         _register("flux", sm.flux, std_sig)
         _register("hydrostatic_pressure", sm.hydrostatic_pressure, std_sig)
         _register("source", _column_to_rank1(sm.source), std_sig)
+        _register("source_explicit",
+                  _column_to_rank1(sm.source_explicit), std_sig)
         _register("mass_matrix", sm.mass_matrix, std_sig)
         _register("source_jacobian", sm.source_jacobian, std_sig)
         _register("update_variables",
                   _column_to_rank1(sm.update_variables), std_sig)
         _register("eigenvalues", _column_to_rank1(sm.eigenvalues), eig_sig)
-        _register("diffusive_flux", sm.diffusive_flux, diff_sig)
         # ``state_update``: explicit-update operator for split substeps
         # (e.g. Chorin corrector).  Returns a rank-1 array of length
         # ``len(equation_to_state_index)``: the new values for those
@@ -413,6 +407,38 @@ class NumpyRuntimeModel:
                           sm.nonconservative_matrix, n_eq)
         _register_ndarray("quasilinear_matrix",
                           sm.quasilinear_matrix, n_st)
+
+        # ``diffusion_matrix``: rank-4 ``A(Q, Qaux, p)`` of shape
+        # ``(n_eq, n_state, n_dim, n_dim)`` — the constitutive tensor in
+        # ``div(A : grad Q)``.  Lambdify per ``(d_flux, d_grad)`` slab as
+        # an ``(n_eq, n_state)`` matrix and stack along the trailing two
+        # axes.  Skipped when the SystemModel does not carry diffusion.
+        def _register_rank4(name, A_arr):
+            if A_arr is None:
+                return
+            slab_fns_4d = []
+            for d in range(n_dim):
+                for e in range(n_dim):
+                    slab = sp.Matrix(
+                        n_eq, n_st,
+                        lambda i, j, _d=d, _e=e: A_arr[i, j, _d, _e],
+                    )
+                    fn = Function(name=f"{name}__d{d}_e{e}",
+                                  args=std_sig, definition=slab)
+                    slab_fns_4d.append(rt._lambdify_function(fn, modules))
+
+            def _runtime_A(Q, Qaux, p, _fns=slab_fns_4d,
+                           _n_dim=n_dim, _n_eq=n_eq, _n_st=n_st):
+                slabs = [np.asarray(f(Q, Qaux, p), dtype=float)
+                         for f in _fns]
+                stacked = np.stack(slabs, axis=-1)
+                new_shape = stacked.shape[:-1] + (_n_dim, _n_dim)
+                return stacked.reshape(new_shape)
+            rt.runtime_functions[name] = _runtime_A
+            setattr(rt, name, _runtime_A)
+
+        _register_rank4("diffusion_matrix", sm.diffusion_matrix)
+        _register_rank4("diffusion_matrix_explicit", sm.diffusion_matrix_explicit)
 
         # Indexed boundary-condition kernels — lambdified via
         # ``_lambdify_function`` so the per-face call is

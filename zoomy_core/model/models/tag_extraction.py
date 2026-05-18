@@ -5,7 +5,8 @@ Single entry point: :func:`collect_solver_tag`, called from a model's
 
 Per-canonical extraction rules:
 
-* ``flux``, ``diffusive_flux``, ``hydrostatic_pressure``
+* ``flux``, ``hydrostatic_pressure`` (and ``diffusion_matrix`` — extracted via the
+  overridable ``Model.diffusion_matrix()`` method, not the tag pipeline)
       Conservative form. Each term must be ``coeff * Derivative(F_i, x_i)``;
       we strip the outermost first-order derivative and place
       ``coeff * F_i`` at column ``i`` of the output row.
@@ -190,7 +191,16 @@ def collect_solver_tag(
     """
     canonical = canonical_solver_tag(tag)
 
-    if canonical in ("flux", "diffusive_flux", "hydrostatic_pressure"):
+    if canonical in ("implicit_diffusion", "explicit_diffusion"):
+        raise NotImplementedError(
+            f"Tag-based extraction of {canonical!r} is not implemented. "
+            "Author diffusion by overriding "
+            "``Model.diffusion_matrix`` (implicit) or "
+            "``Model.diffusion_matrix_explicit`` (explicit) to return "
+            "the rank-4 tensor A of shape (n_eq, n_state, n_dim, n_dim)."
+        )
+
+    if canonical in ("flux", "hydrostatic_pressure"):
         if coords is None:
             raise ValueError(f"tag {canonical!r} requires ``coords``.")
         out = sp.Matrix.zeros(n_variables, n_directions)
@@ -202,7 +212,7 @@ def collect_solver_tag(
             )
         out = sp.MutableDenseNDimArray.zeros(n_variables, n_variables, n_directions)
         kind = "nc"
-    elif canonical in ("source", "time_derivative"):
+    elif canonical in ("implicit_source", "explicit_source", "time_derivative"):
         out = [S.Zero] * n_variables
         kind = "raw"
     else:
@@ -272,33 +282,38 @@ def _classify_term(term, *, state_funcs, gravity_param, t, x):
     - ``coeff * Derivative(state_var, x)`` (deriv arg is a single state
       Function) → ``nonconservative_flux``
     - ``coeff * Derivative(parameter, x)`` (deriv of pure parameter)
-      → ``source``
+      → ``implicit_source``
     - ``coeff(state) * Derivative(F(state), x)`` (state coeff on a
-      compound deriv argument) → ``source`` (too complex for the
-      flux/NC slots)
+      compound deriv argument) → ``implicit_source`` (too complex for
+      the flux/NC slots)
     - ``Derivative(F(state), x)`` with state-independent coeff and
       ``g·state`` inside → ``hydrostatic_pressure``
     - ``Derivative(F(state), x)`` with state-independent coeff
       → ``flux``
-    - everything else (no derivative, …) → ``source`` (catch-all).
+    - everything else (no derivative, …) → ``implicit_source`` (catch-all).
+
+    The "source" catch-all uses **implicit_source** as the safe default
+    because friction / reaction / stiff body forces benefit from
+    implicit treatment.  Authors who want explicit treatment must tag
+    the term manually as ``explicit_source``.
     """
     if any(isinstance(d, sp.Derivative) and t in d.variables
            for d in term.atoms(sp.Derivative)):
         return "time_derivative"
     coeff, deriv = _split_coeff_and_derivative(term)
     if deriv is None:
-        return "source"
+        return "implicit_source"
     if len(deriv.variables) != 1 or deriv.variables[0] != x:
-        return "source"
+        return "implicit_source"
     inner = deriv.args[0]
     if inner in state_funcs:
         return "nonconservative_flux"
     inner_has_state = any(inner.has(f) for f in state_funcs)
     if not inner_has_state:
-        return "source"
+        return "implicit_source"
     coeff_has_state = any(coeff.has(f) for f in state_funcs)
     if coeff_has_state:
-        return "source"
+        return "implicit_source"
     if gravity_param is not None and inner.has(gravity_param):
         return "hydrostatic_pressure"
     return "flux"
