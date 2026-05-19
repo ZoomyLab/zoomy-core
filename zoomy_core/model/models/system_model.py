@@ -28,6 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import sympy as sp
 
 from zoomy_core.misc.misc import Zstruct, ZArray
@@ -292,6 +293,128 @@ class SystemModel:
         """True when n_equations == n_state and equations map identity-style."""
         return (self.n_equations == self.n_state
                 and self.equation_to_state_index == list(range(self.n_state)))
+
+    @property
+    def stationary_indices(self) -> frozenset:
+        """State indices whose evolution is identically zero by
+        construction.
+
+        A field ``Q[i]`` is **stationary** iff its row vanishes in
+        every transport / source / diffusion slot:
+
+        - ``flux[i, :] = 0``
+        - ``hydrostatic_pressure[i, :] = 0``
+        - ``nonconservative_matrix[i, :, :] = 0``
+        - ``source[i] = 0``
+        - ``source_explicit[i] = 0`` (if present)
+        - ``diffusion_matrix[i, :, :, :] = 0`` (if present)
+        - ``diffusion_matrix_explicit[i, :, :, :] = 0`` (if present)
+
+        The discrete time-step then writes nothing to ``Q[i]``, so any
+        post-step hook (slope limiter, positivity projection, ...)
+        that does is introducing **spurious** modification — the
+        canonical example is a vertex-based DG slope limiter clipping
+        the bathymetry ``b`` row in a shallow-water model, which
+        breaks rank-boundary consistency under MPI and silently
+        creates or destroys topography.
+
+        Solvers should consult this set to skip such fields when
+        applying post-step state transforms.  Users can override (in
+        either direction) via per-solver kwargs that resolve handles
+        through :meth:`field_index`.
+        """
+        n = self.n_variables
+        slots = (
+            self.flux, self.hydrostatic_pressure,
+            self.nonconservative_matrix,
+            self.source, self.source_explicit,
+            self.diffusion_matrix, self.diffusion_matrix_explicit,
+        )
+        return frozenset(
+            i for i in range(n)
+            if all(self._row_is_identically_zero(t, i) for t in slots)
+        )
+
+    @staticmethod
+    def _row_is_identically_zero(tensor, i) -> bool:
+        """Return ``True`` if ``tensor[i, ...]`` is identically zero.
+
+        ``None`` (slot absent) counts as zero.  Entries are checked
+        with ``== 0`` only (catches ``sp.S.Zero`` / ``sp.Integer(0)``
+        / ``0`` — the canonical "stationary row" produced by
+        ``Matrix.zeros`` / ``sp.MutableDenseNDimArray.zeros`` plus the
+        model author's explicit zero assignment).  We deliberately do
+        **NOT** fall back to ``sp.simplify`` here — the source / NCP /
+        diffusion rows of non-stationary fields routinely contain
+        deeply nested expressions (Manning friction = nested
+        ``sqrt`` ∘ ``Max`` ∘ ``Rational``) on which ``sp.simplify``
+        runs for many minutes.  Stationary detection runs at solver
+        setup, so any pessimisation hits the user-facing startup
+        latency.  If a model author writes a non-trivially-simplified
+        expression that *happens* to evaluate to zero, they should
+        either simplify it in the model or list the field manually
+        via ``solver.limiter_exclude_fields``.
+        """
+        if tensor is None:
+            return True
+        try:
+            row = tensor[i]
+        except (IndexError, TypeError):
+            return True
+        try:
+            flat = np.asarray(row, dtype=object).ravel()
+        except Exception:
+            flat = [row]
+        for entry in flat:
+            if entry != 0:
+                return False
+        return True
+
+    def field_index(self, field) -> int:
+        """Resolve a state-field handle to its integer index.
+
+        Accepts:
+
+        - ``sp.Symbol`` (e.g. ``self.variables.b``) — matched by name.
+        - ``str`` (e.g. ``"b"``) — matched by name.
+        - ``int`` — returned as-is (with bounds check).
+
+        Raises ``ValueError`` if the handle does not correspond to a
+        registered state variable.  This is the canonical way for
+        solvers to translate the *symbolic* field handles that the
+        model author writes (``[model.variables.b]``) into the
+        *integer* indices the post-processing pipeline uses
+        internally — without ever forcing the model author to think
+        about state layout.
+        """
+        names = list(self.variables.keys())
+        if isinstance(field, str):
+            try:
+                return names.index(field)
+            except ValueError as e:
+                raise ValueError(
+                    f"Unknown state field {field!r}; available: {names}"
+                ) from e
+        if isinstance(field, (int, np.integer)):
+            idx = int(field)
+            if not 0 <= idx < len(names):
+                raise ValueError(
+                    f"State index {idx} out of range [0, {len(names)})"
+                )
+            return idx
+        name = getattr(field, "name", None)
+        if name is None:
+            raise ValueError(
+                f"Cannot resolve field handle {field!r} (type "
+                f"{type(field).__name__}); expected sp.Symbol, str, "
+                "or int."
+            )
+        try:
+            return names.index(name)
+        except ValueError as e:
+            raise ValueError(
+                f"Unknown state field {name!r}; available: {names}"
+            ) from e
 
     # ── Derived-operator computation ────────────────────────────────────
 
@@ -1714,14 +1837,25 @@ class HydrostaticReconstruction:
                 "PrepareForAudusseHR: no 'g' parameter found"
             )
 
+        # ``b`` may live in either ``aux_state`` (b-as-static-aux) or
+        # ``state`` (b-promoted-to-state with ``∂_t b = 0`` row).  HR
+        # only needs the Symbol to match against the gravity packaging
+        # ``P[i, d]`` and ``B[i, h, d]``; it does not care whether
+        # ``b`` evolves.
         b_sym = None
         for s in sm.aux_state:
             if getattr(s, "name", None) == "b":
                 b_sym = s
                 break
         if b_sym is None:
+            for s in sm.state:
+                if getattr(s, "name", None) == "b":
+                    b_sym = s
+                    break
+        if b_sym is None:
             raise ValueError(
-                "PrepareForAudusseHR: no 'b' aux symbol found"
+                "HydrostaticReconstruction: no 'b' symbol found in state "
+                "or aux_state"
             )
 
         n_eq = sm.n_equations
@@ -1779,222 +1913,6 @@ class HydrostaticReconstruction:
                 f"repackaged gravity g·h·(b+h) → g·h²/2 on rows/dims "
                 f"{affected}; -g·h·b_x source dropped — Audusse HR "
                 f"must supply it at runtime"
-            ),
-        })
-        return sm
-
-
-class PromoteBottomToState:
-    """System-level op: promote bathymetry ``b`` from a function-aux
-    entry to a state variable with trivial evolution ``∂_t b = 0``,
-    and re-package the gravity contribution from the standard SWE
-    pressure ``P[xmom_j0] = g·h²/2`` into NCP entries
-    ``B[xmom_j0, h, x] += g·h`` and ``B[xmom_j0, b, x] = g·h``.
-
-    The resulting 8-state form (state appended with ``b``, equations
-    appended with a trivial ``b_eq``) reproduces the structure of the
-    OLD JAX prototype's ``VAMHyperbolic`` model
-    (``web/tutorials/vam/simple.ipynb``): gravity is **entirely in the
-    NCP** so the quasilinear matrix ``A = J_F + B`` carries the
-    well-balancing structurally, and the ``b_x · q_U0``-type elliptic
-    forcing terms become NCP entries (path-integrated at interfaces
-    with Audusse HR) instead of cell-centre forcing.  Both ingredients
-    are needed for the dam-break-over-bump experimental test to run.
-
-    **Precondition**.  Run :class:`HydrostaticReconstruction` first so
-    that ``P[xmom_j0] = g·h²/2`` (no ``b``) and
-    ``B[xmom_j0, h, x] = 0``.  Otherwise the gravity-packaging in the
-    chain's ``escalante`` output won't match what this op rewrites.
-
-    **Effects**:
-
-    * Appends ``b`` to ``state`` (new index ``n_state``).
-    * Appends ``b_eq`` row: ``M[b_eq, b] = 1``, all other operators
-      zero on this row.
-    * Sets ``P[xmom_j0, x] = 0``.
-    * Adds ``B[xmom_j0, h, x] += g·h`` and ``B[xmom_j0, b_new, x] = g·h``.
-    * Removes ``b`` from ``aux_state`` and the function-``b`` entry
-      from ``aux_registry``; aux rows above ``b``'s slot shift down
-      by 1.
-    * Retargets the ``b_x`` derivative entry in ``aux_registry`` to
-      ``target_kind="state"`` with ``state_index`` set to ``b``'s new
-      state position.
-
-    ``boundary_conditions``, ``initial_conditions``, and the
-    indexed-Function BC kernels are NOT updated — they reference the
-    original state layout, and the caller is responsible for
-    re-attaching BCs that cover the new ``b`` state slot (typically by
-    rebuilding the BC list against the post-promotion state).
-    """
-
-    name = "promote_bottom_to_state"
-    description = (
-        "Promote b: aux→state with ∂_t b = 0; move g·h²/2 from P into "
-        "NCP[xmom_j0, h, x] + NCP[xmom_j0, b, x] = g·h."
-    )
-
-    def __call__(self, sm: "SystemModel", *,
-                 h_state_index=None, xmom_j0_row=None):
-        # Locate h state index.
-        if h_state_index is None:
-            for i, s in enumerate(sm.state):
-                if getattr(s, "name", None) == "h":
-                    h_state_index = i
-                    break
-            if h_state_index is None:
-                raise ValueError(
-                    "PromoteBottomToState: no state entry named 'h' found"
-                )
-        h_sym = sm.state[h_state_index]
-
-        # Locate b aux symbol.
-        b_aux_row = None
-        b_sym = None
-        for i, s in enumerate(sm.aux_state):
-            if getattr(s, "name", None) == "b":
-                b_sym = s
-                b_aux_row = i
-                break
-        if b_sym is None:
-            raise ValueError(
-                "PromoteBottomToState: no 'b' aux symbol found; "
-                "expected bathymetry as a function-aux entry"
-            )
-
-        # Locate g parameter.
-        g_sym = None
-        for k in sm.parameters.keys():
-            sym = sm.parameters[k]
-            if getattr(sym, "name", None) == "g":
-                g_sym = sym
-                break
-        if g_sym is None:
-            raise ValueError(
-                "PromoteBottomToState: no 'g' parameter found"
-            )
-
-        # Locate xmom_j0 row.
-        if xmom_j0_row is None:
-            names = getattr(sm, "equation_names", None) or []
-            for i, n in enumerate(names):
-                if n == "xmom_j0":
-                    xmom_j0_row = i
-                    break
-            if xmom_j0_row is None:
-                raise ValueError(
-                    "PromoteBottomToState: no equation named 'xmom_j0'"
-                )
-
-        n_eq = sm.n_equations
-        n_st = sm.n_state
-        n_dim = sm.n_dim
-        b_new_state_idx = n_st       # appended at the end
-        b_new_eq_row    = n_eq
-
-        # ── Extend state operators ─────────────────────────────────
-        # Mass matrix: (n_eq, n_st) -> (n_eq+1, n_st+1).
-        M_new = sp.zeros(n_eq + 1, n_st + 1)
-        for i in range(n_eq):
-            for j in range(n_st):
-                M_new[i, j] = sp.sympify(sm.mass_matrix[i, j])
-        M_new[b_new_eq_row, b_new_state_idx] = sp.S.One
-
-        # Flux & hydrostatic pressure: (n_eq, n_dim) -> (n_eq+1, n_dim).
-        F_new = sp.zeros(n_eq + 1, n_dim)
-        P_new = sp.zeros(n_eq + 1, n_dim)
-        for i in range(n_eq):
-            for d in range(n_dim):
-                F_new[i, d] = sp.sympify(sm.flux[i, d])
-                P_new[i, d] = sp.sympify(sm.hydrostatic_pressure[i, d])
-        # Remove gravity from P[xmom_j0] (we assert HR has been run).
-        x_dim = 0
-        if P_new[xmom_j0_row, x_dim] != 0:
-            # Subtract g·h²/2 only — non-gravity contributions stay.
-            P_new[xmom_j0_row, x_dim] = sp.expand(
-                P_new[xmom_j0_row, x_dim]
-                - g_sym * h_sym**2 / sp.Integer(2)
-            )
-
-        # NCP: (n_eq, n_st, n_dim) -> (n_eq+1, n_st+1, n_dim).
-        B_new = sp.MutableDenseNDimArray.zeros(n_eq + 1, n_st + 1, n_dim)
-        for i in range(n_eq):
-            for j in range(n_st):
-                for d in range(n_dim):
-                    B_new[i, j, d] = sp.sympify(
-                        sm.nonconservative_matrix[i, j, d]
-                    )
-        # Add gravity NCP on xmom_j0.
-        B_new[xmom_j0_row, h_state_index, x_dim] = sp.expand(
-            B_new[xmom_j0_row, h_state_index, x_dim] + g_sym * h_sym
-        )
-        B_new[xmom_j0_row, b_new_state_idx, x_dim] = g_sym * h_sym
-
-        # Source: (n_eq, 1) -> (n_eq+1, 1).
-        S_new = sp.zeros(n_eq + 1, 1)
-        for i in range(n_eq):
-            S_new[i, 0] = sp.sympify(sm.source[i, 0])
-
-        # ── Extend state list & e2s ────────────────────────────────
-        new_state = list(sm.state) + [b_sym]
-        new_e2s = list(sm.equation_to_state_index) + [b_new_state_idx]
-        new_eq_names = list(getattr(sm, "equation_names", []))
-        new_eq_names.append("b_eq")
-
-        # ── Trim aux_state & aux_registry ──────────────────────────
-        new_aux_state = [s for i, s in enumerate(sm.aux_state)
-                         if i != b_aux_row]
-        new_aux_registry = []
-        for entry in (sm.aux_registry or []):
-            e = dict(entry)
-            if e.get("kind") == "function" and e.get("name") == "b":
-                # Drop the function-b entry: b is now state.
-                continue
-            # Shift row indices that pointed above b's removed slot.
-            if "row" in e and e["row"] > b_aux_row:
-                e["row"] = e["row"] - 1
-            # Retarget the b_x derivative entry to the state b.
-            if (e.get("kind") == "derivative"
-                    and e.get("target_name") == "b"
-                    and e.get("target_kind") == "function"):
-                e["target_kind"] = "state"
-                e["state_index"] = b_new_state_idx
-                e.pop("function_row", None)
-            new_aux_registry.append(e)
-
-        # ── Extend update_variables (per-cell state transform) ────
-        # Append the identity transform for b — bathymetry doesn't
-        # get clamped or rescaled.
-        if sm.update_variables is not None and sm.update_variables.shape:
-            old_uv = list(sm.update_variables.tolist())
-            new_uv = old_uv + [b_sym]
-            uv_new = _to_zarray(sp.Matrix(len(new_uv), 1,
-                                          lambda r, _c: new_uv[r]))
-        else:
-            uv_new = sm.update_variables
-
-        # ── Commit ────────────────────────────────────────────────
-        sm.state = new_state
-        sm.aux_state = new_aux_state
-        sm.equation_to_state_index = new_e2s
-        sm.equation_names = new_eq_names
-        sm.aux_registry = new_aux_registry
-        sm.mass_matrix = _to_zarray(M_new)
-        sm.flux = _to_zarray(F_new)
-        sm.hydrostatic_pressure = _to_zarray(P_new)
-        sm.nonconservative_matrix = _to_zarray(B_new)
-        sm.source = _to_zarray(S_new)
-        sm.update_variables = uv_new
-        # Refresh quasilinear & source Jacobian; eigenvalues stay None
-        # (numerical mode).
-        sm.refresh_derived_operators(eigenvalues=False)
-        sm.history.append({
-            "name": self.name,
-            "description": (
-                f"promoted b: aux→state[{b_new_state_idx}]; added "
-                f"b_eq row at {b_new_eq_row}; "
-                f"moved g·h²/2 from P[xmom_j0={xmom_j0_row}] to "
-                f"NCP[xmom_j0, h={h_state_index}, x] and "
-                f"NCP[xmom_j0, b={b_new_state_idx}, x] = g·h"
             ),
         })
         return sm
@@ -2092,5 +2010,4 @@ __all__ = [
     "InvertMassMatrix",
     "RemoveNonDiagonalH",
     "HydrostaticReconstruction",
-    "PromoteBottomToState",
 ]
