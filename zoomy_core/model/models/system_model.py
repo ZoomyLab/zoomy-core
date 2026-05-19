@@ -1154,7 +1154,30 @@ class SystemModel:
         # explicit update), and ``eigenvalues`` (preserved under
         # invertible change-of-vars — xreplace, don't re-solve).
         if self.update_variables is not None:
-            self.update_variables = self.update_variables.xreplace(full_transform)
+            # ``update_variables`` is a per-cell state-to-state map.
+            # Naively xreplacing the OLD state symbols turns
+            # ``identity_in_old(Q_old) = Q_old`` into the inverse
+            # transform on the NEW state — e.g. ``[h, U_0, U_1, ...]``
+            # becomes ``[h, q_U0/h, 3·q_U1/h, ...]`` which actively
+            # destroys the conservative-form state at every step.
+            # If the old map was the identity (default for Models with
+            # no custom clamp), rebuild the identity in the new state.
+            old_uv_list = [sp.sympify(self.update_variables[i, 0])
+                           for i in range(self.update_variables.shape[0])]
+            was_identity = (
+                len(old_uv_list) == len(old_state)
+                and all(sp.simplify(old_uv_list[i] - old_state[i]) == 0
+                        for i in range(len(old_state)))
+            )
+            if was_identity:
+                n_uv = len(new_state)
+                self.update_variables = _to_zarray(sp.Matrix(
+                    n_uv, 1, lambda r, _c: new_state[r]
+                ))
+            else:
+                self.update_variables = self.update_variables.xreplace(
+                    full_transform
+                )
         if self.state_update is not None:
             self.state_update = self.state_update.xreplace(full_transform)
         # Chain-rule propagation for aux derivative entries that target
@@ -1761,6 +1784,222 @@ class HydrostaticReconstruction:
         return sm
 
 
+class PromoteBottomToState:
+    """System-level op: promote bathymetry ``b`` from a function-aux
+    entry to a state variable with trivial evolution ``∂_t b = 0``,
+    and re-package the gravity contribution from the standard SWE
+    pressure ``P[xmom_j0] = g·h²/2`` into NCP entries
+    ``B[xmom_j0, h, x] += g·h`` and ``B[xmom_j0, b, x] = g·h``.
+
+    The resulting 8-state form (state appended with ``b``, equations
+    appended with a trivial ``b_eq``) reproduces the structure of the
+    OLD JAX prototype's ``VAMHyperbolic`` model
+    (``web/tutorials/vam/simple.ipynb``): gravity is **entirely in the
+    NCP** so the quasilinear matrix ``A = J_F + B`` carries the
+    well-balancing structurally, and the ``b_x · q_U0``-type elliptic
+    forcing terms become NCP entries (path-integrated at interfaces
+    with Audusse HR) instead of cell-centre forcing.  Both ingredients
+    are needed for the dam-break-over-bump experimental test to run.
+
+    **Precondition**.  Run :class:`HydrostaticReconstruction` first so
+    that ``P[xmom_j0] = g·h²/2`` (no ``b``) and
+    ``B[xmom_j0, h, x] = 0``.  Otherwise the gravity-packaging in the
+    chain's ``escalante`` output won't match what this op rewrites.
+
+    **Effects**:
+
+    * Appends ``b`` to ``state`` (new index ``n_state``).
+    * Appends ``b_eq`` row: ``M[b_eq, b] = 1``, all other operators
+      zero on this row.
+    * Sets ``P[xmom_j0, x] = 0``.
+    * Adds ``B[xmom_j0, h, x] += g·h`` and ``B[xmom_j0, b_new, x] = g·h``.
+    * Removes ``b`` from ``aux_state`` and the function-``b`` entry
+      from ``aux_registry``; aux rows above ``b``'s slot shift down
+      by 1.
+    * Retargets the ``b_x`` derivative entry in ``aux_registry`` to
+      ``target_kind="state"`` with ``state_index`` set to ``b``'s new
+      state position.
+
+    ``boundary_conditions``, ``initial_conditions``, and the
+    indexed-Function BC kernels are NOT updated — they reference the
+    original state layout, and the caller is responsible for
+    re-attaching BCs that cover the new ``b`` state slot (typically by
+    rebuilding the BC list against the post-promotion state).
+    """
+
+    name = "promote_bottom_to_state"
+    description = (
+        "Promote b: aux→state with ∂_t b = 0; move g·h²/2 from P into "
+        "NCP[xmom_j0, h, x] + NCP[xmom_j0, b, x] = g·h."
+    )
+
+    def __call__(self, sm: "SystemModel", *,
+                 h_state_index=None, xmom_j0_row=None):
+        # Locate h state index.
+        if h_state_index is None:
+            for i, s in enumerate(sm.state):
+                if getattr(s, "name", None) == "h":
+                    h_state_index = i
+                    break
+            if h_state_index is None:
+                raise ValueError(
+                    "PromoteBottomToState: no state entry named 'h' found"
+                )
+        h_sym = sm.state[h_state_index]
+
+        # Locate b aux symbol.
+        b_aux_row = None
+        b_sym = None
+        for i, s in enumerate(sm.aux_state):
+            if getattr(s, "name", None) == "b":
+                b_sym = s
+                b_aux_row = i
+                break
+        if b_sym is None:
+            raise ValueError(
+                "PromoteBottomToState: no 'b' aux symbol found; "
+                "expected bathymetry as a function-aux entry"
+            )
+
+        # Locate g parameter.
+        g_sym = None
+        for k in sm.parameters.keys():
+            sym = sm.parameters[k]
+            if getattr(sym, "name", None) == "g":
+                g_sym = sym
+                break
+        if g_sym is None:
+            raise ValueError(
+                "PromoteBottomToState: no 'g' parameter found"
+            )
+
+        # Locate xmom_j0 row.
+        if xmom_j0_row is None:
+            names = getattr(sm, "equation_names", None) or []
+            for i, n in enumerate(names):
+                if n == "xmom_j0":
+                    xmom_j0_row = i
+                    break
+            if xmom_j0_row is None:
+                raise ValueError(
+                    "PromoteBottomToState: no equation named 'xmom_j0'"
+                )
+
+        n_eq = sm.n_equations
+        n_st = sm.n_state
+        n_dim = sm.n_dim
+        b_new_state_idx = n_st       # appended at the end
+        b_new_eq_row    = n_eq
+
+        # ── Extend state operators ─────────────────────────────────
+        # Mass matrix: (n_eq, n_st) -> (n_eq+1, n_st+1).
+        M_new = sp.zeros(n_eq + 1, n_st + 1)
+        for i in range(n_eq):
+            for j in range(n_st):
+                M_new[i, j] = sp.sympify(sm.mass_matrix[i, j])
+        M_new[b_new_eq_row, b_new_state_idx] = sp.S.One
+
+        # Flux & hydrostatic pressure: (n_eq, n_dim) -> (n_eq+1, n_dim).
+        F_new = sp.zeros(n_eq + 1, n_dim)
+        P_new = sp.zeros(n_eq + 1, n_dim)
+        for i in range(n_eq):
+            for d in range(n_dim):
+                F_new[i, d] = sp.sympify(sm.flux[i, d])
+                P_new[i, d] = sp.sympify(sm.hydrostatic_pressure[i, d])
+        # Remove gravity from P[xmom_j0] (we assert HR has been run).
+        x_dim = 0
+        if P_new[xmom_j0_row, x_dim] != 0:
+            # Subtract g·h²/2 only — non-gravity contributions stay.
+            P_new[xmom_j0_row, x_dim] = sp.expand(
+                P_new[xmom_j0_row, x_dim]
+                - g_sym * h_sym**2 / sp.Integer(2)
+            )
+
+        # NCP: (n_eq, n_st, n_dim) -> (n_eq+1, n_st+1, n_dim).
+        B_new = sp.MutableDenseNDimArray.zeros(n_eq + 1, n_st + 1, n_dim)
+        for i in range(n_eq):
+            for j in range(n_st):
+                for d in range(n_dim):
+                    B_new[i, j, d] = sp.sympify(
+                        sm.nonconservative_matrix[i, j, d]
+                    )
+        # Add gravity NCP on xmom_j0.
+        B_new[xmom_j0_row, h_state_index, x_dim] = sp.expand(
+            B_new[xmom_j0_row, h_state_index, x_dim] + g_sym * h_sym
+        )
+        B_new[xmom_j0_row, b_new_state_idx, x_dim] = g_sym * h_sym
+
+        # Source: (n_eq, 1) -> (n_eq+1, 1).
+        S_new = sp.zeros(n_eq + 1, 1)
+        for i in range(n_eq):
+            S_new[i, 0] = sp.sympify(sm.source[i, 0])
+
+        # ── Extend state list & e2s ────────────────────────────────
+        new_state = list(sm.state) + [b_sym]
+        new_e2s = list(sm.equation_to_state_index) + [b_new_state_idx]
+        new_eq_names = list(getattr(sm, "equation_names", []))
+        new_eq_names.append("b_eq")
+
+        # ── Trim aux_state & aux_registry ──────────────────────────
+        new_aux_state = [s for i, s in enumerate(sm.aux_state)
+                         if i != b_aux_row]
+        new_aux_registry = []
+        for entry in (sm.aux_registry or []):
+            e = dict(entry)
+            if e.get("kind") == "function" and e.get("name") == "b":
+                # Drop the function-b entry: b is now state.
+                continue
+            # Shift row indices that pointed above b's removed slot.
+            if "row" in e and e["row"] > b_aux_row:
+                e["row"] = e["row"] - 1
+            # Retarget the b_x derivative entry to the state b.
+            if (e.get("kind") == "derivative"
+                    and e.get("target_name") == "b"
+                    and e.get("target_kind") == "function"):
+                e["target_kind"] = "state"
+                e["state_index"] = b_new_state_idx
+                e.pop("function_row", None)
+            new_aux_registry.append(e)
+
+        # ── Extend update_variables (per-cell state transform) ────
+        # Append the identity transform for b — bathymetry doesn't
+        # get clamped or rescaled.
+        if sm.update_variables is not None and sm.update_variables.shape:
+            old_uv = list(sm.update_variables.tolist())
+            new_uv = old_uv + [b_sym]
+            uv_new = _to_zarray(sp.Matrix(len(new_uv), 1,
+                                          lambda r, _c: new_uv[r]))
+        else:
+            uv_new = sm.update_variables
+
+        # ── Commit ────────────────────────────────────────────────
+        sm.state = new_state
+        sm.aux_state = new_aux_state
+        sm.equation_to_state_index = new_e2s
+        sm.equation_names = new_eq_names
+        sm.aux_registry = new_aux_registry
+        sm.mass_matrix = _to_zarray(M_new)
+        sm.flux = _to_zarray(F_new)
+        sm.hydrostatic_pressure = _to_zarray(P_new)
+        sm.nonconservative_matrix = _to_zarray(B_new)
+        sm.source = _to_zarray(S_new)
+        sm.update_variables = uv_new
+        # Refresh quasilinear & source Jacobian; eigenvalues stay None
+        # (numerical mode).
+        sm.refresh_derived_operators(eigenvalues=False)
+        sm.history.append({
+            "name": self.name,
+            "description": (
+                f"promoted b: aux→state[{b_new_state_idx}]; added "
+                f"b_eq row at {b_new_eq_row}; "
+                f"moved g·h²/2 from P[xmom_j0={xmom_j0_row}] to "
+                f"NCP[xmom_j0, h={h_state_index}, x] and "
+                f"NCP[xmom_j0, b={b_new_state_idx}, x] = g·h"
+            ),
+        })
+        return sm
+
+
 class InvertMassMatrix:
     """System-level op: left-multiply each evolution row by ``1/M_ii``.
 
@@ -1853,4 +2092,5 @@ __all__ = [
     "InvertMassMatrix",
     "RemoveNonDiagonalH",
     "HydrostaticReconstruction",
+    "PromoteBottomToState",
 ]
