@@ -170,13 +170,51 @@ def build_pressure_elliptic_block(
         for k in range(N_w_active)
     ]
 
-    # Corrector update — written in state Functions, no tilde rename.
-    # The runtime semantics (``U_k`` here refers to the predictor's
-    # tilde value at substep time, since the pressure stage runs after
-    # the predictor has written to ``Q[U_k]``) lives in execution order,
-    # not symbol identity.
-    U_corr = [coeffs_u[k] - (dt / h_fn) * T_u[k] for k in range(M_M + 1)]
-    W_corr = [coeffs_w[k] - (dt / h_fn) * T_w[k] for k in range(N_w_active)]
+    # Corrector update.  Universal formula derived from the row residual
+    # ``M[k, e2s] · ∂_t state[e2s] + ... + p_terms = 0`` ⇒
+    # ``state_new = state - dt · p_terms / M[k, e2s]``.  This handles
+    # both primitive (M = μ_k · h, after ``remove_non_diagonal_h``) and
+    # modal-conservative (M = 1, after ``InvertMassMatrix``) states
+    # without branching: the mass-matrix entry self-selects the right
+    # ratio.  The previous form ``state - (dt/h) · T_u[k]`` baked in the
+    # primitive choice and was off by a factor ``h · μ_k`` for
+    # modal-conservative state — invisible when h ≈ 1, fatal for the
+    # dam-break test (h ranges 0.015–0.34).
+    name_to_eq_idx = {n: i for i, n in enumerate(sm.equation_names)}
+    state_syms = list(sm.state)
+    sym_to_fn   = dict(zip(state_syms, [_to_fn(s) for s in state_syms]))
+
+    def _pressure_part(eq_expr):
+        e    = sp.expand(sp.sympify(eq_expr).doit())
+        no_p = sp.expand(e.subs({p: sp.S.Zero for p in pressure_funcs}).doit())
+        return sp.expand(e - no_p)
+
+    def _mass_entry_in_func_form(row_idx, state_idx):
+        return sp.sympify(sm.mass_matrix[row_idx, state_idx]).xreplace(sym_to_fn)
+
+    def _corrector_for(coeffs, prefix):
+        out = []
+        for k, c in enumerate(coeffs):
+            eq_name = f"{prefix}_j{k}"
+            if eq_name not in name_to_eq_idx:
+                # Row doesn't exist (defensive — coeffs comes from state
+                # names; the row may not match by convention).
+                out.append(c)
+                continue
+            row_idx = name_to_eq_idx[eq_name]
+            e2s     = sm.equation_to_state_index[row_idx]
+            M_kk    = _mass_entry_in_func_form(row_idx, e2s)
+            if M_kk == 0:
+                raise ValueError(
+                    f"Row '{eq_name}' has zero mass-matrix diagonal — "
+                    "cannot build corrector update."
+                )
+            p_terms = _pressure_part(residuals[eq_name])
+            out.append(sp.expand(c - dt * p_terms / M_kk))
+        return out
+
+    U_corr = _corrector_for(coeffs_u, "xmom")
+    W_corr = _corrector_for(coeffs_w, "zmom")
 
     # Elliptic block: substitute U_k → U_k - (dt/h)·T_u_k(P) (and
     # similarly W_k) into every algebraic continuity row.  Sympy's
@@ -647,9 +685,266 @@ def split_for_pressure(sm, pressure_vars, dt, *, bottom=None):
     )
 
 
+def split_simple(sm, pressure_vars, dt, *, bottom=None):
+    """Minimal manual splitter — copies the SystemModel, then deletes
+    rows and terms.
+
+    Algorithm:
+
+    1. **Copy** the parent SystemModel three times → ``(SM_pred,
+       SM_press, SM_corr)``.
+
+    2. **SM_pred**: keep only the rows whose ``equation_name`` does
+       NOT start with ``cont_j`` (evolution rows including any
+       trivial ones like ``b_eq`` for bathymetry-as-state).  Then
+       ZERO out every pressure-state-dependent term:
+       ``F.xreplace({P_k: 0})``, same for ``P``, ``B``, ``S``.
+       The predictor thus advances with kinetic + gravity + NCP
+       and ANY non-pressure source — exactly like the OLD
+       ``PredictorCorrectorSolver`` did with its flux-only step.
+
+    3. **SM_press**: keep only the ``cont_j*`` rows, with the
+       ``dt``-baked ``U_corr`` substitution applied (reuses
+       :func:`build_pressure_elliptic_block` for the substitution
+       machinery).  This is the elliptic block in
+       ``(P_0, P_1)`` that the implicit Newton-Krylov solver
+       targets.
+
+    4. **SM_corr**: the closed-form ``state_update`` formula
+       ``Q[k] ← Q[k] − (dt/h)·T_u_k(P)`` (also from
+       :func:`build_pressure_elliptic_block`).  This is the
+       projection-corrector that applies the freshly-solved
+       pressure to the momentum modes.
+
+    Parameters
+    ----------
+    sm : SystemModel
+        Parent system.  Must carry ``equation_names`` whose values
+        flag algebraic rows by the ``cont_j`` prefix.
+    pressure_vars : Sequence[sp.Symbol]
+        Pressure state symbols (e.g. ``[P_0, P_1]``).
+    dt : sp.Symbol
+        Symbolic time-step (gets baked into ``SM_press`` /
+        ``SM_corr`` operators).
+    bottom : optional
+        Forwarded to :func:`build_pressure_elliptic_block`.
+
+    Returns
+    -------
+    :class:`SplitForPressureResult`
+    """
+    # ── 0. preliminaries
+    state = list(sm.state)
+    state_names = [str(s) for s in state]
+    if "h" not in state_names:
+        raise ValueError("SystemModel must include 'h' state entry.")
+    pressure_indices = [state.index(p) for p in pressure_vars]
+    pressure_subs = {p: sp.S.Zero for p in pressure_vars}
+
+    # ── 1. SM_pred: copy + drop algebraic rows + zero pressure terms ──
+    # Identify evolution rows by equation_name (cont_j* are algebraic).
+    eq_names = list(sm.equation_names)
+    evo_rows = [i for i, name in enumerate(eq_names)
+                if not name.startswith("cont_j")]
+    pred_eq_names = [eq_names[i] for i in evo_rows]
+
+    # Build ``equation_to_state_index`` for SM_pred from the parent.
+    parent_e2s = list(sm.equation_to_state_index) if (
+        sm.equation_to_state_index is not None
+    ) else list(range(sm.n_equations))
+    pred_e2s = [parent_e2s[i] for i in evo_rows]
+
+    n_pred = len(evo_rows)
+    n_st = sm.n_state
+    n_dim = sm.n_dim
+
+    def _ndim(matrix):
+        """Number of array dimensions.  Distinguishes sp.Matrix
+        (ndim=2 always; .rank() = linear-algebra rank) from
+        NDimArray (.rank() = number of indices)."""
+        return len(matrix.shape)
+
+    def _row_slice(matrix, rows):
+        """Slice rows from a (n_eq, ...) array; return sp.Matrix
+        for 2D or NDimArray for 3D."""
+        nd = _ndim(matrix)
+        if nd == 2:
+            return sp.Matrix(
+                len(rows), matrix.shape[1],
+                lambda i, j, rs=rows: sp.sympify(matrix[rs[i], j]),
+            )
+        if nd == 3:
+            n_a, n_b, n_c = matrix.shape
+            out = sp.MutableDenseNDimArray.zeros(len(rows), n_b, n_c)
+            for i_new, i_old in enumerate(rows):
+                for j in range(n_b):
+                    for k in range(n_c):
+                        out[i_new, j, k] = sp.sympify(matrix[i_old, j, k])
+            return out
+        raise ValueError(f"Unsupported matrix ndim {nd}")
+
+    def _zero_pressure(matrix):
+        """Substitute every pressure-state symbol → 0 in every entry."""
+        nd = _ndim(matrix)
+        if nd == 2:
+            return matrix.xreplace(pressure_subs)
+        if nd == 3:
+            n_a, n_b, n_c = matrix.shape
+            out = sp.MutableDenseNDimArray.zeros(n_a, n_b, n_c)
+            for i in range(n_a):
+                for j in range(n_b):
+                    for k in range(n_c):
+                        out[i, j, k] = sp.sympify(matrix[i, j, k]).xreplace(
+                            pressure_subs
+                        )
+            return out
+        raise ValueError(f"Unsupported matrix ndim {nd}")
+
+    F_pred = _zero_pressure(_row_slice(sm.flux, evo_rows))
+    P_pred = _zero_pressure(_row_slice(sm.hydrostatic_pressure, evo_rows))
+    B_pred = _zero_pressure(_row_slice(sm.nonconservative_matrix, evo_rows))
+    S_pred = _zero_pressure(_row_slice(sm.source, evo_rows))
+    M_pred = _row_slice(sm.mass_matrix, evo_rows)    # mass matrix is unchanged
+
+    from zoomy_core.model.models.system_model import SystemModel as _SM
+
+    SM_pred = _SM(
+        time=sm.time,
+        space=list(sm.space),
+        state=list(state),
+        aux_state=list(sm.aux_state),
+        parameters=sm.parameters,
+        parameter_values=sm.parameter_values,
+        flux=F_pred,
+        hydrostatic_pressure=P_pred,
+        nonconservative_matrix=B_pred,
+        source=S_pred,
+        mass_matrix=M_pred,
+        equation_to_state_index=list(pred_e2s),
+        boundary_conditions=sm.boundary_conditions,
+        aux_boundary_conditions=sm.aux_boundary_conditions,
+        boundary_gradients=sm.boundary_gradients,
+        initial_conditions=sm.initial_conditions,
+        aux_initial_conditions=sm.aux_initial_conditions,
+        update_variables=sm.update_variables,
+    )
+    SM_pred.equation_names = list(pred_eq_names)
+    # Copy the aux_registry so the runtime knows how to compute each
+    # aux row.  The aux_state list (Symbol order) is already shared.
+    SM_pred.aux_registry = list(sm.aux_registry) if sm.aux_registry else None
+    SM_pred.history.append({
+        "name": "split_simple[pred]",
+        "description": (
+            f"copied parent + dropped rows {[eq_names[i] for i in range(sm.n_equations) if i not in evo_rows]}"
+            f" + zeroed pressure-state symbols {[str(p) for p in pressure_vars]} in F/P/B/S"
+        ),
+    })
+
+    # ── 2. SM_press: dt-baked elliptic block on the cont_j* rows ─────
+    # Reuse build_pressure_elliptic_block — it does the U_corr
+    # substitution and returns rows ready to use as algebraic
+    # constraints in (P_0, P_1).
+    block = build_pressure_elliptic_block(sm, pressure_vars, dt,
+                                          bottom=bottom)
+    press_eq_names = [f"elliptic_j{j}" for j in sorted(block["rows"])]
+    press_eq_residuals = [
+        sp.expand(block["rows"][j]) for j in sorted(block["rows"])
+    ]
+    SM_press = _build_subsystem(
+        eq_names=press_eq_names,
+        eq_residuals=press_eq_residuals,
+        sm_parent=sm,
+        state=state,
+        equation_to_state_index=list(pressure_indices),
+        history_entry={
+            "name": "split_simple[press]",
+            "description": (
+                f"elliptic block: {len(press_eq_names)} rows determining "
+                f"{[str(p) for p in pressure_vars]}"
+            ),
+        },
+    )
+
+    # ── 3. SM_corr: state_update = U − (dt/h)·T_u(P) ─────────────────
+    # Identical pattern to split_for_pressure's SM_corr.
+    t = sm.time
+    coords = list(sm.space)
+    M_M = len(block["U_corr"]) - 1
+    N_w_active = len(block["W_corr"])
+    corr_e2s_index = []
+    update_exprs = []
+    update_names = []
+
+    def _state_index_for(prefixes_and_k):
+        for pref, k in prefixes_and_k:
+            cand = f"{pref}{k}"
+            if cand in state_names:
+                return state_names.index(cand), cand
+        return None, None
+
+    for k in range(M_M + 1):
+        idx, _ = _state_index_for([("U_", k), ("q_U", k)])
+        if idx is None:
+            continue
+        update_exprs.append(sp.expand(block["U_corr"][k]))
+        corr_e2s_index.append(idx)
+        update_names.append(f"corr_U_{k}")
+    for k in range(N_w_active):
+        idx, _ = _state_index_for([("W_", k), ("q_W", k)])
+        if idx is None:
+            continue
+        update_exprs.append(sp.expand(block["W_corr"][k]))
+        corr_e2s_index.append(idx)
+        update_names.append(f"corr_W_{k}")
+
+    state_funcs = [sp.Function(str(s), real=True)(t, *coords) for s in state]
+    func_to_sym = dict(zip(state_funcs, state))
+    update_exprs_sym = [e.xreplace(func_to_sym) for e in update_exprs]
+
+    n_eq_corr = len(corr_e2s_index)
+    SM_corr = _SM(
+        time=sm.time,
+        space=list(sm.space),
+        state=list(state),
+        aux_state=[],
+        parameters=sm.parameters,
+        parameter_values=sm.parameter_values,
+        flux=sp.zeros(n_eq_corr, n_dim),
+        hydrostatic_pressure=sp.zeros(n_eq_corr, n_dim),
+        nonconservative_matrix=sp.MutableDenseNDimArray.zeros(
+            n_eq_corr, n_st, n_dim),
+        source=sp.zeros(n_eq_corr, 1),
+        mass_matrix=sp.zeros(n_eq_corr, n_st),
+        equation_to_state_index=list(corr_e2s_index),
+        state_update=sp.Array(update_exprs_sym),
+        boundary_conditions=sm.boundary_conditions,
+        aux_boundary_conditions=sm.aux_boundary_conditions,
+        boundary_gradients=sm.boundary_gradients,
+        initial_conditions=sm.initial_conditions,
+        aux_initial_conditions=sm.aux_initial_conditions,
+        update_variables=sm.update_variables,
+    )
+    SM_corr.equation_names = list(update_names)
+    SM_corr.expose_aux_atoms()
+    SM_corr.history.append({
+        "name": "split_simple[corr]",
+        "description": (
+            f"corrector: explicit update on "
+            f"{[state_names[i] for i in corr_e2s_index]} via state_update"
+        ),
+    })
+
+    return SplitForPressureResult(
+        SM_pred=SM_pred,
+        SM_press=SM_press,
+        SM_corr=SM_corr,
+    )
+
+
 __all__ = [
     "build_pressure_elliptic_block",
     "verify_p_linearity",
     "split_for_pressure",
+    "split_simple",
     "SplitForPressureResult",
 ]

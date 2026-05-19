@@ -1157,6 +1157,14 @@ class SystemModel:
             self.update_variables = self.update_variables.xreplace(full_transform)
         if self.state_update is not None:
             self.state_update = self.state_update.xreplace(full_transform)
+        # Chain-rule propagation for aux derivative entries that target
+        # OLD state variables.  Their meaning (∂_x of OLD state) must be
+        # rewritten in terms of NEW-state derivatives, otherwise the
+        # operator expressions disagree with the runtime aux pipeline
+        # (which computes ``∂_x state[i]`` using the NEW state).
+        self._propagate_chain_rule_through_aux(
+            full_transform, J, old_state, new_state,
+        )
         # Re-derive the quasilinear matrix + source jacobian from the new
         # primaries.
         self.refresh_derived_operators(eigenvalues=False)
@@ -1174,6 +1182,124 @@ class SystemModel:
             ),
         })
         return self
+
+    def _propagate_chain_rule_through_aux(self, full_transform, J,
+                                          old_state, new_state):
+        """After ``change_state_variables`` substitutes state Symbols
+        in the operator matrices, the aux-registry entries that
+        represent ``∂_x state[i]`` (where ``state[i]`` is an OLD
+        variable being substituted) carry stale meaning: the symbol
+        in the operator was ``∂_x U_0`` but the runtime computes
+        ``∂_x state[i] = ∂_x q_U0`` after the substitution.  Chain-rule
+        propagation fixes this:
+
+        ``∂_x T_i(Q_new) = Σ_j (∂T_i/∂Q_new[j]) · ∂_x Q_new[j]``
+
+        For every aux entry whose target was an OLD state variable
+        that got substituted, substitute the aux Symbol in the
+        operators with the chain-rule expansion, and add new aux
+        entries for ``∂_x Q_new[j]`` if not already present.
+        """
+        if not getattr(self, "aux_registry", None):
+            return
+
+        from itertools import product
+
+        old_state_names = {str(s): s for s in old_state}
+        new_state_names = {str(s): (j, s) for j, s in enumerate(new_state)}
+        space = list(self.space)
+        if not space:
+            return
+        axis = space[0]   # only handle 1D for now (matches multi_index = (1,))
+
+        aux_subs = {}
+        new_aux_entries = []
+        entries_to_remove = []
+
+        for entry in self.aux_registry:
+            if entry.get("kind") != "derivative":
+                continue
+            if entry.get("target_kind") != "state":
+                continue
+            if entry.get("multi_index") != (1,):
+                continue
+            target_name = entry["target_name"]
+            if target_name not in old_state_names:
+                continue
+            old_sym = old_state_names[target_name]
+            T = full_transform.get(old_sym, old_sym)
+            if T == old_sym:
+                # Identity transform — state retained; just sync state_index
+                # in case the order changed.
+                if target_name in new_state_names:
+                    entry["state_index"] = new_state_names[target_name][0]
+                continue
+            # State substituted; build chain-rule expansion.
+            old_aux_sym = entry["aux_symbol"]
+            chain_expr = sp.S.Zero
+            for j, new_sym in enumerate(new_state):
+                partial = sp.diff(T, new_sym)
+                if partial == 0:
+                    continue
+                new_aux_name = f"{str(new_sym)}_x"
+                new_aux_sym = sp.Symbol(new_aux_name, real=True)
+                # Only add if not already in registry or pending.
+                already = (any(e.get("name") == new_aux_name
+                               for e in self.aux_registry)
+                           or any(e["name"] == new_aux_name
+                                  for e in new_aux_entries))
+                if not already:
+                    new_aux_entries.append({
+                        "kind": "derivative",
+                        "name": new_aux_name,
+                        "row": -1,
+                        "atom": sp.Derivative(new_sym, axis, evaluate=False),
+                        "aux_symbol": new_aux_sym,
+                        "target_name": str(new_sym),
+                        "multi_index": (1,),
+                        "target_kind": "state",
+                        "state_index": j,
+                    })
+                chain_expr += partial * new_aux_sym
+            aux_subs[old_aux_sym] = sp.expand(chain_expr)
+            entries_to_remove.append(entry["name"])
+
+        if not aux_subs:
+            return
+
+        # Apply substitution to all operator matrices.
+        self.flux = self.flux.xreplace(aux_subs)
+        self.hydrostatic_pressure = self.hydrostatic_pressure.xreplace(aux_subs)
+        self.source = self.source.xreplace(aux_subs)
+        self.mass_matrix = self.mass_matrix.xreplace(aux_subs)
+        B = self.nonconservative_matrix
+        shape = B.shape
+        new_B = sp.MutableDenseNDimArray.zeros(*shape)
+        for idx in product(*[range(s) for s in shape]):
+            new_B[idx] = sp.sympify(B[idx]).xreplace(aux_subs)
+        self.nonconservative_matrix = _to_zarray(new_B)
+
+        # Update aux_state list + aux_registry: drop the substituted
+        # entries, append the new ones, and reindex `row` so they form
+        # a contiguous block.
+        keep = [e for e in self.aux_registry
+                if e["name"] not in entries_to_remove]
+        new_aux_state = []
+        new_registry = []
+        for i, entry in enumerate(keep + new_aux_entries):
+            entry = dict(entry)
+            entry["row"] = i
+            new_registry.append(entry)
+            new_aux_state.append(entry["aux_symbol"])
+        self.aux_state = new_aux_state
+        self.aux_registry = new_registry
+        # Stash chain-rule info; ``change_state_variables`` folds it
+        # into its single history entry so callers see one event per
+        # CoV (matches what tests expect).
+        self._last_cov_aux_chain_rule = {
+            "removed": list(entries_to_remove),
+            "added": [e["name"] for e in new_aux_entries],
+        }
 
     def remove_non_diagonal_h(self, **kwargs):
         """Convenience wrapper around :class:`RemoveNonDiagonalH`."""
@@ -1481,6 +1607,363 @@ class RemoveNonDiagonalH:
         return candidates[0]
 
 
+class MovePressureFluxToSource:
+    """System-level op: relocate pressure-state-multiplied flux
+    contributions from ``F`` into the source ``S`` (via chain-rule
+    expansion of the resulting divergence into spatial aux
+    derivatives).
+
+    **Why**.  The old VAM JAX solver
+    (``web/tutorials/vam/simple.ipynb`` commit ``e1c91370``) packs
+    ``∂_x(h·p_k)`` into the source operator as ``dhp_k/dx`` (a
+    derivative aux), and runs a four-step cycle:
+
+      1. Explicit RK1 with the flux operator only (purely kinetic
+         + NCP gravity, no pressure).
+      2. Implicit pressure solve, giving fresh ``P_k``.
+      3. Explicit RK1 with the source operator, which now
+         includes the pressure contribution at fresh ``P_k``.
+      4. SSPRK2 wrap of (1)–(3).
+
+    The chain's `escalante` output instead puts ``h·P_k/ρ`` inside
+    ``F``, so an analogous flux-then-press-then-source cycle on
+    the chain output would double-count pressure: the flux step
+    advances momentum with pressure-at-frozen-``P`` *already*, and
+    then the source step adds the freshly-solved pressure on top.
+
+    This op rewrites for every row ``i`` and dimension ``d``:
+
+    ``F[i, d]   →  F[i, d] − Σ_k  h · P_k / ρ_k`` (any terms that
+    are linear in a pressure-state symbol with a factor of ``h``)
+
+    ``S[i, 0]   →  S[i, 0] + Σ_k  ∂_x(h · P_k / ρ_k)
+                            = S[i, 0] + Σ_k  (h · P_k_x + h_x · P_k) / ρ_k``
+
+    where ``P_k_x`` and ``h_x`` are auto-detected derivative-aux
+    symbols.  If ``P_k_x`` is not yet in ``aux_registry`` (the
+    chain's escalante output only adds it when the source
+    *already* contains a ``∂_x P_k`` atom), the op extends the
+    registry so the runtime LSQ pipeline computes it.
+
+    **Trade-off**.  The new ``S`` uses cell-centred LSQ
+    derivatives of ``h`` and ``P_k``; the old ``F`` used
+    face-reconstructed values.  For Audusse-HR, the WB
+    cancellation works on ``F`` and ``P``, so moving pressure to
+    ``S`` LOSES the implicit WB on pressure terms — only valid
+    when ``P_k`` is zero in the lake-at-rest configuration (as it
+    is for the VAM chain).  Use this transformation when
+    targeting a legacy-style flux-press-source solver
+    (:class:`LegacyStyleChorinVAMSolver`); do NOT use with the
+    standard :class:`ChorinSplitVAMSolver` (it would
+    double-count, in the opposite direction).
+
+    Parameters
+    ----------
+    pressure_vars : Sequence[sp.Symbol], optional
+        The pressure state Symbols to relocate (``[P_0, P_1]`` for
+        VAM(1, 2, 2)).  If ``None``, auto-detected from the
+        SystemModel's pressure rows (the algebraic ``cont_jk``
+        rows' equation_to_state_index).
+    """
+
+    name = "move_pressure_flux_to_source"
+    description = (
+        "Move h·P_k/ρ contributions from F to S as cell-centred "
+        "divergences (h·P_k_x + h_x·P_k)/ρ; for legacy-style "
+        "flux-press-source solvers."
+    )
+
+    def __init__(self, pressure_vars=None):
+        self.pressure_vars = pressure_vars
+
+    def __call__(self, sm: "SystemModel"):
+        # Locate h state.
+        h_state_index = None
+        for i, s in enumerate(sm.state):
+            if getattr(s, "name", None) == "h":
+                h_state_index = i
+                break
+        if h_state_index is None:
+            raise ValueError(
+                "MovePressureFluxToSource: no state entry named 'h' found"
+            )
+        h_sym = sm.state[h_state_index]
+
+        # Pressure state Symbols.  If not supplied, treat every
+        # state entry whose name starts with 'P_' as pressure.
+        if self.pressure_vars is None:
+            pressure_vars = [s for s in sm.state
+                             if str(getattr(s, "name", "")).startswith("P_")]
+        else:
+            pressure_vars = list(self.pressure_vars)
+        if not pressure_vars:
+            sm.history.append({
+                "name": self.name,
+                "description": "no pressure state symbols found; no-op",
+            })
+            return sm
+
+        n_eq = sm.n_equations
+        n_dim = sm.n_dim
+
+        space = list(sm.space)
+        if not space:
+            raise ValueError("SystemModel has no spatial coordinates")
+        axis = space[0]    # 1D only for now
+
+        # Ensure ``h_x`` and ``{P_k}_x`` aux entries exist in the
+        # registry (add them with target_kind='state' if missing).
+        existing_aux_names = {e["name"] for e in (sm.aux_registry or [])}
+        new_aux_entries = []
+        aux_sym_by_state_name = {}
+        for state_idx, state_sym in enumerate(sm.state):
+            name = str(getattr(state_sym, "name", ""))
+            aux_name = f"{name}_x"
+            aux_sym_by_state_name[name] = sp.Symbol(aux_name, real=True)
+            if aux_name in existing_aux_names:
+                continue
+            # Find an existing entry with the same name (sanity).
+            new_aux_entries.append({
+                "kind": "derivative",
+                "name": aux_name,
+                "row": -1,
+                "atom": sp.Derivative(state_sym, axis, evaluate=False),
+                "aux_symbol": aux_sym_by_state_name[name],
+                "target_name": name,
+                "multi_index": (1,),
+                "target_kind": "state",
+                "state_index": state_idx,
+            })
+
+        h_x_aux = aux_sym_by_state_name[str(h_sym)]
+
+        # Locate rho parameter (defaulting to 1 if not present —
+        # pressure already absorbs density in some conventions).
+        rho_sym = None
+        for k in sm.parameters.keys():
+            sym = sm.parameters[k]
+            if getattr(sym, "name", None) == "rho":
+                rho_sym = sym
+                break
+        if rho_sym is None:
+            rho_sym = sp.S.One
+
+        F = sp.Matrix(sm.flux.tolist())
+        S = sp.Matrix(sm.source.tolist())
+
+        affected = []
+        for i in range(n_eq):
+            for d in range(n_dim):
+                F_id = sp.expand(F[i, d])
+                S_id = sp.expand(S[i, 0]) if d == 0 else None
+                moved_total = sp.S.Zero
+                for P_sym in pressure_vars:
+                    # Coefficient of ``h * P_sym`` in F[i, d].  If
+                    # the chain wrote ``P_0·h/ρ`` (i.e. ``h·P_0/ρ``),
+                    # the coefficient of ``h*P_0`` is ``1/ρ``.
+                    coeff = F_id.coeff(h_sym * P_sym)
+                    if coeff == 0:
+                        continue
+                    moved = coeff * h_sym * P_sym
+                    F_id = sp.expand(F_id - moved)
+                    # ∂_x(coeff · h · P_sym) = coeff · (h_x·P_sym + h·P_sym_x)
+                    P_x_aux = aux_sym_by_state_name[str(P_sym)]
+                    moved_total += coeff * (h_x_aux * P_sym + h_sym * P_x_aux)
+                if moved_total != 0:
+                    F[i, d] = F_id
+                    if d == 0:
+                        # Canonical residual: ∂_x F − S.  Moving X
+                        # from F decreases ∂_x F by ∂_x X; to keep
+                        # the residual invariant, S must decrease by
+                        # ∂_x X (so that −S contribution increases by
+                        # ∂_x X, restoring the missing ∂_x X term).
+                        S[i, 0] = sp.expand(S[i, 0] - moved_total)
+                    affected.append((i, d))
+
+        if not affected:
+            sm.history.append({
+                "name": self.name,
+                "description": "no h·P_k/ρ flux contributions found",
+            })
+            return sm
+
+        sm.flux = _to_zarray(F)
+        sm.source = _to_zarray(S)
+
+        # Append any new aux entries (h_x / P_k_x that weren't in
+        # the registry) at the end, reassigning row indices.
+        if new_aux_entries:
+            kept = list(sm.aux_registry or [])
+            for entry in new_aux_entries:
+                entry["row"] = len(kept)
+                kept.append(entry)
+            sm.aux_registry = kept
+            sm.aux_state = [e["aux_symbol"] for e in kept]
+
+        sm.refresh_derived_operators(eigenvalues=False)
+        sm.history.append({
+            "name": self.name,
+            "description": (
+                f"moved h·P_k/ρ flux to source on rows/dims {affected}; "
+                f"added aux entries "
+                f"{[e['name'] for e in new_aux_entries]}"
+            ),
+        })
+        return sm
+
+
+class HydrostaticReconstruction:
+    """System-level op: repack `g·h·∂_x η` from the chain's
+    ``(P, B)`` form to standard SWE ``P = g·h²/2`` form, for use
+    with Audusse hydrostatic-reconstruction Riemann solvers.
+
+    **What this does**
+
+    The chain's ``quadratic_form="escalante"`` output represents
+    the depth-integrated gravity term ``g·h·∂_x η`` as
+
+    ``P[i, d] = g·h·(b + h)``  and  ``B[i, h, d] = −g·(b + h)``,
+
+    because ``∂_x(g·h·η) − g·η·h_x ≡ g·h·∂_x η`` (product rule).
+    This packaging makes the bathymetry ``b`` appear *inside* the
+    hydrostatic-pressure flux, which is correct as a continuous
+    PDE — but Audusse's WB cancellation works most cleanly when
+    ``P`` has the *standard SWE* form ``g·h²/2`` (no ``b``) and
+    the bathymetry-on-momentum contribution ``−g·h·b_x`` is left
+    to be supplied at runtime by the Audusse fluctuation
+    ``(P_raw − P_star) @ n`` (see
+    :meth:`PositiveRusanov.numerical_fluctuations`).
+
+    This op rewrites for every row with that packaging:
+
+    * ``P[i, d]``      →  ``P[i, d] − g·h·(b + h) + g·h²/2``
+                       =  remainder + ``g·h²/2``
+    * ``B[i, h, d]``   →  ``B[i, h, d] + g·(b + h)``
+                       =  ``0`` (chain's escalante form had only
+                          the gravity term here on the j=0 row)
+
+    **Trade-off**
+
+    The resulting symbolic SystemModel is *missing* the
+    ``−g·h·b_x`` term — its residual no longer represents the
+    full PDE on its own.  Audusse HR provides this term via the
+    flux fluctuation at runtime; a non-HR Riemann solver (plain
+    Rusanov) will be inconsistent on a varying bathymetry.  Only
+    apply this op when the runtime is configured to use a
+    ``PositiveRusanov``-family flux (which the
+    :class:`ChorinSplitVAMSolver` does by default).
+
+    **Detection**
+
+    The op auto-detects every row ``i`` whose
+    ``P[i, d]`` contains a ``g·h·(b + h)`` summand AND whose
+    ``B[i, h_state_index, d]`` contains a matching ``−g·(b + h)``.
+    These together signal the chain's gravity-on-η packaging.
+    For VAM(1, 2, 2) this fires on the ``xmom_j0`` row only.
+    """
+
+    name = "hydrostatic_reconstruction"
+    description = (
+        "Convert chain's g·h·η in (P, B) to standard SWE P = g·h²/2 "
+        "for Audusse HR compatibility (drops -g·h·b_x; HR fluctuation "
+        "supplies it at runtime)."
+    )
+
+    def __call__(self, sm: "SystemModel", *, h_state_index=None):
+        # Locate h state index.
+        if h_state_index is None:
+            for i, s in enumerate(sm.state):
+                if getattr(s, "name", None) == "h":
+                    h_state_index = i
+                    break
+            if h_state_index is None:
+                raise ValueError(
+                    "PrepareForAudusseHR: no state entry named 'h' found"
+                )
+        h_sym = sm.state[h_state_index]
+
+        # Locate g (parameter) and b (aux Symbol).
+        g_sym = None
+        for k in sm.parameters.keys():
+            sym = sm.parameters[k]
+            if getattr(sym, "name", None) == "g":
+                g_sym = sym
+                break
+        if g_sym is None:
+            raise ValueError(
+                "PrepareForAudusseHR: no 'g' parameter found"
+            )
+
+        b_sym = None
+        for s in sm.aux_state:
+            if getattr(s, "name", None) == "b":
+                b_sym = s
+                break
+        if b_sym is None:
+            raise ValueError(
+                "PrepareForAudusseHR: no 'b' aux symbol found"
+            )
+
+        n_eq = sm.n_equations
+        n_dim = sm.n_dim
+
+        # Pattern we expect on rows with gravity-on-η packaging:
+        # P[i, d] contains  +g·h·(b + h) = g·h·b + g·h²
+        # B[i, h, d] contains  -g·(b + h) = -g·b - g·h.
+        # Repackage = subtract  g·h·b + g·h²/2  from P
+        #             add  g·(b + h)  to B[i, h, d].
+        # Detection: the *coefficient* of g·h·b in P[i, d] is +1 AND
+        # the coefficient of g·b in B[i, h, d] is -1.  Then the
+        # row has the gravity-on-η packaging.
+
+        P = sp.Matrix(sm.hydrostatic_pressure.tolist())
+        B = sp.MutableDenseNDimArray(
+            sm.nonconservative_matrix.tolist(),
+            shape=tuple(sm.nonconservative_matrix.shape),
+        )
+
+        affected = []
+        for i in range(n_eq):
+            for d in range(n_dim):
+                P_id = sp.expand(P[i, d])
+                B_ihd = sp.expand(B[i, h_state_index, d])
+                # Coefficient of g·h·b in P[i, d].
+                coeff_in_P = P_id.coeff(g_sym * h_sym * b_sym)
+                # Coefficient of g·b in B[i, h, d].
+                coeff_in_B = B_ihd.coeff(g_sym * b_sym)
+                if coeff_in_P == 1 and coeff_in_B == -1:
+                    # Repackage: P -= g·h·(b+h) - g·h²/2 = g·h·b + g·h²/2
+                    P[i, d] = sp.expand(
+                        P_id - g_sym * h_sym * b_sym
+                        - g_sym * h_sym**2 / sp.Integer(2)
+                    )
+                    # B[i, h, d] -= -g·(b+h) = +g·(b+h)
+                    B[i, h_state_index, d] = sp.expand(
+                        B_ihd + g_sym * (b_sym + h_sym)
+                    )
+                    affected.append((i, d))
+
+        if not affected:
+            sm.history.append({
+                "name": self.name,
+                "description": "no rows with gravity-on-η packaging found",
+            })
+            return sm
+
+        sm.hydrostatic_pressure = _to_zarray(P)
+        sm.nonconservative_matrix = _to_zarray(B)
+        sm.refresh_derived_operators(eigenvalues=False)
+        sm.history.append({
+            "name": self.name,
+            "description": (
+                f"repackaged gravity g·h·(b+h) → g·h²/2 on rows/dims "
+                f"{affected}; -g·h·b_x source dropped — Audusse HR "
+                f"must supply it at runtime"
+            ),
+        })
+        return sm
+
+
 class InvertMassMatrix:
     """System-level op: left-multiply each evolution row by ``1/M_ii``.
 
@@ -1572,4 +2055,6 @@ __all__ = [
     "SystemModelDescription",
     "InvertMassMatrix",
     "RemoveNonDiagonalH",
+    "HydrostaticReconstruction",
+    "MovePressureFluxToSource",
 ]
