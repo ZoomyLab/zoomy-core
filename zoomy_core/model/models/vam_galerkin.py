@@ -139,6 +139,14 @@ class VAMModelGalerkin(Model):
         for label in ["U", "V"][:n_horiz]:
             var_names += [f"{label}_{k}" for k in range(n_u_modes)]
         var_names += [f"W_{k}" for k in range(n_w_modes_active)]
+        # ``b`` enters as a state with the trivial evolution ``∂_t b = 0``
+        # — the OLD JAX prototype's structure that makes gravity NCP
+        # cleanly well-balancing and lets the cont_j ``b_x · q_U0``-type
+        # forcing flow through the NCP path-integral instead of as a
+        # cell-centre source.  See `_build_chain` for the matching
+        # ``state.b`` insertion in ``_chain_state_funcs`` and the
+        # ``bathymetry: ∂_t b = 0`` equation added to ``ordered``.
+        var_names += ["b"]
         var_names += [f"P_{k}" for k in range(n_p_modes_active)]
 
         param_dict = {
@@ -323,6 +331,14 @@ class VAMModelGalerkin(Model):
             ordered.append((f"zmom_j{k}",
                             getattr(sys._tree.momentum.z,
                                     f"test_{k}").expr))
+        # Bathymetry-as-state with trivial evolution ``∂_t b = 0``.
+        # Inserted AFTER the tree-level ``∂_t b → 0`` substitutions
+        # (lines ~256 and ~276 above) so this leaf's ``∂_t b`` atom
+        # survives intact; the auto-tagger below routes it to a unit
+        # mass-matrix entry on the b column.  Placed before cont_j
+        # rows so the equation_names order matches the OLD prototype:
+        # mass, xmom_j*, zmom_j*, bathymetry, cont_j*.
+        ordered.append(("bathymetry", sp.Derivative(state.b, state.t)))
         for k in range(1, N_p + 1):
             cont_jk = getattr(sys._tree.continuity, f"test_{k}").expr
             cont_jk_alg = sp.expand(cont_jk.doit().subs(dt_h_sub))
@@ -476,7 +492,11 @@ class VAMModelGalerkin(Model):
         state_funcs = [state.h]
         for coeffs in coeffs_horiz:
             state_funcs += coeffs
-        state_funcs += coeffs_w[:N_w] + coeffs_p[:N_p]
+        state_funcs += coeffs_w[:N_w]
+        # ``b`` between W and P matches the var_names ordering above
+        # and the OLD JAX prototype's state layout.
+        state_funcs += [state.b]
+        state_funcs += coeffs_p[:N_p]
 
         # 11. Auto-tag every row.
         tagged: Dict[str, Expression] = {}

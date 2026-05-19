@@ -545,6 +545,8 @@ def split_for_pressure(sm, pressure_vars, dt, *, bottom=None):
         first match in ``state_names`` or ``None``."""
         if eq_name == "mass":
             return "h"
+        if eq_name == "bathymetry":
+            return "b" if "b" in state_names else None
         if eq_name.startswith("xmom_j"):
             k = eq_name[len("xmom_j"):]
             for cand in (f"U_{k}", f"q_U{k}"):
