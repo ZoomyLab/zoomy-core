@@ -797,33 +797,22 @@ class PositiveHLL(HLL):
     def numerical_flux(self):
         """HLL flux evaluated on the hydrostatically-reconstructed
         face states — positivity-preserving and well-balanced under
-        the lake-at-rest steady state."""
+        the lake-at-rest steady state.
+
+        The bed row is exactly zero by construction: HLL's
+        ``_state_jump`` zeros ``dq[b]`` when ``b`` lives in the
+        conservative state, and a well-posed SWE has ``F[b, :] = 0``
+        symbolically.
+        """
         qLs, qRs, qauxL, qauxR = self.hydrostatic_reconstruction(
             self.variables_minus,
             self.variables_plus,
             self.aux_variables_minus,
             self.aux_variables_plus,
         )
-        flux = self._compute_flux(
+        return self._compute_flux(
             qLs, qRs, qauxL, qauxR, self.parameters, self.normal,
         )
-        # ── Pin the bathymetry row to zero ───────────────────────────
-        # Even though HLL's ``_state_jump`` zeros ``dq[b]`` and a
-        # well-posed SWE has ``F[b, :] = 0`` symbolically, the
-        # hydrostatic reconstruction overrides ``b`` with
-        # ``b_star = max(bL, bR)`` per face, and the resulting
-        # symbolic b-row expression of the HLL flux is non-trivial
-        # to simplify through lambdify.  Residual numerical drift
-        # then accumulates in the bed.  We mask the b row of the
-        # numerical flux to exactly zero — mirroring the
-        # ``get_viscosity_identity_flux`` mask in :class:`Rusanov`
-        # that excludes the bed from the LF dissipation matrix.
-        # The bed therefore stays exactly stationary at every step.
-        b = self._field_handles.get("b")
-        if b is not None and b.container == "q":
-            flux = ZArray(list(flux))
-            flux[b.index] = sp.Integer(0)
-        return flux
 
 
 class PositiveNonconservativeRusanov(PositiveRusanov, NonconservativeRusanov):
@@ -832,6 +821,40 @@ class PositiveNonconservativeRusanov(PositiveRusanov, NonconservativeRusanov):
 
     def get_path_integral_states(self):
         """Get path integral states."""
+        return self.hydrostatic_reconstruction(
+            self.variables_minus,
+            self.variables_plus,
+            self.aux_variables_minus,
+            self.aux_variables_plus,
+        )
+
+
+class PositiveNonconservativeHLL(PositiveHLL, NonconservativeRusanov):
+    """HLL conservative flux + Audusse-Bristeau-Klein hydrostatic
+    reconstruction + path-integral NCP fluctuations.
+
+    Combines the sharper HLL two-wave numerical flux (vs.
+    Rusanov / LF) with the same well-balanced reconstruction and
+    path-integral NCP fluctuations as
+    :class:`PositiveNonconservativeRusanov`.  The bed row is
+    automatically excluded from the LF-style fluctuation dissipation
+    via the bed mask in
+    :meth:`NonconservativeRusanov.get_viscosity_identity_fluctuations`.
+
+    The Python MRO ``(PositiveNonconservativeHLL → PositiveHLL → HLL →
+    NonconservativeRusanov → Rusanov → Numerics)`` resolves
+    ``numerical_flux`` to ``PositiveHLL.numerical_flux`` (hydrostatic
+    reconstruction → HLL combine → bed-row mask) and
+    ``numerical_fluctuations`` to ``NonconservativeRusanov.
+    numerical_fluctuations`` (path-integral NCP + LF identity, bed
+    masked) — exactly the split we want.
+    """
+
+    name = param.String(default="PositiveNonconservativeHLLV2")
+
+    def get_path_integral_states(self):
+        """NCP path-integral evaluated on the hydrostatically-
+        reconstructed face states."""
         return self.hydrostatic_reconstruction(
             self.variables_minus,
             self.variables_plus,
