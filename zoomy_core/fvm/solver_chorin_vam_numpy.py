@@ -27,6 +27,10 @@ import param
 import sympy as sp
 
 from zoomy_core.fvm.solver_numpy import HyperbolicSolver
+from zoomy_core.fvm.riemann_solvers import (
+    PositiveNonconservativeRusanov,
+    PositiveQuasilinearRusanov,
+)
 from zoomy_core.mesh import ensure_lsq_mesh
 from zoomy_core.model.models.system_model import SystemModel, _to_zarray
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
@@ -205,6 +209,69 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
                     f"SM_{name}.state disagrees with SM_pred.state — the "
                     "three sub-systems must share a common state vector."
                 )
+
+    # ------------------------------------------------------------------
+    # Numerics — Audusse well-balanced Rusanov for free-surface flow.
+    # ------------------------------------------------------------------
+
+    def _build_numerics(self, symbolic_model):
+        """Audusse hydrostatic-reconstruction Rusanov for the predictor.
+
+        The plain ``NonconservativeRusanov`` (parent's default) fails
+        lake-at-rest on a varying bathymetry: Rusanov's wavespeed-based
+        dissipation breaks the discrete cancellation of
+        ``g·h·∂_x η`` against the bottom-slope source.  Audusse–
+        Bristeau–Klein hydrostatic reconstruction (
+        :class:`PositiveNonconservativeRusanov`) restores well-
+        balancing and handles wet/dry fronts via the ``h*`` clamp.
+
+        ``scaled_q_indices``: the momentum-density state indices
+        (auto-detected — excludes ``h`` and the pressure-mode state
+        indices from ``self.sm_press``).  These are the rows that
+        get rescaled by ``h*/h`` during the reconstruction (so the
+        velocity stays constant when ``h`` is clipped).  Pressure
+        modes ``P_k`` are NOT rescaled — they are pressure
+        amplitudes, not momentum densities.
+        """
+        state_names = [str(s) for s in symbolic_model.state]
+        excluded = set()
+        if "h" in state_names:
+            excluded.add(state_names.index("h"))
+        if "b" in state_names:
+            # Bathymetry as state (8-state b-promoted path): exclude
+            # from h*/h rescaling — b is static topography, not a
+            # momentum density that needs HR-mass-preservation scaling.
+            excluded.add(state_names.index("b"))
+        # Pressure-mode state indices come straight from the splitter.
+        excluded.update(int(i) for i in self.sm_press.equation_to_state_index)
+        scaled_q_indices = [
+            i for i in range(symbolic_model.n_variables) if i not in excluded
+        ]
+        return PositiveNonconservativeRusanov(
+            symbolic_model,
+            scaled_q_indices=scaled_q_indices,
+        )
+
+    def _build_reconstruction(self, mesh, symbolic_model):
+        """Wet/dry-aware MUSCL reconstruction on the predictor.
+
+        At ``reconstruction_order >= 2`` use
+        :class:`FreeSurfaceLSQMUSCL` (free-surface ``η = h + b`` slope
+        limited, dry-cell clamp) instead of the parent's generic LSQ
+        MUSCL.  Matches the choice made by
+        :class:`FreeSurfaceFlowSolver`.
+        """
+        if self.reconstruction_order >= 2:
+            from zoomy_core.fvm.reconstruction import FreeSurfaceLSQMUSCL
+            from zoomy_core.fvm.solver_numpy import _var_index
+            dim = symbolic_model.dimension
+            h_idx = _var_index(symbolic_model, "h")
+            eps_wet = self._get_dry_threshold(symbolic_model)
+            return FreeSurfaceLSQMUSCL(
+                mesh, dim, h_index=h_idx,
+                eps_wet=eps_wet, limiter=self.limiter,
+            )
+        return super()._build_reconstruction(mesh, symbolic_model)
 
     # ------------------------------------------------------------------
     # Setup
@@ -421,6 +488,46 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         # point, so we track time here.
         self._sim_time += dt
 
+    def _do_flux_only_substep(self, dt):
+        """Explicit RK1 advance using ONLY the flux operator (no source).
+
+        Helper for :class:`LegacyStyleChorinVAMSolver` which mirrors
+        the old ``web/tutorials/vam/simple.ipynb`` algorithm: flux step
+        first (without source), then implicit pressure solve, then
+        source step using the freshly-solved pressure.
+        """
+        Q = self._sim_Q
+        Qaux = self._sim_Qaux
+        parameters = self._sim_parameters
+        time_now = self._sim_time
+        mesh = self._sim_mesh
+        model = self._sim_model
+        flux = self._sim_flux_operator
+        Qnew = Q + dt * flux(dt, time_now, Q, Qaux,
+                             parameters, np.zeros_like(Q))
+        Qnew = self.update_q(Qnew, Qaux, mesh, model, parameters)
+        Qauxnew = self.update_qaux(Qnew, Qaux, Q, Qaux, mesh, model,
+                                    parameters, time_now, dt)
+        self._sim_Q = Qnew
+        self._sim_Qaux = Qauxnew
+
+    def _do_source_only_substep(self, dt):
+        """Explicit RK1 advance using ONLY the source operator.
+
+        Used by :class:`LegacyStyleChorinVAMSolver` after the implicit
+        pressure solve, with the freshly-solved ``P_0, P_1`` exposed
+        in the aux pool so the source-evaluation sees them.
+        """
+        Q = self._sim_Q
+        Qaux = self._sim_Qaux
+        parameters = self._sim_parameters
+        mesh = self._sim_mesh
+        model = self._sim_model
+        source = self._sim_source_operator
+        Qnew = Q + dt * source(dt, Q, Qaux, parameters, np.zeros_like(Q))
+        Qnew = self.update_q(Qnew, Qaux, mesh, model, parameters)
+        self._sim_Q = Qnew
+
     def _params_with_dt(self, base, dt):
         """Splice numeric dt into the last slot of a parameter array
         (where ``dt`` lives by our setup_simulation convention)."""
@@ -584,4 +691,153 @@ def _substitute_dt(sm, old_sym, new_sym):
     return sm
 
 
-__all__ = ["ChorinSplitVAMSolver"]
+class LegacyStyleChorinVAMSolver(ChorinSplitVAMSolver):
+    """Reference solver: mirrors the algorithm of the old
+    ``web/tutorials/vam/simple.ipynb`` (commit ``e1c91370``)
+    ``PredictorCorrectorSolver`` exactly.  Kept as a checked-in
+    reference so the splitter+chain pipeline can be A/B-compared
+    against a known-working configuration.
+
+    Differences vs the standard :class:`ChorinSplitVAMSolver`:
+
+    * **Source step is decoupled from the predictor.**  In the
+      standard solver, the parent ``HyperbolicSolver.step`` evaluates
+      ``flux + source`` together using start-of-step (frozen)
+      pressure.  Here, the cycle is:
+
+      1. Explicit RK1 advance using ONLY the flux operator
+         (no source) on the current state.
+      2. Pressure-projection solve (implicit, dt-baked elliptic
+         block, same as standard solver).
+      3. Explicit RK1 advance using ONLY the source operator,
+         which now sees the freshly-solved pressure modes
+         ``(P_0, P_1)`` in state.
+      4. Corrector update (``state_update``) closes the loop.
+
+      The source contains pressure-dependent terms like
+      ``S[xmom_j0] = −2·P_1·b_x/ρ`` — using fresh ``P_k`` after
+      the projection is a strictly tighter coupling than using
+      frozen ``P_k`` (start of step).
+
+    * **SSPRK2 wrap on the FULL cycle**, not just the predictor.
+      The old algorithm runs the four-step cycle above twice
+      sequentially (each advancing by ``dt`` internally), then
+      averages:
+
+      .. code-block:: python
+
+          Q^(1) = full_cycle(Q^n,   dt)
+          Q^(2) = full_cycle(Q^(1), dt)
+          Q^{n+1} = 0.5·(Q^n + Q^(2))
+
+      Heun's method on the WHOLE pred-press-corr trio.  Matches
+      Escalante 2024 JCP 504 (2024) 112882 §3.1's two-stage TVD-RK2
+      structure exactly.
+
+    Inherits all of :class:`ChorinSplitVAMSolver`'s setup
+    (Audusse `PositiveNonconservativeRusanov`, wet/dry MUSCL at
+    ``reconstruction_order ≥ 2``, BC kernel, aux pools, dt-symbol
+    detection, pressure-GMRES, corrector).  Only ``step`` differs.
+    """
+
+    name = param.String(default="legacy_style_chorin_vam")
+
+    def _build_numerics(self, symbolic_model):
+        """Override with :class:`PositiveQuasilinearRusanov` — matches the
+        OLD ``PredictorCorrectorSolver``'s flux/NCP choice:
+
+        * ``numerical_flux`` returns zero (= OLD's ``flux.Zero()``).
+        * The path-integral fluctuation uses the full *quasilinear
+          matrix* ``A = ∂F/∂Q + ∂P/∂Q + B`` (= OLD's
+          ``nc_flux.segmentpath()`` over the full quasilinear
+          structure), rather than only the explicit NCP ``B``.
+        * Audusse hydrostatic reconstruction is still active —
+          ``b_*`` and ``h_*`` are reconstructed at every face before
+          the path-integral evaluation, giving bit-exact lake-at-rest
+          on a varying bathymetry.
+
+        This is the predictor that the OLD ``simple.ipynb`` solver
+        actually uses (modulo Python→numpy reimplementation).
+        """
+        state_names = [str(s) for s in symbolic_model.state]
+        excluded = set()
+        if "h" in state_names:
+            excluded.add(state_names.index("h"))
+        if "b" in state_names:
+            excluded.add(state_names.index("b"))
+        excluded.update(int(i) for i in self.sm_press.equation_to_state_index)
+        scaled_q_indices = [
+            i for i in range(symbolic_model.n_variables) if i not in excluded
+        ]
+        return PositiveQuasilinearRusanov(
+            symbolic_model,
+            scaled_q_indices=scaled_q_indices,
+        )
+
+    def step(self, dt):
+        """SSPRK2-wrapped legacy-style full cycle (one effective dt)."""
+        Q_n = self._sim_Q.copy()
+        Qaux_n = self._sim_Qaux.copy()
+        t_n = self._sim_time
+
+        # Cycle 1: U^(1) ← full_cycle(U^n, dt).
+        self._legacy_full_cycle(dt)
+        Q1 = self._sim_Q.copy()
+        Qaux1 = self._sim_Qaux.copy()
+
+        # Cycle 2: U^(2) ← full_cycle(U^(1), dt).
+        self._legacy_full_cycle(dt)
+        Q2 = self._sim_Q.copy()
+        Qaux2 = self._sim_Qaux.copy()
+
+        # Heun average + time rewind.
+        self._sim_Q = 0.5 * (Q_n + Q2)
+        self._sim_Qaux = 0.5 * (Qaux_n + Qaux2)
+        self._sim_time = t_n + dt
+        # Refresh derivative-aux rows from the averaged state so the
+        # next call sees consistent aux.  Function-aux (b) is static
+        # and already unchanged.
+        self.update_aux_variables()
+
+    def _legacy_full_cycle(self, dt):
+        """One full cycle in the OLD algorithm's order:
+        flux (no source) → BC + aux → pressure solve → BC + aux →
+        source (with fresh P) → BC + aux.  Advances ``_sim_time``
+        by ``dt``.
+
+        **No corrector step** — the OLD ``PredictorCorrectorSolver``
+        applied the full pressure contribution via the source
+        operator (with the freshly-solved ``P``), so the corrector
+        / projection-step ``Q[corr_e2s] ← Q − (dt/h)·T_u(P)`` would
+        double-count on top of the source's pressure terms.  This
+        is the *structural* difference from
+        :class:`ChorinSplitVAMSolver` whose predictor takes
+        ``flux + source`` together with frozen ``P`` and then uses
+        the corrector to replace pressure contributions with fresh
+        ``P``.
+        """
+        # 1. EXPLICIT FLUX-ONLY advance (RK1).  Parent's flux operator
+        #    already includes BC application (it evaluates the indexed
+        #    BC kernel inline at boundary faces).
+        self._do_flux_only_substep(dt)
+        self.update_aux_variables()
+
+        # 2. IMPLICIT PRESSURE SOLVE (matrix-free GMRES on the elliptic
+        #    block, dt baked in via parameter slot).  Writes the new
+        #    ``(P_0, P_1)`` into ``self._sim_Q[5:7]`` and refreshes the
+        #    pressure-derivative aux rows.
+        self._step_pressure(dt)
+        self.update_aux_variables()
+
+        # 3. EXPLICIT SOURCE-ONLY advance (RK1) using the FRESHLY
+        #    solved pressure.
+        self._do_source_only_substep(dt)
+        self.update_aux_variables()
+
+        self._sim_time += dt
+
+
+__all__ = [
+    "ChorinSplitVAMSolver",
+    "LegacyStyleChorinVAMSolver",
+]
