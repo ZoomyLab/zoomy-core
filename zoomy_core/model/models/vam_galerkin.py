@@ -39,7 +39,7 @@ from typing import Dict
 import param
 import sympy as sp
 
-from zoomy_core.misc.misc import Zstruct
+from zoomy_core.misc.misc import Zstruct, ZArray
 from zoomy_core.model.basemodel import Model
 from zoomy_core.model.models.basisfunctions import Legendre_shifted
 from zoomy_core.model.models.ins_generator import (
@@ -173,6 +173,32 @@ class VAMModelGalerkin(Model):
         self._refresh_state_sym_map(h_new=h_new)
 
         self._initialize_functions()
+
+    def reconstruction_variables(self):
+        """MUSCL well-balanced primitives for VAM.
+
+        The chain emits PRIMITIVE state ``[h, U_0, …, W_0, …, b, P_0,
+        …]`` from ``from_model``.  In primitive form the velocity
+        modes ``U_k``, ``V_k``, ``W_k`` are already bounded as
+        ``h → 0`` — they ARE the velocities — so the only slot needing
+        a WB transform is ``h``, mapped to the free-surface elevation
+        ``η = h + b``.  After a downstream modal-conservative CoV
+        (``U_k → (2k+1)·q_Uk/h``) ``change_state_variables`` xreplaces
+        this map automatically into the conservative form
+        ``η = h + b``, ``q_Uk·(2k+1)/h``, … — the polymorphism falls
+        out of the substitution; no per-mode bookkeeping here.
+
+        See ``thesis/chapters/30_numerics.md`` "Primitive-variable
+        MUSCL reconstruction".
+        """
+        out = list(self.variables.get_list())     # identity
+        keys = list(self.variables.keys())
+        if "h" in keys and "b" in keys:
+            h_idx = keys.index("h")
+            h_sym = self.variables.h
+            b_sym = self.variables.b
+            out[h_idx] = h_sym + b_sym             # η = h + b
+        return ZArray(out)
 
     # ------------------------------------------------------------------
     # Chain construction.

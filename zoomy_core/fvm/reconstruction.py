@@ -1200,3 +1200,59 @@ class DiffusionOperatorV2:
         sol, info = gmres(A, rhs, x0=u, atol=0.0, rtol=tol, maxiter=maxiter)
 
         return sol
+
+
+class PrimitiveReconstruction:
+    """Wraps a base ghost-cell-free reconstruction with pre/post
+    transforms to the model's primitive well-balanced variables.
+
+    Pre  (per cell):  ``state_cell → wb_cell``  via ``forward_fn``.
+    Limit (per cell): base reconstruction on the WB cell values.
+    Post (per face):  ``wb_face → state_face`` via ``inverse_fn``.
+
+    The point of the WB transform is to limit the *physically*
+    bounded quantities (``η = h+b``, ``u = q/h``, …) instead of the
+    conservative state, killing momentum overshoot at the wet/dry
+    front (Audusse-Bouchut-Bristeau and follow-ups; see
+    ``thesis/chapters/30_numerics.md``).  The smooth-limiter
+    choice (Venkatakrishnan, Van Albada) becomes harmless because
+    overshoots happen on ``η`` (nearly flat near LAR) and ``u``
+    (physically bounded), and the recovered ``q_face = h_face · u_face``
+    is positivity-consistent by construction.
+
+    ``forward_fn`` and ``inverse_fn`` are lambdified callables
+    ``f(Q) → wb`` and ``g(WB) → Q`` (vectorised across cells / faces
+    by the caller; this class iterates explicitly to keep the
+    interface model-agnostic).
+    """
+
+    def __init__(self, base, forward_fn, inverse_fn):
+        self.base = base
+        self._forward = forward_fn
+        self._inverse = inverse_fn
+
+    def __call__(self, Q, bf_face_values):
+        # ``Q``: (n_state, n_inner_cells).
+        # ``bf_face_values``: (n_state, n_boundary_faces).
+        wb_Q  = self._apply(self._forward, Q)
+        wb_bf = self._apply(self._forward, bf_face_values)
+        wb_L, wb_R = self.base(wb_Q, wb_bf)
+        Q_L = self._apply(self._inverse, wb_L)
+        Q_R = self._apply(self._inverse, wb_R)
+        return Q_L, Q_R
+
+    @staticmethod
+    def _apply(fn, arr):
+        """Apply a vector-valued symbolic-derived callable column-wise.
+
+        ``fn(*x_col) → x_col_transformed``; we iterate columns to keep
+        the wrapper agnostic to how the user lambdified the maps."""
+        out = np.empty_like(arr)
+        for c in range(arr.shape[1]):
+            out[:, c] = np.asarray(fn(*arr[:, c]), dtype=float).ravel()
+        return out
+
+
+__all__ = (__all__ if "__all__" in dir() else []) + [
+    "PrimitiveReconstruction",
+]

@@ -243,6 +243,10 @@ class Model(param.Parameterized, SymbolicRegistrar):
             ("initial_aux_condition", self.initial_aux_condition, ic_sig),
             ("update_variables", self.update_variables, std_sig),
             ("update_aux_variables", self.update_aux_variables, std_sig),
+            ("reconstruction_variables",
+             self.reconstruction_variables, std_sig),
+            ("state_from_reconstruction",
+             self.state_from_reconstruction, std_sig),
             (
                 "update_variables_jacobian_wrt_variables",
                 self.update_variables_jacobian_wrt_variables,
@@ -445,6 +449,50 @@ class Model(param.Parameterized, SymbolicRegistrar):
     def update_aux_variables(self):
         """Update aux variables."""
         return ZArray(self.aux_variables)
+
+    def reconstruction_variables(self):
+        """Symbolic map ``state → primitive well-balanced variables``
+        used by MUSCL-style reconstruction.
+
+        Override in subclasses to limit *primitive* quantities (η = h+b,
+        u = q_U/h, …) instead of *conservative* ones (h, q_U), which
+        bounds the limited values by physical scales and removes
+        momentum overshoot at wet/dry fronts (Audusse-Bouchut-Bristeau
+        et al.).  Default: identity — the reconstruction layer then
+        limits the conservative state directly.
+
+        Returns a ZArray of length ``n_variables``; entry ``k`` is the
+        symbolic expression for the reconstruction-side variable in
+        the same slot.  The inverse is auto-derived from this expression
+        (see :meth:`state_from_reconstruction`); subclasses with a
+        non-invertible or hand-tuned inverse may override
+        ``state_from_reconstruction`` directly.
+
+        See ``thesis/chapters/30_numerics.md`` "Primitive-variable
+        MUSCL reconstruction".
+        """
+        return ZArray(self.variables)
+
+    def state_from_reconstruction(self):
+        """Symbolic inverse of :meth:`reconstruction_variables`:
+        primitive reconstruction variables → conservative state.
+
+        Default: auto-derived from :meth:`reconstruction_variables`
+        via :func:`zoomy_core.model.reconstruction_inverse.invert_reconstruction`.
+        The result is expressed in terms of fresh ``WB_<state_name>``
+        symbols (one per state slot) which the runtime feeds with the
+        reconstructed primitive face values; the callable then returns
+        the conservative face state.
+
+        Override only if sympy's solver cannot close the inverse
+        symbolically (rare — the SWE / SME / VAM cases all close in
+        closed form).
+        """
+        from zoomy_core.model.reconstruction_inverse import invert_reconstruction
+        return invert_reconstruction(
+            self.reconstruction_variables(),
+            list(self.variables.get_list()),
+        )
 
     def update_variables_jacobian_wrt_variables(self):
         """Update variables jacobian wrt variables."""
