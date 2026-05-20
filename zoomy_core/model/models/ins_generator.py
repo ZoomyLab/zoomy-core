@@ -3810,6 +3810,15 @@ class SigmaTransform(Operation):
             return (sp.Integer(1) / h) * sp.Derivative(inner_expr, sigma)
         if var in self._chain_coords:
             # ∂_s ψ|_z → ∂_s ψ̃ − (∂_s(σ·h + b) / h) · ∂_σ ψ̃
+            # Skip the jacobian term when ``inner_expr`` has no σ
+            # dependency — its ∂_σ is identically zero and emitting it
+            # would leave a sympy ``Derivative(f, ζ)`` atom that the
+            # downstream display has to clean up.  Cleanest case:
+            # ``∂_t b`` on a bottom topography ``b(t, x)``: the bottom
+            # has no z (hence no σ) so the chain-rule branch must
+            # collapse to ``∂_t b`` directly.
+            if sigma not in inner_expr.free_symbols:
+                return sp.Derivative(inner_expr, var)
             jacobian = sp.Derivative(sigma * h + b, var)
             return (sp.Derivative(inner_expr, var)
                     - (jacobian / h) * sp.Derivative(inner_expr, sigma))
@@ -4469,32 +4478,91 @@ class InterfaceKBC(Assumption):
         )
 
 
-class KinematicBCBottom(Assumption):
-    """w|_{z=b} = db/dt + u_b * db/dx [+ v_b * db/dy]"""
+class KinematicBC(Assumption):
+    """Kinematic boundary condition at a moving interface.
 
-    def __init__(self, state: StateSpace):
+    The interface ``η_interface(t, x[, y])`` (typically ``state.b`` for
+    the bottom or ``state.eta = b + h`` for the free surface) moves
+    with the fluid:
+
+    .. math::
+
+        w\\big|_\\text{at}
+          \\;=\\; \\partial_t \\eta_\\text{interface}
+          + u\\big|_\\text{at}\\, \\partial_x \\eta_\\text{interface}
+          \\;[\\,+\\, v\\big|_\\text{at}\\, \\partial_y \\eta_\\text{interface}\\,] .
+
+    Parameters
+    ----------
+    state : StateSpace
+    interface : sympy expression
+        The moving interface — usually ``state.b`` (bottom) or
+        ``state.eta`` (free surface).  Must be a function of
+        ``(t, x[, y])`` only.
+    at : sympy expression
+        Vertical-coordinate value at which the velocity fields are
+        sampled.  Choose by which coordinate system the system is in:
+
+        * physical z:  ``at = state.b`` (bottom) or ``at = state.eta`` (surface)
+        * σ coords:    ``at = sympy.S.Zero`` (bottom) or ``at = sympy.S.One`` (surface)
+
+        The substitution is structural — it replaces ``state.z`` by
+        ``at`` in the velocity function arguments — so it works
+        whether the system is in physical (t, x[, y], z) or
+        post-σ-transform (t, x[, y], ζ) form.
+    name : str, optional
+        History label.  Default: ``"kinematic_bc_at_<at>"``.
+
+    Use :meth:`bottom` and :meth:`surface` factory methods for the
+    canonical interfaces.
+    """
+
+    def __init__(self, state, interface, at, name=None):
         s = state
-        w_at_b = s.w.subs(s.z, s.b)
-        u_at_b = s.u.subs(s.z, s.b)
-        rhs = Derivative(s.b, s.t) + u_at_b * Derivative(s.b, s.x)
+        w_at = s.w.subs(s.z, at)
+        u_at = s.u.subs(s.z, at)
+        rhs = Derivative(interface, s.t) + u_at * Derivative(interface, s.x)
         if s.has_y:
-            v_at_b = s.v.subs(s.z, s.b)
-            rhs += v_at_b * Derivative(s.b, s.y)
-        super().__init__({w_at_b: rhs}, name="kinematic_bc_bottom")
+            v_at = s.v.subs(s.z, at)
+            rhs += v_at * Derivative(interface, s.y)
+        if name is None:
+            name = f"kinematic_bc_at_{at}"
+        super().__init__({w_at: rhs}, name=name)
+
+    @classmethod
+    def bottom(cls, state, *, sigma=False):
+        """KBC at the bottom interface ``η_interface = state.b``.
+
+        * ``sigma=False`` (physical z): evaluates at ``state.b``.
+        * ``sigma=True``  (σ coords):   evaluates at ``ζ = 0``.
+        """
+        at = sp.S.Zero if sigma else state.b
+        return cls(state, interface=state.b, at=at, name="kinematic_bc_bottom")
+
+    @classmethod
+    def surface(cls, state, *, sigma=False):
+        """KBC at the free surface ``η_interface = state.eta``.
+
+        * ``sigma=False`` (physical z): evaluates at ``state.eta``.
+        * ``sigma=True``  (σ coords):   evaluates at ``ζ = 1``.
+        """
+        at = sp.S.One if sigma else state.eta
+        return cls(state, interface=state.eta, at=at, name="kinematic_bc_surface")
 
 
-class KinematicBCSurface(Assumption):
-    """w|_{z=eta} = d(eta)/dt + u_s * d(eta)/dx [+ v_s * d(eta)/dy]"""
+# Convenience aliases for the canonical physical-z interfaces — keep
+# the long-form names so existing callers ``KinematicBCBottom(state)``
+# / ``KinematicBCSurface(state)`` continue to work; new code should
+# prefer ``KinematicBC.bottom(state)`` / ``KinematicBC.surface(state)``.
 
-    def __init__(self, state: StateSpace):
-        s = state
-        w_at_s = s.w.subs(s.z, s.eta)
-        u_at_s = s.u.subs(s.z, s.eta)
-        rhs = Derivative(s.eta, s.t) + u_at_s * Derivative(s.eta, s.x)
-        if s.has_y:
-            v_at_s = s.v.subs(s.z, s.eta)
-            rhs += v_at_s * Derivative(s.eta, s.y)
-        super().__init__({w_at_s: rhs}, name="kinematic_bc_surface")
+def KinematicBCBottom(state: StateSpace):
+    """``w|_{z=b} = ∂_t b + u_b ∂_x b [+ v_b ∂_y b]`` (physical z)."""
+    return KinematicBC.bottom(state, sigma=False)
+
+
+def KinematicBCSurface(state: StateSpace):
+    """``w|_{z=η} = ∂_t η + u_s ∂_x η [+ v_s ∂_y η]`` (physical z)."""
+    return KinematicBC.surface(state, sigma=False)
 
 
 # ``ContinuityClosure`` removed — superseded by the composable pipeline

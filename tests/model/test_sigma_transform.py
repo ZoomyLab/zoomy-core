@@ -111,6 +111,58 @@ def test_continuity_matches_kt2019_3_10():
     assert sp.simplify(cont - expected) == 0, f"got {cont}, expected {expected}"
 
 
+def test_no_jacobian_residue_on_z_independent_function():
+    """Chain-rule term must collapse when the differentiated function
+    has no z (hence no σ) dependency.
+
+    Canonical case: ``∂_t b`` for bottom topography ``b(t, x)`` must
+    stay ``∂_t b`` — emitting the jacobian residue
+    ``(∂_t(ζh+b)/h) · ∂_σ b`` would leave a stray ``Derivative(b, ζ)``
+    atom in the system.
+    """
+    s = _state_2d()
+    # b(t, x) — no z, no σ.
+    out = SigmaTransform(s)._leaf_sp(sp.Derivative(s.b, s.t))
+    assert out == sp.Derivative(s.b, s.t), \
+        f"got {out!r}; expected the bare ∂_t b without jacobian residue"
+    # Same for ∂_x b:
+    out_x = SigmaTransform(s)._leaf_sp(sp.Derivative(s.b, s.x))
+    assert out_x == sp.Derivative(s.b, s.x)
+    # Sanity: a z-dependent function still gets the jacobian.
+    psi = sp.Function("psi", real=True)(s.t, s.x, s.z)
+    out_psi = SigmaTransform(s)._leaf_sp(sp.Derivative(psi, s.x))
+    assert sp.simplify(out_psi - sp.Derivative(psi, s.x)) != 0, \
+        "z-dependent ψ must still pick up the jacobian"
+
+
+def test_kinematic_bc_factories():
+    """KinematicBC.bottom / .surface produce the right substitution
+    dict in both physical-z and σ-coords modes.
+    """
+    from zoomy_core.model.models.ins_generator import KinematicBC
+    s = _state_2d()
+
+    # σ-coords bottom
+    bot_sigma = KinematicBC.bottom(s, sigma=True)
+    expected = {s.w.subs(s.z, sp.S.Zero):
+                sp.Derivative(s.b, s.t)
+                + s.u.subs(s.z, sp.S.Zero) * sp.Derivative(s.b, s.x)}
+    assert bot_sigma.subs_map == expected
+
+    # σ-coords surface
+    sur_sigma = KinematicBC.surface(s, sigma=True)
+    expected = {s.w.subs(s.z, sp.S.One):
+                sp.Derivative(s.eta, s.t)
+                + s.u.subs(s.z, sp.S.One) * sp.Derivative(s.eta, s.x)}
+    assert sur_sigma.subs_map == expected
+
+    # physical-z bottom — must match legacy KinematicBCBottom
+    from zoomy_core.model.models.ins_generator import KinematicBCBottom
+    legacy = KinematicBCBottom(s)
+    bot_phys = KinematicBC.bottom(s, sigma=False)
+    assert bot_phys.subs_map == legacy.subs_map
+
+
 def test_3d_state_emits_y_chain_terms():
     """3D state must produce ∂_y chain-rule terms with ∂_y(ζh+b)."""
     s = StateSpace(dimension=3)
