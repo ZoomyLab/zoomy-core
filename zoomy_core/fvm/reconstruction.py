@@ -357,11 +357,21 @@ class LSQMUSCLReconstruction:
     dim : int
     limiter : str
         "venkatakrishnan" (default), "barth_jespersen", or "minmod".
+    unlimited_indices : sequence of int, optional
+        State-row indices whose slope is used **un-limited** (``φ = 1``).
+        Use for static fields like bathymetry ``b`` — limiting them would
+        smear the topography and reduce well-balanced accuracy.
+        The unlimited gradient is still the LSQ slope from cell averages
+        (no special slope computation), it just isn't clipped by the
+        neighbour min/max bounds.
     """
 
-    def __init__(self, mesh, dim, limiter="venkatakrishnan"):
+    def __init__(self, mesh, dim, limiter="venkatakrishnan",
+                 unlimited_indices=None):
         self.dim = dim
         self._limiter_type = limiter
+        self._unlimited_indices = (tuple(unlimited_indices)
+                                    if unlimited_indices else ())
         nc = mesh.n_inner_cells
         self._nc = nc
         self._n_faces = mesh.n_faces
@@ -684,6 +694,10 @@ class LSQMUSCLReconstruction:
         limiter_fn = _limiter_map[self._limiter_type]
         phi = np.ones((n_vars, self._nc))
         for v in range(n_vars):
+            if v in self._unlimited_indices:
+                # Skip limiting: full LSQ slope.  Used for static fields
+                # (bathymetry) so the topography isn't smeared.
+                continue
             u = Q[v, :]
             u_min, u_max = self._neighbor_bounds(u, bf_face_values[v, :])
             phi[v] = limiter_fn(u, grads[v], u_min, u_max)
@@ -734,15 +748,18 @@ class FreeSurfaceLSQMUSCL(LSQMUSCLReconstruction):
     Clamps h >= 0 at face states after reconstruction.
     """
 
-    def __init__(self, mesh, dim, h_index, eps_wet=1e-3, limiter="venkatakrishnan"):
-        super().__init__(mesh, dim, limiter=limiter)
+    def __init__(self, mesh, dim, h_index, eps_wet=1e-3,
+                 limiter="venkatakrishnan", unlimited_indices=None):
+        super().__init__(mesh, dim, limiter=limiter,
+                         unlimited_indices=unlimited_indices)
         self._h_idx = h_index
         self._eps_wet = eps_wet
 
     def __call__(self, Q, bf_face_values):
         n_vars = Q.shape[0]
         grads, phi = self._compute_limited_gradients(Q, n_vars, bf_face_values)
-        # Wet-dry: zero limiter in dry cells
+        # Wet-dry: zero limiter in dry cells — even on unlimited rows
+        # (so bathymetry's slope stops contributing once h is dry).
         dry = Q[self._h_idx, :] < self._eps_wet
         phi[:, dry] = 0.0
         Q_L, Q_R = self._reconstruct(Q, grads, phi, bf_face_values)
