@@ -496,6 +496,8 @@ def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
         initial_conditions=sm_parent.initial_conditions,
         aux_initial_conditions=sm_parent.aux_initial_conditions,
         update_variables=sm_parent.update_variables,
+        reconstruction_variables=sm_parent.reconstruction_variables,
+        state_from_reconstruction=sm_parent.state_from_reconstruction,
     )
     # Auto-scan: route every non-state Function / Derivative atom in
     # this sub-system's operators into ``aux_state`` + ``aux_registry``
@@ -668,6 +670,8 @@ def split_for_pressure(sm, pressure_vars, dt, *, bottom=None):
         initial_conditions=sm.initial_conditions,
         aux_initial_conditions=sm.aux_initial_conditions,
         update_variables=sm.update_variables,
+        reconstruction_variables=sm.reconstruction_variables,
+        state_from_reconstruction=sm.state_from_reconstruction,
     )
     SM_corr.equation_names = list(update_names)
     SM_corr.expose_aux_atoms()
@@ -829,6 +833,8 @@ def split_simple(sm, pressure_vars, dt, *, bottom=None):
         initial_conditions=sm.initial_conditions,
         aux_initial_conditions=sm.aux_initial_conditions,
         update_variables=sm.update_variables,
+        reconstruction_variables=sm.reconstruction_variables,
+        state_from_reconstruction=sm.state_from_reconstruction,
     )
     SM_pred.equation_names = list(pred_eq_names)
     # Copy the aux_registry so the runtime knows how to compute each
@@ -925,6 +931,8 @@ def split_simple(sm, pressure_vars, dt, *, bottom=None):
         initial_conditions=sm.initial_conditions,
         aux_initial_conditions=sm.aux_initial_conditions,
         update_variables=sm.update_variables,
+        reconstruction_variables=sm.reconstruction_variables,
+        state_from_reconstruction=sm.state_from_reconstruction,
     )
     SM_corr.equation_names = list(update_names)
     SM_corr.expose_aux_atoms()

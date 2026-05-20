@@ -188,6 +188,17 @@ class SystemModel:
     diffusion_matrix: Optional[ZArray] = None         # (n_eq, n_state, n_dim, n_dim) — implicit
     diffusion_matrix_explicit: Optional[ZArray] = None  # (n_eq, n_state, n_dim, n_dim) — explicit
     source_explicit: Optional[ZArray] = None          # (n_eq,) — explicit
+    # ``reconstruction_variables``: symbolic forward map state → primitive
+    # well-balanced variables used by MUSCL-style reconstruction
+    # (η = h+b, u = q_U/h, …).  ``state_from_reconstruction`` is the
+    # symbolic inverse in terms of fresh ``WB_<state_name>`` symbols,
+    # auto-derived from the forward via
+    # :func:`zoomy_core.model.reconstruction_inverse.invert_reconstruction`.
+    # See ``thesis/chapters/30_numerics.md`` "Primitive-variable MUSCL
+    # reconstruction".  The pair is refreshed whenever the state vector
+    # changes (CoV via :meth:`change_state_variables`).
+    reconstruction_variables: Optional[ZArray] = None      # (n_state,)
+    state_from_reconstruction: Optional[ZArray] = None     # (n_state,) in WB_<name> symbols
     # ``state_update``: rank-1 ZArray of length ``len(equation_to_state_index)``
     # encoding an explicit-update operator ``Q[e2s] ← state_update(Q, Qaux, p, dt)``.
     # When set, the solver dispatches this substep as in-place assignment
@@ -211,6 +222,8 @@ class SystemModel:
         self.diffusion_matrix_explicit  = _to_zarray(self.diffusion_matrix_explicit)
         self.source_explicit            = _to_zarray(self.source_explicit)
         self.state_update               = _to_zarray(self.state_update)
+        self.reconstruction_variables   = _to_zarray(self.reconstruction_variables)
+        self.state_from_reconstruction  = _to_zarray(self.state_from_reconstruction)
 
         if self.equation_to_state_index is None:
             self.equation_to_state_index = list(range(self.n_equations))
@@ -688,6 +701,10 @@ class SystemModel:
             diffusion_matrix=A_diff_impl,
             diffusion_matrix_explicit=A_diff_expl,
             source_explicit=S_expl_mat,
+            reconstruction_variables=_to_zarray(
+                model.reconstruction_variables()),
+            state_from_reconstruction=_to_zarray(
+                model.state_from_reconstruction()),
         )
         if equation_names is not None:
             sm.equation_names = list(equation_names)
@@ -1303,6 +1320,21 @@ class SystemModel:
                 )
         if self.state_update is not None:
             self.state_update = self.state_update.xreplace(full_transform)
+        # ``reconstruction_variables`` / ``state_from_reconstruction``:
+        # the forward map xreplaces straight through under CoV (it's an
+        # expression in state symbols).  The inverse is re-derived from
+        # the post-CoV forward + new state — its WB-symbol expressions
+        # depend on the *new* state slot names, so a plain xreplace
+        # wouldn't suffice.
+        if self.reconstruction_variables is not None:
+            from zoomy_core.model.reconstruction_inverse import (
+                invert_reconstruction,
+            )
+            self.reconstruction_variables = (
+                self.reconstruction_variables.xreplace(full_transform))
+            self.state_from_reconstruction = invert_reconstruction(
+                self.reconstruction_variables, list(new_state),
+            )
         # Chain-rule propagation for aux derivative entries that target
         # OLD state variables.  Their meaning (∂_x of OLD state) must be
         # rewritten in terms of NEW-state derivatives, otherwise the

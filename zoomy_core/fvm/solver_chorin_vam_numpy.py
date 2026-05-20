@@ -142,6 +142,8 @@ def _pad_to_square(sm: SystemModel) -> SystemModel:
         initial_conditions=sm.initial_conditions,
         aux_initial_conditions=sm.aux_initial_conditions,
         update_variables=sm.update_variables,
+        reconstruction_variables=sm.reconstruction_variables,
+        state_from_reconstruction=sm.state_from_reconstruction,
     )
     sm_square.aux_registry = list(getattr(sm, "aux_registry", []) or [])
     sm_square.equation_names = (
@@ -259,34 +261,55 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         )
 
     def _build_reconstruction(self, mesh, symbolic_model):
-        """Wet/dry-aware MUSCL reconstruction on the predictor.
+        """Primitive-variable MUSCL reconstruction on the predictor.
 
-        At ``reconstruction_order >= 2`` use
-        :class:`FreeSurfaceLSQMUSCL` (free-surface ``η = h + b`` slope
-        limited, dry-cell clamp) instead of the parent's generic LSQ
-        MUSCL.  Matches the choice made by
-        :class:`FreeSurfaceFlowSolver`.
+        At ``reconstruction_order >= 2``: wrap :class:`FreeSurfaceLSQMUSCL`
+        with :class:`PrimitiveReconstruction` so the slope limiter runs
+        on the model's well-balanced primitives
+        (``sm.reconstruction_variables``: ``η = h+b``, ``u_k = q_Uk/h``,
+        …) — physically bounded quantities — instead of the conservative
+        state.  This kills the momentum overshoot at the wet/dry front
+        that breaks every smooth limiter (Venkatakrishnan,
+        Van Albada) on dam-break-style shocks.  See
+        ``thesis/chapters/30_numerics.md`` "Primitive-variable MUSCL
+        reconstruction".
         """
         if self.reconstruction_order >= 2:
-            from zoomy_core.fvm.reconstruction import FreeSurfaceLSQMUSCL
+            from zoomy_core.fvm.reconstruction import (
+                FreeSurfaceLSQMUSCL, PrimitiveReconstruction,
+            )
             from zoomy_core.fvm.solver_numpy import _var_index
             dim = symbolic_model.dimension
             h_idx = _var_index(symbolic_model, "h")
             eps_wet = self._get_dry_threshold(symbolic_model)
-            # When ``b`` is a state with trivial ``∂_t b = 0``, exempt
-            # it from slope limiting: the bathymetry is static and the
-            # LSQ slope from cell-centre values is the actual b'(x);
-            # limiting it would smear the topography.  Audusse HR still
-            # applies on the unlimited face values.
+            # ``b`` (when state) is static — exempt from slope limiting
+            # so the LSQ slope from cell-centre b passes through cleanly
+            # (Audusse HR still acts on the face values).
             state_names = [str(s) for s in symbolic_model.state]
             unlimited = []
             if "b" in state_names:
                 unlimited.append(state_names.index("b"))
-            return FreeSurfaceLSQMUSCL(
+            base = FreeSurfaceLSQMUSCL(
                 mesh, dim, h_index=h_idx,
                 eps_wet=eps_wet, limiter=self.limiter,
                 unlimited_indices=unlimited or None,
             )
+            # Lambdify the Model-declared WB forward / inverse maps.
+            # ``state_from_reconstruction`` is in ``WB_<state_name>``
+            # symbols — build that signature too.
+            fwd = symbolic_model.reconstruction_variables
+            inv = symbolic_model.state_from_reconstruction
+            if fwd is None or inv is None:
+                # Fall back to bare base limiter — no primitive transform.
+                return base
+            state_syms = list(symbolic_model.state)
+            wb_syms = [sp.Symbol(f"WB_{s.name}", real=True)
+                       for s in state_syms]
+            forward_fn = sp.lambdify(
+                state_syms, list(fwd), modules=["numpy"])
+            inverse_fn = sp.lambdify(
+                wb_syms, list(inv), modules=["numpy"])
+            return PrimitiveReconstruction(base, forward_fn, inverse_fn)
         return super()._build_reconstruction(mesh, symbolic_model)
 
     # ------------------------------------------------------------------
