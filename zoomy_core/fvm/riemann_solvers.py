@@ -814,6 +814,68 @@ class PositiveHLL(HLL):
             qLs, qRs, qauxL, qauxR, self.parameters, self.normal,
         )
 
+    def numerical_fluctuations(self):
+        """Audusse 2004 well-balancing consistency source ``S̃``.
+
+        Audusse-Bouchut-Bristeau-Klein-Perthame 2004, SIAM J. Sci.
+        Comput. 25(6):2050-2065, eq. (2.17)-(2.18):
+
+            F_{i+1/2,L} = F_num(U*_L, U*_R) - S̃_L
+            F_{i+1/2,R} = F_num(U*_L, U*_R) + S̃_R
+
+            S̃_L = (0, ½g h_L² - ½g h*_L²)^T  =  (0, P_raw_L - P*_L)^T
+            S̃_R = (0, ½g h*_R² - ½g h_R²)^T  =  (0, P*_R - P_raw_R)^T
+
+        The HR'd numerical flux alone is not well-balanced; the per-
+        cell-per-face S̃ correction restores consistency with the
+        original SWE (paper, Theorem 2.5).  S̃ depends only on
+        ``hydrostatic_pressure`` and is independent of the underlying
+        Riemann solver — same formula already in
+        :meth:`PositiveRusanov.numerical_fluctuations`.
+
+        ``super().numerical_fluctuations()`` chains the next entry on
+        the MRO.  For plain :class:`PositiveHLL` it lands at
+        :meth:`Numerics.numerical_fluctuations` (returns zero).  For
+        :class:`PositiveNonconservativeHLL` it lands at
+        :meth:`NonconservativeRusanov.numerical_fluctuations` (the
+        DLM path-integral over the NCP) — so the same override gives
+        well-balanced HLL whether the model carries an NCP or not.
+        """
+        qLs, qRs, qauxL, qauxR = self.hydrostatic_reconstruction(
+            self.variables_minus,
+            self.variables_plus,
+            self.aux_variables_minus,
+            self.aux_variables_plus,
+        )
+
+        P_mat_L_raw = self._model_eval(
+            "hydrostatic_pressure",
+            self.variables_minus,
+            self.aux_variables_minus,
+            self.parameters,
+        )
+        P_mat_R_raw = self._model_eval(
+            "hydrostatic_pressure",
+            self.variables_plus,
+            self.aux_variables_plus,
+            self.parameters,
+        )
+        P_mat_L_star = self._model_eval(
+            "hydrostatic_pressure", qLs, qauxL, self.parameters
+        )
+        P_mat_R_star = self._model_eval(
+            "hydrostatic_pressure", qRs, qauxR, self.parameters
+        )
+
+        Dm_jump = (P_mat_L_raw - P_mat_L_star) @ self.normal
+        Dp_jump = (P_mat_R_star - P_mat_R_raw) @ self.normal
+
+        base_fluct = super().numerical_fluctuations()
+        Dp_base = ZArray(base_fluct[0, :])
+        Dm_base = ZArray(base_fluct[1, :])
+
+        return ZArray([Dp_base + Dp_jump, Dm_base + Dm_jump])
+
 
 class PositiveNonconservativeRusanov(PositiveRusanov, NonconservativeRusanov):
     """PositiveNonconservativeRusanov. (class)."""
