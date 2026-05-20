@@ -3641,6 +3641,139 @@ class AffineProjection(Operation):
                 f"\\quad dz = ({sp.latex(self._h)}) \\, d\\zeta$")
 
 
+class SigmaTransform(Operation):
+    """Change of variables (t, x, [y,] z) → (t, x, [y,] ζ) on a PDE leaf.
+
+    With ζ = (z − b) / h, every field ψ(t, x, [y,] z) becomes
+    ψ̃(t, x, [y,] ζ).  Derivatives are rewritten via the chain rule:
+
+        ∂_s ψ |_z = ∂_s ψ̃ |_ζ − (∂_s(ζ h + b) / h) · ∂_ζ ψ̃,
+            s ∈ {t, x, y}
+        ∂_z ψ     = (1/h) · ∂_ζ ψ̃
+
+    Reference: Kowalski & Torrilhon 2019, "Moment Approximations and
+    Model Cascades for Shallow Flow", Commun. Comput. Phys. 25 (2019),
+    eqs. (3.5)–(3.9).  The conservative form (their (3.8),
+
+        h · ∂_s ψ = ∂_s(h ψ̃) − ∂_ζ(∂_s(ζ h + b) ψ̃))
+
+    is the result of multiplying the chain-rule form by ``h`` and
+    applying the product rule.  Reach it with
+    ``model.apply(Multiply(state.h)).apply(Recombine(...))`` *after*
+    this transform.
+
+    Where it fits relative to :class:`AffineProjection`:
+      * ``AffineProjection`` rewrites *integrals* ``∫_b^η f(z) dz`` →
+        ``h · ∫_0^1 f(ζh+b) dζ`` at integration time; the underlying PDE
+        stays in z.
+      * ``SigmaTransform`` rewrites the **PDE itself** in (t, x, [y,] ζ).
+
+    The two operations are complementary.  Use ``SigmaTransform`` when
+    you want the PDE on the fixed reference domain ζ ∈ [0, 1] *before*
+    the moment / Galerkin step (K&T 2019, §3.1).  Use
+    ``AffineProjection`` when you keep the PDE in z and only need the
+    z-integral substituted at projection time (SME / VAM derivations
+    that follow ``physical_z.py``).
+
+    The operator:
+      * substitutes every free ``state.z`` by ``ζ·h + b``;
+      * walks every :class:`sympy.Derivative` and rewrites ∂_s and ∂_z
+        per the formulas above;
+      * substitutes ``z → ζ`` in the argument list of every
+        :class:`sympy.Function` atom (so ``u(t, x, z)`` becomes
+        ``u(t, x, ζ)``).  The function head is kept — ψ and ψ̃ share a
+        name in K&T's text; sympy distinguishes by the call arguments.
+
+    Only first-order derivatives are supported.  Mixed / higher-order
+    z-derivatives raise (the K&T 2019 reference system has none at the
+    relevant derivation stage; see eqs. (3.1)–(3.3)).
+    """
+
+    def __init__(self, state, *, sigma=None, name="sigma_transform",
+                 description=None):
+        self._state = state
+        self._z = state.z
+        self._h = state.h
+        self._b = state.b
+        # The new vertical symbol.  Default: state.zeta_ref (the Symbol),
+        # consistent with downstream basis evaluation on [0, 1].
+        self._sigma = sigma if sigma is not None else state.zeta_ref
+        coords_s = [state.t] + state.coords_h
+        self._chain_coords = tuple(coords_s)            # (t, x[, y])
+        super().__init__(
+            name=name,
+            description=(description or
+                         f"σ-transform: ζ = ({self._z} − {self._b}) / {self._h}, "
+                         "chain-rule on ∂_t, ∂_x[, ∂_y], ∂_z"),
+        )
+
+    def _leaf_sp(self, sp_expr):
+        return self._rewrite(sp_expr)
+
+    def _rewrite(self, e):
+        """Recursive chain-rule rewrite.
+
+        Convention:
+          * inside a :class:`sympy.Function` argument list (the inner
+            args of e.g. ``u(t, x, z)``), substitute z → ζ — this keeps
+            the mapped function ``ψ̃(t, x, ζ)`` opaque in ζ, so
+            ``Derivative(ψ̃, ζ)`` cannot be sympy-chained back into
+            ``∂ψ/∂z · h``.
+          * free atomic z outside Function arg lists is substituted by
+            ζ·h + b (K&T's z = h ζ + h_b — needed for hydrostatic
+            pressure  p_H = (η − z) ρ g  → (η − (ζh+b)) ρ g).
+          * every :class:`sympy.Derivative` is rewritten per the chain
+            rule formulas in the class docstring.
+        """
+        if isinstance(e, sp.Derivative):
+            inner_new = self._rewrite(e.expr)
+            result = inner_new
+            for var, order in e.variable_count:
+                for _ in range(int(order)):
+                    result = self._apply_one_derivative(result, var)
+            return result
+        # Function: replace z by σ in the *argument list*, recurse into
+        # each arg, then rebuild.  Catches all of u, v, w, p, tau_ij.
+        if isinstance(e, sp.Function):
+            new_args = []
+            for a in e.args:
+                a_renamed = a.xreplace({self._z: self._sigma})
+                a_renamed = self._rewrite(a_renamed)
+                new_args.append(a_renamed)
+            return e.func(*new_args)
+        # Generic node with sub-args (Add, Mul, Pow, ...).
+        if e.args:
+            new_args = tuple(self._rewrite(a) for a in e.args)
+            if any(n is not o for n, o in zip(new_args, e.args)):
+                return e.func(*new_args)
+            return e
+        # Atom (Symbol/Number/...): free z in non-Function context.
+        if e == self._z:
+            return self._sigma * self._h + self._b
+        return e
+
+    def _apply_one_derivative(self, inner_expr, var):
+        """Apply one first-order chain-rule step ∂_var to ``inner_expr``."""
+        sigma = self._sigma
+        h, b = self._h, self._b
+
+        if var == self._z:
+            # ∂_z ψ → (1/h) · ∂_σ ψ̃
+            return (sp.Integer(1) / h) * sp.Derivative(inner_expr, sigma)
+        if var in self._chain_coords:
+            # ∂_s ψ|_z → ∂_s ψ̃ − (∂_s(σ·h + b) / h) · ∂_σ ψ̃
+            jacobian = sp.Derivative(sigma * h + b, var)
+            return (sp.Derivative(inner_expr, var)
+                    - (jacobian / h) * sp.Derivative(inner_expr, sigma))
+        return sp.Derivative(inner_expr, var)
+
+    def _repr_latex_(self):
+        return (rf"$\zeta = \frac{{{sp.latex(self._z)} - {sp.latex(self._b)}}}"
+                rf"{{{sp.latex(self._h)}}}, \quad "
+                rf"\partial_s \psi |_z = \partial_s \tilde\psi "
+                rf"- \frac{{\partial_s(\zeta h + b)}}{{h}} \partial_\zeta \tilde\psi$")
+
+
 def _decompose_deriv_factor(term, var):
     """Decompose ``term`` as ``(coeff, inner)`` so that ``term == coeff * Derivative(inner, var)``.
 
