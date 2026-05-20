@@ -135,32 +135,50 @@ def test_no_jacobian_residue_on_z_independent_function():
         "z-dependent ψ must still pick up the jacobian"
 
 
-def test_kinematic_bc_factories():
-    """KinematicBC.bottom / .surface produce the right substitution
-    dict in both physical-z and σ-coords modes.
+def test_kinematic_bc_explicit_at():
+    """``KinematicBC(state, interface, at=...)`` covers physical-z and
+    σ-coord cases with one signature; back-compat aliases agree.
     """
-    from zoomy_core.model.models.ins_generator import KinematicBC
+    from zoomy_core.model.models.ins_generator import (
+        KinematicBC, KinematicBCBottom, KinematicBCSurface, InterfaceKBC,
+    )
     s = _state_2d()
 
-    # σ-coords bottom
-    bot_sigma = KinematicBC.bottom(s, sigma=True)
-    expected = {s.w.subs(s.z, sp.S.Zero):
-                sp.Derivative(s.b, s.t)
-                + s.u.subs(s.z, sp.S.Zero) * sp.Derivative(s.b, s.x)}
-    assert bot_sigma.subs_map == expected
+    # Physical-z default: at = interface.
+    bot_phys = KinematicBC(s, s.b)
+    legacy_b = KinematicBCBottom(s)
+    assert bot_phys.subs_map == legacy_b.subs_map
 
-    # σ-coords surface
-    sur_sigma = KinematicBC.surface(s, sigma=True)
-    expected = {s.w.subs(s.z, sp.S.One):
-                sp.Derivative(s.eta, s.t)
-                + s.u.subs(s.z, sp.S.One) * sp.Derivative(s.eta, s.x)}
-    assert sur_sigma.subs_map == expected
+    sur_phys = KinematicBC(s, s.eta)
+    legacy_s = KinematicBCSurface(s)
+    assert sur_phys.subs_map == legacy_s.subs_map
 
-    # physical-z bottom — must match legacy KinematicBCBottom
-    from zoomy_core.model.models.ins_generator import KinematicBCBottom
-    legacy = KinematicBCBottom(s)
-    bot_phys = KinematicBC.bottom(s, sigma=False)
-    assert bot_phys.subs_map == legacy.subs_map
+    # σ-coord boundaries: explicit ``at=`` overrides the default.
+    bot_sigma = KinematicBC(s, s.b, at=sp.S.Zero)
+    assert bot_sigma.subs_map == {
+        s.w.subs(s.z, sp.S.Zero):
+            sp.Derivative(s.b, s.t)
+            + s.u.subs(s.z, sp.S.Zero) * sp.Derivative(s.b, s.x)
+    }
+
+    sur_sigma = KinematicBC(s, s.eta, at=sp.S.One)
+    assert sur_sigma.subs_map == {
+        s.w.subs(s.z, sp.S.One):
+            sp.Derivative(s.eta, s.t)
+            + s.u.subs(s.z, sp.S.One) * sp.Derivative(s.eta, s.x)
+    }
+
+    # Internal interface with mass flux (multi-layer pattern).
+    z_1 = sp.Function("z_1", real=True)(s.t, s.x)
+    m_1 = sp.Function("m_1", real=True)(s.t, s.x)
+    bc = KinematicBC(s, z_1, mass_flux=m_1)
+    rhs_expected = (sp.Derivative(z_1, s.t)
+                    + s.u.subs(s.z, z_1) * sp.Derivative(z_1, s.x)
+                    + m_1 / s.rho)
+    assert bc.subs_map == {s.w.subs(s.z, z_1): rhs_expected}
+
+    # InterfaceKBC is now an alias of KinematicBC — identical behaviour.
+    assert InterfaceKBC is KinematicBC
 
 
 def test_3d_state_emits_y_chain_terms():

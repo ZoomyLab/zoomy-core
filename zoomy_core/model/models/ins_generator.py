@@ -4428,141 +4428,125 @@ class materials:
 # Assumptions library
 # ---------------------------------------------------------------------------
 
-class InterfaceKBC(Assumption):
-    """Kinematic BC at an arbitrary interface ``z = interface(t, x[, y])``.
-
-    Generalises :class:`KinematicBCBottom` / :class:`KinematicBCSurface`:
-    parameterised on the interface height and an optional mass flux
-    ``m`` (mass per unit area per unit time crossing the interface),
-    so a single class covers solid bed, free surface, and every
-    internal layer interface in a multi-layer derivation.
-
-    ``w|_{z=interface}`` is substituted with::
-
-        ∂_t interface + u|·∂_x interface [+ v|·∂_y interface] + mass_flux / rho
-
-    Pass ``mass_flux=None`` for impermeable interfaces (bottom / top);
-    pass a sympy expression (typically a freshly-minted ``Function``)
-    for internal interfaces whose flux is an unknown of the resulting
-    system.
-
-    Usage::
-
-        # Bottom (identical to KinematicBCBottom):
-        model.apply(InterfaceKBC(state, state.b))
-
-        # Free surface (identical to KinematicBCSurface):
-        model.apply(InterfaceKBC(state, state.eta))
-
-        # Internal layer interface with mass flux m_1:
-        model.apply(InterfaceKBC(state, z_1, mass_flux=m_1))
-    """
-
-    def __init__(self, state: StateSpace, interface, mass_flux=None,
-                 name=None, description=None):
-        s = state
-        w_at = s.w.subs(s.z, interface)
-        u_at = s.u.subs(s.z, interface)
-        rhs = Derivative(interface, s.t) + u_at * Derivative(interface, s.x)
-        if s.has_y:
-            v_at = s.v.subs(s.z, interface)
-            rhs += v_at * Derivative(interface, s.y)
-        if mass_flux is not None:
-            rhs = rhs + mass_flux / s.rho
-        default_name = f"kinematic_bc@{interface}"
-        super().__init__({w_at: rhs}, name=name or default_name)
-        # ``Relation.__init__`` doesn't carry a description, so attach
-        # one directly so history_mermaid labels stay readable.
-        self.description = description or (
-            f"w|_{{z={interface}}} = ∂_t + u·∂_x (+ v·∂_y) (+ m/ρ)"
-        )
-
-
 class KinematicBC(Assumption):
     """Kinematic boundary condition at a moving interface.
 
-    The interface ``η_interface(t, x[, y])`` (typically ``state.b`` for
-    the bottom or ``state.eta = b + h`` for the free surface) moves
-    with the fluid:
+    One explicit signature covering every kinematic-BC pattern in the
+    codebase — solid bed, free surface, σ-domain boundary in a
+    σ-transformed system, and every internal interface in a multi-layer
+    derivation.
+
+    The interface ``interface(t, x[, y])`` moves with the fluid:
 
     .. math::
 
         w\\big|_\\text{at}
-          \\;=\\; \\partial_t \\eta_\\text{interface}
-          + u\\big|_\\text{at}\\, \\partial_x \\eta_\\text{interface}
-          \\;[\\,+\\, v\\big|_\\text{at}\\, \\partial_y \\eta_\\text{interface}\\,] .
+          \\;=\\; \\partial_t \\,\\text{interface}
+          + u\\big|_\\text{at}\\, \\partial_x \\,\\text{interface}
+          \\;[\\,+\\, v\\big|_\\text{at}\\, \\partial_y \\,\\text{interface}\\,]
+          \\;+\\; \\frac{\\text{mass\\_flux}}{\\rho}\\,.
 
     Parameters
     ----------
     state : StateSpace
     interface : sympy expression
-        The moving interface — usually ``state.b`` (bottom) or
-        ``state.eta`` (free surface).  Must be a function of
-        ``(t, x[, y])`` only.
-    at : sympy expression
+        The moving surface, a function of ``(t, x[, y])``.  Typical
+        choices: ``state.b`` (bottom), ``state.eta`` (free surface),
+        a freshly-minted ``Function("z_k")(t, x[, y])`` for an
+        internal multi-layer interface.
+    at : sympy expression, optional
         Vertical-coordinate value at which the velocity fields are
-        sampled.  Choose by which coordinate system the system is in:
+        sampled.  Defaults to ``interface`` — the natural physical-z
+        choice "evaluate at the interface itself".  Use an explicit
+        ``at`` when the system has been mapped to a reference vertical
+        (e.g. ``at=sp.S.Zero`` after :class:`SigmaTransform` for the
+        bottom; ``at=sp.S.One`` for the surface; per-layer σ values
+        in ML).  The substitution is purely structural — replaces
+        ``state.z`` by ``at`` in the velocity arg lists — so it works
+        in physical ``(t, x[, y], z)`` or post-σ ``(t, x[, y], ζ)``
+        form regardless.
+    mass_flux : sympy expression, optional
+        Mass flux ``m`` per unit area per unit time crossing the
+        interface.  Adds ``mass_flux / ρ`` to the RHS.  Default
+        ``None`` for impermeable interfaces (bottom / free surface).
+        Use a fresh ``Function`` for internal layer interfaces whose
+        flux is an unknown of the resulting multi-layer system.
+    name, description : str, optional
+        History labels.
 
-        * physical z:  ``at = state.b`` (bottom) or ``at = state.eta`` (surface)
-        * σ coords:    ``at = sympy.S.Zero`` (bottom) or ``at = sympy.S.One`` (surface)
+    Examples
+    --------
+    Single-layer in physical z (default ``at=interface``)::
 
-        The substitution is structural — it replaces ``state.z`` by
-        ``at`` in the velocity function arguments — so it works
-        whether the system is in physical (t, x[, y], z) or
-        post-σ-transform (t, x[, y], ζ) form.
-    name : str, optional
-        History label.  Default: ``"kinematic_bc_at_<at>"``.
+        sys.apply(KinematicBC(state, state.b))
+        sys.apply(KinematicBC(state, state.eta))
 
-    Use :meth:`bottom` and :meth:`surface` factory methods for the
-    canonical interfaces.
+    Single-layer after :class:`SigmaTransform` — evaluate at the σ
+    endpoints rather than at the (now opaque) physical interface::
+
+        sys.apply(KinematicBC(state, state.b,   at=sp.S.Zero))
+        sys.apply(KinematicBC(state, state.eta, at=sp.S.One))
+
+    Multi-layer (interfaces ``z_k``; internals carry a mass flux
+    ``m_k``; each layer's state has its own σ but the formula is the
+    same — only ``interface``, ``at``, and ``mass_flux`` change per
+    call)::
+
+        for k, z_k in enumerate(interfaces):
+            m_k = mass_fluxes[k] if 0 < k < N else None
+            sys_layer_above.apply(KinematicBC(state_above, z_k, at=0, mass_flux=m_k))
+            sys_layer_below.apply(KinematicBC(state_below, z_k, at=1, mass_flux=m_k))
     """
 
-    def __init__(self, state, interface, at, name=None):
+    def __init__(self, state, interface, *, at=None,
+                 mass_flux=None, name=None, description=None):
         s = state
+        if at is None:
+            at = interface
         w_at = s.w.subs(s.z, at)
         u_at = s.u.subs(s.z, at)
         rhs = Derivative(interface, s.t) + u_at * Derivative(interface, s.x)
         if s.has_y:
             v_at = s.v.subs(s.z, at)
             rhs += v_at * Derivative(interface, s.y)
+        if mass_flux is not None:
+            rhs = rhs + mass_flux / s.rho
         if name is None:
-            name = f"kinematic_bc_at_{at}"
+            # "evaluated at the interface itself" (default physical-z) →
+            # ``kinematic_bc@interface``; "evaluated at a different
+            # vertical value" (post-σ, ML per-layer σ values, ...) →
+            # ``kinematic_bc@interface|_{at=...}``.
+            name = (f"kinematic_bc@{interface}" if at == interface
+                    else f"kinematic_bc@{interface}|_{{at={at}}}")
         super().__init__({w_at: rhs}, name=name)
-
-    @classmethod
-    def bottom(cls, state, *, sigma=False):
-        """KBC at the bottom interface ``η_interface = state.b``.
-
-        * ``sigma=False`` (physical z): evaluates at ``state.b``.
-        * ``sigma=True``  (σ coords):   evaluates at ``ζ = 0``.
-        """
-        at = sp.S.Zero if sigma else state.b
-        return cls(state, interface=state.b, at=at, name="kinematic_bc_bottom")
-
-    @classmethod
-    def surface(cls, state, *, sigma=False):
-        """KBC at the free surface ``η_interface = state.eta``.
-
-        * ``sigma=False`` (physical z): evaluates at ``state.eta``.
-        * ``sigma=True``  (σ coords):   evaluates at ``ζ = 1``.
-        """
-        at = sp.S.One if sigma else state.eta
-        return cls(state, interface=state.eta, at=at, name="kinematic_bc_surface")
+        # ``Relation.__init__`` doesn't carry a description; attach so
+        # history-mermaid labels stay readable.
+        flux_tail = f" + {mass_flux}/ρ" if mass_flux is not None else ""
+        self.description = description or (
+            f"w|_{{at={at}}} = ∂_t {interface} + u|·∂_x {interface}"
+            f"{' + v|·∂_y ' + str(interface) if s.has_y else ''}"
+            f"{flux_tail}"
+        )
 
 
-# Convenience aliases for the canonical physical-z interfaces — keep
-# the long-form names so existing callers ``KinematicBCBottom(state)``
-# / ``KinematicBCSurface(state)`` continue to work; new code should
-# prefer ``KinematicBC.bottom(state)`` / ``KinematicBC.surface(state)``.
-
+# Back-compat aliases — the canonical physical-z bottom / surface KBCs.
+# Used by ``derived_chain/depth_integrated.py``, ``model_derivation.py``,
+# the SME / VAM walkthroughs.  New code should call ``KinematicBC``
+# directly with explicit ``interface`` (and ``at=`` when not physical-z).
 def KinematicBCBottom(state: StateSpace):
     """``w|_{z=b} = ∂_t b + u_b ∂_x b [+ v_b ∂_y b]`` (physical z)."""
-    return KinematicBC.bottom(state, sigma=False)
+    return KinematicBC(state, state.b, name="kinematic_bc_bottom")
 
 
 def KinematicBCSurface(state: StateSpace):
     """``w|_{z=η} = ∂_t η + u_s ∂_x η [+ v_s ∂_y η]`` (physical z)."""
-    return KinematicBC.surface(state, sigma=False)
+    return KinematicBC(state, state.eta, name="kinematic_bc_surface")
+
+
+# ``InterfaceKBC`` was the previous "arbitrary interface (with mass
+# flux)" form; subsumed by :class:`KinematicBC` (which now accepts
+# ``mass_flux`` directly).  Keep the symbol so legacy imports resolve.
+InterfaceKBC = KinematicBC
 
 
 # ``ContinuityClosure`` removed — superseded by the composable pipeline
