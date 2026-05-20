@@ -365,9 +365,22 @@ class Zstruct(SimpleNamespace):
         return f"Zstruct({args})"
 
     def __getitem__(self, key):
-        """Hook `__getitem__`."""
+        """Hook `__getitem__`.
+
+        Supports lookup by string name, by integer index, or by any
+        object with a ``.name`` attribute that matches a key (e.g. a
+        sympy ``Symbol``).  The Symbol path lets callers write
+        ``z[sym]`` after iterating ``for sym in z`` — the iterator
+        yields *values* (Symbols), so re-indexing them needs to round-
+        trip through ``Symbol.name``.
+        """
         if isinstance(key, str):
             return getattr(self, key)
+        # Symbol (or any object with .name) → look up by name when the
+        # name matches a key.
+        name = getattr(key, "name", None)
+        if isinstance(name, str) and name in self.keys():
+            return getattr(self, name)
         return self.values()[key]
 
     def __setitem__(self, key, value):
