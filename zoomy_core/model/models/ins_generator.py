@@ -108,7 +108,7 @@ class StateSpace:
         return self.dim > 2
 
     def __repr__(self):
-        n_tau = len(self.tau)
+        n_tau = self.tau.length()
         fields = "[u,v,w,p]" if self.has_y else "[u,w,p]"
         return f"StateSpace(dim={self.dim}, fields={fields}, tau={n_tau} components)"
 
