@@ -183,6 +183,15 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
     pressure_maxit = param.Integer(
         default=500, bounds=(1, None),
         doc="Maximum iterations for the elliptic pressure solve")
+    time_order = param.Integer(
+        default=1, bounds=(1, 2),
+        doc=("Order of the time integration.  1: single pred-press-corr "
+             "cycle (forward-Euler-style Chorin step).  2: SSPRK2 / Heun "
+             "wrap around the full cycle — two cycles of length dt then "
+             "Heun-average ``Q^{n+1} = 0.5·(Q^n + Q^(2))``.  Note the "
+             "cont_jk constraints are satisfied exactly at each cycle "
+             "output, the Heun average carries a small O(dt²) drift "
+             "that the next step's pressure solve corrects."))
 
     def __init__(self, sm_pred, sm_press, sm_corr, **kwargs):
         if not isinstance(sm_pred, SystemModel):
@@ -264,9 +273,19 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
             dim = symbolic_model.dimension
             h_idx = _var_index(symbolic_model, "h")
             eps_wet = self._get_dry_threshold(symbolic_model)
+            # When ``b`` is a state with trivial ``∂_t b = 0``, exempt
+            # it from slope limiting: the bathymetry is static and the
+            # LSQ slope from cell-centre values is the actual b'(x);
+            # limiting it would smear the topography.  Audusse HR still
+            # applies on the unlimited face values.
+            state_names = [str(s) for s in symbolic_model.state]
+            unlimited = []
+            if "b" in state_names:
+                unlimited.append(state_names.index("b"))
             return FreeSurfaceLSQMUSCL(
                 mesh, dim, h_index=h_idx,
                 eps_wet=eps_wet, limiter=self.limiter,
+                unlimited_indices=unlimited or None,
             )
         return super()._build_reconstruction(mesh, symbolic_model)
 
@@ -461,28 +480,55 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
                     break
 
     def step(self, dt):
-        """One Chorin step: predictor → pressure → corrector.
+        """One Chorin step.
 
-        Predictor: inherited :class:`HyperbolicSolver.step` — proper
-        Rusanov + NCP + indexed-BC.  Mass-conservative.
+        ``time_order == 1`` (default): single ``predictor → pressure →
+        corrector`` cycle (forward-Euler-style Chorin step).
+            - Predictor: inherited :class:`HyperbolicSolver.step` —
+              proper Rusanov + NCP + indexed-BC; mass-conservative.
+            - Pressure: matrix-free GMRES on the lambdified elliptic
+              residual (linear in P ⇒ 1–2 iters from warm start).
+            - Corrector: one lambdify call to ``state_update`` +
+              atomic in-place assignment.
 
-        Pressure: scipy.optimize.fsolve on the lambdified elliptic
-        residual (linear in P ⇒ 1–2 Newton iters from warm start).
-
-        Corrector: one lambdify call to ``state_update`` + atomic
-        in-place assignment.  Read-then-write is safe — Python
-        evaluates the RHS fully before assigning to the LHS slice.
+        ``time_order == 2``: SSPRK2 / Heun wrap on the full cycle.
+        Two cycles of length ``dt`` are applied sequentially, then
+        Heun-averaged: ``Q^{n+1} = 0.5·(Q^n + Q^(2))``.  The
+        cont_jk constraints are satisfied exactly at each cycle
+        output; the Heun average carries a small ``O(dt²)`` drift
+        the next step's pressure solve corrects.
         """
+        if self.time_order == 2:
+            Q_n    = self._sim_Q.copy()
+            Qaux_n = self._sim_Qaux.copy()
+            t_n    = self._sim_time
+            # Cycle 1.
+            self._chorin_cycle(dt)
+            # Cycle 2 (starting from Q^(1) the cycle just produced).
+            self._chorin_cycle(dt)
+            Q2    = self._sim_Q
+            Qaux2 = self._sim_Qaux
+            # Heun average.  Refresh derivative aux from the averaged
+            # state so the next step sees a consistent ∂_x Q.
+            self._sim_Q    = 0.5 * (Q_n + Q2)
+            self._sim_Qaux = 0.5 * (Qaux_n + Qaux2)
+            self._sim_time = t_n + dt
+            self.update_aux_variables()
+        else:
+            self._chorin_cycle(dt)
+
+    def _chorin_cycle(self, dt):
+        """One ``predictor → pressure → corrector`` cycle — the
+        innermost building block.  Advances ``_sim_time`` by ``dt``."""
         super().step(dt)              # predictor: parent's RK + flux + source
         self.update_aux_variables()
         self._step_pressure(dt)
         self.update_aux_variables()
         self._step_corrector(dt)
         self.update_aux_variables()
-        # Parent's step advances self._sim_time internally? Check.
-        # HyperbolicSolver.step doesn't update self._sim_time — that's
-        # done in run_simulation.  Our step is the user-facing entry
-        # point, so we track time here.
+        # Parent's HyperbolicSolver.step does not advance _sim_time
+        # (run_simulation does); this is the user-facing entry, so we
+        # track time here.
         self._sim_time += dt
 
     def _params_with_dt(self, base, dt):
