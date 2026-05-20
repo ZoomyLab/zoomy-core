@@ -1439,21 +1439,26 @@ class _StripArgsLatexPrinter(_LatexPrinter):
 
     Shapes recognised:
 
-    ===========  ============  ================================
-    arity        canonical     restriction-bar variable
-    ===========  ============  ================================
-    ``f(t,x)``   ``(t, x)``    *none — purely horizontal, strip*
-    ``f(t,x,y)`` ``(t, x, y)`` *none — 3D horizontal, strip*
-    ``f(t,x,z)`` ``(t, x, z)`` ``z``  — vertical / 2D vertical
-    ``f(t,x,y,z)`` ``(t,x,y,z)`` ``z`` — vertical / 3D vertical
+    ============== ============== ================================
+    arity          canonical      restriction-bar variable
+    ============== ============== ================================
+    ``f(t,x)``     ``(t, x)``     *none — purely horizontal, strip*
+    ``f(t,x,y)``   ``(t, x, y)``  *none — 3D horizontal, strip*
+    ``f(t,x,z)``   ``(t, x, z)``  ``z``  — vertical / 2D vertical
+    ``f(t,x,y,z)`` ``(t,x,y,z)``  ``z`` — vertical / 3D vertical
+    ``f(t,x,ζ)``   ``(t, x, ζ)``  ``ζ`` — **σ-mapped**, head decorated ``\\tilde f``
+    ``f(t,x,y,ζ)`` ``(t,x,y,ζ)``  ``ζ`` — σ-mapped, 3D
     ``f(ζ) / f(z)`` ``(ζ,)`` or ``(z,)`` — basis test functions
-                                (bar variable elided)
-    ===========  ============  ================================
+                                  (bar variable elided)
+    ============== ============== ================================
 
     Examples (in 2D)::
 
         u(t, x, z)         →  u
         u(t, x, b+h)       →  u|_{z=b+h}
+        u(t, x, zeta)      →  \\tilde{u}                            (after SigmaTransform)
+        u(t, x, 0)         →  \\tilde{u}|_{ζ=0}                     (bottom value, σ coords)
+        u(t, x, 1)         →  \\tilde{u}|_{ζ=1}                     (top value, σ coords)
         b(t, x)            →  b
         phi_0(zeta)        →  phi_0
         phi_0(z)           →  phi_0
@@ -1461,6 +1466,16 @@ class _StripArgsLatexPrinter(_LatexPrinter):
         phi_0(b+h)         →  phi_0|_{b+h}
         phi_0((z-b)/h)     →  phi_0|_{(z-b)/h}
         Subs(u(t,x,z),z,b) →  u|_{z=b}        (via sympy's Subs printer)
+
+    The σ-mapped (tilde) detection fires when the last argument
+    structurally contains the canonical ``ζ`` symbol (i.e. the field
+    has been transported across :class:`SigmaTransform`).  Functions
+    that still depend on the physical ``z`` render bare-or-restricted
+    as before.  Numeric ``0``/``1`` in the last slot is ambiguous from
+    args alone; we treat them as σ-mapped boundary values when
+    rendered after a σ-transform-aware derivation (the common case
+    when this shape appears).  Mixed-coord derivations should make
+    the bar variable explicit at the call site.
     """
 
     _t = sp.Symbol("t", real=True)
@@ -1560,6 +1575,29 @@ class _StripArgsLatexPrinter(_LatexPrinter):
         tex = self._deal_with_super_sub(name)
         args = expr.args
 
+        # σ-transform detection: if the last "vertical" arg structurally
+        # contains the canonical ζ symbol (i.e. the field has been
+        # transported across SigmaTransform), decorate the head as
+        # ``\tilde f`` and use ζ as the bar variable.  This is the
+        # display-only counterpart of the truly distinct sympy object
+        # ``Function("u")(t, x, ζ)`` — semantically already a different
+        # function from ``Function("u")(t, x, z)``.
+        def _is_sigma_mapped(vertical_arg):
+            """True iff ``vertical_arg`` is in the ζ-domain.
+
+            Triggers when the arg structurally contains the canonical
+            ζ symbol *or* equals the canonical ζ-domain endpoint
+            (``0`` or ``1``).  Physical-z boundary values
+            (``b``, ``η = b + h``, …) are functions and don't match;
+            they keep the bare-or-restricted physical rendering.
+            """
+            if vertical_arg == sp.S.Zero or vertical_arg == sp.S.One:
+                return True
+            try:
+                return self._zeta in vertical_arg.free_symbols
+            except AttributeError:
+                return False
+
         # Identify the shape: which symbols are "natural", and which
         # symbol — if any — is the restriction-bar variable.
         bar_var = None
@@ -1576,14 +1614,24 @@ class _StripArgsLatexPrinter(_LatexPrinter):
             recognised = True
         elif (len(args) == 3
               and args[0] == self._t and args[1] == self._x):
-            # f(t, x, z) — 2D vertical.  Last arg is the bar variable.
-            bar_var, bar_value = self._z, args[2]
+            # f(t, x, *) — 2D vertical.  Choose bar variable by the
+            # last arg's coordinate flavour: ζ-flavoured ⇒ σ-mapped
+            # (tilde), otherwise physical z.
+            if _is_sigma_mapped(args[2]):
+                tex = r"\tilde{%s}" % tex
+                bar_var, bar_value = self._zeta, args[2]
+            else:
+                bar_var, bar_value = self._z, args[2]
             recognised = True
         elif (len(args) == 4
               and args[0] == self._t and args[1] == self._x
               and args[2] == self._y):
-            # f(t, x, y, z) — 3D vertical.
-            bar_var, bar_value = self._z, args[3]
+            # f(t, x, y, *) — 3D vertical.  Same coord-flavour rule.
+            if _is_sigma_mapped(args[3]):
+                tex = r"\tilde{%s}" % tex
+                bar_var, bar_value = self._zeta, args[3]
+            else:
+                bar_var, bar_value = self._z, args[3]
             recognised = True
         elif len(args) == 1:
             # f(ζ) — basis-style: the single arg is the bar variable.
