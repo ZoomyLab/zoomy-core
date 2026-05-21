@@ -3864,11 +3864,13 @@ def _rule_anti_product_rule(expr, *, vars=(), **kwargs):
     ``Derivative(α·f, v)`` term.  Unmatched Derivative terms and
     Derivative-free terms pass through unchanged.
 
-    The match is signed: two terms must have the same sign to combine
-    (``+α·∂_v f`` with ``+f·∂_v α`` → ``+∂_v(α f)``;
-    ``−α·∂_v f`` with ``−f·∂_v α`` → ``−∂_v(α f)``).  Numerical
-    coefficients on each side are absorbed into the coeff / inner parts
-    before matching, so ``2α·∂_v f + 2f·∂_v α`` still pairs correctly.
+    The match is signed and accepts a common numerical (rational)
+    prefactor on both terms: ``k·α·∂_v f + k·f·∂_v α → k·∂_v(α f)``
+    pairs cleanly for any common rational ``k``.  This is needed
+    because earlier pipeline steps (layer-weight `l_α = 1/L`, layer-
+    mean closure factors, σ-Galerkin normalisations) typically leave
+    a numerical prefactor on both conjugate terms; without absorbing
+    it the structural comparison ``α == α'`` fails on ``α/2 ≠ α``.
     """
     for v in vars:
         terms = list(Add.make_args(sp.expand(expr)))
@@ -3876,19 +3878,26 @@ def _rule_anti_product_rule(expr, *, vars=(), **kwargs):
         for i, term in enumerate(terms):
             d = _decompose_deriv_factor(term, v)
             if d is not None:
-                decomp[i] = d
+                ci, ii = d
+                # Extract a numerical (rational) prefactor from ``ci``
+                # so the structural comparison is on the symbolic part
+                # only.  ``as_coeff_Mul`` returns ``(numeric_part, rest)``
+                # for any Mul / atom.
+                k_i, sym_i = ci.as_coeff_Mul()
+                decomp[i] = (k_i, sym_i, ii)
         used = set()
         for i in list(decomp):
             if i in used:
                 continue
-            ci, ii = decomp[i]
+            k_i, sym_i, ii = decomp[i]
             for j in list(decomp):
                 if j <= i or j in used:
                     continue
-                cj, ij = decomp[j]
-                # α·∂_v f + f·∂_v α  ⇔  ci == ij AND cj == ii
-                if ci == ij and cj == ii:
-                    terms[i] = sp.Derivative(ci * ii, v)
+                k_j, sym_j, ij = decomp[j]
+                # Match if the symbolic parts swap (sym_i ↔ ij,
+                # sym_j ↔ ii) AND the numerical prefactors agree.
+                if k_i == k_j and sym_i == ij and sym_j == ii:
+                    terms[i] = k_i * sp.Derivative(sym_i * ii, v)
                     terms[j] = S.Zero
                     used.update([i, j])
                     break
