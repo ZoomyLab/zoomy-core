@@ -4427,28 +4427,36 @@ class materials:
 class LayerMeanClosure(Operation):
     """Specialise a σ-resolved system to L piecewise-constant layers.
 
-    For each leaf that depends on the σ-coordinate, substitute the
-    opaque velocity ``u(t, x, σ)`` by the piecewise-constant ansatz
-    ``u(t, x, σ) = u_α(t, x)`` for ``σ ∈ [σ_{α-1/2}, σ_{α+1/2}]``, then
-    integrate the leaf over each layer's σ-bounds explicitly.  The
-    result is one per-layer leaf with key ``layer_α``.
+    For each leaf that depends on the σ-coordinate, project onto each
+    layer ``α = 1..L``: integrate symbolically over the layer's
+    σ-bounds ``[σ_{α-1/2}, σ_{α+1/2}]`` while keeping ``u(t, x, σ)``
+    *opaque*, then resolve the surviving bulk integrals using the
+    **layer-mean closure** ``∫_{layer α} u(σ) dσ = l_α · u_α(t, x)``.
+    Interior IBP rules handle ``f(σ) · u^k · ∂_σ u`` terms via the
+    identity ``u^k · ∂_σ u = (1/(k+1)) ∂_σ u^{k+1}``.
 
-    Why ``Piecewise`` rather than ``Σ u_α · H(σ - σ_{α-1/2}) (1 - H(σ - σ_{α+1/2}))``:
-    sympy integrates ``Piecewise``-substituted integrands cleanly under
-    explicit-bounds integration; the Heaviside-product form trips the
-    Meijer-G fallback in ``sp.integrate(method="analytical")``.
+    The boundary atoms ``u(t, x, σ_{α±1/2})`` and ``w(t, x, σ_{α±1/2})``
+    are deliberately **left opaque** in the resulting per-layer leaves.
+    That is the user's modeling choice — apply :class:`KinematicBC`
+    with ``mass_flux=G_{α+1/2}/ρ`` at each interface to resolve ``w``,
+    and apply an interface-velocity choice
+    (donor-cell / central / sign-upwind) for the surviving ``u``
+    boundary atoms.  AHS26 (9) is the standard donor-cell-by-G choice;
+    other closures are equally valid and now visible as separate
+    substitutions rather than buried in the projection.
 
-    Interface upwinding (AHS26 (9)) emerges *automatically* from sympy's
-    evaluation of ``Piecewise`` at the layer boundary: layer α's
-    contribution at ``σ_{α+1/2}`` uses ``u_α`` (the donor below), and
-    layer α+1's contribution at ``σ_{α-1/2} = σ_{α+1/2}`` uses
-    ``u_{α+1}`` (the donor above).  No upwinding choice has to be
-    made by hand.
+    Why **not** substitute a piecewise ansatz before integration:
+      * ``Piecewise(u_α, σ in layer α)`` substituted globally would
+        force sympy's integration to *pick a specific value at the
+        layer boundary* (dominant-branch convention), silently
+        committing the user to a specific (asymmetric) interface
+        velocity.
+      * ``Σ u_α · 𝟙_{[σ_{α-1/2}, σ_{α+1/2}]}(σ)`` (Heaviside form)
+        trips sympy's Meijer-G fallback when products of Heavisides
+        meet ∂_σ in the integrand.
 
-    Interface vertical velocities ``w(t, x, σ_{α±1/2})`` survive as
-    opaque atoms in the per-layer leaves; apply
-    :class:`KinematicBC` with ``mass_flux=G_{α+1/2}/ρ`` afterwards
-    at each interface to resolve them.
+    Keeping ``u`` opaque and integrating term-by-term avoids both
+    traps and surfaces the modeling choice explicitly.
 
     Parameters
     ----------
@@ -4457,12 +4465,17 @@ class LayerMeanClosure(Operation):
     sigma : sympy.Symbol
         σ-coordinate of the σ-mapped system (typically ``state.zeta_ref``).
     u_field : sympy.Function call
-        The opaque ``u(t, x, σ)`` atom that will be substituted.
+        The opaque ``u(t, x, σ)`` atom whose layer-mean closure we use.
     u_layer : sequence of sympy Function calls
         Per-layer mean velocities ``u_α(t, x)``, one per layer α.
     weights : sequence of sympy expressions, optional
         Layer weights ``l_α`` summing to 1.  Default: uniform
         ``l_α = 1/L``.
+    max_u_power : int, optional
+        Maximum monomial power of ``u_field`` to recognise in IBP
+        patterns ``f(σ) · u^k · ∂_σ u`` (default 3 — covers
+        ``∂_σ u``, ``u·∂_σ u`` (momentum convection), ``u²·∂_σ u``
+        (cubic shallow-water) and ``u³·∂_σ u``).
     name, description
         Standard operation labels for derivation history.
     """
@@ -4470,18 +4483,19 @@ class LayerMeanClosure(Operation):
     rank_changes_leaf = True
 
     def __init__(self, state, sigma, u_field, u_layer,
-                 *, weights=None, name="layer_mean_closure",
-                 description=None):
+                 *, weights=None, max_u_power=3,
+                 name="layer_mean_closure", description=None):
         super().__init__(
             name=name,
             description=(description or
-                         f"Piecewise-constant {len(u_layer)}-layer closure"),
+                         f"Layer-mean closure on {len(u_layer)} layers"),
         )
         self._state = state
         self._sigma = sigma
         self._u_field = u_field
         self._u_layer = list(u_layer)
         self._L = len(u_layer)
+        self._max_u_power = max_u_power
         if weights is None:
             weights = [sp.Rational(1, self._L)] * self._L
         weights = list(weights)
@@ -4494,28 +4508,77 @@ class LayerMeanClosure(Operation):
             raise ValueError(f"Layer weights must sum to 1, got {sum(weights)}")
         self._weights = weights
         self._sigma_iface = [sum(weights[:k]) for k in range(self._L + 1)]
-        # Build the piecewise ansatz.  Order: last branch (default) is
-        # the top layer — sympy evaluates Piecewise top-down, so we list
-        # the lower L-1 layers first as σ-bounded conditions and let
-        # the L-th layer be the catch-all.
-        cases = [
-            (u_layer[k],
-             sp.And(self._sigma >= self._sigma_iface[k],
-                    self._sigma <  self._sigma_iface[k + 1]))
-            for k in range(self._L - 1)
-        ]
-        cases.append((u_layer[-1], True))
-        self._u_pw = sp.Piecewise(*cases)
+
+    def _resolve_layer_integral(self, integral_atom, u_alpha):
+        """Resolve one ``Integral(integrand, (σ, a, b))`` atom.
+
+        Each additive term of the integrand is matched against:
+          1. ``f(σ) · u^k · ∂_σ u`` for ``k = 0..max_u_power`` — IBP
+             via ``u^k · ∂_σ u = (1/(k+1)) ∂_σ u^{k+1}``.  Boundary
+             atoms ``u_field|_{σ=a,b}`` stay opaque; the bulk reduces
+             to ``-1/(k+1) · ∫_a^b (∂_σ f) · u_α^{k+1} dσ``.
+          2. No ``∂_σ u`` factor — substitute ``u → u_α`` (layer-mean
+             closure) and let sympy integrate the σ-polynomial.
+        """
+        var, a, bnd = integral_atom.limits[0]
+        integrand = sp.expand(integral_atom.function)
+        du = sp.Derivative(self._u_field, self._sigma)
+
+        result = sp.S.Zero
+        for term in sp.Add.make_args(integrand):
+            if du not in term.atoms(sp.Derivative):
+                bulk_term = term.subs(self._u_field, u_alpha)
+                result += sp.integrate(bulk_term, (self._sigma, a, bnd))
+                continue
+            handled = False
+            for k_test in range(self._max_u_power + 1):
+                f_wild = sp.Wild("f", exclude=[du, self._u_field])
+                if k_test == 0:
+                    m = term.match(f_wild * du)
+                else:
+                    m = term.match(f_wild * self._u_field**k_test * du)
+                if (m is not None and m[f_wild] != 0
+                        and not m[f_wild].has(self._u_field, du)):
+                    f = m[f_wild]
+                    u_b = self._u_field.subs(self._sigma, bnd)
+                    u_a = self._u_field.subs(self._sigma, a)
+                    f_b = f.subs(self._sigma, bnd)
+                    f_a = f.subs(self._sigma, a)
+                    coef = sp.Rational(1, k_test + 1)
+                    boundary = coef * (f_b * u_b**(k_test + 1)
+                                       - f_a * u_a**(k_test + 1))
+                    df = sp.diff(f, self._sigma)
+                    bulk = -coef * sp.integrate(
+                        df * u_alpha**(k_test + 1),
+                        (self._sigma, a, bnd))
+                    result += boundary + bulk
+                    handled = True
+                    break
+            if not handled:
+                # Unrecognised pattern — leave as unevaluated Integral
+                # so the user sees it.
+                result += sp.Integral(term, (self._sigma, a, bnd))
+        return result
 
     def _apply_leaf(self, expression):
-        """Substitute ``u_field → u_pw``, integrate per-layer over σ."""
+        """Integrate opaque u, resolve bulk integrals via layer-mean closure."""
         from zoomy_core.misc.misc import Zstruct
-        sub_expr = expression.expr.subs(self._u_field, self._u_pw).doit()
         out = Zstruct()
         for k in range(self._L):
             lo, hi = self._sigma_iface[k], self._sigma_iface[k + 1]
-            layer_expr = sp.integrate(sub_expr, (self._sigma, lo, hi))
-            layer_expr = sp.simplify(layer_expr)
+            u_alpha = self._u_layer[k]
+            raw = sp.integrate(expression.expr, (self._sigma, lo, hi))
+            raw = sp.simplify(raw)
+            # Resolve bulk Integral atoms over [lo, hi].
+            for atom in list(raw.atoms(sp.Integral)):
+                if len(atom.limits) != 1:
+                    continue
+                var, a, bnd = atom.limits[0]
+                if var != self._sigma or a != lo or bnd != hi:
+                    continue
+                resolved = self._resolve_layer_integral(atom, u_alpha)
+                raw = raw.subs(atom, resolved)
+            layer_expr = sp.simplify(raw)
             child_name = f"layer_{k + 1}"
             child = Expression(
                 layer_expr, child_name,

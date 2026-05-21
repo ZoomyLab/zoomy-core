@@ -106,9 +106,10 @@ def test_weights_must_sum_to_one():
     raise AssertionError("expected ValueError for weights summing to 2/3")
 
 
-def test_donor_cell_upwinding_at_interface():
-    """∫_layer_1 u(σ) · ∂_σ w dσ — the boundary value at σ=1/2 should be
-    layer 1's velocity (donor below), per AHS26 upwinding convention.
+def test_u_dsigma_w_uses_layer_mean_in_bulk():
+    """∫_layer_α u(σ) · ∂_σ w dσ: the bulk u becomes the layer-mean u_α
+    (no ∂_σ u in this term, so the IBP path is not taken — direct
+    layer-mean substitution), and w stays opaque at the boundaries.
     """
     s = _state_2d()
     sigma = s.zeta_ref
@@ -116,7 +117,6 @@ def test_donor_cell_upwinding_at_interface():
     w_field = s.w.xreplace({s.z: sigma})
     u_layer = [sp.Function(f"u_{k+1}", real=True)(s.t, s.x) for k in range(2)]
 
-    # Integrand: u · ∂_σ w.  IBP-style result: u·w|_lo^hi - ∫ ∂_σ u · w dσ.
     test_sys = System("test_sys", s)
     test_sys.add_equation("eq", Expression(u_field * sp.Derivative(w_field, sigma),
                                             name="eq"))
@@ -124,11 +124,40 @@ def test_donor_cell_upwinding_at_interface():
     closure = LayerMeanClosure(s, sigma, u_field, u_layer)
     test_sys.eq.apply(closure)
 
-    # For layer 1 (σ ∈ [0, 1/2]), the Piecewise is u_1 throughout, so:
-    #   ∫_0^{1/2} u_1 · ∂_σ w dσ = u_1 · (w(1/2) - w(0))
+    # ∫_0^{1/2} u_1 · ∂_σ w dσ = u_1 · (w(1/2) - w(0)) since u_1 is x-only.
     expected_l1 = u_layer[0] * (w_field.subs(sigma, sp.S.Half) - w_field.subs(sigma, 0))
     assert sp.simplify(test_sys.eq.layer_1.expr - expected_l1) == 0, \
         f"got {test_sys.eq.layer_1.expr}, expected {expected_l1}"
+
+
+def test_boundary_u_atoms_stay_opaque():
+    """``f(σ) · ∂_σ u`` is IBP'd: the boundary atoms u(σ=a), u(σ=b)
+    survive opaque (so the user can pick an interface-velocity rule).
+    The bulk part reduces to ``-(∂_σ f) · u_α``."""
+    s = _state_2d()
+    sigma = s.zeta_ref
+    u_field = s.u.xreplace({s.z: sigma})
+    u_layer = [sp.Function(f"u_{k+1}", real=True)(s.t, s.x) for k in range(2)]
+
+    # f(σ) = σ.  Integrand = σ · ∂_σ u.
+    # IBP: ∫_a^b σ · ∂_σ u dσ = [σ u]_a^b - ∫_a^b u dσ.
+    #                          = b u(b) - a u(a) - (b-a) u_α.
+    test_sys = System("test_sys", s)
+    test_sys.add_equation("eq", Expression(sigma * sp.Derivative(u_field, sigma),
+                                            name="eq"))
+
+    closure = LayerMeanClosure(s, sigma, u_field, u_layer)
+    test_sys.eq.apply(closure)
+
+    # Layer 1 (a=0, b=1/2): (1/2) u(1/2) - 0 - (1/2) u_1 = (u(1/2) - u_1)/2.
+    expected_l1 = (u_field.subs(sigma, sp.S.Half) - u_layer[0]) / 2
+    assert sp.simplify(test_sys.eq.layer_1.expr - expected_l1) == 0, \
+        f"got {test_sys.eq.layer_1.expr}, expected {expected_l1}"
+    # Layer 2 (a=1/2, b=1): u(1) - (1/2) u(1/2) - (1/2) u_2.
+    expected_l2 = (u_field.subs(sigma, 1) - u_field.subs(sigma, sp.S.Half) / 2
+                   - u_layer[1] / 2)
+    assert sp.simplify(test_sys.eq.layer_2.expr - expected_l2) == 0, \
+        f"got {test_sys.eq.layer_2.expr}, expected {expected_l2}"
 
 
 def test_layer_sub_leaf_count_for_L_layers():
