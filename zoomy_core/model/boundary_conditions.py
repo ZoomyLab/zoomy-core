@@ -407,6 +407,98 @@ class Periodic(BoundaryCondition):
         return ZArray(Q)
 
 
+class WindStress(BoundaryCondition):
+    """Mixed Neumann + Dirichlet BC — POM-style wind-stress surface.
+
+    Some state rows get a prescribed *value* (Dirichlet); others get a
+    prescribed *face-normal gradient* (Neumann).  Rows mentioned in
+    neither default to zero-gradient extrapolation.  Symbolic specs in
+    state / aux / parameter symbols are supported on the codegen and
+    Firedrake-DG paths (boundary kernels lambdify the resulting
+    expressions); the numpy paths require numeric specs.
+
+    Built for the canonical POM surface BC (BM87 §2.15)::
+
+        ρ_o K_M ∂_z U = τ_o            ← Neumann on the velocity row
+        ∂_z T = 0                       ← Neumann on the tracer row
+        q² = B₁^(2/3) u_τs²             ← Dirichlet on the q² row
+        q²ℓ = 0                         ← Dirichlet on the q²ℓ row
+
+    For the velocity Neumann gradient ``∂_z U = u_*² / K_M`` the user
+    pulls the symbolic ``K_M`` from the model so the BC stays
+    consistent with the interior closure::
+
+        sm = SystemModel.from_model(my_col)
+        K_M_sym = sm.diffusion_matrix[0, 0, 0, 0]
+        bc = WindStress(
+            tag="surface",
+            prescribe_gradients={0: sm.parameters.u_star**2 / K_M_sym,
+                                 1: 0},
+            prescribe_values={2: sm.parameters.B1 ** sp.Rational(2, 3)
+                                * sm.parameters.u_star**2,
+                              3: 0},
+        )
+
+    Same mechanism handles the bottom BC (no-slip + zero heat flux +
+    bottom-stress q² + zero q²ℓ) with different per-row specs.
+    """
+
+    prescribe_values = param.Dict(default={})
+    prescribe_gradients = param.Dict(default={})
+
+    @staticmethod
+    def _coerce(v):
+        if isinstance(v, sympy.Basic):
+            return v
+        return sympy.sympify(v)
+
+    def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
+        """Dirichlet rows take the prescribed value; others extrapolate."""
+        out = ZArray(Q)
+        for k, spec in self.prescribe_values.items():
+            out[k] = self._coerce(spec)
+        return out
+
+    def compute_boundary_gradient(self, time, X, dX, Q, Qaux, parameters, normal):
+        """Neumann rows take the prescribed gradient; others zero."""
+        n_vars = len(Q.get_list()) if hasattr(Q, "get_list") else len(Q)
+        out = ZArray.zeros(n_vars)
+        for k, spec in self.prescribe_gradients.items():
+            out[k] = self._coerce(spec)
+        return out
+
+    def face_value(self, Q_inner, Qaux_inner, normal, d_face, time, parameters):
+        """Numpy: Dirichlet rows get the prescribed value, others extrapolate.
+        Only numeric specs work here; symbolic specs need to flow through
+        the codegen / Firedrake-DG path."""
+        Q_out = np.asarray(Q_inner, dtype=float).copy()
+        for k, spec in self.prescribe_values.items():
+            try:
+                Q_out[k] = float(spec)
+            except (ValueError, TypeError) as e:
+                raise NotImplementedError(
+                    f"WindStress.face_value: symbolic spec {spec!r} for "
+                    f"row {k} is not lowerable through the numpy path; use "
+                    "compute_boundary_condition / codegen instead."
+                ) from e
+        return Q_out
+
+    def face_gradient(self, Q_inner, Q_face, Qaux_inner, normal, d_face,
+                      time, parameters):
+        """Numpy: Neumann rows get the prescribed gradient; others zero.
+        Numeric specs only (same caveat as ``face_value``)."""
+        out = np.zeros_like(np.asarray(Q_inner, dtype=float))
+        for k, spec in self.prescribe_gradients.items():
+            try:
+                out[k] = float(spec)
+            except (ValueError, TypeError) as e:
+                raise NotImplementedError(
+                    f"WindStress.face_gradient: symbolic spec {spec!r} for "
+                    f"row {k} is not lowerable through the numpy path."
+                ) from e
+        return out
+
+
 # --- System-Aware Boundary Conditions ---
 #
 # These are applied via system.boundary_conditions.apply(SystemWall(), tag="right").
