@@ -4424,6 +4424,112 @@ class materials:
     inviscid = Inviscid
 
 
+class LayerMeanClosure(Operation):
+    """Specialise a σ-resolved system to L piecewise-constant layers.
+
+    For each leaf that depends on the σ-coordinate, substitute the
+    opaque velocity ``u(t, x, σ)`` by the piecewise-constant ansatz
+    ``u(t, x, σ) = u_α(t, x)`` for ``σ ∈ [σ_{α-1/2}, σ_{α+1/2}]``, then
+    integrate the leaf over each layer's σ-bounds explicitly.  The
+    result is one per-layer leaf with key ``layer_α``.
+
+    Why ``Piecewise`` rather than ``Σ u_α · H(σ - σ_{α-1/2}) (1 - H(σ - σ_{α+1/2}))``:
+    sympy integrates ``Piecewise``-substituted integrands cleanly under
+    explicit-bounds integration; the Heaviside-product form trips the
+    Meijer-G fallback in ``sp.integrate(method="analytical")``.
+
+    Interface upwinding (AHS26 (9)) emerges *automatically* from sympy's
+    evaluation of ``Piecewise`` at the layer boundary: layer α's
+    contribution at ``σ_{α+1/2}`` uses ``u_α`` (the donor below), and
+    layer α+1's contribution at ``σ_{α-1/2} = σ_{α+1/2}`` uses
+    ``u_{α+1}`` (the donor above).  No upwinding choice has to be
+    made by hand.
+
+    Interface vertical velocities ``w(t, x, σ_{α±1/2})`` survive as
+    opaque atoms in the per-layer leaves; apply
+    :class:`KinematicBC` with ``mass_flux=G_{α+1/2}/ρ`` afterwards
+    at each interface to resolve them.
+
+    Parameters
+    ----------
+    state : StateSpace
+        The state-space the operation lives on.
+    sigma : sympy.Symbol
+        σ-coordinate of the σ-mapped system (typically ``state.zeta_ref``).
+    u_field : sympy.Function call
+        The opaque ``u(t, x, σ)`` atom that will be substituted.
+    u_layer : sequence of sympy Function calls
+        Per-layer mean velocities ``u_α(t, x)``, one per layer α.
+    weights : sequence of sympy expressions, optional
+        Layer weights ``l_α`` summing to 1.  Default: uniform
+        ``l_α = 1/L``.
+    name, description
+        Standard operation labels for derivation history.
+    """
+
+    rank_changes_leaf = True
+
+    def __init__(self, state, sigma, u_field, u_layer,
+                 *, weights=None, name="layer_mean_closure",
+                 description=None):
+        super().__init__(
+            name=name,
+            description=(description or
+                         f"Piecewise-constant {len(u_layer)}-layer closure"),
+        )
+        self._state = state
+        self._sigma = sigma
+        self._u_field = u_field
+        self._u_layer = list(u_layer)
+        self._L = len(u_layer)
+        if weights is None:
+            weights = [sp.Rational(1, self._L)] * self._L
+        weights = list(weights)
+        if len(weights) != self._L:
+            raise ValueError(
+                f"weights has length {len(weights)} but u_layer has "
+                f"length {self._L}"
+            )
+        if sum(weights) != sp.S.One:
+            raise ValueError(f"Layer weights must sum to 1, got {sum(weights)}")
+        self._weights = weights
+        self._sigma_iface = [sum(weights[:k]) for k in range(self._L + 1)]
+        # Build the piecewise ansatz.  Order: last branch (default) is
+        # the top layer — sympy evaluates Piecewise top-down, so we list
+        # the lower L-1 layers first as σ-bounded conditions and let
+        # the L-th layer be the catch-all.
+        cases = [
+            (u_layer[k],
+             sp.And(self._sigma >= self._sigma_iface[k],
+                    self._sigma <  self._sigma_iface[k + 1]))
+            for k in range(self._L - 1)
+        ]
+        cases.append((u_layer[-1], True))
+        self._u_pw = sp.Piecewise(*cases)
+
+    def _apply_leaf(self, expression):
+        """Substitute ``u_field → u_pw``, integrate per-layer over σ."""
+        from zoomy_core.misc.misc import Zstruct
+        sub_expr = expression.expr.subs(self._u_field, self._u_pw).doit()
+        out = Zstruct()
+        for k in range(self._L):
+            lo, hi = self._sigma_iface[k], self._sigma_iface[k + 1]
+            layer_expr = sp.integrate(sub_expr, (self._sigma, lo, hi))
+            layer_expr = sp.simplify(layer_expr)
+            child_name = f"layer_{k + 1}"
+            child = Expression(
+                layer_expr, child_name,
+                term_tags=dict(expression._term_tags),
+                tag_order=list(expression._tag_order),
+                solver_groups=expression._solver_groups,
+            )
+            rel = getattr(expression, "_as_relation", None)
+            if rel is not None:
+                child._as_relation = dict(rel)
+            setattr(out, child_name, child)
+        return out
+
+
 # ---------------------------------------------------------------------------
 # Assumptions library
 # ---------------------------------------------------------------------------
