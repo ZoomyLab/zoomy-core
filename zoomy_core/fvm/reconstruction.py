@@ -420,6 +420,20 @@ class LSQMUSCLReconstruction:
         self._lsq_neighbors = mesh.lsq_neighbors    # (n_cells, max_nbr)
         self._lsq_scale = mesh.lsq_scale_factors    # (n_monomials,)
 
+        # Boundary-face neighbours for LSQ — when present, ``A_loc`` is
+        # sized ``(n_cell_nbr + n_bf_nbr, n_monomials)`` so ``delta_u``
+        # must also include the boundary-face values to match.  When
+        # absent, ``A_loc`` only covers interior cells.  See
+        # ``zoomy_core.mesh.lsq_reconstruction.compute_derivatives``
+        # for the partner code that does the boundary-aware extension
+        # in the off-line derivative case.
+        self._lsq_bf_neighbors = getattr(mesh,
+                                         "lsq_boundary_face_neighbors", None)
+        self._lsq_has_bdy = (
+            self._lsq_bf_neighbors is not None
+            and self._lsq_bf_neighbors.size > 0
+        )
+
         # Venkatakrishnan smoothing: eps² = (K·h)²
         cell_vols = mesh.cell_volumes[:nc]
         h = cell_vols ** (1.0 / max(dim, 1))
@@ -447,7 +461,7 @@ class LSQMUSCLReconstruction:
         by face_value(Q_L) in the flux operator).
         """
         n_vars = Q.shape[0]
-        grads = self._compute_gradients(Q, n_vars)
+        grads = self._compute_gradients(Q, n_vars, bf_face_values=bf_face_values)
         if phi is None:
             phi = self._compute_phi(Q, n_vars, bf_face_values, grads)
         # Limited cell-centre gradient (n_vars, dim, nc) — consumed by
@@ -462,15 +476,29 @@ class LSQMUSCLReconstruction:
         state — and pass it back into :meth:`__call__` to freeze the
         limiter through an implicit-solver Newton iteration."""
         n_vars = Q.shape[0]
-        grads = self._compute_gradients(Q, n_vars)
+        grads = self._compute_gradients(Q, n_vars, bf_face_values=bf_face_values)
         return self._compute_phi(Q, n_vars, bf_face_values, grads)
 
     # ── LSQ gradient ────────────────────────────────────────────────
 
-    def _lsq_gradient(self, u):
+    def _lsq_gradient(self, u, u_bf=None):
         """Cell-center gradient via precomputed LSQ stencil.
 
-        Only interior cells are used in the stencil (guaranteed by LSQMesh).
+        When the mesh carries boundary-face neighbours
+        (``lsq_boundary_face_neighbors``), the LSQ ``A`` matrix was
+        built including them — so ``delta_u`` must also include the
+        boundary-face values to match ``A_loc``'s row count.  This
+        mirrors :func:`zoomy_core.mesh.lsq_reconstruction.compute_derivatives`.
+
+        Parameters
+        ----------
+        u : ndarray, shape (n_cells,)
+            Inner-cell field values.
+        u_bf : ndarray, shape (n_boundary_faces,), optional
+            Boundary-face values from the BC kernel.  When the mesh
+            has boundary-face neighbours and ``u_bf`` is ``None``,
+            extrapolation is used (face value = inner-cell value).
+
         Returns (dim, nc).
         """
         nc = self._nc
@@ -479,13 +507,25 @@ class LSQMUSCLReconstruction:
         A_glob = self._lsq_gradQ
         neighbors = self._lsq_neighbors
         scale = self._lsq_scale
+        has_bdy = self._lsq_has_bdy
+        bdy_nbr = self._lsq_bf_neighbors
 
         for i in range(nc):
             A_loc = A_glob[i]                     # (max_nbr, n_monomials)
-            nbr_idx = neighbors[i]                # (max_nbr,)
-            delta_u = u[nbr_idx] - u[i]           # (max_nbr,)
+            nbr_idx = neighbors[i]                # (n_cell_nbr,)
+            u_i = u[i]
+            u_cells = u[nbr_idx] - u_i            # (n_cell_nbr,)
+            if has_bdy:
+                bf = bdy_nbr[i]
+                # ``bf < 0`` means "no boundary face on this side" —
+                # use the inner cell value (extrapolation).
+                u_bf_i = (u_bf[np.maximum(bf, 0)] if u_bf is not None
+                          else np.full_like(bf, u_i, dtype=float))
+                u_bf_delta = np.where(bf >= 0, u_bf_i - u_i, 0.0)
+                delta_u = np.concatenate([u_cells, u_bf_delta])
+            else:
+                delta_u = u_cells
             coeffs = scale * (A_loc.T @ delta_u)  # (n_monomials,)
-            # First `dim` monomials are the gradient components for degree=1
             grad[:, i] = coeffs[:dim]
 
         return grad
@@ -673,12 +713,19 @@ class LSQMUSCLReconstruction:
 
     # ── Core pipeline ───────────────────────────────────────────────
 
-    def _compute_gradients(self, Q, n_vars):
+    def _compute_gradients(self, Q, n_vars, bf_face_values=None):
         """Raw LSQ cell-centre gradients (n_vars, dim, nc) — a fixed
-        linear stencil, hence smooth (C∞) in ``Q``."""
+        linear stencil, hence smooth (C∞) in ``Q``.
+
+        ``bf_face_values`` (n_vars, n_boundary_faces) come from the
+        BC kernel and are threaded into the LSQ stencil whenever the
+        mesh carries boundary-face neighbours.  Without it the LSQ
+        falls back to inner-cell extrapolation."""
         grads = np.zeros((n_vars, self.dim, self._nc))
         for v in range(n_vars):
-            grads[v] = self._lsq_gradient(Q[v, :])
+            u_bf = (bf_face_values[v] if bf_face_values is not None
+                    else None)
+            grads[v] = self._lsq_gradient(Q[v, :], u_bf=u_bf)
         return grads
 
     def _compute_phi(self, Q, n_vars, bf_face_values, grads):
