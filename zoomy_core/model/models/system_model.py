@@ -855,6 +855,14 @@ class SystemModel:
                     self.mass_matrix]
         if self.state_update is not None:
             matrices.append(self.state_update)
+        # State-dependent diffusion (e.g. MY-2.5 K_M(ℓ, q, G_H)) can
+        # carry ``Derivative(state, x)`` atoms via the Galperin G_H
+        # argument; auto-expose them so the rank-4 A tensor lambdifies
+        # cleanly through the Firedrake-DG / NumpyRuntimeModel path.
+        if self.diffusion_matrix is not None:
+            matrices.append(self.diffusion_matrix)
+        if self.diffusion_matrix_explicit is not None:
+            matrices.append(self.diffusion_matrix_explicit)
 
         # ── Pass 1: collect *user-defined* Function atoms (excl. state).
         # ``atoms(sp.Function)`` matches every Function subclass — including
@@ -873,11 +881,57 @@ class SystemModel:
                         continue
                     function_atoms.setdefault(name, []).append(atom)
 
+        # ── Pass 1.5: collect ``limit(Derivative(...), scheme)`` atoms.
+        # These flag a derivative for runtime TVD limiting via the
+        # numerics layer (see ``zoomy_core.model.numerics.limit``).  We
+        # substitute each with a dedicated aux Symbol BEFORE the plain
+        # Derivative scan below — so the limited derivative gets a
+        # ``limited_derivative`` aux entry with a ``limiter_scheme``
+        # field, and the un-wrapped Derivative atom is no longer present
+        # to be picked up by Pass 2.
+        from zoomy_core.model.numerics import limit as _limit_fn
+        limit_atoms = {}   # (target_name, multi_index_tuple, scheme) → [atoms]
+        for M in matrices:
+            for ent in _iter_entries(M):
+                for atom in sp.sympify(ent).atoms(_limit_fn):
+                    inner = atom.args[0]
+                    scheme = str(atom.args[1])
+                    if not isinstance(inner, sp.Derivative):
+                        continue
+                    target = inner.args[0]
+                    target_name = (target.func.__name__
+                                   if isinstance(target, sp.Function)
+                                   else str(target))
+                    mi = [0] * n_dim
+                    has_time = False
+                    for var, n in inner.variable_count:
+                        vn = str(var)
+                        if vn in space_names:
+                            mi[space_names[vn]] += int(n)
+                        else:
+                            has_time = True
+                            break
+                    if has_time or all(o == 0 for o in mi):
+                        continue
+                    key = (target_name, tuple(mi), scheme)
+                    limit_atoms.setdefault(key, []).append(atom)
+
         # ── Pass 2: collect Derivative atoms (skip time-derivs). ────
+        # Note: any Derivative that was inside a ``limit(...)`` wrapper
+        # is collected in Pass 1.5 above and skipped here (the .atoms
+        # scan walks the tree, so it WOULD pick up the inner derivative
+        # too — we filter by checking whether the parent expression
+        # contains a wrapping ``limit`` atom).
         deriv_atoms = {}    # (target_name, multi_index_tuple) → [atoms]
+        limited_inner_atoms = set()
+        for lst in limit_atoms.values():
+            for a in lst:
+                limited_inner_atoms.add(a.args[0])
         for M in matrices:
             for entry in _iter_entries(M):
                 for d in sp.sympify(entry).atoms(sp.Derivative):
+                    if d in limited_inner_atoms:
+                        continue
                     target = d.args[0]
                     target_name = (target.func.__name__
                                    if isinstance(target, sp.Function)
@@ -922,6 +976,44 @@ class SystemModel:
                 "atom": atoms[0],
                 "aux_symbol": sym,
             })
+
+        # ── Limited-derivative entries (from Pass 1.5). ──────────
+        # Substitute the ``limit(D, scheme)`` atom with a dedicated aux
+        # Symbol, and register the limiter scheme so the solver knows to
+        # apply it after the LSQ gradient computation.
+        for (target_name, mi, scheme), atoms in limit_atoms.items():
+            suffix = "_".join(
+                str(self.space[d])
+                for d in range(n_dim) for _ in range(mi[d])
+            )
+            aux_name = f"{target_name}_{suffix}__{scheme}"
+            sym = sp.Symbol(aux_name, real=True)
+            for a in atoms:
+                sub_dict[a] = sym
+            row = n_aux_before + len(new_syms)
+            new_syms.append(sym)
+            entry = {
+                "kind": "limited_derivative",
+                "name": aux_name,
+                "row": row,
+                "atom": atoms[0],
+                "aux_symbol": sym,
+                "target_name": target_name,
+                "multi_index": tuple(mi),
+                "limiter_scheme": scheme,
+            }
+            if target_name in state_names:
+                entry["target_kind"] = "state"
+                entry["state_index"] = next(
+                    i for i, s in enumerate(self.state)
+                    if str(s) == target_name
+                )
+            elif target_name in function_row_of_name:
+                entry["target_kind"] = "function"
+                entry["function_row"] = function_row_of_name[target_name]
+            else:
+                entry["target_kind"] = "unknown"
+            registry.append(entry)
 
         # ── Derivative entries. ───────────────────────────────────
         for (target_name, mi), atoms in deriv_atoms.items():
@@ -970,6 +1062,11 @@ class SystemModel:
             sub_dict)
         if self.state_update is not None:
             self.state_update = self.state_update.xreplace(sub_dict)
+        if self.diffusion_matrix is not None:
+            self.diffusion_matrix = self.diffusion_matrix.xreplace(sub_dict)
+        if self.diffusion_matrix_explicit is not None:
+            self.diffusion_matrix_explicit = (
+                self.diffusion_matrix_explicit.xreplace(sub_dict))
 
         # Keep the derived operators consistent: recompute
         # quasilinear_matrix / source_jacobian from the substituted

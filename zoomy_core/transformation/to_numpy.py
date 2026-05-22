@@ -94,6 +94,19 @@ class NumpyRuntimeModel:
         for arg_idx, expected in enumerate(sig_values):
             _build_plan(expected, arg_idx, ())
 
+        def _safe_hasattr(obj, name):
+            """``hasattr`` shadowed by ``getattr`` with broad exception
+            handling — UFL exposes ``.T`` as a property that raises
+            ``ValueError`` on rank-1 tensors, and Python's ``hasattr``
+            returns ``False`` only on AttributeError, propagating
+            everything else.  Treat any exception as 'attribute not
+            usable here'."""
+            try:
+                getattr(obj, name)
+                return True
+            except Exception:
+                return False
+
         def fast_flatten(runtime_args):
             result = []
             for arg_idx, path in plan:
@@ -101,7 +114,7 @@ class NumpyRuntimeModel:
                 for step_type, step_key, step_idx in path:
                     if isinstance(val, np.ndarray):
                         val = val[step_idx]
-                    elif step_type == "key" and hasattr(val, step_key):
+                    elif step_type == "key" and _safe_hasattr(val, step_key):
                         val = getattr(val, step_key)
                     else:
                         try:

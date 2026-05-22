@@ -8,6 +8,55 @@ from zoomy_core.transformation.to_numpy import (
 )
 
 
+# Spatial-coordinate-name → UFL grad axis index used by the
+# Derivative-resolver path.  Matches Firedrake's default mesh
+# coordinate ordering ``(x, y, z)``.
+_UFL_AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
+
+
+class _ZdGrad(sp.Function):
+    """Symbolic placeholder for a sympy ``Derivative`` atom.
+
+    Pre-substituted by :meth:`UFLRuntimeModel._lambdify_function` so
+    that lambdify can serialise the expression through the default
+    printer — sympy's ``PythonCodePrinter`` has no ``_print_Derivative``
+    method and raises on inline derivatives.  At runtime the UFL
+    module dict maps ``_ZdGrad(field, axis_idx0, axis_idx1, ...)`` to
+    ``ufl.grad(field)[axis_idx0][axis_idx1]...`` (chained for higher
+    orders).
+    """
+
+    @classmethod
+    def from_derivative(cls, deriv):
+        """Build ``_ZdGrad(field, idx0, idx1, ...)`` from a
+        ``sp.Derivative(field, var0, var1, ...)`` atom.  Each
+        coordinate Symbol's name resolves to a fixed-index integer
+        via :data:`_UFL_AXIS_INDEX`."""
+        target = deriv.args[0]
+        idxs = []
+        for var, n in deriv.variable_count:
+            try:
+                idx = _UFL_AXIS_INDEX[str(var)]
+            except KeyError as e:
+                raise KeyError(
+                    f"_ZdGrad: spatial coordinate {var!r} not in "
+                    f"{sorted(_UFL_AXIS_INDEX)}."
+                ) from e
+            for _ in range(int(n)):
+                idxs.append(sp.Integer(idx))
+        return cls(target, *idxs)
+
+
+def _zd_grad_resolver(field, *axis_indices):
+    """Runtime resolver: ``ufl.grad(field)[axis_indices...]`` with one
+    ``ufl.grad`` per axis index.  Single-index = first-order
+    derivative; repeated = higher orders / mixed partials."""
+    val = field
+    for idx in axis_indices:
+        val = ufl.grad(val)[int(idx)]
+    return val
+
+
 def _ufl_conditional(condition, true_val, false_val):
     """Internal helper `_ufl_conditional`."""
     if condition is True:
@@ -133,13 +182,58 @@ class UFLRuntimeModel(NumpyRuntimeModel):
         return result
 
     def _lambdify_function(self, function_obj, modules):
-        """Skip functions with zero-size output (e.g. Jacobian when n_aux=0)."""
+        """Skip functions with zero-size output (e.g. Jacobian when n_aux=0).
+
+        Otherwise pre-substitute inline ``sp.Derivative`` atoms with
+        the :class:`_ZdGrad` placeholder Function so lambdify's default
+        printer can serialise the expression.  The UFL module dict
+        binds ``_ZdGrad`` to a resolver that chains ``ufl.grad`` to
+        produce the requested partial.
+        """
         expr = function_obj.definition
         if hasattr(expr, 'shape') and any(int(s) == 0 for s in expr.shape):
             import numpy as np
             shape = tuple(int(s) for s in expr.shape)
             return lambda *a, _s=shape: np.empty(_s)
+        # Replace every Derivative atom with its _ZdGrad image.  This
+        # is structurally equivalent to ``SystemModel.expose_aux_atoms``
+        # but stays at the Model-level lambdify path — needed because
+        # the Firedrake backend builds the runtime from Model directly
+        # (via UFLRuntimeModel(model)) before SystemModel substitution
+        # runs.
+        function_obj = self._substitute_derivative_atoms(function_obj)
         return super()._lambdify_function(function_obj, modules)
+
+    @staticmethod
+    def _substitute_derivative_atoms(function_obj):
+        """Return a function object with every ``sp.Derivative`` atom in
+        its definition replaced by the corresponding ``_ZdGrad`` placeholder.
+
+        Inline derivatives of state w.r.t. spatial coordinates (``∂_z T``,
+        ``∂_z U``, ...) are common in eddy-viscosity closures — e.g. the
+        MY-2.5 Galperin G_H argument depends on ``∂_z T``.  Without this
+        substitution the default lambdify printer raises on the
+        Derivative atom.
+        """
+        from zoomy_core.model.basefunction import Function
+        expr = function_obj.definition
+        if hasattr(expr, "tolist"):
+            entries = sp.flatten(expr.tolist())
+        else:
+            entries = [expr]
+        deriv_atoms = set()
+        for e in entries:
+            deriv_atoms.update(sp.sympify(e).atoms(sp.Derivative))
+        if not deriv_atoms:
+            return function_obj
+        subs = {d: _ZdGrad.from_derivative(d) for d in deriv_atoms}
+        new_def = (expr.xreplace(subs) if hasattr(expr, "xreplace")
+                   else sp.sympify(expr).xreplace(subs))
+        return Function(
+            name=function_obj.name,
+            args=function_obj.args,
+            definition=new_def,
+        )
 
     module = {
         'ones_like': lambda x: 0*x + 1,
@@ -207,6 +301,10 @@ class UFLRuntimeModel(NumpyRuntimeModel):
         # --- Array / matrix serialisation ---
         "_ZoomyVector": lambda *args: ufl.as_vector(list(args)),
         "ImmutableDenseMatrix": lambda data: ufl.as_tensor(data),
+        # --- Derivative atom resolver
+        # Replaces ``sp.Derivative(field, x, ...)`` substituted in by
+        # ``_substitute_derivative_atoms`` with ``ufl.grad`` chains.
+        "_ZdGrad": _zd_grad_resolver,
     }
 
 
