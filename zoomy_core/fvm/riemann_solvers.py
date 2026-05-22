@@ -597,9 +597,21 @@ class PositiveRusanov(Rusanov):
         hL_star = sp.Max(0.0, hL + bL - b_star)
         hR_star = sp.Max(0.0, hR + bR - b_star)
 
-        eps = self._eps_symbol()
-        hL_eff = sp.Max(hL, eps)
-        hR_eff = sp.Max(hR, eps)
+        # Audusse momentum rescaling regularization.  Must be at
+        # **floating-point scale** (just enough to avoid the ``0 / 0``
+        # at truly dry faces), *not* the model's wet/dry threshold
+        # ``eps`` (typically ``1e-2`` for SWE).  Using the wet/dry
+        # threshold here biases the rescaling — for any face value
+        # ``hL ∈ (0, eps)`` it scales the momentum down by
+        # ``hL / eps`` instead of leaving it unchanged, which breaks
+        # the cell-mean positivity decomposition of Xing & Zhang 2013
+        # (J. Sci. Comput. 57(1):19-41, doi:10.1007/s10915-013-9695-y).
+        # The ``hinv`` slot — when present — gets the same FP-scale
+        # regularization for the same reason: velocity ``u = hu · hinv``
+        # would otherwise be artificially compressed in thin-water cells.
+        hr_eps = sp.Float(1e-14)
+        hL_eff = sp.Max(hL, hr_eps)
+        hR_eff = sp.Max(hR, hr_eps)
 
         self.b_field.assign(qLs, qauxL, b_star)
         self.b_field.assign(qRs, qauxR, b_star)
@@ -611,8 +623,8 @@ class PositiveRusanov(Rusanov):
             qRs[idx] = qR[idx] * hR_star / hR_eff
 
         if self.hinv_field is not None:
-            self.hinv_field.assign(qLs, qauxL, 1 / (hL_star + eps))
-            self.hinv_field.assign(qRs, qauxR, 1 / (hR_star + eps))
+            self.hinv_field.assign(qLs, qauxL, 1 / (hL_star + hr_eps))
+            self.hinv_field.assign(qRs, qauxR, 1 / (hR_star + hr_eps))
 
         return qLs, qRs, qauxL, qauxR
 
