@@ -11,7 +11,7 @@ from zoomy_core.model.basemodel import Model
 from zoomy_core.misc.misc import ZArray
 
 
-class ScalarAdvection(Model):
+class Advection(Model):
     """Scalar advection du/dt + a · ∇u = 0."""
 
     def __init__(self, dimension=1, **kwargs):
@@ -44,7 +44,7 @@ class ScalarAdvection(Model):
         return ZArray([ev])
 
 
-class ScalarAdvectionDiffusion(Model):
+class AdvectionDiffusion(Model):
     """Scalar advection-diffusion: du/dt + a · ∇u = ∇ · (ν ∇u).
 
     The diffusive flux is F_diff = -ν * ∇u (isotropic).

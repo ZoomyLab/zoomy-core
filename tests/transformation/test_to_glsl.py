@@ -22,7 +22,7 @@ from zoomy_core.model.boundary_conditions import (
     Extrapolation,
     Wall,
 )
-from zoomy_core.model.models.advection_model import ScalarAdvection
+from zoomy_core.model.models.advection import Advection
 from zoomy_core.fvm.riemann_solvers import HLL, HLLC
 from zoomy_core.transformation.to_glsl import GlslModel, GlslNumerics
 
@@ -127,7 +127,7 @@ def test_swe_glsl_compiles(swe_glsl):
 @pytest.mark.parametrize("dim", [1, 2, 3])
 def test_advection_glsl_compiles(dim):
     """A second, structurally different model also compiles."""
-    glsl = GlslModel(ScalarAdvection(dimension=dim)).generate()
+    glsl = GlslModel(Advection(dimension=dim)).generate()
     ok, output = _glslang_validate(glsl)
     assert ok, f"glslangValidator rejected ScalarAdvection GLSL:\n{output}"
 
