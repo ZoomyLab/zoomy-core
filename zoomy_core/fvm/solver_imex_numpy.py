@@ -159,8 +159,8 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
     def setup_simulation(self, mesh, model, write_output=False):
         """Build all operators. Extends HyperbolicSolver.setup_simulation."""
         t0 = time.time()
-        self._imex_reconstruction_order = self.reconstruction_order
         super().setup_simulation(mesh, model, write_output=write_output)
+        self._imex_reconstruction_order = self.nsm.reconstruction.order
 
         # Resolve source mode
         self._sim_source_mode = self._resolve_source_mode(self._sim_model)
@@ -192,7 +192,7 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
         model = self._sim_model
 
         # Explicit flux step (convection) — BCs inside flux_operator
-        if self.reconstruction_order >= 2:
+        if self.nsm.reconstruction.order >= 2:
             Q0 = np.array(Q)
             dQ = self._sim_flux_operator(dt, time_now, Q, Qaux, parameters, np.zeros_like(Q))
             Q1 = Q + dt * dQ

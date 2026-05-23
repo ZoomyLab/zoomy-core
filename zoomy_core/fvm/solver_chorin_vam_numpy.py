@@ -33,6 +33,7 @@ from zoomy_core.fvm.riemann_solvers import (
 )
 from zoomy_core.mesh import ensure_lsq_mesh
 from zoomy_core.model.models.system_model import SystemModel, _to_zarray
+from zoomy_core.numerics import NumericalSystemModel
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
 from zoomy_core.misc.logger_config import logger
 from zoomy_core.misc.misc import Zstruct, ZArray
@@ -370,7 +371,8 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
              "entries as ``limited_derivative`` directly in the "
              "operator-form pipeline."))
 
-    def __init__(self, sm_pred, sm_press, sm_corr, **kwargs):
+    def __init__(self, sm_pred, sm_press, sm_corr, *,
+                 reconstruction=None, **kwargs):
         if not isinstance(sm_pred, SystemModel):
             raise TypeError("sm_pred must be a SystemModel")
         if not isinstance(sm_press, SystemModel):
@@ -383,6 +385,13 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         self.sm_corr = sm_corr
         self.state = list(sm_pred.state)
         self.n_state = sm_pred.n_state
+
+        # Predictor reconstruction spec — seeded into the auto-built
+        # NSM at ``setup_simulation`` time.  Defaults to first-order
+        # constant; pass ``reconstruction=ReconstructionSpec(order=2,
+        # limiter=...)`` for the primitive-WB MUSCL path.
+        from zoomy_core.numerics import ReconstructionSpec
+        self._reconstruction_spec = reconstruction or ReconstructionSpec()
 
         self._dt_symbol = self._detect_dt_symbol()
 
@@ -493,7 +502,7 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         ``thesis/chapters/30_numerics.md`` "Primitive-variable MUSCL
         reconstruction".
         """
-        if self.reconstruction_order >= 2:
+        if self.nsm.reconstruction.order >= 2:
             from zoomy_core.fvm.reconstruction import (
                 FreeSurfaceLSQMUSCL, PrimitiveReconstruction,
             )
@@ -510,7 +519,7 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
                 unlimited.append(state_names.index("b"))
             base = FreeSurfaceLSQMUSCL(
                 mesh, dim, h_index=h_idx,
-                eps_wet=eps_wet, limiter=self.limiter,
+                eps_wet=eps_wet, limiter=self.nsm.reconstruction.limiter,
                 unlimited_indices=unlimited or None,
             )
             # Lambdify the Model-declared WB forward / inverse maps.
@@ -551,10 +560,13 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         t0 = _time.time()
 
         # 1. Pad SM_pred to square and let the parent set up the
-        #    predictor's flux machinery.
+        #    predictor's flux machinery.  Wrap in NSM so the parent
+        #    uses the reconstruction spec we were configured with.
         sm_pred_square = _pad_to_square(self.sm_pred)
         self._sm_pred_square = sm_pred_square
-        super().setup_simulation(mesh, sm_pred_square, write_output=write_output)
+        nsm_pred = NumericalSystemModel.from_system_model(
+            sm_pred_square, reconstruction=self._reconstruction_spec)
+        super().setup_simulation(mesh, nsm_pred, write_output=write_output)
 
         # 2. dt rename + parameter registration on the dt-dependent subsystems.
         if self._dt_symbol is not None:

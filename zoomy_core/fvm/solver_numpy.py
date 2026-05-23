@@ -234,13 +234,13 @@ class HyperbolicSolver(Solver):
     time_end = param.Number(default=0.1, bounds=(0, None), doc="Simulation end time")
     min_dt = param.Number(default=1e-6, bounds=(0, None), doc="Minimum allowed timestep")
     compute_dt = param.Parameter(default=None, doc="Time-stepping strategy (callable)")
-    reconstruction_order = param.Integer(default=1, bounds=(1, 2),
-        doc="Spatial reconstruction order: 1=piecewise-constant, 2=MUSCL")
-    limiter = param.Selector(default="venkatakrishnan",
-        objects=["venkatakrishnan", "barth_jespersen", "minmod"],
-        doc="Slope limiter for MUSCL reconstruction")
-    eigenvalue_regularization = 1e-8
     _diffusion_in_flux = True  # explicit diffusion in flux operator
+    # Numerical knobs (``reconstruction.order``, ``reconstruction.limiter``,
+    # ``regularization.eigenvalue_eps``) live on the
+    # :class:`NumericalSystemModel`; the solver reads ``self.nsm.*`` after
+    # ``setup_simulation``.  Constructors no longer accept those kwargs —
+    # pass an NSM (or a Model / SystemModel that gets auto-promoted to
+    # one with default specs).
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -262,44 +262,22 @@ class HyperbolicSolver(Solver):
 
     def _coerce_to_nsm(self, model):
         """Normalise ``model`` to a (NumericalSystemModel, source-Model)
-        pair.  ``source_model`` is the *original* :class:`Model` when
-        one was passed (needed for ``resolve_periodic_bcs``, which
-        walks ``boundary_conditions_list`` — a field that lives on
-        the Model object and not on the lambdified SystemModel BC
-        kernel).  When the caller supplied a bare SystemModel or NSM,
-        ``source_model`` is ``None``.
+        pair.  Auto-promotes Model / SystemModel by building an NSM
+        with default specs (``ReconstructionSpec(order=1)``,
+        ``RegularizationSpec(eigenvalue_eps=1e-8)``, etc.) — to override
+        defaults, build the NSM explicitly and pass that in.
 
-        When auto-promoting (Model or SystemModel), the NSM is seeded
-        from the current solver attributes so callers that set
-        ``solver.reconstruction_order = 2`` before ``setup_simulation``
-        keep working.  An explicitly-supplied NSM bypasses this path —
-        its slots win."""
+        ``source_model`` is the *original* :class:`Model` when one was
+        passed (needed for ``resolve_periodic_bcs``, which walks
+        ``boundary_conditions_list`` — a field that lives on the Model
+        object and not on the lambdified SystemModel BC kernel).  When
+        the caller supplied a bare SystemModel or NSM, ``source_model``
+        is ``None``."""
         if isinstance(model, NumericalSystemModel):
             return model, None
-        # Lazy import — placing these at module level would create a
-        # zoomy_core.numerics → zoomy_core.fvm cycle.
-        from zoomy_core.numerics import (
-            ReconstructionSpec, RegularizationSpec,
-        )
-        recon = ReconstructionSpec(
-            order=self.reconstruction_order, limiter=self.limiter)
-        reg = RegularizationSpec(eigenvalue_eps=self.eigenvalue_regularization)
-        nsm = NumericalSystemModel.from_system_model(
-            model, reconstruction=recon, regularization=reg)
+        nsm = NumericalSystemModel.from_system_model(model)
         source_model = None if isinstance(model, SystemModel) else model
         return nsm, source_model
-
-    def _apply_nsm_overrides(self, nsm):
-        """Seed solver attributes from the NSM's numerical slots when
-        the caller has not explicitly overridden them on the solver
-        instance.  Keeps the legacy "set kwargs on the solver" path
-        functional; the NSM is the single source of truth when it
-        carries an explicit non-default value."""
-        # ``reconstruction.order`` always takes effect — the NSM is
-        # the new home for this knob.  Same for limiter.
-        self.reconstruction_order = nsm.reconstruction.order
-        self.limiter = nsm.reconstruction.limiter
-        self.eigenvalue_regularization = nsm.regularization.eigenvalue_eps
 
     # -- Symbolic model helpers ----------------------------------------
 
@@ -335,7 +313,7 @@ class HyperbolicSolver(Solver):
         keys = list(symbolic_model.variables.keys())
         fi_h = keys.index("h") if "h" in keys else None
         dry_thr = self._get_dry_threshold(symbolic_model) if fi_h is not None else 0.0
-        eps_reg = self.eigenvalue_regularization
+        eps_reg = self.nsm.regularization.eigenvalue_eps
         reg_diag = eps_reg * np.eye(n_vars)
         if fi_h is not None and "b" in keys:
             reg_diag[keys.index("b"), keys.index("b")] = 0.0
@@ -444,8 +422,9 @@ class HyperbolicSolver(Solver):
             ConstantReconstructionV2, LSQMUSCLReconstruction,
         )
         dim = symbolic_model.dimension
-        if self.reconstruction_order >= 2:
-            return LSQMUSCLReconstruction(mesh, dim, limiter=self.limiter)
+        if self.nsm.reconstruction.order >= 2:
+            return LSQMUSCLReconstruction(
+                mesh, dim, limiter=self.nsm.reconstruction.limiter)
         return ConstantReconstructionV2(mesh, dim)
 
     def get_flux_operator(self, mesh, model):
@@ -653,7 +632,6 @@ class HyperbolicSolver(Solver):
         """
         nsm, source_model = self._coerce_to_nsm(model)
         self.nsm = nsm
-        self._apply_nsm_overrides(nsm)
         mesh = ensure_lsq_mesh(mesh, nsm.sm,
                                lsq_degree=nsm.resolved_lsq_degree())
         # Periodic-BC topology resolution needs the ``BoundaryConditions``
@@ -733,7 +711,7 @@ class HyperbolicSolver(Solver):
             dQ_s = source(dt, Q_in, Qaux, parameters, np.zeros_like(Q_in))
             return dQ_f + dQ_s
 
-        if self.reconstruction_order >= 2:
+        if self.nsm.reconstruction.order >= 2:
             # SSP-RK2 (Heun) — flux + source per stage
             Q0 = np.array(Q)
             Q1 = Q + dt * rhs(time_now, Q)
@@ -826,10 +804,11 @@ class FreeSurfaceFlowSolver(HyperbolicSolver):
 
     def _build_reconstruction(self, mesh, symbolic_model):
         dim = symbolic_model.dimension
-        if self.reconstruction_order >= 2:
+        if self.nsm.reconstruction.order >= 2:
             from zoomy_core.fvm.reconstruction import FreeSurfaceLSQMUSCL
             h_idx = _var_index(symbolic_model, "h")
             eps_wet = self._get_dry_threshold(symbolic_model)
-            return FreeSurfaceLSQMUSCL(mesh, dim, h_index=h_idx,
-                                       eps_wet=eps_wet, limiter=self.limiter)
+            return FreeSurfaceLSQMUSCL(
+                mesh, dim, h_index=h_idx, eps_wet=eps_wet,
+                limiter=self.nsm.reconstruction.limiter)
         return super()._build_reconstruction(mesh, symbolic_model)
