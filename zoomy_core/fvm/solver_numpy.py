@@ -197,9 +197,14 @@ class Solver(param.Parameterized):
             else:
                 # Unknown target — leave whatever the caller put there.
                 continue
-            u_full[nc:] = 0.0
+            # TODO(boundary-aware-LSQ): supply BC-evaluated face values
+            # for state-aux derivatives (analogous to
+            # ChorinSplitVAMSolver._compute_boundary_face_state).  For
+            # now the predictor's parent uses extrapolation = Neumann-
+            # zero, matching the legacy behaviour at boundary cells.
             d = mesh.compute_derivatives(
                 u_full, degree=max(mi), derivatives_multi_index=[mi],
+                u_boundary_face="extrapolation",
             )
             Qaux[row, :] = d[:nc, 0]
         return Qaux

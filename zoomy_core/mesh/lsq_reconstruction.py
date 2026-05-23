@@ -89,20 +89,55 @@ def compute_gaussian_weights(dX, sigma=1.0):
 def least_squares_reconstruction_local(
     n_cells, dim, neighbors_list, cell_centers, lsq_degree,
     n_inner_cells=None,
+    boundary_face_centers=None,
+    cell_boundary_faces=None,
 ):
     """Build per-cell LSQ gradient operators.
 
-    Only interior cells (index < n_inner_cells) are used as neighbors.
-    Boundary cells grow their stencil inward automatically.
+    Interior cells (index < ``n_inner_cells``) are used as neighbors.
+    Boundary cells additionally include the boundary-face center(s)
+    they touch as **virtual sampling positions** — the LSQ row at a
+    boundary face contributes the BC-prescribed face value, so the
+    cell-centered derivative is boundary-aware.  This is the
+    ghost-cell-free analogue of "apply boundary_operator then take
+    the gradient": the boundary face is a first-class entity in the
+    mesh, sampled at distance ``|face_center − cell_center|`` (= dx/2
+    in 1D, vs. dx for the legacy ghost-cell convention), so the
+    boundary-face stencil is also tighter and more accurate.
+
+    Parameters
+    ----------
+    boundary_face_centers : ndarray, shape ``(n_boundary_faces, dim)``, optional
+        Face centers of all boundary faces.  Required when
+        ``cell_boundary_faces`` provides any non-empty entry.
+    cell_boundary_faces : sequence, length ``n_cells``, optional
+        For each cell, the list of boundary-face indices touching that
+        cell.  Empty list for interior cells.  When omitted, the
+        stencil reduces to the legacy interior-only form.
 
     Returns
     -------
-    A_glob : (n_cells, max_neighbors, n_monomials)
-    neighbors_array : (n_cells, max_neighbors) int
+    A_glob : ``(n_cells, max_neighbors + max_bdy_per_cell, n_monomials)``
+    neighbors_array : ``(n_cells, max_neighbors)`` int
+    boundary_face_neighbors_array : ``(n_cells, max_bdy_per_cell)`` int
+        Boundary-face indices used by each cell's stencil, padded with
+        ``-1`` in unused slots.  Empty array (shape ``(n_cells, 0)``)
+        when no boundary-face augmentation was requested.
     mon_indices : list of tuples
     """
     if n_inner_cells is None:
         n_inner_cells = n_cells
+    if cell_boundary_faces is None:
+        cell_boundary_faces = [[] for _ in range(n_cells)]
+    has_bdy = any(len(b) > 0 for b in cell_boundary_faces)
+    if has_bdy and boundary_face_centers is None:
+        raise ValueError(
+            "cell_boundary_faces lists boundary faces but "
+            "boundary_face_centers is None."
+        )
+    max_bdy_per_cell = (max(len(b) for b in cell_boundary_faces)
+                        if has_bdy else 0)
+
     mon_indices = build_monomial_indices(lsq_degree, dim)
     degree = get_polynomial_degree(mon_indices)
     required_neighbors = get_required_monomials_count(degree, dim)
@@ -122,6 +157,7 @@ def least_squares_reconstruction_local(
     max_neighbors = max(len(nbrs) for nbrs in neighbors_all)
     A_glob = []
     neighbors_array = np.empty((n_cells, max_neighbors), dtype=int)
+    bdy_neighbors_array = -np.ones((n_cells, max_bdy_per_cell), dtype=int)
 
     for i_c in range(n_cells):
         current_neighbors = list(neighbors_all[i_c])
@@ -146,30 +182,132 @@ def least_squares_reconstruction_local(
 
         neighbors_array[i_c, :] = trimmed_neighbors
 
-        dX = np.zeros((max_neighbors, dim), dtype=float)
+        # Boundary-face virtual neighbors for this cell.
+        bdy_faces = list(cell_boundary_faces[i_c])
+        n_bdy_here = len(bdy_faces)
+        bdy_neighbors_array[i_c, :n_bdy_here] = bdy_faces
+
+        # Build dX with [cell rows | boundary-ghost rows].
+        # Boundary points are placed at the GHOST-CELL position (offset
+        # = 2·(face - cell)) — the symmetric image of the inner cell
+        # through the boundary face.  This matches the FV ghost-cell
+        # convention used by OpenFOAM, JAX legacy VAM Poisson, and the
+        # standard FV literature.  Placing the boundary point at the
+        # FACE (offset dx/2) over-constrains the LSQ for Neumann-zero
+        # BCs (which is the common case for h, b, P): two stencil
+        # points with the same value at separated x positions force the
+        # boundary slope to be too close to zero, distorting the
+        # elliptic-block coefficients.  The ghost-cell placement at
+        # offset dx makes the slope between ghost and cell_0 = 0 only at
+        # the MIDPOINT — i.e. exactly at the boundary face — giving the
+        # correct Neumann-zero discretisation.  For prescribed-value
+        # BCs the caller supplies ``u_ghost = 2·u_face - u_cell_0`` via
+        # ``_resolve_u_boundary_face``, recovering linear extrapolation
+        # through the face.
+        total_rows = max_neighbors + max_bdy_per_cell
+        dX = np.zeros((total_rows, dim), dtype=float)
         for j, neighbor in enumerate(trimmed_neighbors):
             dX[j, :] = cell_centers[neighbor] - cell_centers[i_c]
+        for j, bf in enumerate(bdy_faces):
+            dX[max_neighbors + j, :] = (
+                2 * (boundary_face_centers[bf] - cell_centers[i_c])
+            )
+        # Pad unused boundary-face rows by repeating the cell itself
+        # (zero offset, contributes nothing to the LSQ fit).
+        # ``dX`` rows with zero distance get zero Gaussian weight via
+        # the eps check below; but to keep them harmless we leave them
+        # at zero (cell-center offset) and let the weight handle it.
 
         V = build_vandermonde(dX, mon_indices)
-        weights = compute_gaussian_weights(dX)
-        W = np.diag(weights)
-        VW = W @ V
-        alpha = dX.min() * 1e-8
-        A_loc = np.linalg.pinv(VW.T @ VW + alpha * np.eye(VW.shape[1])) @ VW.T @ W
+        # Apples-to-apples with the JAX-legacy LSQ (``/tmp/vam_legacy_jax.py``):
+        # unweighted Moore–Penrose pseudoinverse, no Tikhonov
+        # regularisation.  The previous Gaussian-weighted +
+        # α-regularised form gave subtly different gradients at boundary
+        # / shock cells (chain h_x ≈ 1.5× JAX h_x at cell 0 / cell 50),
+        # which contaminated the elliptic-block coefficients in the
+        # pressure projection.  Switch to plain ``pinv(V)`` so chain LSQ
+        # numerically equals JAX LSQ given the same stencil + values.
+        # Zero out the padding boundary-face rows by replacing those
+        # rows of V with zero (so they contribute nothing to the
+        # pseudoinverse).
+        for j in range(n_bdy_here, max_bdy_per_cell):
+            V[max_neighbors + j, :] = 0.0
+        A_loc = np.linalg.pinv(V)
         A_glob.append(A_loc.T)
 
     A_glob = np.array(A_glob)
-    return A_glob, neighbors_array, mon_indices
+    return A_glob, neighbors_array, bdy_neighbors_array, mon_indices
 
 
 # ── Derivative computation ────────────────────────────────────────────────────
 
-def compute_derivatives(u, mesh, derivatives_multi_index=None):
-    """Cell-wise derivative estimates using the mesh LSQ stencil."""
+_BC_EXTRAPOLATION = "extrapolation"
+
+
+def _resolve_u_boundary_face(u, u_boundary_face, mesh):
+    """Resolve ``u_boundary_face`` → values at the boundary virtual-
+    neighbour position.
+
+    The LSQ stencil places boundary points at the **ghost-cell**
+    position (symmetric image of the inner cell through the boundary
+    face — see ``least_squares_reconstruction_local``).  The value
+    assigned to that ghost point is:
+
+    * ``'extrapolation'`` (Neumann-zero / ``zeroGradient``): ghost =
+      inner cell value.  Slope between ghost and cell is zero, and by
+      symmetry the slope at the midpoint (= boundary face) is zero —
+      the exact Neumann-zero discretisation.
+    * ndarray of face values (Dirichlet / Lambda prescribed): ghost =
+      face value directly (the JAX-legacy / OpenFOAM convention for
+      Dirichlet at ghost-cell-centred grids).  The LSQ fit then gives
+      ``u(x_face) ≈ (u_ghost + u_cell)/2`` to leading order — close to
+      ``u_bc`` for smooth fields, exact in the limit ``dx → 0``.
+
+    Passing ``None`` or any other type raises — callers must be
+    explicit about the BC interpretation.
+    """
+    if isinstance(u_boundary_face, np.ndarray):
+        return u_boundary_face
+    if isinstance(u_boundary_face, str) and u_boundary_face == _BC_EXTRAPOLATION:
+        return u[mesh.boundary_face_cells]
+    raise ValueError(
+        "compute_derivatives: u_boundary_face must be either an ndarray "
+        "of shape (n_boundary_faces,) of face values, or the literal "
+        f"string 'extrapolation'.  Got: {u_boundary_face!r}.  "
+        "Pass 'extrapolation' explicitly for Neumann-zero / "
+        "zeroGradient at boundary faces (e.g. the pressure-projection "
+        "variable in Chorin), or supply BC-evaluated face values "
+        "(e.g. from sm.boundary_conditions(...)) for prescribed BCs."
+    )
+
+
+def compute_derivatives(u, mesh, derivatives_multi_index=None, *,
+                        u_boundary_face):
+    """Cell-wise derivative estimates using the mesh LSQ stencil.
+
+    Parameters
+    ----------
+    u : ndarray, shape ``(n_cells,)``
+        Field values at cell centers (interior + sentinel/ghost slots).
+    u_boundary_face : ndarray | ``'extrapolation'``
+        **Required.**  Either an ``(n_boundary_faces,)`` array of values
+        at boundary face centers (typically from the SystemModel's
+        ``boundary_conditions`` runtime kernel applied to the inner-
+        cell state) — for prescribed-value BCs (Dirichlet, Lambda) — or
+        the literal string ``'extrapolation'`` to request Neumann-zero
+        / face = inner-cell-value treatment (the Chorin pressure
+        projection's natural P BC, and the safe fallback for
+        intrinsically-Neumann fields like static bathymetry).
+    """
     A_glob = mesh.lsq_gradQ
     neighbors = mesh.lsq_neighbors
     mon_indices = mesh.lsq_monomial_multi_index
     scale_factors = mesh.lsq_scale_factors
+    bdy_neighbors = getattr(mesh, "lsq_boundary_face_neighbors", None)
+    has_bdy = bdy_neighbors is not None and bdy_neighbors.size > 0
+    if has_bdy:
+        u_boundary_face = _resolve_u_boundary_face(
+            u, u_boundary_face, mesh)
 
     if derivatives_multi_index is None:
         derivatives_multi_index = mon_indices
@@ -180,8 +318,14 @@ def compute_derivatives(u, mesh, derivatives_multi_index=None):
         A_loc = A_glob[i]
         neighbor_idx = neighbors[i]
         u_i = u[i]
-        u_neighbors = u[neighbor_idx]
-        delta_u = u_neighbors - u_i
+        u_cells = u[neighbor_idx]
+        if has_bdy:
+            bf = bdy_neighbors[i]
+            u_bdy = np.where(bf >= 0, u_boundary_face[np.maximum(bf, 0)], u_i)
+            u_full = np.concatenate([u_cells, u_bdy])
+        else:
+            u_full = u_cells
+        delta_u = u_full - u_i
         out[i, :] = (scale_factors * (A_loc.T @ delta_u))[indices]
 
     return out

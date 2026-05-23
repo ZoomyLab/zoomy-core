@@ -313,6 +313,7 @@ class DerivativeAwareSolverMixin:
             data,
             mesh,
             derivatives_multi_index=[[n_x]],
+            u_boundary_face="extrapolation",
         )[:, 0]
         return deriv
 

@@ -49,6 +49,7 @@ class LSQMesh(FVMMesh):
 
     _lsq_gradQ = param.Array(default=None, allow_None=True)
     _lsq_neighbors = param.Array(default=None, allow_None=True)
+    _lsq_boundary_face_neighbors = param.Array(default=None, allow_None=True)
     _lsq_monomial_multi_index = param.Parameter(default=None)
     _lsq_scale_factors = param.Array(default=None, allow_None=True)
     _face_neighbors = param.Array(default=None, allow_None=True)
@@ -60,6 +61,10 @@ class LSQMesh(FVMMesh):
     @property
     def lsq_neighbors(self):
         return self._lsq_neighbors
+
+    @property
+    def lsq_boundary_face_neighbors(self):
+        return self._lsq_boundary_face_neighbors
 
     @property
     def lsq_monomial_multi_index(self):
@@ -74,12 +79,33 @@ class LSQMesh(FVMMesh):
         return self._face_neighbors
 
     def compute_derivatives(self, u: np.ndarray, degree: int = 1,
-                            derivatives_multi_index=None) -> np.ndarray:
-        """Compute derivatives using precomputed LSQ stencil."""
+                            derivatives_multi_index=None, *,
+                            u_boundary_face) -> np.ndarray:
+        """Compute derivatives using precomputed LSQ stencil.
+
+        Parameters
+        ----------
+        u_boundary_face : ndarray | ``'extrapolation'``
+            **Required.**  Either ``(n_boundary_faces,)`` array of face
+            values (from a prescribed BC kernel), or the string
+            ``'extrapolation'`` for Neumann-zero / face = inner-cell.
+            See :func:`zoomy_core.mesh.lsq_reconstruction.compute_derivatives`
+            for the rationale: silent extrapolation was deprecated
+            because it masks Dirichlet BCs as Neumann-zero.
+        """
+        from zoomy_core.mesh.lsq_reconstruction import (
+            _resolve_u_boundary_face,
+        )
         A_glob = self._lsq_gradQ
         neighbors = self._lsq_neighbors
+        bdy_neighbors = self._lsq_boundary_face_neighbors
         mon_indices = self._lsq_monomial_multi_index
         sf = self._lsq_scale_factors
+
+        has_bdy = bdy_neighbors is not None and bdy_neighbors.size > 0
+        if has_bdy:
+            u_boundary_face = _resolve_u_boundary_face(
+                u, u_boundary_face, self)
 
         if derivatives_multi_index is None:
             derivatives_multi_index = mon_indices
@@ -89,8 +115,16 @@ class LSQMesh(FVMMesh):
         for i in range(A_glob.shape[0]):
             A_loc = A_glob[i]
             nbr_idx = neighbors[i]
-            u_neighbors = u[nbr_idx]
-            delta_u = u_neighbors - u[i]
+            u_cells = u[nbr_idx]
+            if has_bdy:
+                bf = bdy_neighbors[i]
+                u_bdy = np.where(
+                    bf >= 0, u_boundary_face[np.maximum(bf, 0)], u[i]
+                )
+                u_full = np.concatenate([u_cells, u_bdy])
+            else:
+                u_full = u_cells
+            delta_u = u_full - u[i]
             out[i, :] = (sf * (A_loc.T @ delta_u))[indices]
 
         return out
@@ -186,13 +220,31 @@ class LSQMesh(FVMMesh):
         )
 
         dim = fvm.dimension
-        centers = fvm.cell_centers_computed()
+        centers = fvm.cell_centers_computed()       # (dim_pad, n_cells)
+        face_centers = fvm.face_centers_computed()  # (n_faces, dim_pad)
 
-        lsq._lsq_gradQ, lsq._lsq_neighbors, lsq._lsq_monomial_multi_index = (
+        # Boundary face centers: shape (n_boundary_faces, dim).
+        bdy_face_centers = face_centers[
+            fvm.boundary_face_face_indices, :dim
+        ]
+
+        # Inverse map: per cell, the list of boundary face indices
+        # touching it.  Most cells have none; boundary cells have 1
+        # (1D) or more (2D / 3D corners).
+        cell_boundary_faces = [[] for _ in range(fvm.n_cells)]
+        for i_bf, inner_cell in enumerate(fvm.boundary_face_cells):
+            cell_boundary_faces[int(inner_cell)].append(i_bf)
+
+        (lsq._lsq_gradQ,
+         lsq._lsq_neighbors,
+         lsq._lsq_boundary_face_neighbors,
+         lsq._lsq_monomial_multi_index) = (
             least_squares_reconstruction_local(
                 fvm.n_cells, dim, fvm.cell_neighbors,
                 centers[:dim, :].T, lsq_degree,
                 n_inner_cells=fvm.n_inner_cells,
+                boundary_face_centers=bdy_face_centers,
+                cell_boundary_faces=cell_boundary_faces,
             )
         )
         lsq._lsq_scale_factors = scale_lsq_derivative(lsq._lsq_monomial_multi_index)

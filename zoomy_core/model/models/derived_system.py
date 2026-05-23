@@ -393,6 +393,27 @@ class _NodeProxy:
         """
         return _deep_clone(self._node)
 
+    def set(self, expr):
+        """Replace this leaf's Expression with ``expr``.
+
+        Companion to :meth:`System.add_vector_equation`: declare the
+        vector with placeholder leaves, then call ``proxy.set(...)`` to
+        fill each component.
+
+        Example::
+
+            system.add_vector_equation("momentum", ("x", "z"))
+            system.momentum.x.set(x_momentum_expr)
+            system.momentum.z.set(z_momentum_expr)
+
+        ``expr`` is wrapped in :class:`Expression` (carrying this
+        proxy's leaf name) if it's a plain sympy expression.
+        """
+        if not isinstance(expr, Expression):
+            expr = Expression(expr, self._path[-1] if self._path else "")
+        self._replace(expr)
+        return self
+
     def remove(self):
         """Remove this node from the tree.
 
@@ -577,6 +598,40 @@ class System:
         if not isinstance(expr, Expression):
             expr = Expression(expr, parts[-1])
         setattr(node, parts[-1], expr)
+
+    def add_vector_equation(self, name, components):
+        """Register a vector equation as a group node with placeholder
+        per-component leaves.
+
+        After this call, every component ``c`` in ``components`` has an
+        Expression placeholder at ``system.<name>.<c>``, accessible via
+        the per-component proxy.  Fill the placeholders with
+        ``system.<name>.<c>.set(expression)``.  Broadcast operations
+        across all components via ``system.<name>.apply(op)``.
+
+        Example::
+
+            system.add_vector_equation("momentum", ("x", "z"))
+            system.momentum.x.set(x_momentum_expr)
+            system.momentum.z.set(z_momentum_expr)
+            system.momentum.apply(my_op)         # acts on x and z
+
+        Parameters
+        ----------
+        name : str
+            Group name.  Becomes a top-level node on the system tree.
+        components : sequence of str
+            Per-component names (``("x", "z")``, ``("x", "y", "z")``,
+            ``("0", "1", "2")``, …).  Each is attached as an empty
+            Expression leaf so the proxy ``system.<name>.<c>`` is
+            immediately addressable.
+        """
+        import sympy as sp
+        setattr(self._tree, name, Zstruct())
+        for comp in components:
+            placeholder = Expression(sp.S.Zero, comp)
+            setattr(getattr(self._tree, name), comp, placeholder)
+        return self
 
     def remove_equation(self, path):
         if isinstance(path, str):

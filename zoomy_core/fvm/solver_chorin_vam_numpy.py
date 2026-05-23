@@ -27,7 +27,10 @@ import param
 import sympy as sp
 
 from zoomy_core.fvm.solver_numpy import HyperbolicSolver
-from zoomy_core.fvm.riemann_solvers import PositiveNonconservativeRusanov
+from zoomy_core.fvm.riemann_solvers import (
+    NonconservativeRusanov,
+    PositiveNonconservativeRusanov,
+)
 from zoomy_core.mesh import ensure_lsq_mesh
 from zoomy_core.model.models.system_model import SystemModel, _to_zarray
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
@@ -36,6 +39,134 @@ from zoomy_core.misc.misc import Zstruct, ZArray
 
 
 _EMPTY_AUX = np.empty(0, dtype=float)
+
+
+def _apply_cell_limiter(u, grad, multi_index, scheme, mesh):
+    """Apply a TVD limiter to a cell-centred gradient.
+
+    Parameters
+    ----------
+    u : ndarray, shape ``(nc,)``
+        Cell-centre values of the field being differentiated.
+    grad : ndarray, shape ``(nc,)``
+        Unlimited LSQ-computed gradient at cell centres.
+    multi_index : tuple
+        Derivative order (only first-order — ``(1,)`` in 1D — is
+        limited; higher orders pass through unchanged).
+    scheme : str
+        One of ``"minmod"``, ``"venkatakrishnan"``, ``"barth_jespersen"``.
+    mesh : object with ``cell_centers`` attribute.
+
+    Returns
+    -------
+    ndarray, shape ``(nc,)``
+        Limited gradient: ``φ · grad`` where ``φ ∈ [0, 1]`` is
+        cell-wise.
+
+    Convention follows MUSCL slope limiting (LeVeque, *Finite Volume
+    Methods for Hyperbolic Problems*, §6.9): the limiter compares the
+    LSQ-extrapolated face value against the upwind neighbour bound and
+    clips the slope so the reconstruction stays monotone.
+
+    Higher-order derivatives (e.g. ``∂_xx``) are NOT limited here —
+    they live in the elliptic block's principal part and need their
+    own (e.g. compact-FD) discretisation if shock-robustness is
+    required.  Limiting them with this routine would zero them at
+    smooth maxima and break consistency.
+    """
+    if max(multi_index) != 1:
+        return grad
+    nc = u.shape[0]
+    if nc < 3:
+        return grad
+    # 1D cell spacing — assumes uniform grid for the cell-centred
+    # forward/backward deltas.  ``mesh.cell_centers`` has shape
+    # ``(dim, n_cells)`` or ``(n_cells, dim)``; handle either.
+    xc = mesh.cell_centers
+    if xc.ndim == 2 and xc.shape[0] <= 3:
+        x1d = xc[0, :nc]
+    else:
+        x1d = xc[:nc, 0]
+    dx = float(np.mean(np.diff(x1d)))
+    if dx <= 0:
+        return grad
+    # Forward / backward neighbour differences.
+    d_F = np.zeros(nc); d_B = np.zeros(nc)
+    d_F[:-1] = (u[1:] - u[:-1]) / dx
+    d_F[-1] = d_F[-2]
+    d_B[1:] = (u[1:] - u[:-1]) / dx
+    d_B[0] = d_B[1]
+    if scheme == "minmod":
+        # Cell-centred minmod: clip slope to MIN-magnitude
+        # neighbour delta of consistent sign.
+        eps = 1e-14
+        same_sign = (d_F * d_B) > eps
+        slope_lim = np.where(
+            same_sign,
+            np.sign(d_F) * np.minimum(np.abs(d_F), np.abs(d_B)),
+            0.0,
+        )
+        # φ = ratio of limited slope to LSQ slope, clipped to [0, 1].
+        phi = np.where(np.abs(grad) > eps,
+                       np.clip(slope_lim / np.where(np.abs(grad) > eps,
+                                                     grad, 1.0), 0.0, 1.0),
+                       1.0)
+        return phi * grad
+    elif scheme == "barth_jespersen":
+        # Cell-bound BJ: u_min/u_max from immediate neighbours.
+        u_min = np.minimum(np.roll(u, 1), np.roll(u, -1))
+        u_min = np.minimum(u_min, u)
+        u_max = np.maximum(np.roll(u, 1), np.roll(u, -1))
+        u_max = np.maximum(u_max, u)
+        eps = 1e-14
+        # Reconstructed face values at the two cell faces.
+        u_F = u + grad * (dx / 2)
+        u_B = u - grad * (dx / 2)
+        phi = np.ones(nc)
+        # Where u_F exceeds u_max or undershoots u_min, scale.
+        for u_face in (u_F, u_B):
+            over = u_face > u_max + eps
+            under = u_face < u_min - eps
+            ratio_over = np.where(np.abs(u_face - u) > eps,
+                                  (u_max - u) / np.where(np.abs(u_face - u) > eps,
+                                                          u_face - u, 1.0),
+                                  1.0)
+            ratio_under = np.where(np.abs(u_face - u) > eps,
+                                   (u_min - u) / np.where(np.abs(u_face - u) > eps,
+                                                           u_face - u, 1.0),
+                                   1.0)
+            phi = np.where(over, np.minimum(phi, ratio_over), phi)
+            phi = np.where(under, np.minimum(phi, ratio_under), phi)
+        phi = np.clip(phi, 0.0, 1.0)
+        return phi * grad
+    elif scheme == "venkatakrishnan":
+        # Smooth variant of BJ — same bounds machinery but with K-eps
+        # smoothing to remove the kink.  Use K = 5 (standard).
+        K = 5.0
+        u_min = np.minimum(np.roll(u, 1), np.roll(u, -1))
+        u_max = np.maximum(np.roll(u, 1), np.roll(u, -1))
+        eps2 = (K * dx) ** 3
+        d_max = u_max - u
+        d_min = u_min - u
+        # Per-face evaluation.
+        phi = np.ones(nc)
+        for sign in (+1, -1):
+            d_face = grad * (sign * dx / 2)
+            num = d_face * (d_max if sign > 0 else d_min)
+            den_sq = (d_max if sign > 0 else d_min) ** 2
+            psi = ((den_sq + eps2) * d_face + 2 * d_face**2 * (
+                d_max if sign > 0 else d_min)) / (
+                d_face * (den_sq + 2 * d_face**2 + (
+                    d_max if sign > 0 else d_min) * d_face + eps2) + 1e-30
+            )
+            phi = np.where(d_face != 0, np.minimum(phi, psi), phi)
+        phi = np.clip(phi, 0.0, 1.0)
+        return phi * grad
+    else:
+        raise ValueError(
+            f"_apply_cell_limiter: unknown scheme {scheme!r}.  "
+            "Supported: 'minmod', 'barth_jespersen', 'venkatakrishnan'."
+        )
 
 
 def _pad_to_square(sm: SystemModel) -> SystemModel:
@@ -194,6 +325,50 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
              "cont_jk constraints are satisfied exactly at each cycle "
              "output, the Heun average carries a small O(dt²) drift "
              "that the next step's pressure solve corrects."))
+    pressure_solver = param.Selector(
+        default="gmres", objects=["gmres", "lu"],
+        doc=("Linear-solve backend for the elliptic pressure block.  "
+             "``'gmres'`` (default): scipy matrix-free GMRES on the "
+             "operator ``A·P = R(P) − b``; cheap matvec, suitable for "
+             "larger meshes once a preconditioner is wired in.  "
+             "``'lu'``: assemble ``A`` as a dense ``(N×N)`` matrix by "
+             "applying the matvec to canonical basis vectors, then "
+             "solve via :func:`numpy.linalg.solve`.  Exact to machine "
+             "precision in one call — appropriate for small 1D meshes "
+             "(N up to a few thousand) and for diagnostic / reference "
+             "runs.  Use ``'lu'`` when comparing against the legacy "
+             "VAM Chorin reference, since the elliptic operator is "
+             "non-symmetric and unpreconditioned GMRES can take "
+             "thousands of iterations to reach `pressure_tol`."))
+    riemann_solver = param.Selector(
+        default="hr", objects=["hr", "ncp"],
+        doc=("Predictor Riemann route.  ``'hr'`` (default): Audusse–"
+             "Bristeau–Klein hydrostatic reconstruction wrapped around "
+             "NonconservativeRusanov (``PositiveNonconservativeRusanov``) "
+             "— well-balancing comes from the runtime HR step + the "
+             "chain's post-HR NCP entry ``B[xmom, b, x] = g·h``.  "
+             "``'ncp'``: plain ``NonconservativeRusanov`` with an inline "
+             "subclass adding the LAR-balance identity ``Id[h, b] = 1`` "
+             "to the fluctuation dissipation.  No HR step at runtime — "
+             "the chain must NOT apply ``HydrostaticReconstruction`` "
+             "either, so ``g·h·∂_x(b+h)`` stays symbolically in NCP and "
+             "the path-integral fluctuation supplies the bed-slope "
+             "force.  Both routes operate on the same SystemModel API; "
+             "only the face-flux machinery changes."))
+    limited_aux_fields = param.Dict(
+        default={},
+        doc=("Per-aux-derivative TVD limiter map ``{aux_name: scheme}``.  "
+             "Applied at runtime to LSQ-computed gradients before they "
+             "enter the source / elliptic block.  Schemes: ``'minmod'``, "
+             "``'venkatakrishnan'``, ``'barth_jespersen'``.  Use to "
+             "stabilise pressure-projection at shocks / dam-break "
+             "interfaces where the un-limited LSQ gradient overshoots "
+             "(e.g. ``{'h_x': 'minmod', 'q_U0_x': 'minmod'}`` for a "
+             "VAM dam-break-over-bump test).  Sister mechanism to the "
+             "symbolic ``limit(Derivative, scheme)`` wrapper from "
+             "``zoomy_core.model.numerics`` — that path tags aux "
+             "entries as ``limited_derivative`` directly in the "
+             "operator-form pipeline."))
 
     def __init__(self, sm_pred, sm_press, sm_corr, **kwargs):
         if not isinstance(sm_pred, SystemModel):
@@ -223,42 +398,86 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
     # ------------------------------------------------------------------
 
     def _build_numerics(self, symbolic_model):
-        """Audusse hydrostatic-reconstruction Rusanov for the predictor.
+        """Predictor Riemann numerics.  Two routes, selected by
+        :attr:`riemann_solver`:
 
-        The plain ``NonconservativeRusanov`` (parent's default) fails
-        lake-at-rest on a varying bathymetry: Rusanov's wavespeed-based
-        dissipation breaks the discrete cancellation of
-        ``g·h·∂_x η`` against the bottom-slope source.  Audusse–
-        Bristeau–Klein hydrostatic reconstruction (
-        :class:`PositiveNonconservativeRusanov`) restores well-
-        balancing and handles wet/dry fronts via the ``h*`` clamp.
-
-        ``scaled_q_indices``: the momentum-density state indices
-        (auto-detected — excludes ``h`` and the pressure-mode state
-        indices from ``self.sm_press``).  These are the rows that
-        get rescaled by ``h*/h`` during the reconstruction (so the
-        velocity stays constant when ``h`` is clipped).  Pressure
-        modes ``P_k`` are NOT rescaled — they are pressure
-        amplitudes, not momentum densities.
+        * ``"hr"`` (default) — Audusse–Bristeau–Klein hydrostatic
+          reconstruction Rusanov (:class:`PositiveNonconservativeRusanov`).
+          The plain ``NonconservativeRusanov`` fails lake-at-rest on a
+          varying bathymetry: Rusanov's wavespeed-based dissipation
+          breaks the discrete cancellation of ``g·h·∂_x η`` against
+          the bottom-slope source.  Audusse HR restores well-balancing
+          and handles wet/dry fronts via the ``h*`` clamp.
+          ``scaled_q_indices`` are the momentum-density state indices
+          (auto-detected — excludes ``h``, ``b`` and the pressure-mode
+          state indices); these get rescaled by ``h*/h`` during the
+          reconstruction so the velocity stays constant when ``h`` is
+          clipped.  Pressure modes ``P_k`` are NOT rescaled — they are
+          pressure amplitudes, not momentum densities.
+        * ``"ncp"`` — plain :class:`NonconservativeRusanov` with an
+          inline subclass that overrides
+          :meth:`get_viscosity_identity_fluctuations` to add the
+          LAR-balance entry ``Id[h, b] = 1``.  For lake-at-rest
+          (``η = h + b = const`` ⇒ ``dh = -db``) the resulting h-row
+          fluctuation dissipation ``s_max · (dh + db) = 0`` cancels
+          exactly, the path-integral NCP fluctuation supplies the
+          bed-slope force, and no Audusse face-state reconstruction is
+          needed.  Requires ``h`` and ``b`` both in the conservative
+          state — and the SystemModel must NOT have had
+          ``HydrostaticReconstruction`` applied (the gravity term must
+          still be symbolically in NCP, not split into ``g·h²/2`` flux
+          + ``g·h·∂_x b`` NCP).
         """
         state_names = [str(s) for s in symbolic_model.state]
-        excluded = set()
-        if "h" in state_names:
-            excluded.add(state_names.index("h"))
-        if "b" in state_names:
-            # Bathymetry as state (8-state b-promoted path): exclude
-            # from h*/h rescaling — b is static topography, not a
-            # momentum density that needs HR-mass-preservation scaling.
-            excluded.add(state_names.index("b"))
-        # Pressure-mode state indices come straight from the splitter.
-        excluded.update(int(i) for i in self.sm_press.equation_to_state_index)
-        scaled_q_indices = [
-            i for i in range(symbolic_model.n_variables) if i not in excluded
-        ]
-        return PositiveNonconservativeRusanov(
-            symbolic_model,
-            scaled_q_indices=scaled_q_indices,
-        )
+
+        if self.riemann_solver == "hr":
+            excluded = set()
+            if "h" in state_names:
+                excluded.add(state_names.index("h"))
+            if "b" in state_names:
+                # Bathymetry as state (8-state b-promoted path): exclude
+                # from h*/h rescaling — b is static topography, not a
+                # momentum density that needs HR-mass-preservation scaling.
+                excluded.add(state_names.index("b"))
+            # Pressure-mode state indices come straight from the splitter.
+            excluded.update(int(i) for i in self.sm_press.equation_to_state_index)
+            scaled_q_indices = [
+                i for i in range(symbolic_model.n_variables) if i not in excluded
+            ]
+            return PositiveNonconservativeRusanov(
+                symbolic_model,
+                scaled_q_indices=scaled_q_indices,
+            )
+
+        # "ncp" route: plain NCP-Rusanov with the LAR-balance identity.
+        if "h" not in state_names or "b" not in state_names:
+            raise ValueError(
+                "ChorinSplitVAMSolver(riemann_solver='ncp') requires "
+                "both ``h`` and ``b`` in the model state — found state "
+                f"{state_names}.  The NCP route relies on "
+                "``Id[h, b] = 1`` to balance Rusanov dissipation at "
+                "lake-at-rest, and on a chain that has *not* applied "
+                "HydrostaticReconstruction so that ``g·h·∂_x(b+h)`` "
+                "stays in NCP."
+            )
+        h_idx = state_names.index("h")
+        b_idx = state_names.index("b")
+
+        class _NCPRusanovLARBalanced(NonconservativeRusanov):
+            """``NonconservativeRusanov`` with LAR-balance entry
+            ``Id[h, b] = 1`` added to the fluctuation dissipation.
+            Parent already sets ``Id[b, b] = 0``; we add the off-
+            diagonal coupling that cancels the h-row dissipation for
+            ``dh = -db`` (lake-at-rest on varying bathymetry).
+            """
+            name = param.String(default="NCPRusanovLARBalancedV2")
+
+            def get_viscosity_identity_fluctuations(self):
+                Id = super().get_viscosity_identity_fluctuations()
+                Id[h_idx, b_idx] = 1
+                return Id
+
+        return _NCPRusanovLARBalanced(symbolic_model)
 
     def _build_reconstruction(self, mesh, symbolic_model):
         """Primitive-variable MUSCL reconstruction on the predictor.
@@ -399,14 +618,18 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         self._press_state_idx_set = set(int(i) for i in self._press_state_idx)
         self._press_aux_recompute = []
         for entry in (self.sm_press.aux_registry or []):
-            if (entry["kind"] != "derivative"
+            if (entry["kind"] not in ("derivative", "limited_derivative")
                     or entry.get("target_kind") != "state"
                     or entry.get("state_index") not in self._press_state_idx_set):
                 continue
+            scheme = (entry.get("limiter_scheme")
+                      if entry["kind"] == "limited_derivative"
+                      else self.limited_aux_fields.get(entry["name"]))
             self._press_aux_recompute.append({
                 "row":         entry["row"],
                 "state_index": entry["state_index"],
                 "multi_index": entry["multi_index"],
+                "limiter_scheme": scheme,
             })
 
         logger.info(
@@ -449,6 +672,40 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
             return self.Qaux_corr, sm.aux_registry or []
         raise ValueError(f"Unknown sub-system {sm}")
 
+    def _compute_boundary_face_state(self):
+        """Apply the SystemModel's indexed BC kernel to every boundary
+        face; return ``(n_state, n_boundary_faces)`` face-state array.
+
+        Used by :meth:`update_aux_variables` to give the LSQ derivative
+        stencil at boundary cells the BC-correct face values — so a
+        prescribed-Lambda BC (e.g. ``q_U0_face = 0.11197``) flows into
+        the cell-centered ``∂_x q_U0`` estimate via the boundary-face
+        virtual neighbor.  Without this, the LSQ at boundary cells
+        falls back to extrapolation (Neumann-zero) which silently
+        violates prescribed-value inflow BCs.
+        """
+        if self._n_bf == 0:
+            return np.zeros((self._sim_Q.shape[0], 0))
+        Q = self._sim_Q
+        Qaux = self._sim_Qaux
+        p = self._sim_parameters
+        mesh = self._sim_mesh
+        face_centers = mesh.face_centers
+        normals_arr = mesh.face_normals[:mesh.dimension, :]
+        n_state = Q.shape[0]
+        Q_face = np.zeros((n_state, self._n_bf))
+        for i_bf in range(self._n_bf):
+            fidx = self._bf_fidx[i_bf]
+            inner = self._bf_cells[i_bf]
+            qaux_inner = (Qaux[:, inner]
+                           if Qaux.shape[0] > 0 else _EMPTY_AUX)
+            Q_face[:, i_bf] = self._bc_fn(
+                self._bc_indices[i_bf], self._sim_time,
+                face_centers[fidx, :], self._d_face[i_bf],
+                Q[:, inner], qaux_inner, p, normals_arr[:, fidx],
+            )
+        return Q_face
+
     def update_aux_variables(self):
         """Refresh derivative-aux rows by LSQ in each sub-system's
         ``Qaux`` pool.  Each sub-system has its own ``aux_state``
@@ -466,10 +723,16 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         mesh = self._sim_mesh
         u_full = np.zeros(n_cells)
 
+        # BC-correct face state for state-derivative aux entries.
+        # Function-aux fields (e.g. bathymetry ``b``) fall back to
+        # extrapolation since their BC isn't carried by the SystemModel
+        # BC kernel — but ``b`` is static so its derivatives also are.
+        Q_face = self._compute_boundary_face_state()
+
         for sm in (self.sm_pred, self.sm_press, self.sm_corr):
             Qaux, registry = self._aux_pool_for(sm)
             for entry in registry:
-                if entry["kind"] != "derivative":
+                if entry["kind"] not in ("derivative", "limited_derivative"):
                     continue
                 row = entry["row"]
                 if row >= Qaux.shape[0]:
@@ -477,17 +740,46 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
                 mi = entry["multi_index"]
                 tk = entry["target_kind"]
                 if tk == "state":
-                    u_full[:nc] = Q[entry["state_index"], :]
+                    state_i = entry["state_index"]
+                    u_full[:nc] = Q[state_i, :]
+                    # FORCE extrapolation BC everywhere to match the
+                    # old chain behaviour (silent extrapolation default
+                    # before this session) AND the JAX-legacy convention
+                    # for h/b/P — see ``apply_bc`` in
+                    # ``/tmp/vam_legacy_jax.py``.  Apples-to-apples
+                    # comparison with JAX requires identical BC
+                    # treatment for the LSQ-recomputed aux.  Prescribed-
+                    # Dirichlet inflow values are handled separately
+                    # (predictor flux only); the elliptic block sees
+                    # ∂_n = 0 at the boundary face.
+                    u_face = "extrapolation"
                 elif tk == "function":
                     u_full[:nc] = Qaux[entry["function_row"], :]
+                    # Function-aux (e.g. static bathymetry ``b``) — the
+                    # SystemModel doesn't carry a per-field BC kernel
+                    # here, so default to extrapolation (Neumann-zero,
+                    # appropriate for static topography).
+                    u_face = "extrapolation"
                 else:
                     continue
-                u_full[nc:] = 0.0
                 d = mesh.compute_derivatives(
                     u_full, degree=max(mi),
                     derivatives_multi_index=[mi],
+                    u_boundary_face=u_face,
                 )
-                Qaux[row, :] = d[:nc, 0]
+                grad_lsq = d[:nc, 0]
+                # Apply TVD limiter to the LSQ gradient if the aux entry
+                # is flagged as ``limited_derivative`` (via the symbolic
+                # ``limit(D, scheme)`` wrapper) or if its name matches an
+                # entry in ``self.limited_aux_fields`` (for ad-hoc
+                # solver-level limiting without modifying the model).
+                scheme = (entry.get("limiter_scheme")
+                          if entry["kind"] == "limited_derivative"
+                          else self.limited_aux_fields.get(entry["name"]))
+                if scheme is not None:
+                    grad_lsq = _apply_cell_limiter(
+                        u_full[:nc], grad_lsq, mi, scheme, mesh)
+                Qaux[row, :] = grad_lsq
 
     def set_function_aux(self, name, values):
         """Set a function-aux row (e.g. static topography ``b``) on
@@ -599,19 +891,30 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         def _refresh_pressure_aux(p_mat, Qaux_work):
             """LSQ-recompute the P-dependent derivative-aux rows from
             the current iterate ``p_mat`` (shape ``(nP, nc)``).  In-
-            place on ``Qaux_work``."""
+            place on ``Qaux_work``.
+
+            Pressure modes use ``'extrapolation'`` at boundary faces —
+            the standard Chorin / projection-method BC (``∂_n P = 0``).
+            The chain's SystemModel doesn't carry a separate BC kernel
+            for P, so we apply the convention explicitly here.
+            """
             u_full = np.zeros(n_cells)
             for entry in self._press_aux_recompute:
                 state_i = entry["state_index"]
                 k = local_of_state[state_i]
                 u_full[:nc] = p_mat[k, :]
-                u_full[nc:] = 0.0
                 mi = entry["multi_index"]
                 d = mesh.compute_derivatives(
                     u_full, degree=max(mi),
                     derivatives_multi_index=[mi],
+                    u_boundary_face="extrapolation",
                 )
-                Qaux_work[entry["row"], :] = d[:nc, 0]
+                grad_lsq = d[:nc, 0]
+                scheme = entry.get("limiter_scheme")
+                if scheme is not None:
+                    grad_lsq = _apply_cell_limiter(
+                        u_full[:nc], grad_lsq, mi, scheme, mesh)
+                Qaux_work[entry["row"], :] = grad_lsq
 
         def _residual(p_vec):
             p_mat = p_vec.reshape(nP, nc)
@@ -641,19 +944,29 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         def apply_A(p_vec):
             return _residual(p_vec) - b
 
-        A = LinearOperator((N, N), matvec=apply_A, dtype=float)
-        p0 = Q[e2s, :].ravel()                      # warm start
-        p_new, info = gmres(
-            A, -b, x0=p0,
-            rtol=self.pressure_tol,
-            atol=self.pressure_tol,    # absolute floor — survives tiny ‖b‖
-            maxiter=self.pressure_maxit,
-        )
-        if info != 0:
-            logger.warning(
-                "Chorin pressure GMRES did not fully converge "
-                "(info=%d, ‖b‖=%.3e)", info, b_norm,
+        if self.pressure_solver == "lu":
+            # Dense assembly by canonical-basis application + direct solve.
+            A_dense = np.empty((N, N), dtype=float)
+            e_j = np.zeros(N)
+            for j in range(N):
+                e_j[j] = 1.0
+                A_dense[:, j] = apply_A(e_j)
+                e_j[j] = 0.0
+            p_new = np.linalg.solve(A_dense, -b)
+        else:
+            A = LinearOperator((N, N), matvec=apply_A, dtype=float)
+            p0 = Q[e2s, :].ravel()                      # warm start
+            p_new, info = gmres(
+                A, -b, x0=p0,
+                rtol=self.pressure_tol,
+                atol=self.pressure_tol,    # absolute floor — survives tiny ‖b‖
+                maxiter=self.pressure_maxit,
             )
+            if info != 0:
+                logger.warning(
+                    f"Chorin pressure GMRES did not fully converge "
+                    f"(info={info}, ‖b‖={b_norm:.3e})"
+                )
         Q[e2s, :] = p_new.reshape(nP, nc)
         self._sim_Q = Q
         # Reflect the solved pressure into Qaux_press derivative rows

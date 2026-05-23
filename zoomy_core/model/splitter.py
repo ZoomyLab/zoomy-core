@@ -342,12 +342,27 @@ class SplitForPressureResult:
 
 
 def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
-                     equation_to_state_index, history_entry):
+                     equation_to_state_index, history_entry,
+                     source_only=False):
     """Build a rectangular SystemModel from a list of (name, residual)
-    pairs.  Each residual is auto-tagged then converted to an
-    operator-form SystemModel by walking the tags.
+    pairs.
 
-    Returns a fresh :class:`SystemModel`.
+    Parameters
+    ----------
+    source_only : bool, default False
+        Default (False) auto-tags each residual into flux / NCP /
+        source operators and a mass matrix — appropriate for sub-
+        systems whose runtime uses the symbolic Riemann / NCP path-
+        integral framework (predictor, corrector).  Set True for sub-
+        systems that should use **central discretisation through the
+        aux-derivative stencil**: the entire non-time-derivative
+        residual is packed into ``source`` (sign-flipped to SystemModel
+        ``... − S = 0`` convention), ``F = P_hydro = B = 0``, and any
+        spatial derivatives become aux entries registered by
+        ``expose_aux_atoms``.  Use this for elliptic / Poisson-type
+        sub-systems (e.g. SM_press from :func:`split_simple`) where
+        a centrally-differenced stencil — not Roe / path-integral
+        upwinding — is the natural numerics.
     """
     from zoomy_core.model.models.system_model import SystemModel
     from zoomy_core.model.models.tag_extraction import (
@@ -392,39 +407,53 @@ def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
     n_dim = len(coords)
     variable_map = {n: [i] for i, n in enumerate(eq_names)}
 
-    F = collect_solver_tag(
-        holder, "flux", variable_map=variable_map,
-        n_variables=n_eq, n_directions=n_dim, coords=coords,
-        state_variables=state_funcs, policy="strict",
-    )
-    P = collect_solver_tag(
-        holder, "hydrostatic_pressure", variable_map=variable_map,
-        n_variables=n_eq, n_directions=n_dim, coords=coords,
-        state_variables=state_funcs, policy="strict",
-    )
-    # ``collect_solver_tag`` allocates a square (N × N × n_dim) NCP
-    # array.  Our sub-systems are rectangular (n_eq < n_state); pass
-    # ``n_variables=max(n_eq, n_state)`` and then take the first n_eq
-    # rows / n_state columns.
-    n_max = max(n_eq, n_state)
-    B_raw = collect_solver_tag(
-        holder, "nonconservative_flux", variable_map=variable_map,
-        n_variables=n_max, n_directions=n_dim, coords=coords,
-        state_variables=state_funcs, policy="strict",
-    )
-    S_list = collect_solver_tag(
-        holder, "source", variable_map=variable_map,
-        n_variables=n_eq, policy="strict",
-    )
-    # SystemModel residual form is ``... − S(Q) = 0``; auto-tagger
-    # stores source terms with their original LHS sign — negate.
-    S_mat = sp.Matrix(n_eq, 1, lambda i, _j: -S_list[i])
+    if source_only:
+        F = sp.zeros(n_eq, n_dim)
+        P = sp.zeros(n_eq, n_dim)
+        B = sp.MutableDenseNDimArray.zeros(n_eq, n_state, n_dim)
+        S_list = []
+        for i, name in enumerate(eq_names):
+            res_func = sp.sympify(eq_residuals[i]).xreplace(sym_to_func)
+            td_part = tagged[name].get_solver_tag("time_derivative")
+            non_td = sp.expand(
+                (res_func - (td_part if td_part is not None else sp.S.Zero)).doit()
+            )
+            S_list.append(non_td)
+        S_mat = sp.Matrix(n_eq, 1, lambda i, _j: -S_list[i])
+    else:
+        F = collect_solver_tag(
+            holder, "flux", variable_map=variable_map,
+            n_variables=n_eq, n_directions=n_dim, coords=coords,
+            state_variables=state_funcs, policy="strict",
+        )
+        P = collect_solver_tag(
+            holder, "hydrostatic_pressure", variable_map=variable_map,
+            n_variables=n_eq, n_directions=n_dim, coords=coords,
+            state_variables=state_funcs, policy="strict",
+        )
+        # ``collect_solver_tag`` allocates a square (N × N × n_dim) NCP
+        # array.  Our sub-systems are rectangular (n_eq < n_state); pass
+        # ``n_variables=max(n_eq, n_state)`` and then take the first n_eq
+        # rows / n_state columns.
+        n_max = max(n_eq, n_state)
+        B_raw = collect_solver_tag(
+            holder, "nonconservative_flux", variable_map=variable_map,
+            n_variables=n_max, n_directions=n_dim, coords=coords,
+            state_variables=state_funcs, policy="strict",
+        )
+        S_list = collect_solver_tag(
+            holder, "source", variable_map=variable_map,
+            n_variables=n_eq, policy="strict",
+        )
+        # SystemModel residual form is ``... − S(Q) = 0``; auto-tagger
+        # stores source terms with their original LHS sign — negate.
+        S_mat = sp.Matrix(n_eq, 1, lambda i, _j: -S_list[i])
 
-    B = sp.MutableDenseNDimArray.zeros(n_eq, n_state, n_dim)
-    for i in range(n_eq):
-        for j in range(n_state):
-            for d in range(n_dim):
-                B[i, j, d] = B_raw[i, j, d]
+        B = sp.MutableDenseNDimArray.zeros(n_eq, n_state, n_dim)
+        for i in range(n_eq):
+            for j in range(n_state):
+                for d in range(n_dim):
+                    B[i, j, d] = B_raw[i, j, d]
 
     # Mass matrix: rebuild from the time-derivative tag on each row.
     # ``.doit()`` expands compound ``Derivative(c·F, t)`` atoms.
@@ -864,11 +893,18 @@ def split_simple(sm, pressure_vars, dt, *, bottom=None):
         sm_parent=sm,
         state=state,
         equation_to_state_index=list(pressure_indices),
+        source_only=True,
         history_entry={
             "name": "split_simple[press]",
             "description": (
-                f"elliptic block: {len(press_eq_names)} rows determining "
-                f"{[str(p) for p in pressure_vars]}"
+                f"elliptic block (source-only / central-discretised): "
+                f"{len(press_eq_names)} rows determining "
+                f"{[str(p) for p in pressure_vars]}.  The full elliptic "
+                "residual is packed into ``source``; spatial derivatives "
+                "become aux entries evaluated by a centrally-differenced "
+                "LSQ stencil at runtime — the natural numerics for an "
+                "elliptic problem, in contrast to the path-integral / "
+                "Riemann decomposition used by the hyperbolic predictor."
             ),
         },
     )

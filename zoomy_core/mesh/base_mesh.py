@@ -566,7 +566,8 @@ class BaseMesh(param.Parameterized):
     # ── gradient computation (on-the-fly LSQ) ───────────────────────────
 
     def compute_derivatives(self, u: np.ndarray, degree: int = 1,
-                            derivatives_multi_index=None) -> np.ndarray:
+                            derivatives_multi_index=None, *,
+                            u_boundary_face) -> np.ndarray:
         """Compute derivatives using on-the-fly LSQ reconstruction."""
         from zoomy_core.mesh.lsq_reconstruction import (
             least_squares_reconstruction_local,
@@ -574,13 +575,27 @@ class BaseMesh(param.Parameterized):
             find_derivative_indices,
             compute_derivatives as _compute_derivs,
         )
-        centers = self.cell_centers_computed()
+        centers = self.cell_centers_computed()       # (dim_pad, n_cells)
+        face_centers = self.face_centers_computed()  # (n_faces, dim_pad)
         dim = self.dimension
-        lsq_gradQ, lsq_neighbors, lsq_monomial_multi_index = (
+
+        bdy_face_centers = face_centers[
+            self.boundary_face_face_indices, :dim
+        ]
+        cell_boundary_faces = [[] for _ in range(self.n_cells)]
+        for i_bf, inner_cell in enumerate(self.boundary_face_cells):
+            cell_boundary_faces[int(inner_cell)].append(i_bf)
+
+        (lsq_gradQ,
+         lsq_neighbors,
+         lsq_boundary_face_neighbors,
+         lsq_monomial_multi_index) = (
             least_squares_reconstruction_local(
                 self.n_cells, dim, self.cell_neighbors,
                 centers[:dim, :].T, degree,
                 n_inner_cells=self.n_inner_cells,
+                boundary_face_centers=bdy_face_centers,
+                cell_boundary_faces=cell_boundary_faces,
             )
         )
         lsq_scale_factors = scale_lsq_derivative(lsq_monomial_multi_index)
@@ -591,9 +606,12 @@ class BaseMesh(param.Parameterized):
         s = _Stencil()
         s.lsq_gradQ = lsq_gradQ
         s.lsq_neighbors = lsq_neighbors
+        s.lsq_boundary_face_neighbors = lsq_boundary_face_neighbors
         s.lsq_monomial_multi_index = lsq_monomial_multi_index
         s.lsq_scale_factors = lsq_scale_factors
-        return _compute_derivs(u, s, derivatives_multi_index)
+        s.boundary_face_cells = self.boundary_face_cells
+        return _compute_derivs(u, s, derivatives_multi_index,
+                               u_boundary_face=u_boundary_face)
 
     # ── I/O ─────────────────────────────────────────────────────────────
 
