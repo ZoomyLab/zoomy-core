@@ -632,8 +632,7 @@ class HyperbolicSolver(Solver):
         """
         nsm, source_model = self._coerce_to_nsm(model)
         self.nsm = nsm
-        mesh = ensure_lsq_mesh(mesh, nsm.sm,
-                               lsq_degree=nsm.resolved_lsq_degree())
+        mesh = ensure_lsq_mesh(mesh, nsm)
         # Periodic-BC topology resolution needs the ``BoundaryConditions``
         # object (it iterates ``.boundary_conditions_list`` for tagged
         # periodic pairs).  Done here, *before* normalising to a

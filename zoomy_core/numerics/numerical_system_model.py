@@ -96,7 +96,6 @@ class NumericalSystemModel:
     reconstruction: ReconstructionSpec = field(default_factory=ReconstructionSpec)
     diffusion: DiffusionSpec = field(default_factory=DiffusionSpec)
     regularization: RegularizationSpec = field(default_factory=RegularizationSpec)
-    lsq_degree: Optional[int] = None
     # Captured at promotion time so SDM-style derivative declarations
     # survive Model → SystemModel.  SystemModel itself has no back-
     # reference to its source Model and ``derivative_specs`` is a
@@ -106,6 +105,17 @@ class NumericalSystemModel:
     # ``SystemModel.from_model`` runs (so the aux_registry's
     # ``kind=="derivative"`` scan misses them).
     source_derivative_specs: Optional[list] = None
+    # Co-running SystemModels whose derivative requirements must be
+    # max'd into the LSQ stencil sizing.  For Chorin VAM the predictor
+    # alone declares only first-order spatial derivatives, but the
+    # pressure block's elliptic operator carries ``∂_xx P`` — the LSQ
+    # stencil at every cell needs degree 2 to fit them.  Without
+    # ``additional_systems`` the predictor-only NSM would silently
+    # pick degree 1 and the pressure GMRES residual would zero the
+    # curvature contribution (yesterday's root-cause for the dam-break
+    # blow-up).  Solvers that compose sub-systems set this slot;
+    # single-system solvers leave it empty.
+    additional_systems: list = field(default_factory=list)
 
     # ── Constructors ──────────────────────────────────────────────
 
@@ -118,7 +128,7 @@ class NumericalSystemModel:
         reconstruction: Optional[ReconstructionSpec] = None,
         diffusion: Optional[DiffusionSpec] = None,
         regularization: Optional[RegularizationSpec] = None,
-        lsq_degree: Optional[int] = None,
+        additional_systems: Optional[list] = None,
     ) -> "NumericalSystemModel":
         """Build an NSM from a :class:`SystemModel` (or a :class:`Model`,
         auto-promoted via :meth:`SystemModel.from_model`).
@@ -130,9 +140,13 @@ class NumericalSystemModel:
               non-zero ``diffusion_matrix`` and a positive ``nu``;
               otherwise disabled.
             - ``regularization`` → ``eigenvalue_eps=1e-8``
-            - ``lsq_degree`` → auto from ``sm.aux_registry`` (or, when
-              the source was a :class:`StructuredDerivativeModel`, from
-              its captured ``derivative_specs``).
+
+        LSQ polynomial degree is **always** auto-derived (from
+        ``sm.aux_registry`` plus any ``additional_systems``) — it is
+        no longer a hand-adjustable knob.  Composite solvers pass
+        ``additional_systems=[sm_press, sm_corr, ...]`` so the
+        predictor's mesh stencil is large enough for the co-running
+        sub-systems' derivatives.
         """
         source_specs = getattr(sm, "derivative_specs", None)
         if not isinstance(sm, SystemModel):
@@ -156,9 +170,9 @@ class NumericalSystemModel:
             reconstruction=reconstruction,
             diffusion=diffusion,
             regularization=regularization,
-            lsq_degree=lsq_degree,
             source_derivative_specs=(
                 list(source_specs) if source_specs else None),
+            additional_systems=list(additional_systems or []),
         )
 
     # ── LSQ-degree resolution ─────────────────────────────────────
@@ -166,42 +180,30 @@ class NumericalSystemModel:
     def resolved_lsq_degree(self) -> int:
         """Return the LSQ polynomial degree the mesh should use.
 
-        Order of precedence:
+        Computed as the max spatial-derivative order across:
 
-        1. ``self.lsq_degree`` (explicit override) wins.
-        2. The maximum spatial-derivative order across
-           ``sm.aux_registry`` entries of ``kind == "derivative"``.
-           ``aux_registry`` is populated by
-           :meth:`SystemModel.from_model` for *every* SystemModel
-           (more general than ``derivative_specs`` which only
-           exists on :class:`StructuredDerivativeModel`).
-        3. Fallback: 1.
+        - ``self.sm.aux_registry`` (every SystemModel carries this,
+          populated by :meth:`SystemModel.from_model`),
+        - every entry in ``self.additional_systems`` (composite
+          sub-systems that share the same mesh; both
+          ``aux_registry`` and ``derivative_specs`` are consulted —
+          entries may be either Models or SystemModels), and
+        - ``self.source_derivative_specs`` (captured at promotion
+          when the source was a :class:`StructuredDerivativeModel`,
+          whose ``D.dxx(...)`` calls are substituted by Symbols
+          before ``SystemModel.from_model`` runs — so the source-side
+          declaration is the only signal that survives).
+
+        Falls back to 1 when no signal exists.  **Never user-set.**
         """
-        if self.lsq_degree is not None:
-            return self.lsq_degree
-        registry = getattr(self.sm, "aux_registry", None) or []
-        spatial_orders = [
-            sum(int(k) for k in entry["multi_index"])
-            for entry in registry
-            if entry.get("kind") == "derivative"
-            and entry.get("multi_index") is not None
-        ]
-        if spatial_orders:
-            return max(spatial_orders)
-        # Fallback to ``source_derivative_specs`` captured at
-        # promotion (StructuredDerivativeModel path).  The SDM
-        # substitutes ``D.dxx(Q.h)`` calls by Symbols *before* the
-        # SystemModel is built, so the aux_registry derivative scan
-        # never sees them — the source-side declaration is the only
-        # signal that survives.
-        specs = self.source_derivative_specs or []
-        if specs:
-            spatial = [
-                sum(1 for a in spec.axes if a != "t") for spec in specs
-            ]
-            if spatial:
-                return max(spatial) or 1
-        return 1
+        candidates = [1, _lsq_degree_from_aux_registry(self.sm)]
+        candidates.append(
+            _lsq_degree_from_derivative_specs(self.source_derivative_specs))
+        for sm in self.additional_systems:
+            candidates.append(_lsq_degree_from_aux_registry(sm))
+            candidates.append(_lsq_degree_from_derivative_specs(
+                getattr(sm, "derivative_specs", None)))
+        return max(candidates)
 
     # ── Numerics + runtime construction ───────────────────────────
 
@@ -232,3 +234,26 @@ def _diffusion_auto_enabled(sm) -> bool:
     except Exception:
         return False
     return any(sp.simplify(e) != 0 for e in flat)
+
+
+def _lsq_degree_from_aux_registry(sm) -> int:
+    """Max spatial-derivative order across ``sm.aux_registry``
+    derivative entries.  Returns 1 when none are present (the LSQ
+    stencil always at least supports first derivatives)."""
+    registry = getattr(sm, "aux_registry", None) or []
+    orders = [
+        sum(int(k) for k in entry["multi_index"])
+        for entry in registry
+        if entry.get("kind") in ("derivative", "limited_derivative")
+        and entry.get("multi_index") is not None
+    ]
+    return max(orders) if orders else 1
+
+
+def _lsq_degree_from_derivative_specs(specs) -> int:
+    """Max spatial-axes count across ``StructuredDerivativeModel``
+    derivative specs.  Returns 1 when ``specs`` is empty."""
+    if not specs:
+        return 1
+    orders = [sum(1 for a in spec.axes if a != "t") for spec in specs]
+    return max(orders) if orders else 1

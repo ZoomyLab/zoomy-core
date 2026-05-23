@@ -187,8 +187,17 @@ class LSQMesh(FVMMesh):
         return csr_matrix(D)
 
     @classmethod
-    def from_fvm(cls, fvm: FVMMesh, lsq_degree: int = 1) -> "LSQMesh":
-        """Build an LSQMesh by computing LSQ operators from an FVMMesh."""
+    def from_fvm(cls, fvm: FVMMesh) -> "LSQMesh":
+        """Build an LSQMesh shell from an FVMMesh, populating the LSQ
+        stencil at degree 1 (the minimum that supports any derivative
+        reconstruction).
+
+        The LSQ polynomial degree is **not** a hand-adjustable knob
+        here — use :func:`zoomy_core.mesh.ensure_lsq_mesh(mesh, model)`
+        for any solver setup, which sizes the stencil from the model's
+        NumericalSystemModel.  This factory exists for low-level mesh
+        construction; the degree is set by the model in the higher
+        layers."""
         lsq = cls(
             dimension=fvm.dimension,
             type=fvm.type,
@@ -219,35 +228,7 @@ class LSQMesh(FVMMesh):
             _face_centers=fvm._face_centers,
         )
 
-        dim = fvm.dimension
-        centers = fvm.cell_centers_computed()       # (dim_pad, n_cells)
-        face_centers = fvm.face_centers_computed()  # (n_faces, dim_pad)
-
-        # Boundary face centers: shape (n_boundary_faces, dim).
-        bdy_face_centers = face_centers[
-            fvm.boundary_face_face_indices, :dim
-        ]
-
-        # Inverse map: per cell, the list of boundary face indices
-        # touching it.  Most cells have none; boundary cells have 1
-        # (1D) or more (2D / 3D corners).
-        cell_boundary_faces = [[] for _ in range(fvm.n_cells)]
-        for i_bf, inner_cell in enumerate(fvm.boundary_face_cells):
-            cell_boundary_faces[int(inner_cell)].append(i_bf)
-
-        (lsq._lsq_gradQ,
-         lsq._lsq_neighbors,
-         lsq._lsq_boundary_face_neighbors,
-         lsq._lsq_monomial_multi_index) = (
-            least_squares_reconstruction_local(
-                fvm.n_cells, dim, fvm.cell_neighbors,
-                centers[:dim, :].T, lsq_degree,
-                n_inner_cells=fvm.n_inner_cells,
-                boundary_face_centers=bdy_face_centers,
-                cell_boundary_faces=cell_boundary_faces,
-            )
-        )
-        lsq._lsq_scale_factors = scale_lsq_derivative(lsq._lsq_monomial_multi_index)
+        lsq._build_lsq_stencil(degree=1)
 
         lsq._face_neighbors = _build_face_neighbors(
             fvm.face_cells, fvm.cell_neighbors,
@@ -256,28 +237,70 @@ class LSQMesh(FVMMesh):
 
         return lsq
 
+    def _build_lsq_stencil(self, degree: int) -> None:
+        """Rebuild the LSQ stencil at the given polynomial ``degree``.
+
+        Called from :meth:`from_fvm` (with ``degree=1``) and from
+        :func:`zoomy_core.mesh.ensure_lsq_mesh` (with the model-derived
+        degree).  Mutates the LSQ-cache slots on ``self`` in place.
+
+        The ``degree`` parameter is **internal**: user code never sets
+        it.  The right entry point for solver setup is
+        ``ensure_lsq_mesh(mesh, model)``."""
+        dim = self.dimension
+        centers = self.cell_centers_computed()
+        face_centers = self.face_centers_computed()
+        bdy_face_centers = face_centers[
+            self.boundary_face_face_indices, :dim
+        ]
+        cell_boundary_faces = [[] for _ in range(self.n_cells)]
+        for i_bf, inner_cell in enumerate(self.boundary_face_cells):
+            cell_boundary_faces[int(inner_cell)].append(i_bf)
+
+        (self._lsq_gradQ,
+         self._lsq_neighbors,
+         self._lsq_boundary_face_neighbors,
+         self._lsq_monomial_multi_index) = (
+            least_squares_reconstruction_local(
+                self.n_cells, dim, self.cell_neighbors,
+                centers[:dim, :].T, degree,
+                n_inner_cells=self.n_inner_cells,
+                boundary_face_centers=bdy_face_centers,
+                cell_boundary_faces=cell_boundary_faces,
+            )
+        )
+        self._lsq_scale_factors = scale_lsq_derivative(
+            self._lsq_monomial_multi_index)
+
+    def _current_lsq_degree(self) -> int:
+        """Polynomial degree currently represented by the cached
+        stencil.  Used by ``ensure_lsq_mesh`` to decide if a rebuild
+        is needed."""
+        if self._lsq_monomial_multi_index is None:
+            return 0
+        return max(sum(mi) for mi in self._lsq_monomial_multi_index)
+
     @classmethod
-    def from_msh(cls, filepath: str, lsq_degree: int = 1) -> "LSQMesh":
+    def from_msh(cls, filepath: str) -> "LSQMesh":
         fvm = FVMMesh.from_msh(filepath)
-        return cls.from_fvm(fvm, lsq_degree)
+        return cls.from_fvm(fvm)
 
     @classmethod
-    def from_hdf5(cls, filepath: str, lsq_degree: int = 1) -> "LSQMesh":
+    def from_hdf5(cls, filepath: str) -> "LSQMesh":
         fvm = FVMMesh.from_hdf5(filepath)
-        return cls.from_fvm(fvm, lsq_degree)
+        return cls.from_fvm(fvm)
 
     @classmethod
-    def create_1d(cls, domain: tuple, n_inner_cells: int, lsq_degree: int = 1) -> "LSQMesh":
+    def create_1d(cls, domain: tuple, n_inner_cells: int) -> "LSQMesh":
         fvm = FVMMesh.create_1d(domain, n_inner_cells)
-        return cls.from_fvm(fvm, lsq_degree)
+        return cls.from_fvm(fvm)
 
     @classmethod
-    def create_2d(cls, domain: tuple, nx: int, ny: int, lsq_degree: int = 1) -> "LSQMesh":
+    def create_2d(cls, domain: tuple, nx: int, ny: int) -> "LSQMesh":
         fvm = FVMMesh.create_2d(domain, nx, ny)
-        return cls.from_fvm(fvm, lsq_degree)
+        return cls.from_fvm(fvm)
 
     @classmethod
-    def create_3d(cls, domain: tuple, nx: int, ny: int, nz: int,
-                  lsq_degree: int = 1) -> "LSQMesh":
+    def create_3d(cls, domain: tuple, nx: int, ny: int, nz: int) -> "LSQMesh":
         fvm = FVMMesh.create_3d(domain, nx, ny, nz)
-        return cls.from_fvm(fvm, lsq_degree)
+        return cls.from_fvm(fvm)

@@ -560,12 +560,19 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         t0 = _time.time()
 
         # 1. Pad SM_pred to square and let the parent set up the
-        #    predictor's flux machinery.  Wrap in NSM so the parent
-        #    uses the reconstruction spec we were configured with.
+        #    predictor's flux machinery.  Wrap in NSM with the
+        #    pressure + corrector SystemModels as ``additional_systems``
+        #    so the predictor's mesh LSQ stencil is sized for the
+        #    pressure block's ∂_xx P terms (degree-2 stencil — yesterday's
+        #    root-cause fix for the dam-break blow-up).  The reconstruction
+        #    spec we were configured with is honoured too.
         sm_pred_square = _pad_to_square(self.sm_pred)
         self._sm_pred_square = sm_pred_square
         nsm_pred = NumericalSystemModel.from_system_model(
-            sm_pred_square, reconstruction=self._reconstruction_spec)
+            sm_pred_square,
+            reconstruction=self._reconstruction_spec,
+            additional_systems=[self.sm_press, self.sm_corr],
+        )
         super().setup_simulation(mesh, nsm_pred, write_output=write_output)
 
         # 2. dt rename + parameter registration on the dt-dependent subsystems.

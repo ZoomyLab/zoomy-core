@@ -57,9 +57,18 @@ class SplittingSolver(IMEXSolver):
         return list(range(model.dimension))
 
     def setup_simulation(self, mesh, model, write_output=False):
-        """Build all operators including Poisson infrastructure."""
+        """Build all operators including Poisson infrastructure.
+
+        NOTE: this solver is marked inactive in the audit — it has no
+        active tests.  The NSM auto-LSQ-degree derivation may not be
+        sufficient for its implicit pressure-Poisson stage; a proper
+        fix mirrors :class:`ChorinSplitVAMSolver` and exposes the
+        pressure block as a sibling SystemModel passed via
+        ``NumericalSystemModel.from_system_model(...,
+        additional_systems=[sm_press])``.
+        """
         t0 = time.time()
-        mesh = ensure_lsq_mesh(mesh, model, lsq_degree=2)
+        mesh = ensure_lsq_mesh(mesh, model)
         # Periodic-BC topology resolution needs the ``BoundaryConditions``
         # object — done before the SystemModel normalisation.
         if hasattr(mesh, "resolve_periodic_bcs") and not isinstance(model, SystemModel):
