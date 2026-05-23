@@ -26,6 +26,7 @@ import zoomy_core.fvm.timestepping as timestepping
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel, NumpyRuntimeSymbolic
 from zoomy_core.mesh import ensure_lsq_mesh
 from zoomy_core.model.models.system_model import SystemModel
+from zoomy_core.numerics import NumericalSystemModel
 from zoomy_core.fvm.riemann_solvers import (
     PositiveNonconservativeRusanov,
     NonconservativeRusanov,
@@ -256,6 +257,49 @@ class HyperbolicSolver(Solver):
         Q = model.initial_conditions.apply(mesh.cell_centers[:, :nc], Q)
         Qaux = model.aux_initial_conditions.apply(mesh.cell_centers[:, :nc], Qaux)
         return Q, Qaux
+
+    # -- NSM coercion --------------------------------------------------
+
+    def _coerce_to_nsm(self, model):
+        """Normalise ``model`` to a (NumericalSystemModel, source-Model)
+        pair.  ``source_model`` is the *original* :class:`Model` when
+        one was passed (needed for ``resolve_periodic_bcs``, which
+        walks ``boundary_conditions_list`` — a field that lives on
+        the Model object and not on the lambdified SystemModel BC
+        kernel).  When the caller supplied a bare SystemModel or NSM,
+        ``source_model`` is ``None``.
+
+        When auto-promoting (Model or SystemModel), the NSM is seeded
+        from the current solver attributes so callers that set
+        ``solver.reconstruction_order = 2`` before ``setup_simulation``
+        keep working.  An explicitly-supplied NSM bypasses this path —
+        its slots win."""
+        if isinstance(model, NumericalSystemModel):
+            return model, None
+        # Lazy import — placing these at module level would create a
+        # zoomy_core.numerics → zoomy_core.fvm cycle.
+        from zoomy_core.numerics import (
+            ReconstructionSpec, RegularizationSpec,
+        )
+        recon = ReconstructionSpec(
+            order=self.reconstruction_order, limiter=self.limiter)
+        reg = RegularizationSpec(eigenvalue_eps=self.eigenvalue_regularization)
+        nsm = NumericalSystemModel.from_system_model(
+            model, reconstruction=recon, regularization=reg)
+        source_model = None if isinstance(model, SystemModel) else model
+        return nsm, source_model
+
+    def _apply_nsm_overrides(self, nsm):
+        """Seed solver attributes from the NSM's numerical slots when
+        the caller has not explicitly overridden them on the solver
+        instance.  Keeps the legacy "set kwargs on the solver" path
+        functional; the NSM is the single source of truth when it
+        carries an explicit non-default value."""
+        # ``reconstruction.order`` always takes effect — the NSM is
+        # the new home for this knob.  Same for limiter.
+        self.reconstruction_order = nsm.reconstruction.order
+        self.limiter = nsm.reconstruction.limiter
+        self.eigenvalue_regularization = nsm.regularization.eigenvalue_eps
 
     # -- Symbolic model helpers ----------------------------------------
 
@@ -600,20 +644,26 @@ class HyperbolicSolver(Solver):
     def setup_simulation(self, mesh, model, write_output=True):
         """Build all operators once. Stores simulation state on self.
 
-        ``model`` may be a :class:`Model` or a :class:`SystemModel`;
-        it is normalised once to a SystemModel — the self-contained
-        numerical model every downstream method consumes.
+        ``model`` may be a :class:`Model`, a :class:`SystemModel`, or a
+        :class:`NumericalSystemModel`.  Plain models are auto-promoted
+        through Model → SystemModel → NSM internally; when an NSM is
+        passed directly its numerical slots (reconstruction order,
+        limiter, regularization) seed the solver attributes and its
+        auto-resolved LSQ degree drives the mesh stencil.
         """
-        mesh = ensure_lsq_mesh(mesh, model)
+        nsm, source_model = self._coerce_to_nsm(model)
+        self.nsm = nsm
+        self._apply_nsm_overrides(nsm)
+        mesh = ensure_lsq_mesh(mesh, nsm.sm,
+                               lsq_degree=nsm.resolved_lsq_degree())
         # Periodic-BC topology resolution needs the ``BoundaryConditions``
         # object (it iterates ``.boundary_conditions_list`` for tagged
         # periodic pairs).  Done here, *before* normalising to a
         # SystemModel — the SystemModel only carries the indexed BC
         # function, not the object.
-        if hasattr(mesh, "resolve_periodic_bcs") and not isinstance(model, SystemModel):
-            mesh.resolve_periodic_bcs(model.boundary_conditions)
-        if not isinstance(model, SystemModel):
-            model = SystemModel.from_model(model)
+        if hasattr(mesh, "resolve_periodic_bcs") and source_model is not None:
+            mesh.resolve_periodic_bcs(source_model.boundary_conditions)
+        model = nsm.sm
         self.sm = model
         Q, Qaux = self.initialize(mesh, model)
         Q, Qaux, parameters, mesh, model = self.create_runtime(Q, Qaux, mesh, model)
