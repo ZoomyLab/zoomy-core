@@ -785,6 +785,21 @@ class SystemModel:
         )
         if equation_names is not None:
             sm.equation_names = list(equation_names)
+        # Stash the source ``BoundaryConditions`` instances so
+        # :meth:`change_state_variables` can *rebuild* the BC / gradient
+        # / aux-BC kernels against the new state Zstruct rather than
+        # ``xreplace`` on the old Piecewise body.  ``xreplace`` corrupts
+        # extrapolation slots — the ``ZArray(Q)`` body produced by
+        # ``Extrapolation.compute_boundary_condition`` contains the OLD
+        # state Symbols as *index placeholders*, and a CoV substitution
+        # remaps them into the physical inverse transform (e.g.
+        # ``U_0 → q_U0/h``).  The runtime then divides the inflow
+        # momentum by the depth at every extrapolation face — h NaNs.
+        # Rebuilding via the source object treats the BC bodies
+        # semantically: extrapolation comes out as ``ZArray(new_state)``,
+        # which is what the user wants.
+        sm._bc_source = getattr(model, "boundary_conditions", None)
+        sm._aux_bc_source = getattr(model, "aux_boundary_conditions", None)
         sm.history.append({"name": "from_model",
                             "description": f"extracted from {type(model).__name__}"})
         # Auto-scan: every non-state Function atom and every Derivative
@@ -1566,23 +1581,25 @@ class SystemModel:
             self.diffusion_matrix_explicit, full_transform, J, n_state=n,
         )
         # Symbolic BC kernels — boundary_conditions /
-        # aux_boundary_conditions / boundary_gradients.  Each is a
-        # :class:`zoomy_core.model.basefunction.Function` whose
-        # ``definition`` is a :class:`~sympy.Piecewise` body referencing
-        # state Symbols, and whose ``args.variables`` Zstruct is the
-        # positional binding the lambdifier consumes.  Both need to be
-        # rewritten under CoV: substitute the OLD state Symbols in the
-        # definition with their NEW-state expressions, and rebuild
-        # ``args.variables`` so the names / Symbols match the new state.
-        self.boundary_conditions = _cov_propagate_bc_function(
-            self.boundary_conditions, full_transform, new_state,
-        )
-        self.aux_boundary_conditions = _cov_propagate_bc_function(
-            self.aux_boundary_conditions, full_transform, new_state,
-        )
-        self.boundary_gradients = _cov_propagate_bc_function(
-            self.boundary_gradients, full_transform, new_state,
-        )
+        # aux_boundary_conditions / boundary_gradients.  CoV cannot be
+        # done by ``xreplace`` on the existing Piecewise body: an
+        # extrapolation slot's body is ``ZArray(Q)`` — the OLD state
+        # Symbols as *index placeholders*, not as physical quantities —
+        # and a ``{U_0: q_U0/h, …}`` substitution rewrites every such
+        # placeholder into the inverse transform of the old symbol.
+        # The runtime then divides inflow momentum by the depth at
+        # every extrapolation face, NaN-ing ``h`` immediately.
+        #
+        # Correct treatment: rebuild the BC kernels from their source
+        # :class:`zoomy_core.model.boundary_conditions.BoundaryConditions`
+        # against the NEW state Zstruct, so extrapolation comes out
+        # ``ZArray(new_state)`` (identity on slot symbols) while
+        # prescribed-value BCs continue to reference the parameter
+        # Symbols they were built with.
+        new_variables_zstruct = Zstruct(**{str(s): s for s in new_state})
+        new_variables_zstruct._symbolic_name = "Q"
+        self._cov_rebuild_bc_kernels(new_variables_zstruct, full_transform,
+                                     new_state)
         # Chain-rule propagation for aux derivative entries that target
         # OLD state variables.  Their meaning (∂_x of OLD state) must be
         # rewritten in terms of NEW-state derivatives, otherwise the
@@ -1608,6 +1625,112 @@ class SystemModel:
             ),
         })
         return self
+
+    def _cov_rebuild_bc_kernels(self, new_variables_zstruct,
+                                full_transform, new_state):
+        """Rebuild the symbolic BC kernels against a NEW state Zstruct.
+
+        Called from :meth:`change_state_variables` after the primary
+        operator matrices are updated.  Three kernels are rebuilt:
+        ``boundary_conditions``, ``boundary_gradients`` (both from
+        ``self._bc_source``) and ``aux_boundary_conditions``
+        (from ``self._aux_bc_source``).
+
+        The source ``BoundaryConditions`` instances are cached on the
+        SystemModel by :meth:`from_model` (``_bc_source`` /
+        ``_aux_bc_source``).  When a source is available we call
+        ``source.get_boundary_condition_function(...)`` (and the
+        gradient variant) with the new state Zstruct — the body
+        re-emerges semantically:
+
+          * Extrapolation slots → ``ZArray(new_state)``
+            (identity on slot symbols, *not* the inverse transform of
+            the old symbols);
+          * Prescribed values / pressure rows / wall BCs that compute
+            *physical* expressions of state get rebuilt against the
+            new symbols by the BC subclasses themselves.
+
+        Fallback: when the source isn't available (e.g. the SystemModel
+        was constructed by hand without going through ``from_model``)
+        we drop back to the legacy ``xreplace`` propagation with a
+        ``stacklevel=3`` warning.  Hand-built BC bodies that were
+        *physical* expressions of state survive that fallback
+        correctly; extrapolation-shaped bodies do not, which is why
+        rebuilding is the default.
+        """
+        bc_source = getattr(self, "_bc_source", None)
+        aux_bc_source = getattr(self, "_aux_bc_source", None)
+
+        def _reuse_arg(args, name):
+            """Read a non-variables arg out of an existing BC kernel's
+            args Zstruct (time, position, distance, parameters, normal,
+            etc.) — these are stable under CoV."""
+            return args[name] if hasattr(args, "__contains__") and name in args.keys() else args[name]
+
+        # boundary_conditions + boundary_gradients share the main BC
+        # source (``self._bc_source`` is the model's ``boundary_conditions``).
+        if bc_source is not None and self.boundary_conditions is not None:
+            old_args = self.boundary_conditions.args
+            t   = old_args.time
+            X   = old_args.position
+            dX  = old_args.distance
+            Qx  = old_args.aux_variables
+            p_z = old_args.parameters
+            n_z = old_args.normal
+            self.boundary_conditions = (
+                bc_source.get_boundary_condition_function(
+                    t, X, dX, new_variables_zstruct, Qx, p_z, n_z,
+                    function_name=self.boundary_conditions.name,
+                )
+            )
+            if self.boundary_gradients is not None:
+                self.boundary_gradients = (
+                    bc_source.get_boundary_gradient_function(
+                        t, X, dX, new_variables_zstruct, Qx, p_z, n_z,
+                        function_name=self.boundary_gradients.name,
+                    )
+                )
+        elif self.boundary_conditions is not None:
+            import warnings
+            warnings.warn(
+                "SystemModel.change_state_variables: BC source object "
+                "not available (this SystemModel was constructed without "
+                "from_model); falling back to xreplace-based propagation "
+                "of boundary_conditions.  This is correct for BC bodies "
+                "that are physical expressions of state but WRONG for "
+                "extrapolation slots (placeholder Q[i] symbols).  Rebuild "
+                "the BC kernels manually against the new state if your "
+                "system uses extrapolation.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            self.boundary_conditions = _cov_propagate_bc_function(
+                self.boundary_conditions, full_transform, new_state,
+            )
+            self.boundary_gradients = _cov_propagate_bc_function(
+                self.boundary_gradients, full_transform, new_state,
+            )
+
+        # aux_boundary_conditions: separate source.
+        if (aux_bc_source is not None
+                and self.aux_boundary_conditions is not None):
+            old_args = self.aux_boundary_conditions.args
+            t   = old_args.time
+            X   = old_args.position
+            dX  = old_args.distance
+            Qx  = old_args.aux_variables
+            p_z = old_args.parameters
+            n_z = old_args.normal
+            self.aux_boundary_conditions = (
+                aux_bc_source.get_boundary_condition_function(
+                    t, X, dX, new_variables_zstruct, Qx, p_z, n_z,
+                    function_name=self.aux_boundary_conditions.name,
+                )
+            )
+        elif self.aux_boundary_conditions is not None:
+            self.aux_boundary_conditions = _cov_propagate_bc_function(
+                self.aux_boundary_conditions, full_transform, new_state,
+            )
 
     def _propagate_chain_rule_through_aux(self, full_transform, J,
                                           old_state, new_state):
