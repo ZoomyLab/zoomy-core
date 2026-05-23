@@ -116,6 +116,14 @@ class NumericalSystemModel:
     # blow-up).  Solvers that compose sub-systems set this slot;
     # single-system solvers leave it empty.
     additional_systems: list = field(default_factory=list)
+    # Indices (into ``sm.state``) of state rows that the Audusse HR /
+    # ``PositiveRusanov``-style Riemann should rescale by ``h*/h`` at
+    # face states.  Default (``None``) lets the Riemann class pick —
+    # which excludes only ``h`` and ``b``.  For VAM-Chorin we must
+    # exclude pressure modes ``P_k`` too (they are amplitudes, not
+    # depth-scaled momenta).  ``ChorinSplitVAMSolverJax`` computes the
+    # right list at setup time and passes it here.
+    scaled_q_indices: Optional[list] = None
 
     # ── Constructors ──────────────────────────────────────────────
 
@@ -129,6 +137,7 @@ class NumericalSystemModel:
         diffusion: Optional[DiffusionSpec] = None,
         regularization: Optional[RegularizationSpec] = None,
         additional_systems: Optional[list] = None,
+        scaled_q_indices: Optional[list] = None,
     ) -> "NumericalSystemModel":
         """Build an NSM from a :class:`SystemModel` (or a :class:`Model`,
         auto-promoted via :meth:`SystemModel.from_model`).
@@ -151,6 +160,10 @@ class NumericalSystemModel:
         source_specs = getattr(sm, "derivative_specs", None)
         if not isinstance(sm, SystemModel):
             sm = SystemModel.from_model(sm)
+        _assert_bc_kernels_match_state(sm)
+        for sub in (additional_systems or []):
+            if isinstance(sub, SystemModel):
+                _assert_bc_kernels_match_state(sub)
         if riemann is None:
             # Imported lazily — fvm/riemann_solvers.py imports from
             # zoomy_core.transformation.to_numpy which transitively
@@ -173,6 +186,9 @@ class NumericalSystemModel:
             source_derivative_specs=(
                 list(source_specs) if source_specs else None),
             additional_systems=list(additional_systems or []),
+            scaled_q_indices=(
+                list(scaled_q_indices) if scaled_q_indices is not None
+                else None),
         )
 
     # ── LSQ-degree resolution ─────────────────────────────────────
@@ -208,7 +224,16 @@ class NumericalSystemModel:
     # ── Numerics + runtime construction ───────────────────────────
 
     def build_numerics(self):
-        """Instantiate the symbolic Riemann numerics over ``sm``."""
+        """Instantiate the symbolic Riemann numerics over ``sm``.
+
+        Threads ``self.scaled_q_indices`` into the Riemann constructor
+        when set — the Audusse-HR variants (``PositiveRusanov`` family)
+        use it to control which state rows are rescaled by ``h*/h`` at
+        face states.  Default (``None``) lets the Riemann class fall
+        back to its own heuristic (excluding only ``h`` and ``b``)."""
+        if self.scaled_q_indices is not None:
+            return self.riemann(self.sm,
+                                scaled_q_indices=self.scaled_q_indices)
         return self.riemann(self.sm)
 
     def build_runtime_numpy(self):
@@ -248,6 +273,58 @@ def _lsq_degree_from_aux_registry(sm) -> int:
         and entry.get("multi_index") is not None
     ]
     return max(orders) if orders else 1
+
+
+def _assert_bc_kernels_match_state(sm) -> None:
+    """Fail loudly if any of the SystemModel's BC kernels was built
+    against state symbols that no longer match ``sm.state``.
+
+    This catches the silent-wrong-result trap where
+    ``sm.change_state_variables(...)`` remaps state in
+    ``flux`` / ``source`` / ``NCP`` / ``mass_matrix`` but the
+    BC kernel ``Function`` objects (signature + definition) keep
+    their original state Zstruct.  The runtime then evaluates the
+    BC with a Q vector whose slot ``i`` carries the NEW symbol value
+    but the BC body computes against the OLD symbol — Lambda inflow
+    values land on the wrong scaled state, mass drifts, etc.
+
+    Raised at NSM construction so the trap can't reach a solver.
+
+    Checks ``sm.boundary_conditions``, ``sm.boundary_gradients`` and
+    ``sm.aux_boundary_conditions`` when present.  Each is a
+    ``zoomy_core.model.basefunction.Function`` exposing
+    ``.args.variables`` (a Zstruct whose values are the state symbols
+    bound at kernel-construction time)."""
+    expected = list(sm.state)
+    for attr in ("boundary_conditions",
+                 "boundary_gradients",
+                 "aux_boundary_conditions"):
+        kernel = getattr(sm, attr, None)
+        if kernel is None:
+            continue
+        args = getattr(kernel, "args", None)
+        if args is None or not hasattr(args, "contains") \
+                or not args.contains("variables"):
+            continue
+        bound = list(args.variables.values())
+        if bound != expected:
+            raise ValueError(
+                f"SystemModel.{attr} is stale: its state signature\n"
+                f"  {[str(s) for s in bound]}\n"
+                f"does not match sm.state\n"
+                f"  {[str(s) for s in expected]}.\n"
+                "This typically means sm.change_state_variables(...) "
+                "remapped the state symbols in flux/source/NCP but did "
+                "NOT rebuild the BC kernel.  The BC body still "
+                "references the original state symbols and will read "
+                "the wrong slot of Q at runtime — Lambda-inflow values "
+                "land on the wrong (scaled) state, mass drifts.\n\n"
+                "Either rebuild the BC kernel against the new state "
+                "(see vam_chorin_bump_8state_chain.py for the canonical "
+                "pattern) — or, once SystemModel.change_state_variables "
+                "is fixed upstream, the BC remap will happen "
+                "automatically and this check becomes a no-op."
+            )
 
 
 def _lsq_degree_from_derivative_specs(specs) -> int:
