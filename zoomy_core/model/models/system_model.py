@@ -61,6 +61,83 @@ def _iter_indices(shape):
             yield (i,) + rest
 
 
+def _cov_diffusion_tensor(A_old, sub_map, J, *, n_state):
+    """Apply a state-variable change-of-vars to a diffusion tensor.
+
+    ``A`` has shape ``(n_eq, n_state, n_dim, n_dim)`` and enters the
+    residual via the contraction
+    ``F_diff[i, d] = Σ_{j, e} A[i, j, d, e] · ∂_e Q[j]``.
+    Under ``∂_e Q_old[j] = J[j, k] · ∂_e Q_new[k]`` this rewrites to
+    ``A_new[i, k, d, e] = Σ_j A_old[i, j, d, e](T) · J[j, k]``.
+
+    Returns ``None`` when ``A_old`` is ``None`` (default-zero slot).
+    """
+    if A_old is None:
+        return None
+    n_eq, _, n_dim, _ = A_old.shape
+    A_new = sp.MutableDenseNDimArray.zeros(n_eq, n_state, n_dim, n_dim)
+    for i in range(n_eq):
+        for d in range(n_dim):
+            for e in range(n_dim):
+                slab = sp.Matrix(
+                    1, A_old.shape[1],
+                    lambda _r, _j, _i=i, _d=d, _e=e: sp.sympify(
+                        A_old[_i, _j, _d, _e]),
+                )
+                slab_sub = slab.xreplace(sub_map)
+                slab_new = sp.expand(slab_sub * J)
+                for k in range(n_state):
+                    A_new[i, k, d, e] = slab_new[0, k]
+    return _to_zarray(A_new)
+
+
+def _cov_propagate_bc_function(bc_func, sub_map, new_state):
+    """Apply a state-variable change-of-vars to a symbolic BC kernel.
+
+    The BC kernel is a :class:`zoomy_core.model.basefunction.Function`
+    whose ``definition`` is a (typically Piecewise) sympy expression
+    referencing state Symbols, and whose ``args`` Zstruct binds named
+    positional arguments — including ``variables`` — to those Symbols.
+
+    Under CoV we (i) xreplace the OLD state Symbols in ``definition``
+    with their NEW-state expressions, and (ii) rebuild
+    ``args.variables`` as a fresh Zstruct over the new state Symbols
+    (preserving the ``_symbolic_name`` so the lambdifier sees the same
+    positional slot).  Other ``args`` entries (``time``, ``position``,
+    ``distance``, ``aux_variables``, ``parameters``, ``normal``,
+    ``idx``) stay untouched.
+
+    Returns ``None`` when ``bc_func`` is ``None``.
+    """
+    if bc_func is None:
+        return None
+    from zoomy_core.model.basefunction import Function
+
+    new_defn = bc_func.definition
+    if hasattr(new_defn, "xreplace"):
+        new_defn = new_defn.xreplace(sub_map)
+
+    new_args = bc_func.args
+    if (new_args is not None
+            and hasattr(new_args, "keys")
+            and "variables" in list(new_args.keys())):
+        old_vars = new_args.variables
+        sym_name = getattr(old_vars, "_symbolic_name", "Q")
+        new_vars = Zstruct(**{str(s): s for s in new_state})
+        new_vars._symbolic_name = sym_name
+        new_args_kwargs = {
+            k: (new_vars if k == "variables" else new_args[k])
+            for k in list(new_args.keys())
+        }
+        new_args = Zstruct(**new_args_kwargs)
+
+    return Function(
+        name=bc_func.name,
+        args=new_args,
+        definition=new_defn,
+    )
+
+
 @dataclass
 class SystemModel:
     """Symbolic operator-form PDE system.
@@ -1301,9 +1378,43 @@ class SystemModel:
             expression in the NEW state variables.  Old states not
             mentioned are assumed to map identically to themselves.
 
-        Updates ``flux``, ``hydrostatic_pressure``,
-        ``nonconservative_matrix``, ``source``, ``mass_matrix``, and
-        ``state`` in place.
+        Updates **every state-dependent field** in place:
+
+        * the state list itself (``state``);
+        * primary operators — ``flux``, ``hydrostatic_pressure``,
+          ``nonconservative_matrix``, ``source``, ``mass_matrix``;
+        * explicit / IMEX twins — ``source_explicit``,
+          ``diffusion_matrix``, ``diffusion_matrix_explicit``;
+        * derived operators (refreshed) — ``quasilinear_matrix``,
+          ``source_jacobian``;
+        * eigenvalue spectrum (``eigenvalues`` — invariant under
+          invertible CoV, so just xreplace);
+        * MUSCL well-balanced pair —
+          ``reconstruction_variables`` (xreplaced) and
+          ``state_from_reconstruction`` (re-inverted against the new
+          state slots);
+        * per-cell state remap (``update_variables``) and the
+          explicit Chorin-corrector update (``state_update``);
+        * **symbolic BC kernels** — ``boundary_conditions``,
+          ``aux_boundary_conditions``, ``boundary_gradients`` —
+          definitions are xreplaced through ``transform`` and the
+          ``args.variables`` Zstruct is rebuilt to bind the new state
+          symbols positionally (otherwise ``state.u`` would still be
+          named in the BC args after the CoV substitutes it away);
+        * the aux registry — chain-rule propagation through
+          ``∂_x state_old[i] = J[i, k] · ∂_x state_new[k]`` for every
+          derivative aux entry that targeted a substituted state slot.
+
+        Fields **not** transformed by this method:
+
+        * ``initial_conditions`` and ``aux_initial_conditions`` — these
+          are runtime callable objects (``InitialConditions`` subclasses
+          like ``Constant``, ``RP``, ``UserFunction``) that produce
+          per-cell numeric arrays.  They do not reference state Symbols
+          symbolically; the user must re-supply them with values in the
+          new state ordering after a CoV (e.g. ``Constant(constants=
+          lambda n: [h, q_U0=h·U_0, …])`` instead of the old
+          ``[h, U_0, …]``).
 
         Mechanics.  Let ``T_i(Q_new) = transform[Q_old[i]]`` (identity
         if not in ``transform``) and ``J[i, j] = ∂T_i/∂Q_new[j]``.  In
@@ -1317,9 +1428,12 @@ class SystemModel:
             ``S_new = S_old(T(Q_new))``.
           * ``B_new[i, k, d] = Σ_j B_old[i, j, d](T) · J[j, k]``.
           * ``M_new = M_old(T(Q_new)) · J``.
+          * ``A_new[i, k, d, e] = Σ_j A_old[i, j, d, e](T) · J[j, k]``
+            (state-axis multiplication on the diffusion tensor; same
+            pattern as the NCP).
 
         This contract preserves the residual ``M ∂_t Q + ∂_x F + ∂_x P
-        + B · ∂_x Q − S`` under the change of variables.
+        + B · ∂_x Q − ∇·(A:∇Q) − S`` under the change of variables.
         """
         n = self.n_state
         if len(new_state) != n:
@@ -1432,6 +1546,43 @@ class SystemModel:
             self.state_from_reconstruction = invert_reconstruction(
                 self.reconstruction_variables, list(new_state),
             )
+        # Explicit-source twin: same shape and same CoV mechanics as
+        # ``source`` — just substitute the transform and re-expand.
+        if self.source_explicit is not None:
+            self.source_explicit = (
+                self.source_explicit.xreplace(full_transform).expand()
+            )
+        # Diffusion-matrix tensors (shape ``(n_eq, n_state, n_dim, n_dim)``).
+        # The constitutive contraction
+        #   ``F_diff[i, d] = Σ_{j, e} A[i, j, d, e] · ∂_e Q[j]``
+        # combined with ``∂_e Q_old[j] = J[j, k] · ∂_e Q_new[k]`` gives
+        #   ``A_new[i, k, d, e] = Σ_j A_old[i, j, d, e](T) · J[j, k]``
+        # — a per-(i, d, e) slab Matrix-multiply on the state axis,
+        # mirroring how the NCP is transformed above.
+        self.diffusion_matrix = _cov_diffusion_tensor(
+            self.diffusion_matrix, full_transform, J, n_state=n,
+        )
+        self.diffusion_matrix_explicit = _cov_diffusion_tensor(
+            self.diffusion_matrix_explicit, full_transform, J, n_state=n,
+        )
+        # Symbolic BC kernels — boundary_conditions /
+        # aux_boundary_conditions / boundary_gradients.  Each is a
+        # :class:`zoomy_core.model.basefunction.Function` whose
+        # ``definition`` is a :class:`~sympy.Piecewise` body referencing
+        # state Symbols, and whose ``args.variables`` Zstruct is the
+        # positional binding the lambdifier consumes.  Both need to be
+        # rewritten under CoV: substitute the OLD state Symbols in the
+        # definition with their NEW-state expressions, and rebuild
+        # ``args.variables`` so the names / Symbols match the new state.
+        self.boundary_conditions = _cov_propagate_bc_function(
+            self.boundary_conditions, full_transform, new_state,
+        )
+        self.aux_boundary_conditions = _cov_propagate_bc_function(
+            self.aux_boundary_conditions, full_transform, new_state,
+        )
+        self.boundary_gradients = _cov_propagate_bc_function(
+            self.boundary_gradients, full_transform, new_state,
+        )
         # Chain-rule propagation for aux derivative entries that target
         # OLD state variables.  Their meaning (∂_x of OLD state) must be
         # rewritten in terms of NEW-state derivatives, otherwise the
