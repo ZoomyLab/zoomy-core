@@ -11,8 +11,8 @@ Unlike the SME projection, VAM has:
 - Poisson constraint equations I1, I2
 
 Usage:
-    from zoomy_core.model.models.vam_derivation import derive_vam_moments
-    from zoomy_core.model.models.vam_zeta_projection import project_vam_to_zeta
+    from zoomy_core.model.models.legacy.vam_derivation import derive_vam_moments
+    from zoomy_core.model.models.legacy.vam_zeta_projection import project_vam_to_zeta
 
     state = StateSpace(dimension=2)
     vam = derive_vam_moments(state)
@@ -24,8 +24,8 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Literal
 from enum import Enum
 
-from zoomy_core.model.models.vam_derivation import VAMPreProjectedEquations
-from zoomy_core.model.models.zeta_projection import ZetaTerm
+from zoomy_core.model.models.legacy.vam_derivation import VAMPreProjectedEquations
+from zoomy_core.model.models.legacy.zeta_projection import ZetaTerm
 
 
 # ---------------------------------------------------------------------------

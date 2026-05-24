@@ -5,8 +5,8 @@ Takes PreProjectedEquations (basis-independent) + a basis + level,
 projects onto the basis, applies M^-1, and produces a Model-compatible class.
 
 Usage:
-    from zoomy_core.model.models.model_derivation import derive_shallow_moments
-    from zoomy_core.model.models.projected_model import ProjectedModel
+    from zoomy_core.model.models.legacy.model_derivation import derive_shallow_moments
+    from zoomy_core.model.models.legacy.projected_model import ProjectedModel
 
     state = StateSpace(dimension=2)
     pre = derive_shallow_moments(state)
@@ -49,7 +49,7 @@ def get_cached_matrices(basis, level, integrator):
 
 def clear_matrix_cache():
     _basis_matrix_cache.clear()
-from zoomy_core.model.models.model_derivation import PreProjectedEquations, TaggedTerm
+from zoomy_core.model.models.legacy.model_derivation import PreProjectedEquations, TaggedTerm
 
 
 class ProjectedModel(Model):
@@ -92,7 +92,7 @@ class ProjectedModel(Model):
             from zoomy_core.model.models.ins_generator import (
                 StateSpace, Newtonian, Inviscid,
             )
-            from zoomy_core.model.models.model_derivation import derive_shallow_moments
+            from zoomy_core.model.models.legacy.model_derivation import derive_shallow_moments
 
             state = StateSpace(dimension=dimension)
             material_map = {"newtonian": Newtonian, "inviscid": Inviscid}

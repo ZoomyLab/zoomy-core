@@ -29,9 +29,9 @@ from zoomy_core.model.basemodel import Model
 from zoomy_core.misc.misc import ZArray, Zstruct
 from zoomy_core.model.models.basisfunctions import Legendre_shifted, Basisfunction
 from zoomy_core.model.models.symbolic_integrator import SymbolicIntegrator
-from zoomy_core.model.models.projected_model import get_cached_matrices
-from zoomy_core.model.models.vam_derivation import VAMPreProjectedEquations
-from zoomy_core.model.models.vam_zeta_projection import (
+from zoomy_core.model.models.legacy.projected_model import get_cached_matrices
+from zoomy_core.model.models.legacy.vam_derivation import VAMPreProjectedEquations
+from zoomy_core.model.models.legacy.vam_zeta_projection import (
     project_vam_to_zeta, VAMZetaProjectedEquations,
 )
 

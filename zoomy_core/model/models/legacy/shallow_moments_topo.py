@@ -8,7 +8,7 @@ import sympy as sp
 from zoomy_core.model.basemodel import Model
 from zoomy_core.misc.misc import ZArray
 from zoomy_core.model.kernel_functions import conditional
-from zoomy_core.model.models.basismatrices import Basismatrices
+from zoomy_core.model.models.legacy.basismatrices import Basismatrices
 from zoomy_core.model.models.basisfunctions import Legendre_shifted, Basisfunction
 
 

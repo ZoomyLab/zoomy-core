@@ -17,8 +17,8 @@ Mathematical steps performed here:
     7. Term tagging: temporal, flux, nonconservative, source
 
 Usage:
-    from zoomy_core.model.models.model_derivation import derive_shallow_moments
-    from zoomy_core.model.models.zeta_projection import project_to_zeta
+    from zoomy_core.model.models.legacy.model_derivation import derive_shallow_moments
+    from zoomy_core.model.models.legacy.zeta_projection import project_to_zeta
 
     state = StateSpace(dimension=2)
     pre = derive_shallow_moments(state)
@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Literal
 from enum import Enum
 
-from zoomy_core.model.models.model_derivation import PreProjectedEquations
+from zoomy_core.model.models.legacy.model_derivation import PreProjectedEquations
 
 
 # ---------------------------------------------------------------------------

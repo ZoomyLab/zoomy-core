@@ -15,7 +15,7 @@ Derivation::
 import sympy as sp
 from sympy import Function, S
 
-from zoomy_core.model.models.derived_model import DerivedModel
+from zoomy_core.model.models.legacy.derived_model import DerivedModel
 
 
 def hydrostatic_scaling(state):

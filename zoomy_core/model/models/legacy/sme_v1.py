@@ -20,7 +20,7 @@ recovered at ``level=0`` with a per-layer ``Monomials`` inner basis.
 
 from __future__ import annotations
 
-from zoomy_core.model.models.sme_model import SMEModel
+from zoomy_core.model.models.legacy.sme_model import SMEModel
 
 
 class SME(SMEModel):

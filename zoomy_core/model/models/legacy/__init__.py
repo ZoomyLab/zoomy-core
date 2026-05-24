@@ -5,12 +5,12 @@ These models are preserved for reference but are no longer actively
 maintained.  New development should use the 3-phase pipeline:
 
     from zoomy_core.model.models.ins_generator import StateSpace, FullINS
-    from zoomy_core.model.models.model_derivation import derive_shallow_moments
-    from zoomy_core.model.models.projected_model import ProjectedModel
+    from zoomy_core.model.models.legacy.model_derivation import derive_shallow_moments
+    from zoomy_core.model.models.legacy.projected_model import ProjectedModel
 
 For VAM (non-hydrostatic):
-    from zoomy_core.model.models.vam_derivation import derive_vam_moments
-    from zoomy_core.model.models.vam_projected_model import VAMProjectedHyperbolic
+    from zoomy_core.model.models.legacy.vam_derivation import derive_vam_moments
+    from zoomy_core.model.models.legacy.vam_projected_model import VAMProjectedHyperbolic
 """
 
 import warnings

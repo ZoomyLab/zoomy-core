@@ -24,7 +24,7 @@ from zoomy_core.model.basemodel import (
     eigenvalue_dict_to_matrix,
 )
 from zoomy_core.model.basemodel import Model
-from zoomy_core.model.models.basismatrices import Basismatrices
+from zoomy_core.model.models.legacy.basismatrices import Basismatrices
 from zoomy_core.model.models.basisfunctions import Legendre_shifted, Basisfunction
 
 from sympy.integrals.quadrature import gauss_legendre

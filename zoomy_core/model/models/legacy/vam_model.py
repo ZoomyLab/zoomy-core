@@ -49,10 +49,10 @@ from sympy import Matrix, MutableDenseNDimArray, Rational, S, Symbol, sqrt
 import param
 import numpy as np
 
-from zoomy_core.model.models.derived_model import (
+from zoomy_core.model.models.legacy.derived_model import (
     DerivedModel, get_cached_matrices,
 )
-from zoomy_core.model.models.sme_model import INSModel
+from zoomy_core.model.models.legacy.sme_model import INSModel
 from zoomy_core.model.basemodel import Model
 from zoomy_core.misc.misc import ZArray, Zstruct
 from zoomy_core.model.models.basisfunctions import Legendre_shifted, Basisfunction

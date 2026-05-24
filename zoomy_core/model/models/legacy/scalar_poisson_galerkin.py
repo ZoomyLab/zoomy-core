@@ -29,9 +29,9 @@ import sympy as sp
 
 from zoomy_core.model.basemodel import Model
 from zoomy_core.model.models.ins_generator import Expression, Multiply
-from zoomy_core.model.models.integrate_over_domain import IntegrateOverDomain
-from zoomy_core.model.models.divergence_theorem import DivergenceTheorem
-from zoomy_core.model.models.map_to_reference import MapToReferenceElement
+from zoomy_core.model.models.legacy.integrate_over_domain import IntegrateOverDomain
+from zoomy_core.model.models.legacy.divergence_theorem import DivergenceTheorem
+from zoomy_core.model.models.legacy.map_to_reference import MapToReferenceElement
 from zoomy_core.symbolic.domains import Simplex
 
 

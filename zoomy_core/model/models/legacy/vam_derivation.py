@@ -28,7 +28,7 @@ from zoomy_core.model.models.ins_generator import (
     materials, Newtonian, Inviscid,
     KinematicBCBottom, KinematicBCSurface,
 )
-from zoomy_core.model.models.model_derivation import TaggedTerm
+from zoomy_core.model.models.legacy.model_derivation import TaggedTerm
 
 
 # ---------------------------------------------------------------------------

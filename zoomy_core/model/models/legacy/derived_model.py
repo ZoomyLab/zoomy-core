@@ -43,7 +43,7 @@ from zoomy_core.model.basemodel import Model
 from zoomy_core.misc.misc import ZArray, Zstruct
 from zoomy_core.model.models.basisfunctions import Legendre_shifted, Basisfunction
 from zoomy_core.model.models.symbolic_integrator import SymbolicIntegrator
-from zoomy_core.model.models.derived_system import DerivedSystem
+from zoomy_core.model.models.legacy.derived_system import DerivedSystem
 
 
 # ── Basis matrix cache ────────────────────────────────────────────────────────
