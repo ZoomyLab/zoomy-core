@@ -44,6 +44,15 @@ class SME(SigmaReference):
     (``continuity_0`` for ``h``, ``momentum_x_0..2`` for ``q_0..q_2``).
     """
 
+    # Equations leave ``derive_model`` in Function form (``h(t, x)``,
+    # ``q_fn(k, t, x)``) so optional closures like
+    # ``apply_slip_newton_friction`` can manipulate them with
+    # ``Derivative(g·h², x)`` semantics intact.  The Function → Symbol
+    # substitution + auto-tagging + ``_initialize_functions`` run later,
+    # either via an explicit ``sme._finalize_for_systemmodel()`` call
+    # or automatically when ``SystemModel.from_model(sme)`` is invoked.
+    _finalize_lazy = True
+
     def __init__(self, N: int = 2, **kwargs):
         self.N = N
         # Indexed modal-coefficient Functions (declared before super()
@@ -68,7 +77,11 @@ class SME(SigmaReference):
     # ── Derivation hook ─────────────────────────────────────────────
     def derive_model(self):
         """Build reference equations (via SigmaReference) and run the
-        SME post-σ pipeline."""
+        SME post-σ pipeline.  Equations are left in Function form
+        (``h(t, x)``, ``q_fn(k, t, x)``) so optional closures can
+        manipulate them; the Function → Symbol substitution happens
+        in ``_prepare_for_systemmodel`` (called automatically by
+        ``SystemModel.from_model``)."""
         super().derive_model()
         self._multiply_h_and_fold_conservative()
         self._substitute_modal_ansatz()
@@ -81,11 +94,13 @@ class SME(SigmaReference):
         self._gravity_self_pair_fold()
         self._higher_mode_w_closure()
         self._invert_mass_matrix()
-        # Final step: substitute derivation Functions → Model Symbols
-        # so the operator-API extraction sees Symbols.
+
+    def _prepare_for_systemmodel(self):
+        """Lazy finalisation: substitute derivation Functions →
+        Model Symbols and set ``_variable_map``.  Called by
+        ``_finalize_for_systemmodel`` (which itself is called either
+        explicitly or automatically by ``SystemModel.from_model``)."""
         self._substitute_to_model_symbols()
-        # Tell the base class which equation contributes to which
-        # row of the operator-API matrices.
         self._variable_map = self._build_variable_map()
 
     # ── pre-σ hook: hydrostatic + p-elimination ─────────────────────
@@ -260,3 +275,97 @@ class SME(SigmaReference):
         for k in range(self.N + 1):
             m[f"momentum_x_{k}"] = [k + 1]
         return m
+
+    # ── Optional stress closure: slip-Newton friction ─────────────
+    def apply_slip_newton_friction(self):
+        """Close the open ``τ_xz`` BC + Integral atoms with the
+        slip-Newton constitutive law.
+
+        Substitutions per K&T 2019 §4.3:
+          * Newtonian bulk: ``τ_xz(σ) = (ν/h) · ∂_σ u(σ)``;
+          * Free-surface BC: ``τ_xz(σ=1) = 0``;
+          * Navier-slip bottom BC: ``τ_xz(σ=0) = (ν/λ) · u(σ=0)``.
+
+        Reads ``ν``, ``λ`` from the Model's parameters Zstruct —
+        the caller must declare them at construction:
+
+            sme = SME(N=2, parameters={
+                "g": 9.81, "rho": 1.0,
+                "nu": 1e-3, "lambda": 1e-2,
+            }, ...)
+            sme.apply_slip_newton_friction()
+
+        After this call, the equations carry algebraic friction
+        terms in ``ν, λ, ρ`` instead of unresolved ``Integral(τ_xz,
+        …)`` atoms.  Tags are re-computed; ``SystemModel.from_model``
+        picks up the closed source.
+        """
+        # Require nu, lambda in Model.parameters so Symbol identity
+        # stays consistent.
+        missing = [k for k in ("nu", "lambda") if k not in self.parameters.keys()]
+        if missing:
+            raise ValueError(
+                f"apply_slip_newton_friction: parameter {missing[0]!r} "
+                f"must be declared at construction "
+                f"(e.g. `parameters={{'g': 9.81, 'rho': 1.0, "
+                f"'nu': 1e-3, 'lambda': 1e-2}}`)."
+            )
+        s, src = self.state, self.src
+        nu = self.parameters.nu
+        lam = self.parameters["lambda"]
+        rho = self.parameters.rho
+        tau_xz = sp.Function("tau_xz", real=True)
+
+        # Reconstruct u(σ) = Σ_k (q_k/h)·φ_k(σ) in Function form
+        # — uses ``src.h`` (Function call) and the derivation's
+        # ``self.q_fn(k, t, x)`` Function calls so the resulting
+        # substitution merges cleanly with the rest of the
+        # equation (which is still in Function form at this point).
+        # The Function → Symbol substitution happens later in
+        # ``_prepare_for_systemmodel`` (triggered by
+        # ``SystemModel.from_model``).
+        def u_at(sig):
+            return sum((self.q_fn(k, s.t, s.x) / src.h)
+                       * self.legendre_u.eval(k, sig)
+                       for k in range(self.N + 1))
+
+        def newton(t_arg, x_arg, sig):
+            return (nu / src.h) * sp.diff(u_at(sig), sig)
+
+        from zoomy_core.model.operations import (
+            Expression, ProductRule, EvaluateIntegrals,
+        )
+
+        def integral_via_product_rule(*integral_args):
+            integrand, (var, lo, hi) = integral_args[0], integral_args[1]
+            rewritten = Expression(integrand, "").apply(
+                ProductRule(variables=[var], direction="inverse")
+            ).expr
+            return sum((sp.integrate(piece, (var, lo, hi))
+                        for piece in sp.Add.make_args(rewritten)),
+                       sp.S.Zero)
+
+        tau_at_0_slip = (nu / lam) * u_at(sp.S.Zero)
+        tau_at_1_free = sp.S.Zero
+
+        for eq in self:
+            eq.expr = eq.expr.replace(sp.Integral, integral_via_product_rule)
+            eq.expr = eq.expr.xreplace({
+                tau_xz(s.t, s.x, sp.S.Zero): tau_at_0_slip,
+                tau_xz(s.t, s.x, sp.S.One):  tau_at_1_free,
+            })
+            eq.expr = eq.expr.replace(tau_xz, newton)
+            eq.simplify()
+        self.apply(EvaluateIntegrals(s))
+        for eq in self:
+            eq.simplify()
+
+        # Friction mutated the equations after construction.  Reset
+        # the finalize flag so the next ``SystemModel.from_model``
+        # (or explicit ``_finalize_for_systemmodel`` call) re-runs
+        # the substitution + tagging pass on the now-friction-laden
+        # equations.
+        self._finalized = False
+        for eq in self:
+            eq._solver_groups = None
+        return self

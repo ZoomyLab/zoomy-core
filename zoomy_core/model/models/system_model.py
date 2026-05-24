@@ -631,7 +631,17 @@ class SystemModel:
         ``model.source()``, ``model.hydrostatic_pressure()`` once and
         freezes the matrices.  ``state`` / ``aux_state`` /
         ``parameters`` come from the model's Zstructs.
+
+        Lazy-finalised models (e.g. SME, VAM whose ``derive_model``
+        leaves equations in Function form so optional closures can
+        manipulate them) are *auto-finalised* here — the Function →
+        Symbol substitution, ``_variable_map`` setup, auto-tagging
+        and ``_initialize_functions`` run now, just before the
+        operator-API matrices are read.
         """
+        if hasattr(model, "_finalize_for_systemmodel") \
+                and not getattr(model, "_finalized", True):
+            model._finalize_for_systemmodel()
         time_sym = getattr(model, "time", sp.Symbol("t", real=True))
         dim = getattr(model, "dimension", 1)
         coord_names = ["x", "y", "z"]

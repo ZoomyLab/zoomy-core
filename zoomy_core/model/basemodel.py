@@ -111,21 +111,35 @@ class Model(param.Parameterized, SymbolicRegistrar):
     initial_conditions = param.ClassSelector(class_=InitialConditions, default=None)
     aux_initial_conditions = param.ClassSelector(class_=InitialConditions, default=None)
 
+    # ── Lazy-finalization flag ─────────────────────────────────────
+    # Subclasses whose ``derive_model`` leaves equations in Function
+    # form (e.g. SME, VAM) set ``_finalize_lazy = True``.  For those:
+    # ``__init__`` stops after the pipeline; the Function → Symbol
+    # substitution + auto-tagging + ``_initialize_functions`` happen
+    # later — either via an explicit ``model._finalize_for_systemmodel()``
+    # call or automatically when ``SystemModel.from_model(model)``
+    # runs.  This lets the user apply optional closures
+    # (e.g. ``apply_slip_newton_friction``) on Function-form equations
+    # without breaking ``Derivative(g·h², x)`` (which would evaluate
+    # to 0 on bare Symbols).  Default ``False`` preserves the
+    # existing flow for hand-written subclasses (SWE etc.).
+    _finalize_lazy = False
+
     def __init__(self, init_functions=True, **params):
         super().__init__(**params)
         self.functions, self.call = Zstruct(), Zstruct()
-        # Direct storage for the equation graph populated by
-        # ``derive_model()``.  Equations are accessed externally as
-        # NAMED ATTRIBUTES (e.g. `self.momentum_x`) via __getattr__;
-        # the dict is internal-only.
         self._equations: dict = {}
         self.history: list = []
         # ``_variable_map`` maps equation names to row indices in the
         # operator-API matrices (e.g. {"continuity_0": [0],
         # "momentum_x_0": [1], ...}).  Subclasses set this in
-        # `derive_model` *after* the pipeline produces the final
-        # equation set.  Default: empty (no extraction).
+        # ``_finalize_for_systemmodel`` *after* the pipeline produces
+        # the final equation set.  Default: empty (no extraction).
         self._variable_map: dict = {}
+        # Set by ``_finalize_for_systemmodel`` so subsequent calls
+        # short-circuit; reset by mutating methods like
+        # ``apply_slip_newton_friction``.
+        self._finalized = False
         self._initialize_derived_properties()
         # Subclass derivation hook — populates ``self._equations``
         # via ``self.add_equation`` + ``self.apply(Op(...))`` and may
@@ -134,11 +148,41 @@ class Model(param.Parameterized, SymbolicRegistrar):
         # After the derivation, every Symbol used in any equation must
         # have a numeric value declared in ``self.parameter_values``.
         self._assert_parameter_values_supplied()
-        # Auto-classify equation terms into canonical solver tags so
-        # the default ``flux/source/...`` extractors can work.
+        if self._finalize_lazy:
+            # Stop here — equations stay in Function form; user can
+            # apply closures, then ``SystemModel.from_model`` will
+            # auto-call ``_finalize_for_systemmodel``.
+            return
+        # Non-lazy (default) path: tag + register functions now.
+        self._finalize_for_systemmodel(init_functions=init_functions)
+
+    def _finalize_for_systemmodel(self, *, init_functions=True):
+        """Run the steps that prepare equations for SystemModel
+        hand-off: subclass-specific Function → Symbol substitution,
+        ``_variable_map`` setup, auto-tagging, and (optionally)
+        ``_initialize_functions``.
+
+        Idempotent — subsequent calls short-circuit unless
+        ``self._finalized`` is reset (e.g. by a mutating method like
+        ``apply_slip_newton_friction``).  Subclasses override
+        ``_prepare_for_systemmodel`` to do the substitution; this
+        outer method orchestrates the universal steps.
+        """
+        if self._finalized:
+            return self
+        self._prepare_for_systemmodel()
         self._auto_tag_equations()
         if init_functions:
             self._initialize_functions()
+        self._finalized = True
+        return self
+
+    def _prepare_for_systemmodel(self):
+        """Subclass hook called by ``_finalize_for_systemmodel`` before
+        auto-tagging.  Default: no-op.  Subclasses (SME, VAM) override
+        to substitute derivation Function calls with Model Symbols
+        and to set ``self._variable_map``."""
+        return None
 
     # ── derivation hook + minimal Model surface ───────────────────
     #

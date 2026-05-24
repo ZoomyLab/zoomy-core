@@ -34,6 +34,11 @@ __all__ = ["VAM"]
 class VAM(SigmaReference):
     """Non-hydrostatic Vertically-Averaged Moments at level ``N``."""
 
+    # Same lazy-finalization story as SME: derive_model leaves
+    # equations in Function form; substitute + tag in
+    # ``_prepare_for_systemmodel``.
+    _finalize_lazy = True
+
     def __init__(self, N: int = 2, **kwargs):
         self.N = N
         # Indexed modal-coefficient Functions (declared before super()
@@ -80,6 +85,10 @@ class VAM(SigmaReference):
         self._gravity_self_pair_fold()
         self._invert_mass_matrix()
         self._eliminate_dt_h_via_continuity_0()
+
+    def _prepare_for_systemmodel(self):
+        """Lazy finalisation hook (called by
+        ``_finalize_for_systemmodel``)."""
         self._substitute_to_model_symbols()
         self._variable_map = self._build_variable_map()
 
