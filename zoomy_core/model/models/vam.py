@@ -17,6 +17,7 @@ from __future__ import annotations
 import sympy as sp
 
 from zoomy_core.model.models.sigmaref import SigmaReference
+from zoomy_core.model.models.basis_cache import get_basis_matrices
 from zoomy_core.model.operations import (
     Multiply,
     ResolveDummy,
@@ -31,16 +32,38 @@ from zoomy_core.model.operations import (
 __all__ = ["VAM"]
 
 
+def _default_basis_factory(level):
+    """Default basis used by VAM — shifted Legendre on σ ∈ [0, 1]."""
+    return Legendre_shifted(level=level)
+
+
 class VAM(SigmaReference):
-    """Non-hydrostatic Vertically-Averaged Moments at level ``N``."""
+    """Non-hydrostatic Vertically-Averaged Moments at level ``N``.
+
+    Parameters
+    ----------
+    N : int
+        Moment level — number of u / w / p modes is ``N + 1``.
+    basis_factory : callable, optional
+        ``basis_factory(level) → Basisfunction``.  Constructs the
+        u-basis (level ``N``) and the w-basis (level ``N + 1``).
+        Default: ``Legendre_shifted(level=level)``.  Subclasses can
+        swap this for any other basis without touching the pipeline.
+    """
 
     # Same lazy-finalization story as SME: derive_model leaves
     # equations in Function form; substitute + tag in
     # ``_prepare_for_systemmodel``.
     _finalize_lazy = True
 
-    def __init__(self, N: int = 2, **kwargs):
+    def __init__(self, N: int = 2, *, basis_factory=None, **kwargs):
         self.N = N
+        self.basis_factory = basis_factory or _default_basis_factory
+        # u-basis carries N+1 modes; w-basis carries N+2 (one extra for
+        # the optional KBC closure — VAM uses only the first N+1, but
+        # the level=N+1 convention matches SME).
+        self.basis_u = self.basis_factory(N)
+        self.basis_w = self.basis_factory(N + 1)
         # Indexed modal-coefficient Functions (declared before super()
         # so the derive_model pipeline can reference them).
         self.u_fn = sp.Function("u", real=True)
@@ -179,33 +202,39 @@ class VAM(SigmaReference):
 
     def _resolve_dummies(self):
         N = self.N
-        self.legendre_u = Legendre_shifted(level=N)
-        self.legendre_w = Legendre_shifted(level=N + 1)
 
         def basis_value(basis, k_arg, sigma_arg):
             if k_arg.is_Integer:
                 return basis.eval(int(k_arg), sigma_arg)
             return sp.Function("phi_unresolved")(k_arg, sigma_arg)
 
-        def legendre_value(basis, k):
+        def basis_lambda(basis, k):
             return lambda arg, _b=basis, _k=k: _b.eval(_k, arg)
+
+        # Back-compat aliases (some downstream code reads these).
+        self.legendre_u = self.basis_u
+        self.legendre_w = self.basis_w
 
         self.apply(ResolveDummy(self.omega, lambda arg: sp.S.One))
         self.apply(ResolveDummy(
             self.phi_u_fn,
-            lambda k, sig, _b=self.legendre_u: basis_value(_b, k, sig)))
+            lambda k, sig, _b=self.basis_u: basis_value(_b, k, sig)))
         self.apply(ResolveDummy(
             self.phi_w_fn,
-            lambda k, sig, _b=self.legendre_w: basis_value(_b, k, sig)))
+            lambda k, sig, _b=self.basis_w: basis_value(_b, k, sig)))
         self.apply(ResolveDummy(
             self.phi_p_fn,
-            lambda k, sig, _b=self.legendre_u: basis_value(_b, k, sig)))
+            lambda k, sig, _b=self.basis_u: basis_value(_b, k, sig)))
+        # Galerkin test counts: VAM uses N+1 test functions for both
+        # psi_u and psi_w (matching the N+1 dynamic equations per
+        # block).  This deliberately uses only the first N+1 modes of
+        # basis_w even though basis_w.level + 1 = N + 2.
         self.apply(ResolveDummy(
             self.psi_u,
-            [legendre_value(self.legendre_u, k) for k in range(N + 1)]))
+            [basis_lambda(self.basis_u, k) for k in range(N + 1)]))
         self.apply(ResolveDummy(
             self.psi_w,
-            [legendre_value(self.legendre_w, k) for k in range(N + 1)]))
+            [basis_lambda(self.basis_w, k) for k in range(N + 1)]))
 
     def _evaluate_integrals(self):
         self.apply(EvaluateIntegrals(self.state))
@@ -239,12 +268,38 @@ class VAM(SigmaReference):
             mom0.simplify()
 
     def _invert_mass_matrix(self):
+        """Multiply each row by the inverse diagonal of its
+        corresponding basis' Galerkin mass matrix.
+
+        * ``momentum_x_k`` ← projected via psi_u → uses ``basis_u``'s ``M``.
+        * ``momentum_z_k`` ← projected via psi_w → uses ``basis_w``'s ``M``.
+
+        For shifted Legendre (default): ``M = diag(1/(2k+1))``, so each
+        row is multiplied by ``(2k+1)`` — the historical hand-rolled
+        factor.  For :class:`LayeredBasis`: ``M = diag(α_ℓ/(2m+1))``
+        and the per-layer ``α`` is applied automatically.
+        """
+        M_u = get_basis_matrices(self.basis_u)["M"]
+        M_w = get_basis_matrices(self.basis_w)["M"]
+        # Diagonal-only assumption (Legendre / LayeredBasis / Chebyshev).
+        for label, M in (("basis_u", M_u), ("basis_w", M_w)):
+            n = M.shape[0]
+            for k in range(n):
+                for i in range(n):
+                    if i != k and M[k, i] != 0:
+                        raise ValueError(
+                            f"_invert_mass_matrix ({label}): mass matrix "
+                            f"not diagonal — M[{k}, {i}] = {M[k, i]} ≠ 0."
+                        )
         for k in range(self.N + 1):
-            for name in (f"momentum_x_{k}", f"momentum_z_{k}"):
-                eq = self._equations.get(name)
-                if eq is not None:
-                    eq.expr = (2 * k + 1) * eq.expr
-                    eq.simplify()
+            eq_x = self._equations.get(f"momentum_x_{k}")
+            if eq_x is not None:
+                eq_x.expr = (1 / M_u[k, k]) * eq_x.expr
+                eq_x.simplify()
+            eq_z = self._equations.get(f"momentum_z_{k}")
+            if eq_z is not None:
+                eq_z.expr = (1 / M_w[k, k]) * eq_z.expr
+                eq_z.simplify()
 
     def _eliminate_dt_h_via_continuity_0(self):
         """``∂_t h → −∂_x q_0`` (depth-mean continuity) in all

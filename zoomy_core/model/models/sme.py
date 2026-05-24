@@ -21,6 +21,7 @@ from __future__ import annotations
 import sympy as sp
 
 from zoomy_core.model.models.sigmaref import SigmaReference
+from zoomy_core.model.models.basis_cache import get_basis_matrices
 from zoomy_core.model.operations import (
     Expression,
     Multiply,
@@ -37,11 +38,27 @@ from zoomy_core.model.operations import (
 __all__ = ["SME"]
 
 
+def _default_basis_factory(level):
+    """Default basis used by SME / VAM — shifted Legendre on σ ∈ [0, 1]."""
+    return Legendre_shifted(level=level)
+
+
 class SME(SigmaReference):
     """Shallow Moment Equations at level ``N``.
 
     Default ``N = 2`` matches K&T (4.17): 4 dynamic equations
     (``continuity_0`` for ``h``, ``momentum_x_0..2`` for ``q_0..q_2``).
+
+    Parameters
+    ----------
+    N : int
+        Per-layer moment level — number of u-modes is ``N + 1``.
+    basis_factory : callable, optional
+        ``basis_factory(level) → Basisfunction``.  Used to construct
+        the u-basis (level ``N``) and the w-basis (level ``N + 1``).
+        Default: ``Legendre_shifted(level=level)``.  Subclasses such
+        as :class:`MLSME` swap this for a multi-layer basis
+        (``LayeredBasis``) without touching the pipeline.
     """
 
     # Equations leave ``derive_model`` in Function form (``h(t, x)``,
@@ -53,8 +70,15 @@ class SME(SigmaReference):
     # or automatically when ``SystemModel.from_model(sme)`` is invoked.
     _finalize_lazy = True
 
-    def __init__(self, N: int = 2, **kwargs):
+    def __init__(self, N: int = 2, *, basis_factory=None, **kwargs):
         self.N = N
+        # Basis instances — drive everything downstream (modal mode
+        # count, Galerkin branching count, cached mass matrix).  The
+        # factory is per-level so subclasses can vary inner_level
+        # without changing other layer kwargs.
+        self.basis_factory = basis_factory or _default_basis_factory
+        self.basis_u = self.basis_factory(N)
+        self.basis_w = self.basis_factory(N + 1)
         # Indexed modal-coefficient Functions (declared before super()
         # so the derive_model pipeline can reference them).
         self.u_fn = sp.Function("u", real=True)
@@ -67,9 +91,10 @@ class SME(SigmaReference):
         self.psi_w    = sp.Function("psi_w", real=True)
         self.omega    = sp.Function("omega", real=True)
 
+        n_u_modes = self.basis_u.level + 1
         kwargs.setdefault("name", f"SME-L={N}")
         kwargs.setdefault(
-            "variables", ["h"] + [f"q_{k}" for k in range(N + 1)])
+            "variables", ["h"] + [f"q_{k}" for k in range(n_u_modes)])
         kwargs.setdefault("parameters", {"g": 9.81, "rho": 1.0})
         kwargs.setdefault("eigenvalue_mode", "numerical")
         super().__init__(**kwargs)
@@ -127,14 +152,16 @@ class SME(SigmaReference):
             eq.simplify()
 
     def _substitute_modal_ansatz(self):
-        N, s, src = self.N, self.state, self.src
+        s, src = self.state, self.src
         sigma = s.zeta_ref
+        n_u = self.basis_u.level + 1
+        n_w = self.basis_w.level + 1
         self.u_ansatz = sum(
             self.u_fn(k, s.t, s.x) * self.phi_u_fn(k, sigma)
-            for k in range(N + 1))
+            for k in range(n_u))
         self.w_ansatz = sum(
             self.w_fn(k, s.t, s.x) * self.phi_w_fn(k, sigma)
-            for k in range(N + 2))
+            for k in range(n_w))
         self.apply({src.u.xreplace({s.z: sigma}): self.u_ansatz,
                     src.w.xreplace({s.z: sigma}): self.w_ansatz})
 
@@ -182,9 +209,10 @@ class SME(SigmaReference):
         self.kbc_closure = closure
 
     def _cov_u_to_q(self):
-        N, s, src = self.N, self.state, self.src
-        self.u_modes = [self.u_fn(k, s.t, s.x) for k in range(N + 1)]
-        self.q_modes = [self.q_fn(k, s.t, s.x) for k in range(N + 1)]
+        s, src = self.state, self.src
+        n_u = self.basis_u.level + 1
+        self.u_modes = [self.u_fn(k, s.t, s.x) for k in range(n_u)]
+        self.q_modes = [self.q_fn(k, s.t, s.x) for k in range(n_u)]
         self.apply(
             {u: q / src.h for u, q in zip(self.u_modes, self.q_modes)},
             level="minor", description="CoV u(k,t,x) → q(k,t,x)/h",
@@ -193,31 +221,34 @@ class SME(SigmaReference):
             eq.simplify()
 
     def _resolve_dummies(self):
-        N = self.N
-        self.legendre_u = Legendre_shifted(level=N)
-        self.legendre_w = Legendre_shifted(level=N + 1)
+        n_u = self.basis_u.level + 1
+        n_w = self.basis_w.level + 1
 
         def basis_value(basis, k_arg, sigma_arg):
             if k_arg.is_Integer:
                 return basis.eval(int(k_arg), sigma_arg)
             return sp.Function("phi_unresolved")(k_arg, sigma_arg)
 
-        def legendre_value(basis, k):
+        def basis_lambda(basis, k):
             return lambda arg, _b=basis, _k=k: _b.eval(_k, arg)
+
+        # Back-compat aliases (some downstream code reads these).
+        self.legendre_u = self.basis_u
+        self.legendre_w = self.basis_w
 
         self.apply(ResolveDummy(self.omega, lambda arg: sp.S.One))
         self.apply(ResolveDummy(
             self.phi_u_fn,
-            lambda k, sig, _b=self.legendre_u: basis_value(_b, k, sig)))
+            lambda k, sig, _b=self.basis_u: basis_value(_b, k, sig)))
         self.apply(ResolveDummy(
             self.phi_w_fn,
-            lambda k, sig, _b=self.legendre_w: basis_value(_b, k, sig)))
+            lambda k, sig, _b=self.basis_w: basis_value(_b, k, sig)))
         self.apply(ResolveDummy(
             self.psi_u,
-            [legendre_value(self.legendre_u, k) for k in range(N + 1)]))
+            [basis_lambda(self.basis_u, k) for k in range(n_u)]))
         self.apply(ResolveDummy(
             self.psi_w,
-            [legendre_value(self.legendre_w, k) for k in range(N + 2)]))
+            [basis_lambda(self.basis_w, k) for k in range(n_w)]))
 
     def _evaluate_integrals(self):
         self.apply(EvaluateIntegrals(self.state))
@@ -238,10 +269,13 @@ class SME(SigmaReference):
             mom0.simplify()
 
     def _higher_mode_w_closure(self):
-        N, s = self.N, self.state
-        w_higher = [self.w_fn(k, s.t, s.x) for k in range(2, N + 2)]
+        s = self.state
+        n_w = self.basis_w.level + 1   # total w-modes
+        # w_0, w_1 closed by KBC modal closure; w_2..w_{n_w-1} closed by
+        # higher continuities continuity_1..continuity_{n_w-2}.
+        w_higher = [self.w_fn(k, s.t, s.x) for k in range(2, n_w)]
         residuals = [getattr(self, f"continuity_{k}").expr
-                     for k in range(1, N + 1)]
+                     for k in range(1, n_w - 1)]
         solution = sp.solve(residuals, w_higher, dict=True)[0]
         self.apply(solution, level="minor",
                    description="continuity_k → w_(k+1)")
@@ -249,9 +283,36 @@ class SME(SigmaReference):
             eq.simplify()
 
     def _invert_mass_matrix(self):
-        for k in range(self.N + 1):
+        """Multiply each ``momentum_x_k`` row by ``(M^{-1})[k,k]`` where
+        ``M`` is the cached Galerkin mass matrix of ``self.basis_u``.
+
+        For shifted Legendre: ``M = diag(1/(2k+1))``, so this multiplies
+        by ``(2k+1)`` — the same hand-rolled factor used historically.
+        For :class:`LayeredBasis`: ``M = diag(α_ℓ/(2m+1))`` where
+        ``(ℓ, m)`` is the layered flat-index of ``k``, so this
+        multiplies by ``(2m+1)/α_ℓ`` automatically.
+
+        Asserts ``M`` is diagonal — every basis used so far satisfies
+        this; if a non-orthogonal basis is added later, this step needs
+        to apply the full ``M^{-1}`` row-by-row.
+        """
+        matrices = get_basis_matrices(self.basis_u)
+        M = matrices["M"]
+        n_u = self.basis_u.level + 1
+        # Diagonal-only assumption (Legendre / LayeredBasis / Chebyshev
+        # all satisfy this).  If extended later, replace with full
+        # M^{-1} row multiplication.
+        for k in range(n_u):
+            for i in range(n_u):
+                if i != k and M[k, i] != 0:
+                    raise ValueError(
+                        f"_invert_mass_matrix: mass matrix is not diagonal — "
+                        f"M[{k}, {i}] = {M[k, i]} ≠ 0.  Add full M^-1 "
+                        f"row-multiplication path."
+                    )
+        for k in range(n_u):
             eq = getattr(self, f"momentum_x_{k}")
-            eq.expr = (2 * k + 1) * eq.expr
+            eq.expr = (1 / M[k, k]) * eq.expr
             eq.simplify()
 
     # ── final: Function → Symbol substitution ─────────────────────
@@ -261,8 +322,9 @@ class SME(SigmaReference):
         self.variables.q_k) so the equations are Symbol-based ready
         for tag extraction."""
         s, src = self.state, self.src
+        n_u = self.basis_u.level + 1
         subs = {src.h: self.variables.h}
-        for k in range(self.N + 1):
+        for k in range(n_u):
             subs[self.q_fn(k, s.t, s.x)] = self.variables[f"q_{k}"]
         for eq in self:
             eq.expr = eq.expr.xreplace(subs)
@@ -271,8 +333,9 @@ class SME(SigmaReference):
         """``{eq_name: [row_index]}`` for tag extraction.  For
         SME(N=L): ``continuity_0 → row 0 (h)``, ``momentum_x_k → row
         k+1 (q_k)``."""
+        n_u = self.basis_u.level + 1
         m = {"continuity_0": [0]}
-        for k in range(self.N + 1):
+        for k in range(n_u):
             m[f"momentum_x_{k}"] = [k + 1]
         return m
 
@@ -324,10 +387,11 @@ class SME(SigmaReference):
         # The Function → Symbol substitution happens later in
         # ``_prepare_for_systemmodel`` (triggered by
         # ``SystemModel.from_model``).
+        n_u = self.basis_u.level + 1
         def u_at(sig):
             return sum((self.q_fn(k, s.t, s.x) / src.h)
-                       * self.legendre_u.eval(k, sig)
-                       for k in range(self.N + 1))
+                       * self.basis_u.eval(k, sig)
+                       for k in range(n_u))
 
         def newton(t_arg, x_arg, sig):
             return (nu / src.h) * sp.diff(u_at(sig), sig)
