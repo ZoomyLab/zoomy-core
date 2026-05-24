@@ -243,8 +243,17 @@ def collect_solver_tag(
                 for (j, i, coeff) in contribs:
                     out[row, j, i] = out[row, j, i] + coeff
         else:  # raw
+            # SystemModel convention: ``∂_t Q + ∂_x F + ∂_x P + B·∂_x Q
+            # = S`` (S on the RHS).  Source-tagged terms come from the
+            # *LHS* of the equation (``... + source_term = 0``), so
+            # they get a sign flip when moved to the RHS source slot.
+            # ``time_derivative`` is NOT flipped — it goes into the
+            # mass_matrix slot which sits on the LHS with the temporal
+            # derivative.
+            sign = -1 if canonical in (
+                "implicit_source", "explicit_source") else +1
             for row in rows:
-                out[row] = out[row] + tag_expr
+                out[row] = out[row] + sign * tag_expr
 
     return out
 

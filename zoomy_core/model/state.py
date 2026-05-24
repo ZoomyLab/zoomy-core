@@ -171,11 +171,15 @@ class MassMomentum:
         if s.has_y:
             components["y"] = self._build_one_momentum(
                 self.v, "y", rho, gravity=sp.S.Zero)
-        # z-momentum carries the gravity term ρ g (acting downward;
-        # the equation's LHS = balance = 0, so we add +ρg here and
-        # the user moves it where their convention demands).
+        # z-momentum carries the gravity term ``g`` (the acceleration,
+        # NOT the body force ``ρg``).  The full equation is
+        # ∂_t w + ∇·(w·u) + (1/ρ)∂_z p − (1/ρ)∇·τ_z + g = 0,
+        # i.e. divided through by ρ — matches the legacy FullINS
+        # convention and K&T 2019.  (The previous ``ρ·g`` form
+        # propagated a spurious ρ factor through the hydrostatic
+        # pressure substitution into the SME source term.)
         components["z"] = self._build_one_momentum(
-            self.w, "z", rho, gravity=rho * g)
+            self.w, "z", rho, gravity=g)
         return Zstruct(**components)
 
     def _build_one_momentum(self, vel, axis, rho, *, gravity):
