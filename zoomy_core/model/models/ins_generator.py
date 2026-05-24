@@ -221,7 +221,16 @@ class Expression(SymbolicBase):
             ts = self.terms[i]
             combined = sum((t.expr for t in ts), S.Zero)
             return Expression(combined, self.name)
-        return self.terms[i]
+        if isinstance(i, (list, tuple)):
+            # Batch read-only view of selected terms — fresh Expression
+            # carrying the sum of the picked terms.  Not a live accessor.
+            ts = self.terms
+            combined = sum((ts[k].expr for k in i), S.Zero)
+            return Expression(combined, self.name)
+        # Integer index — return a live accessor whose `.apply(...)`
+        # mutates this parent Expression in place.  Use ``.terms[i]``
+        # if you want a detached snapshot Expression.
+        return _TermAccessor(self, i)
 
     def apply_to_term(self, index, *operations):
         """Apply operations to a specific term and return the full expression.
@@ -230,6 +239,13 @@ class Expression(SymbolicBase):
 
             xmom.apply_to_term(5, ProductRule())
             xmom.apply_to_term(5, {old: new})
+
+        .. note::
+           Public callers should prefer ``xmom[5].apply(...)`` —
+           ``Expression.__getitem__`` returns a live accessor whose
+           ``.apply`` mutates the parent in place.  This method is kept
+           as the internal split-apply-merge primitive that the accessor
+           uses; library code may continue to call it directly.
         """
         terms = self.terms
         modified = terms[index].apply(*operations)
@@ -1191,7 +1207,7 @@ class Expression(SymbolicBase):
             With all depth integrals replaced by basis matrix products.
         """
         from zoomy_core.model.models.symbolic_integrator import SymbolicIntegrator
-        from zoomy_core.model.models.projected_model import get_cached_matrices
+        from zoomy_core.model.models.legacy.projected_model import get_cached_matrices
 
         basis_obj = basis(level=level)
         integrator = SymbolicIntegrator(basis_obj)
@@ -4360,7 +4376,7 @@ def FullINS(state, equations=None):
         ``"momentum.y"``, ``"momentum.z"``.  Top-level ``"momentum"`` means
         all momentum components.  Default: everything.
     """
-    from zoomy_core.model.models.derived_system import System
+    from zoomy_core.model.models.legacy.derived_system import System
 
     builder = _INSBuilder(state)
     system = System("INS", state)
