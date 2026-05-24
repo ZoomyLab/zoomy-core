@@ -114,9 +114,292 @@ class Model(param.Parameterized, SymbolicRegistrar):
     def __init__(self, init_functions=True, **params):
         super().__init__(**params)
         self.functions, self.call = Zstruct(), Zstruct()
+        # Direct storage for the equation graph populated by
+        # ``derive_model()``.  Equations are accessed externally as
+        # NAMED ATTRIBUTES (e.g. `self.momentum_x`) via __getattr__;
+        # the dict is internal-only.
+        self._equations: dict = {}
+        self.history: list = []
+        # ``_variable_map`` maps equation names to row indices in the
+        # operator-API matrices (e.g. {"continuity_0": [0],
+        # "momentum_x_0": [1], ...}).  Subclasses set this in
+        # `derive_model` *after* the pipeline produces the final
+        # equation set.  Default: empty (no extraction).
+        self._variable_map: dict = {}
         self._initialize_derived_properties()
+        # Subclass derivation hook — populates ``self._equations``
+        # via ``self.add_equation`` + ``self.apply(Op(...))`` and may
+        # extend ``self.variables`` / ``self.parameters``.
+        self.derive_model()
+        # After the derivation, every Symbol used in any equation must
+        # have a numeric value declared in ``self.parameter_values``.
+        self._assert_parameter_values_supplied()
+        # Auto-classify equation terms into canonical solver tags so
+        # the default ``flux/source/...`` extractors can work.
+        self._auto_tag_equations()
         if init_functions:
             self._initialize_functions()
+
+    # ── derivation hook + minimal Model surface ───────────────────
+    #
+    # The Model class exposes ONLY four public methods:
+    # `add_equation / remove_equation / apply / describe`.  All
+    # transformations are `Operation` subclasses (see
+    # `zoomy_core.model.operations`) and are applied via
+    # `model.apply(SomeOp(args))`.  In particular: there is NO
+    # `multiply` or `resolve_dummy` convenience method — those become
+    # `Multiply(...)` and `ResolveDummy(...)` Operations.
+    #
+    # Equations live in the private `self._equations` dict and are
+    # accessed externally via `__getattr__` (named-attribute style):
+    # `self.momentum_x.apply(...)`, `self.continuity.apply(...)`.
+    # Iteration is via `for eq in self: ...` (`__iter__`).  There is
+    # NO public `.equations` collection on Model.
+
+    def derive_model(self):
+        """Subclass hook — populate equations via
+        `self.add_equation(name, expr)` and `self.apply(Op(...))`.
+        No-op on the base class."""
+        return None
+
+    def add_equation(self, name, expression=None, shape=None):
+        """Insert an equation into the model under ``name``.
+        Accessible afterwards as ``self.<name>``.
+
+        With ``shape=None``: scalar equation; ``self.<name>`` is the
+        single :class:`Equation`.
+
+        With ``shape=(s1, s2, ...)`` or a list of component labels:
+        creates one sub-equation per index combo, named
+        ``"{name}_{i}_{j}_..."``.
+        """
+        from zoomy_core.model.equation import Equation
+        if shape is None:
+            expr = expression if expression is not None else sp.S.Zero
+            self._equations[name] = Equation(expr, name=name, model=self)
+            self._history("add_equation", name)
+            return self
+        # Branched: vector / tensor add_equation.
+        import itertools as _it
+        if all(isinstance(c, str) for c in shape):
+            combos = [(c,) for c in shape]
+        else:
+            combos = list(_it.product(*shape))
+        for combo in combos:
+            sub = "_".join([name] + list(combo))
+            self._equations[sub] = Equation(sp.S.Zero, name=sub, model=self)
+            self._history("add_equation", sub)
+        return self
+
+    def remove_equation(self, name):
+        """Remove an equation by name.  After this, ``self.<name>``
+        raises ``AttributeError``."""
+        del self._equations[name]
+        self._history("remove_equation", name)
+        return self
+
+    def apply(self, op, *, level="major", description=None):
+        """Broadcast an Operation across every equation in the model.
+
+        ``op`` may be:
+
+        * an :class:`Operation` whose ``whole_model_op == True`` — in
+          which case ``op.apply_to_model(self)`` is called once;
+        * an :class:`Operation` whose ``whole_model_op == False`` —
+          applied per-equation via ``Equation.apply(op)``;
+        * a substitution :class:`dict` — broadcast as ``xreplace``;
+        * a :class:`Relation` — broadcast via its substitution map;
+        * a callable — broadcast via ``Equation.apply``.
+        """
+        # Whole-model dispatch: e.g. ResolveDummy([v1, v2]) needs
+        # access to the whole equation dict to branch.
+        whole_model = getattr(op, "whole_model_op", False)
+        if whole_model and hasattr(op, "apply_to_model"):
+            op.apply_to_model(self)
+        else:
+            for eq in self._equations.values():
+                eq.apply(op, _no_history=True)
+        self._history(
+            getattr(op, "name", None) or type(op).__name__,
+            "*", level=level, description=description,
+        )
+        return self
+
+    def describe(self, *, show_history=False, include_minor=False):
+        """Human-readable inspection of the derivation state."""
+        lines = [f"{type(self).__name__}({self.name!r}) — "
+                 f"{len(self._equations)} equations, "
+                 f"{len(self.history)} ops"]
+        for name, eq in self._equations.items():
+            lines.append(f"  {name}  :  {eq.expr}  =  0")
+        text = "\n".join(lines)
+        print(text)
+        if show_history:
+            print("\nhistory:")
+            for h in self.history:
+                if not include_minor and h.get("level") == "minor":
+                    continue
+                desc = f" — {h['description']}" if h.get("description") else ""
+                print(f"  [{h['op']}] target={h['target']}{desc}")
+        return self
+
+    def _history(self, op_label, target, *, level="major", description=None):
+        self.history.append({
+            "op": op_label, "target": target,
+            "level": level, "description": description or "",
+        })
+
+    # ── Dunders ──────────────────────────────────────────────────
+    def __getattr__(self, name):
+        """Named-attribute access to equations.  Only called when
+        normal attribute lookup fails — so ``self.parameters``,
+        ``self.variables``, etc. (real attributes) are not affected.
+        ``self.momentum_x`` returns the Equation registered under
+        ``"momentum_x"`` if any, else raises AttributeError."""
+        # Avoid infinite recursion during `__init__` when
+        # `self._equations` itself doesn't yet exist.
+        eqs = self.__dict__.get("_equations", None)
+        if eqs is not None and name in eqs:
+            return eqs[name]
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute "
+            f"or equation {name!r}"
+        )
+
+    def __iter__(self):
+        """Iterate over equations in insertion order."""
+        return iter(self._equations.values())
+
+    def __len__(self):
+        return len(self._equations)
+
+    def _assert_parameter_values_supplied(self):
+        """Walk all equation expressions and collect their free
+        Symbols.  Every Symbol that names a declared parameter
+        (matched by ``str(sym)`` against ``self.parameter_values``
+        keys) must have a numeric value supplied; otherwise raise.
+
+        Coordinate Symbols (``t``, ``x``, ``y``, ``z``, ``dX``,
+        ``zeta``, normal components) and state Symbols are skipped.
+
+        Symbols *not* in ``self.parameter_values`` and *not* in the
+        skip list are unresolved free parameters — raise so the user
+        learns at construction time."""
+        if not self._equations:
+            return
+        # Symbols that legitimately appear in equations but are not
+        # parameters (coordinates, distance, normal axes, state).
+        skip = set()
+        for attr in ("time", "distance"):
+            v = getattr(self, attr, None)
+            if v is not None:
+                skip.add(v)
+        for zstruct_attr in ("position", "normal", "variables", "aux_variables"):
+            z = getattr(self, zstruct_attr, None)
+            if z is None:
+                continue
+            for k in z.keys():
+                v = z[k]
+                if isinstance(v, sp.Symbol):
+                    skip.add(v)
+        # StateSpace exposes reference coordinates that propagate
+        # through σ-mapped equations (zeta, zeta_ref, optionally y, z).
+        # Parameters (state.g, state.rho) are *not* skipped — they're
+        # exactly what we want to flag when the user forgot to supply
+        # a numeric default.  (In the new design, state.g / state.rho
+        # don't exist on StateSpace anyway — parameters live on
+        # `self.parameters`.)
+        state = getattr(self, "state", None)
+        if state is not None:
+            for nm in ("t", "x", "y", "z", "zeta", "zeta_ref"):
+                v = getattr(state, nm, None)
+                if isinstance(v, sp.Symbol):
+                    skip.add(v)
+        param_value_names = set(self.parameter_values.keys()) if hasattr(self, "parameter_values") else set()
+        param_symbol_names = set(self.parameters.keys()) if hasattr(self, "parameters") else set()
+        missing: dict = {}
+        for name, eq in self._equations.items():
+            try:
+                fsyms = eq.expr.free_symbols
+            except AttributeError:
+                continue
+            for sym in fsyms:
+                if sym in skip:
+                    continue
+                sym_name = str(sym)
+                if sym_name in param_value_names:
+                    continue
+                if sym_name in param_symbol_names:
+                    # Declared as a Symbol on the Model but no value —
+                    # still record as missing (user must declare value).
+                    if sym_name not in param_value_names:
+                        missing.setdefault(sym_name, sym)
+                    continue
+                # Unknown free Symbol (neither declared nor in skip).
+                missing.setdefault(sym_name, sym)
+        if missing:
+            names = ", ".join(sorted(missing.keys()))
+            raise ValueError(
+                f"symbol {sorted(missing.keys())[0]!r} found in {type(self).__name__} "
+                f"equations but no numeric default supplied in "
+                f"parameters={{...}}; missing: [{names}]. Supply via "
+                f"`{type(self).__name__}(..., parameters={{...}})`."
+            )
+
+    def _auto_tag_equations(self):
+        """For every equation lacking solver tags, run
+        :func:`zoomy_core.model.models.tag_extraction.auto_solver_tag`
+        on its expression so the default operator extractors can
+        pull tagged sub-expressions.
+
+        State variables (``self.variables``) are passed as the "state
+        atoms" the classifier uses.  In the new design, after
+        ``derive_model()`` finishes its Function→Symbol substitution
+        pass, equation atoms ARE the Symbols on ``self.variables`` —
+        no separate "state Function calls" list is needed.
+
+        Equations that have no state atoms (e.g. ``bottom: ∂_t b = 0``)
+        produce no tags and are skipped naturally."""
+        if not self._equations:
+            return
+        from zoomy_core.model.models.tag_extraction import auto_solver_tag
+        # State atoms = self.variables (Symbols after derive_model
+        # finishes its substitution pass).
+        state_atoms = [v for v in self.variables.values()
+                       if isinstance(v, sp.Symbol)]
+        if not state_atoms:
+            return
+        t_sym = self.time
+        coords = [self.position[d] for d in range(self.dimension)]
+        x_sym = coords[0] if coords else None
+        if x_sym is None:
+            return
+        # Gravity parameter Symbol for the hydrostatic_pressure
+        # classifier.  In the new design, equation atoms reference
+        # ``self.parameters.g`` directly (parameters live on the
+        # Model and are propagated into MassMomentum at construction
+        # time — no Symbol-identity mismatch).
+        gravity_param = None
+        if hasattr(self, "parameters") and "g" in self.parameters.keys():
+            gravity_param = self.parameters.g
+        for name, eq in self._equations.items():
+            sg = getattr(eq, "_solver_groups", None)
+            if sg:  # already tagged
+                continue
+            try:
+                tagged = auto_solver_tag(
+                    eq.expr, state_funcs=state_atoms,
+                    t=t_sym, x=x_sym, gravity_param=gravity_param,
+                )
+            except Exception:
+                # Heuristic can fail on degenerate shapes; leave
+                # untagged so the extractor sees zero.
+                continue
+            # Stash solver groups on the equation.  The Expression
+            # returned by auto_solver_tag carries ``_solver_groups``;
+            # the Equation interface expects ``get_solver_tag`` /
+            # ``solver_tags`` / ``untagged_remainder``.
+            eq._solver_groups = getattr(tagged, "_solver_groups", {})
 
     def _resolve_input(self, val):
         if isinstance(val, param.Parameter):
@@ -134,19 +417,22 @@ class Model(param.Parameterized, SymbolicRegistrar):
         var_def = self._resolve_input(self.variables)
         aux_def = self._resolve_input(self.aux_variables)
 
-        # 1. Parameters
-        # Symbols (used in symbolic derivation) live in ``_parameter_symbols``.
-        # Values (the user-facing interface) live in ``parameters``.
-        self._parameter_symbols = parse_definition_to_zstruct(p_def, "p")
-        self._parameter_symbols._symbolic_name = "p"
-        defaults = extract_parameter_defaults(p_def)
-        # ``self.parameters`` is a plain Zstruct holding numeric values.
-        # Users can do ``model.parameters.nu = 0.01`` or
-        # ``model.parameters.update({"nu": 0.01, "lamda": 1e-2})``.
-        self.parameters = Zstruct(
-            **{k: float(defaults.get(k, 0.0)) for k in self._parameter_symbols.keys()}
-        )
+        # 1. Parameters — symbolic / numeric split (canonical naming).
+        # ``self.parameters`` — Zstruct of sympy Symbols used in
+        #   equations and in the operator API (``flux``, ``source``,
+        #   …).  This is the *symbolic identity* of each parameter.
+        # ``self.parameter_values`` — Zstruct of numeric floats,
+        #   user-mutable (e.g. ``model.parameter_values.g = 12.0``).
+        #   Carried into ``SystemModel.parameter_values`` and lifted
+        #   into the runtime callable argument named ``parameter`` at
+        #   the printer / ``lambdify`` boundary.
+        self.parameters = parse_definition_to_zstruct(p_def, "p")
         self.parameters._symbolic_name = "p"
+        defaults = extract_parameter_defaults(p_def)
+        self.parameter_values = Zstruct(
+            **{k: float(defaults.get(k, 0.0)) for k in self.parameters.keys()}
+        )
+        self.parameter_values._symbolic_name = "p"
 
         # 2. Parse Variables
         self.variables = parse_definition_to_zstruct(var_def, "q")
@@ -158,10 +444,16 @@ class Model(param.Parameterized, SymbolicRegistrar):
 
         self.n_variables = self.variables.length()
         self.n_aux_variables = self.aux_variables.length()
+        # Equal cardinality on the symbol Zstruct and the values Zstruct
+        # — same keys, just different value types.
         self.n_parameters = self.parameters.length()
 
         self.time, self.distance = sp.symbols("t dX", real=True)
-        self.position = parse_definition_to_zstruct(3, "X")
+        # Position carries x / y / z (matches StateSpace + SystemModel
+        # + sympy convention).  The `_symbolic_name = "X"` is preserved
+        # for the codegen path which prefixes positional args as `X[d]`.
+        self.position = parse_definition_to_zstruct(
+            ["x", "y", "z"], "X")
         self.position._symbolic_name = "X"
         self.normal = parse_definition_to_zstruct(
             ["n" + str(i) for i in range(self.dimension)]
@@ -179,7 +471,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
         std_sig = Zstruct(
             variables=self.variables,
             aux_variables=self.aux_variables,
-            p=self._parameter_symbols,
+            p=self.parameters,
         )
         eig_sig = Zstruct(**std_sig.as_dict(), normal=self.normal)
         res_sig = Zstruct(
@@ -193,7 +485,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
         )
         proj_sig = Zstruct(position=self.position, **std_sig.as_dict())
 
-        ic_sig = Zstruct(position=self.position, p=self._parameter_symbols)
+        ic_sig = Zstruct(position=self.position, p=self.parameters)
 
         # Gradient symbols — still produced for code-generation backends
         # (generic_c / amrex) that carry ``∇Q`` as an LDG-style explicit
@@ -275,7 +567,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
                 self.distance,
                 self.variables,
                 self.aux_variables,
-                self._parameter_symbols,
+                self.parameters,
                 self.normal,
                 function_name="boundary_conditions",
             )
@@ -287,7 +579,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
                 self.distance,
                 self.variables,
                 self.aux_variables,
-                self._parameter_symbols,
+                self.parameters,
                 self.normal,
                 function_name="boundary_gradients",
             )
@@ -333,7 +625,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
                 self.distance,
                 self.variables,
                 self.aux_variables,
-                self._parameter_symbols,
+                self.parameters,
                 self.normal,
                 function_name="aux_boundary_conditions",  # [FIX] Pass the name here!
             )
@@ -344,10 +636,72 @@ class Model(param.Parameterized, SymbolicRegistrar):
         """Print boundary conditions."""
         return self._boundary_conditions.definition
 
-    # --- Physics Methods (Unchanged) ---
+    # --- Physics Methods ---
+    # Default implementations route through ``tag_extraction``: every
+    # equation in ``self.equations`` is walked, terms are pulled by
+    # canonical solver tag, and the resulting matrix is translated
+    # from derivation Symbols / Function calls (e.g. ``h(t, x)``,
+    # ``q(k, t, x)``, ``Symbol("g", positive=True)``) to Model Symbols
+    # (``self.variables.h``, ``self.variables.q_k``,
+    # ``self.parameters.g``) via ``self._symbol_map()``.
+    #
+    # Subclasses that prefer hand-written operators (legacy SWE-style)
+    # may still override these methods directly — the override wins
+    # and ``self.equations`` need not be populated.
+
+    def _extract_via_tag(self, canonical_tag):
+        """Walk ``self._equations.values()`` and collect every term
+        carrying the canonical solver tag into an operator matrix.
+
+        Returns ``None`` (signal to fall back to a zero default) when
+        the model has no equations or no variable map (i.e. the
+        subclass has not declared which equation goes into which row
+        of the operator matrix).
+
+        In the new design, equation atoms are already Model Symbols
+        (after derive_model's Function→Symbol substitution).  No
+        post-extraction substitution / xreplace is needed.
+        """
+        if not self._equations or not self._variable_map:
+            return None
+        from zoomy_core.model.models.tag_extraction import (
+            collect_solver_tag,
+            canonical_solver_tag,
+        )
+        canonical = canonical_solver_tag(canonical_tag)
+        state_atoms = [v for v in self.variables.values()
+                       if isinstance(v, sp.Symbol)]
+        coords = [self.position[d] for d in range(self.dimension)]
+        n_dir = self.dimension if canonical in (
+            "flux", "hydrostatic_pressure", "nonconservative_flux") else 1
+        # `collect_solver_tag` walks `system._equations` natively (we
+        # wrap self in an adapter only because the legacy signature
+        # expected `.equations` dict-attr — Model exposes `_equations`
+        # now).
+        class _EqAdapter:
+            equations = self._equations
+        return collect_solver_tag(
+            _EqAdapter(), canonical,
+            variable_map=self._variable_map,
+            n_variables=self.n_variables,
+            n_directions=n_dir,
+            state_variables=state_atoms,
+            coords=coords,
+            policy="warn",
+        )
+
     def flux(self):
-        """Flux."""
-        return ZArray.zeros(self.n_variables, self.dimension)
+        """Flux ``F(Q, Qaux, p)`` — rank-2 ZArray ``(n_eq, n_dim)``.
+
+        Default: walks ``self.equations`` via tag extraction, pulls
+        every ``flux``-tagged term, substitutes derivation Symbols
+        for Model Symbols, returns as ``ZArray``.  Falls back to
+        zeros when the derivation tree is empty.
+        """
+        raw = self._extract_via_tag("flux")
+        if raw is None:
+            return ZArray.zeros(self.n_variables, self.dimension)
+        return ZArray(raw)
 
     def diffusion_matrix(self):
         """Diffusion matrix A(Q, Qaux, p) — **implicit treatment**.
@@ -393,30 +747,50 @@ class Model(param.Parameterized, SymbolicRegistrar):
         return ZArray.zeros(self.n_variables, self.dimension)
     
     def hydrostatic_pressure(self):
-        """Hydrostatic pressure."""
-        return ZArray.zeros(self.n_variables, self.dimension)
+        """Hydrostatic pressure ``P(Q, Qaux, p)`` — rank-2 ZArray
+        ``(n_eq, n_dim)``.
+
+        Default: tag-extracted from ``self.equations`` (canonical tag
+        ``hydrostatic_pressure``).  Falls back to zeros."""
+        raw = self._extract_via_tag("hydrostatic_pressure")
+        if raw is None:
+            return ZArray.zeros(self.n_variables, self.dimension)
+        return ZArray(raw)
 
     def nonconservative_matrix(self):
-        """Nonconservative matrix."""
-        return ZArray.zeros(self.n_variables, self.n_variables, self.dimension)
+        """Nonconservative matrix ``B(Q, Qaux, p)`` — rank-3 ZArray
+        ``(n_eq, n_state, n_dim)``.
+
+        Default: tag-extracted from ``self.equations`` (canonical tag
+        ``nonconservative_flux``).  Falls back to zeros."""
+        raw = self._extract_via_tag("nonconservative_flux")
+        if raw is None:
+            return ZArray.zeros(self.n_variables, self.n_variables, self.dimension)
+        return ZArray(raw)
 
     def source(self):
         """Source — **implicit treatment** (Manning friction,
-        reactions, stiff body forces).  Rank-1 ``ZArray`` of length
-        ``n_variables``.  IMEX-capable backends fold this into the
-        source-step Newton residual at ``Qnp1``.  Default: zero."""
-        return ZArray.zeros(self.n_variables)
+        reactions, stiff body forces).  Rank-1 ZArray of length
+        ``n_variables``.
+
+        Default: tag-extracted from ``self.equations`` (canonical tag
+        ``implicit_source``).  Falls back to zeros."""
+        raw = self._extract_via_tag("implicit_source")
+        if raw is None:
+            return ZArray.zeros(self.n_variables)
+        return ZArray(raw)
 
     def source_explicit(self):
         """Source — **explicit treatment** (non-stiff body forces,
-        gravity, prescribed momentum sources).  Rank-1 ``ZArray`` of
-        length ``n_variables``.  IMEX-capable backends fold this into
-        the convective step at ``Qn`` (Forward-Euler).  Default: zero.
+        gravity, prescribed momentum sources).  Rank-1 ZArray of
+        length ``n_variables``.
 
-        A model may declare both ``source`` and ``source_explicit``;
-        the solver adds each at the appropriate stage.  Explicit-only
-        backends compound: ``S_total = S_implicit + S_explicit``."""
-        return ZArray.zeros(self.n_variables)
+        Default: tag-extracted from ``self.equations`` (canonical tag
+        ``explicit_source``).  Falls back to zeros."""
+        raw = self._extract_via_tag("explicit_source")
+        if raw is None:
+            return ZArray.zeros(self.n_variables)
+        return ZArray(raw)
 
     def residual(self):
         """Residual."""
@@ -650,7 +1024,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
                 eig_list = None
                 eig_summary = "symbolic (failed to compute)"
 
-        params = dict(self.parameters.as_dict(recursive=False))
+        params = dict(self.parameter_values.as_dict(recursive=False))
 
         config = {
             "class": self.__class__.__name__,

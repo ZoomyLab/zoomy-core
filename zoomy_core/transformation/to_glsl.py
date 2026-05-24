@@ -241,9 +241,11 @@ class GlslModel(GenericGlslBase):
         self.register_map("n", model.normal.values())
         if hasattr(model, "position"):
             self.register_map("X", model.position.values())
-        # Map the *symbolic* parameters (``_parameter_symbols``); the
-        # public ``model.parameters`` Zstruct holds numeric values.
-        self.register_map("p", model._parameter_symbols.values())
+        # Map the *symbolic* parameters; per the canonical naming
+        # convention ``model.parameters`` is the Zstruct of sympy
+        # Symbols (``model.parameter_values`` is the Zstruct of
+        # numeric floats).
+        self.register_map("p", model.parameters.values())
 
     def generate(self):
         """Generate all GLSL kernels as a single code string."""

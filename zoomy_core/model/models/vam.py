@@ -1,53 +1,49 @@
 """VAM — non-hydrostatic Vertically-Averaged Moment system.
 
-Builds on :class:`SigmaRef` but does NOT eliminate pressure via
-hydrostatic reduction; ``state.w`` and ``state.p`` stay as state
-variables and the z-momentum equation is Galerkin-projected
-alongside continuity and momentum.x.
+Inherits :class:`SigmaReference` (and through it,
+:class:`zoomy_core.model.basemodel.Model`).  Unlike SME, the pressure
+is NOT eliminated via hydrostatic reduction: ``w`` and ``p`` stay as
+state variables and the z-momentum equation is Galerkin-projected
+alongside continuity and momentum_x.
 
-See the transparent-derivation notebook
-``thesis/notebooks/modeling/transparent_derivations/vam_clean.ipynb``.
+State (matrix-extraction surface):
+    ``[h, q_0..q_N, r_0..r_N, p_0..p_N]`` with ``q_k = h·u_k``,
+    ``r_k = h·w_k``.  Pressure modes ``p_k`` are kept symbolic (no
+    closure imposed at this level).
 """
 
 from __future__ import annotations
 
 import sympy as sp
 
-from zoomy_core.model.models.model import Symmetrize
-from zoomy_core.model.models.operations import (
-    Expression,
+from zoomy_core.model.models.sigmaref import SigmaReference
+from zoomy_core.model.operations import (
     Multiply,
+    ResolveDummy,
     ProductRule,
     Integrate,
     EvaluateIntegrals,
-    KinematicBC,
+    Symmetrize,
     Legendre_shifted,
 )
-from zoomy_core.model.models.sigmaref import SigmaRef
 
 
 __all__ = ["VAM"]
 
 
-class VAM(SigmaRef):
-    """Non-hydrostatic VAM at level ``N``.
+class VAM(SigmaReference):
+    """Non-hydrostatic Vertically-Averaged Moments at level ``N``."""
 
-    State (matrix-extraction surface):
-      ``[h, q_0..q_N, r_0..r_N]``  with  ``r_k = h · w_k``;
-    pressure modes ``p_0..p_N`` are *auxiliary* (closed implicitly
-    by the z-momentum equation; this scaffolding leaves p as
-    free fields in the source).
-    """
-
-    def __init__(self, N: int = 2, *, name: str | None = None):
+    def __init__(self, N: int = 2, **kwargs):
         self.N = N
-        # Indexed modal-coefficient Functions.
+        # Indexed modal-coefficient Functions (declared before super()
+        # so the derive_model pipeline can reference them).
         self.u_fn = sp.Function("u", real=True)
         self.w_fn = sp.Function("w", real=True)
         self.p_fn = sp.Function("p", real=True)
         self.q_fn = sp.Function("q", real=True)
         self.r_fn = sp.Function("r", real=True)
-        # Opaque basis/test/weight dummies.
+        # Opaque basis / test / weight dummies — resolved at the end.
         self.phi_u_fn = sp.Function("phi_u", real=True)
         self.phi_w_fn = sp.Function("phi_w", real=True)
         self.phi_p_fn = sp.Function("phi_p", real=True)
@@ -55,8 +51,23 @@ class VAM(SigmaRef):
         self.psi_w    = sp.Function("psi_w", real=True)
         self.omega    = sp.Function("omega", real=True)
 
-        super().__init__(name=name or f"VAM-L={N}")
+        kwargs.setdefault("name", f"VAM-L={N}")
+        var_names = (
+            ["h"]
+            + [f"q_{k}" for k in range(N + 1)]
+            + [f"r_{k}" for k in range(N + 1)]
+            + [f"p_{k}" for k in range(N + 1)]
+        )
+        kwargs.setdefault("variables", var_names)
+        kwargs.setdefault("parameters", {"g": 9.81, "rho": 1.0})
+        kwargs.setdefault("eigenvalue_mode", "numerical")
+        super().__init__(**kwargs)
 
+    # ── Derivation hook ─────────────────────────────────────────────
+    def derive_model(self):
+        """Build reference equations (via SigmaReference) and run the
+        VAM post-σ pipeline."""
+        super().derive_model()
         self._multiply_h_and_fold_conservative()
         self._substitute_modal_ansatz()
         self._galerkin_project_all_three()
@@ -69,27 +80,25 @@ class VAM(SigmaRef):
         self._gravity_self_pair_fold()
         self._invert_mass_matrix()
         self._eliminate_dt_h_via_continuity_0()
+        self._substitute_to_model_symbols()
+        self._variable_map = self._build_variable_map()
 
-    # No pre-σ hook needed — VAM keeps w, p as state.
+    # VAM keeps w, p as state → no pre-σ hook needed.
 
     # ── pipeline steps ──────────────────────────────────────────────
     def _multiply_h_and_fold_conservative(self):
-        s, m = self.state, self.model
-        t, x = s.t, s.x
-        m.multiply(s.h)
-        for eq in m.equations.values():
+        s, src, t, x = self.state, self.src, self.state.t, self.state.x
+        self.apply(Multiply(src.h))
+        for eq in self:
             eq.simplify()
-        # Per-equation conservative-form folds.
-        m.equations["continuity"][[0]].apply(ProductRule(variables=[x]))
-        m.equations["momentum_x"][[0, 1, 7]].apply(
-            ProductRule(variables=[t, x]))
-        m.equations["momentum_z"][[2, 3, 11]].apply(
-            ProductRule(variables=[t, x]))
-        for eq in m.equations.values():
+        self.continuity[[0]].apply(ProductRule(variables=[x]))
+        self.momentum_x[[0, 1, 7]].apply(ProductRule(variables=[t, x]))
+        self.momentum_z[[2, 3, 11]].apply(ProductRule(variables=[t, x]))
+        for eq in self:
             eq.simplify()
 
     def _substitute_modal_ansatz(self):
-        N, s = self.N, self.state
+        N, s, src = self.N, self.state, self.src
         sigma = s.zeta_ref
         self.u_ansatz = sum(
             self.u_fn(k, s.t, s.x) * self.phi_u_fn(k, sigma)
@@ -100,66 +109,63 @@ class VAM(SigmaRef):
         self.p_ansatz = sum(
             self.p_fn(k, s.t, s.x) * self.phi_p_fn(k, sigma)
             for k in range(N + 1))
-        self.model.apply({
-            s.u.xreplace({s.z: sigma}): self.u_ansatz,
-            s.w.xreplace({s.z: sigma}): self.w_ansatz,
-            s.p.xreplace({s.z: sigma}): self.p_ansatz,
+        self.apply({
+            src.u.xreplace({s.z: sigma}): self.u_ansatz,
+            src.w.xreplace({s.z: sigma}): self.w_ansatz,
+            src.p.xreplace({s.z: sigma}): self.p_ansatz,
         })
 
     def _galerkin_project_all_three(self):
         s = self.state
         sigma = s.zeta_ref
-        # Continuity and x-momentum share the u-test; z-momentum uses
-        # the w-test.
-        self.model.equations["continuity"].apply(
+        # Continuity + x-momentum share the u-test; z-momentum uses w-test.
+        self.continuity.apply(
             Multiply(self.psi_u(sigma) * self.omega(sigma)))
-        self.model.equations["momentum_x"].apply(
+        self.momentum_x.apply(
             Multiply(self.psi_u(sigma) * self.omega(sigma)))
-        self.model.equations["momentum_z"].apply(
+        self.momentum_z.apply(
             Multiply(self.psi_w(sigma) * self.omega(sigma)))
 
     def _sigma_integrate(self):
         s = self.state
         sigma = s.zeta_ref
         for name in ("continuity", "momentum_x", "momentum_z"):
-            self.model.equations[name].apply(
+            getattr(self, name).apply(
                 Integrate(sigma, sp.S.Zero, sp.S.One, method="auto"))
-        for eq in self.model.equations.values():
+        for eq in self:
             eq.simplify()
 
     def _kbc_modal_closure(self):
-        s = self.state
+        s, src = self.state, self.src
         sigma = s.zeta_ref
-        kbc_bot = KinematicBC(s, s.b,   at=sp.S.Zero)
-        kbc_top = KinematicBC(s, s.eta, at=sp.S.One)
 
-        def residual(kbc, at_value):
-            (lhs, rhs), = kbc.subs_map.items()
+        def residual(interface, at_value):
+            lhs = src.w.subs(s.z, at_value)
+            rhs = (sp.Derivative(interface, s.t)
+                   + src.u.subs(s.z, at_value) * sp.Derivative(interface, s.x))
             return (lhs - rhs).xreplace({
-                s.w.subs(s.z, at_value): self.w_ansatz.subs(sigma, at_value),
-                s.u.subs(s.z, at_value): self.u_ansatz.subs(sigma, at_value),
+                src.w.subs(s.z, at_value): self.w_ansatz.subs(sigma, at_value),
+                src.u.subs(s.z, at_value): self.u_ansatz.subs(sigma, at_value),
             })
 
         closure = sp.solve(
-            [residual(kbc_bot, sp.S.Zero),
-             residual(kbc_top, sp.S.One)],
+            [residual(src.b, sp.S.Zero), residual(src.eta, sp.S.One)],
             [self.w_fn(0, s.t, s.x), self.w_fn(1, s.t, s.x)],
             dict=True,
         )[0]
-        self.model.apply(closure, level="minor",
-                          description="KBC modal closure")
-        for eq in self.model.equations.values():
+        self.apply(closure, level="minor", description="KBC modal closure")
+        for eq in self:
             eq.simplify()
 
     def _cov_u_to_q(self):
-        N, s = self.N, self.state
+        N, s, src = self.N, self.state, self.src
         self.u_modes = [self.u_fn(k, s.t, s.x) for k in range(N + 1)]
         self.q_modes = [self.q_fn(k, s.t, s.x) for k in range(N + 1)]
-        self.model.apply(
-            {u: q / s.h for u, q in zip(self.u_modes, self.q_modes)},
+        self.apply(
+            {u: q / src.h for u, q in zip(self.u_modes, self.q_modes)},
             level="minor", description="CoV u(k,t,x) → q(k,t,x)/h",
         )
-        for eq in self.model.equations.values():
+        for eq in self:
             eq.simplify()
 
     def _resolve_dummies(self):
@@ -175,49 +181,49 @@ class VAM(SigmaRef):
         def legendre_value(basis, k):
             return lambda arg, _b=basis, _k=k: _b.eval(_k, arg)
 
-        m = self.model
-        m.resolve_dummy(self.omega, lambda arg: sp.S.One)
-        m.resolve_dummy(
+        self.apply(ResolveDummy(self.omega, lambda arg: sp.S.One))
+        self.apply(ResolveDummy(
             self.phi_u_fn,
-            lambda k, sig, _b=self.legendre_u: basis_value(_b, k, sig))
-        m.resolve_dummy(
+            lambda k, sig, _b=self.legendre_u: basis_value(_b, k, sig)))
+        self.apply(ResolveDummy(
             self.phi_w_fn,
-            lambda k, sig, _b=self.legendre_w: basis_value(_b, k, sig))
-        m.resolve_dummy(
+            lambda k, sig, _b=self.legendre_w: basis_value(_b, k, sig)))
+        self.apply(ResolveDummy(
             self.phi_p_fn,
-            lambda k, sig, _b=self.legendre_u: basis_value(_b, k, sig))
-        m.resolve_dummy(
+            lambda k, sig, _b=self.legendre_u: basis_value(_b, k, sig)))
+        self.apply(ResolveDummy(
             self.psi_u,
-            [legendre_value(self.legendre_u, k) for k in range(N + 1)])
-        m.resolve_dummy(
+            [legendre_value(self.legendre_u, k) for k in range(N + 1)]))
+        self.apply(ResolveDummy(
             self.psi_w,
-            [legendre_value(self.legendre_w, k) for k in range(N + 1)])
+            [legendre_value(self.legendre_w, k) for k in range(N + 1)]))
 
     def _evaluate_integrals(self):
-        self.model.apply(EvaluateIntegrals(self.state))
-        for eq in self.model.equations.values():
+        self.apply(EvaluateIntegrals(self.state))
+        for eq in self:
             eq.simplify()
 
     def _cov_w_to_r(self):
-        """``w_k → r_k / h`` so the vertical momentum equations have
+        """``w_k → r_k / h`` so the vertical momentum equations carry
         conservative time-derivative atoms ``∂_t r_k``."""
-        N, s = self.N, self.state
+        N, s, src = self.N, self.state, self.src
         self.w_modes = [self.w_fn(k, s.t, s.x) for k in range(N + 1)]
         self.r_modes = [self.r_fn(k, s.t, s.x) for k in range(N + 1)]
-        self.model.apply(
-            {w: r / s.h for w, r in zip(self.w_modes, self.r_modes)},
+        self.apply(
+            {w: r / src.h for w, r in zip(self.w_modes, self.r_modes)},
             level="minor", description="CoV w(k,t,x) → r(k,t,x)/h",
         )
-        for eq in self.model.equations.values():
+        for eq in self:
             eq.simplify()
 
     def _gravity_self_pair_fold(self):
-        s = self.state
-        mom0 = self.model.equations["momentum_x_0"]
+        s, src = self.state, self.src
+        g = self.parameters.g
+        mom0 = self.momentum_x_0
         grav = next(
             (t for t in mom0
-             if t.expr.has(s.g) and t.expr.has(sp.Derivative(s.h, s.x))
-             and not t.expr.has(s.b)),
+             if t.expr.has(g) and t.expr.has(sp.Derivative(src.h, s.x))
+             and not t.expr.has(src.b)),
             None)
         if grav is not None:
             grav.apply(Symmetrize(ProductRule(variables=[s.x])))
@@ -226,21 +232,51 @@ class VAM(SigmaRef):
     def _invert_mass_matrix(self):
         for k in range(self.N + 1):
             for name in (f"momentum_x_{k}", f"momentum_z_{k}"):
-                if name in self.model.equations:
-                    eq = self.model.equations[name]
+                eq = self._equations.get(name)
+                if eq is not None:
                     eq.expr = (2 * k + 1) * eq.expr
                     eq.simplify()
 
     def _eliminate_dt_h_via_continuity_0(self):
-        """Substitute ``∂_t h → −∂_x q_0`` (from depth-mean continuity)
-        in all non-continuity equations.  Without this the chain-rule
-        residual ``−w·∂_t h`` from ``ProductRule(inverse)`` on
-        ``h·∂_t w`` shows up as state-dependent mass-matrix entries."""
-        s = self.state
-        cont0_subst = {sp.Derivative(s.h, s.t):
+        """``∂_t h → −∂_x q_0`` (depth-mean continuity) in all
+        non-continuity equations."""
+        s, src = self.state, self.src
+        cont0_subst = {sp.Derivative(src.h, s.t):
                         -sp.Derivative(self.q_fn(0, s.t, s.x), s.x)}
-        for name, eq in self.model.equations.items():
+        for name, eq in self._equations.items():
             if name == "continuity_0":
                 continue
             eq.expr = eq.expr.xreplace(cont0_subst)
             eq.simplify()
+
+    # ── final: Function → Symbol substitution ─────────────────────
+    def _substitute_to_model_symbols(self):
+        s, src = self.state, self.src
+        subs = {src.h: self.variables.h}
+        for k in range(self.N + 1):
+            subs[self.q_fn(k, s.t, s.x)] = self.variables[f"q_{k}"]
+            subs[self.r_fn(k, s.t, s.x)] = self.variables[f"r_{k}"]
+            subs[self.p_fn(k, s.t, s.x)] = self.variables[f"p_{k}"]
+        for eq in self:
+            eq.expr = eq.expr.xreplace(subs)
+
+    def _build_variable_map(self):
+        """``{eq_name: [row_index]}`` for tag extraction.
+
+        Layout: ``[h, q_0..q_N, r_0..r_N, p_0..p_N]``.
+
+        * ``continuity_0`` → row 0 (h).
+        * ``momentum_x_k`` → row ``1 + k`` for ``k = 0..N``.
+        * ``momentum_z_k`` → row ``1 + (N+1) + k`` for ``k = 0..N``.
+        * Pressure rows (``p_0..p_N``) are not dynamic equations at
+          this stage — they remain auxiliary closures.
+        """
+        N = self.N
+        m = {"continuity_0": [0]}
+        for k in range(N + 1):
+            m[f"momentum_x_{k}"] = [1 + k]
+        for k in range(N + 1):
+            mz = f"momentum_z_{k}"
+            if mz in self._equations:
+                m[mz] = [1 + (N + 1) + k]
+        return m

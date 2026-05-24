@@ -640,14 +640,18 @@ class SystemModel:
         state = [model.variables[k] for k in model.variables.keys()]
         aux_state = [model.aux_variables[k]
                      for k in model.aux_variables.keys()]
+        # NEW naming convention (matches the Model side after the
+        # ``_parameter_symbols → parameters`` / ``parameters → parameter_values``
+        # rename): ``model.parameters`` carries sympy Symbols,
+        # ``model.parameter_values`` carries numeric floats.
         parameters = Zstruct(
-            **{k: model._parameter_symbols[k]
-               for k in model._parameter_symbols.keys()}
+            **{k: model.parameters[k]
+               for k in model.parameters.keys()}
         )
         parameters._symbolic_name = "p"
         parameter_values = Zstruct(
-            **{k: getattr(model.parameters, k, 0.0)
-               for k in model._parameter_symbols.keys()}
+            **{k: getattr(model.parameter_values, k, 0.0)
+               for k in model.parameters.keys()}
         )
         normal = Zstruct(
             **{k: model.normal[k] for k in model.normal.keys()}

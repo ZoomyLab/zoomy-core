@@ -1,62 +1,31 @@
-"""Canonical model derivations.
+"""Canonical model derivation classes (lazy-imported to avoid cycles).
 
-The five derivation classes — :class:`SigmaRef`, :class:`SME`,
-:class:`VAM`, :class:`MLME`, :class:`MLVAM` — are progressively built
-on top of one another: ``SigmaRef`` is the common mass+momentum
-σ-mapped reference; ``SME`` and ``VAM`` add level-N Galerkin
-projection (hydrostatic vs. non-hydrostatic); ``MLME`` and ``MLVAM``
-stack ``N_layers`` such derivations with appropriate interface
-topography and pressure.
+After the Model-class rewrite, primitives moved out of this package
+into ``zoomy_core/model/{basemodel,equation,state,operations}.py``.
+This package retains only the derivation subclasses
+(``SigmaReference``, ``SME``, ``VAM``).
 
-All five reuse the same :class:`Model` /:class:`Equation`
-/:class:`Term` framework and the same operations re-exported by
-``operations`` (``Multiply``, ``ProductRule``, ``Integrate``,
-``EvaluateIntegrals``, ``SigmaTransform``, ``AffineProjection``,
-``KinematicBC``) — those operations themselves still live in the
-library backend ``ins_generator``.
+Lazy import (PEP 562) is used so that importing
+``zoomy_core.model.models.basisfunctions`` (e.g. from
+``zoomy_core.model.operations``) does not trigger eager loading of
+the derivation classes — which themselves depend on
+``zoomy_core.model.operations`` and would create a cycle.
 
-Legacy app-level model files have been moved to the ``legacy/``
-sub-package.
+Users get the eager-looking surface (``from zoomy_core.model.models
+import SME``) without the cycle.
 """
 
-from zoomy_core.model.models.model import (
-    Term,
-    Equation,
-    Model,
-    Symmetrize,
-)
-from zoomy_core.model.models.operations import (
-    Expression,
-    Operation,
-    Relation,
-    Assumption,
-    StateSpace,
-    MassMomentum,
-    Multiply,
-    ProductRule,
-    Integrate,
-    EvaluateIntegrals,
-    SigmaTransform,
-    AffineProjection,
-    KinematicBC,
-    Legendre_shifted,
-)
-from zoomy_core.model.models.sigmaref import SigmaRef
-from zoomy_core.model.models.sme   import SME
-from zoomy_core.model.models.vam   import VAM
-from zoomy_core.model.models.mlme  import MLME
-from zoomy_core.model.models.mlvam import MLVAM
+__all__ = ["SigmaReference", "SME", "VAM"]
 
 
-__all__ = [
-    # Framework.
-    "Term", "Equation", "Model", "Symmetrize",
-    # Operations + symbolic primitives.
-    "Expression", "Operation", "Relation", "Assumption",
-    "StateSpace", "MassMomentum",
-    "Multiply", "ProductRule", "Integrate", "EvaluateIntegrals",
-    "SigmaTransform", "AffineProjection", "KinematicBC",
-    "Legendre_shifted",
-    # Derivation classes.
-    "SigmaRef", "SME", "VAM", "MLME", "MLVAM",
-]
+def __getattr__(name):
+    if name == "SigmaReference":
+        from zoomy_core.model.models.sigmaref import SigmaReference
+        return SigmaReference
+    if name == "SME":
+        from zoomy_core.model.models.sme import SME
+        return SME
+    if name == "VAM":
+        from zoomy_core.model.models.vam import VAM
+        return VAM
+    raise AttributeError(f"module 'zoomy_core.model.models' has no attribute {name!r}")

@@ -143,9 +143,10 @@ class JsModel(GenericJsBase):
         self.register_map("n", model.normal.values())
         if hasattr(model, "position"):
             self.register_map("X", model.position.values())
-        # Map the *symbolic* parameters; ``model.parameters`` holds the
-        # numeric values, which would never match a symbol in an expr.
-        self.register_map("p", model._parameter_symbols.values())
+        # Map the *symbolic* parameters; ``model.parameters`` now
+        # holds Symbols (post-rename), ``model.parameter_values``
+        # holds floats.
+        self.register_map("p", model.parameters.values())
 
     def generate(self):
         """Generate all JS kernels as a single code string."""
