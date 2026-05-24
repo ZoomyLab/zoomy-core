@@ -22,7 +22,7 @@ from typing import Sequence
 
 import sympy as sp
 
-from zoomy_core.model.models.ins_generator import Operation
+from zoomy_core.model.models.legacy.ins_generator import Operation
 from zoomy_core.symbolic.domains import (
     BoundaryIntegral,
     Domain,

@@ -385,7 +385,7 @@ def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
 
     # Auto-tag every residual (converting Symbol state to Function form
     # for the tag classifier).
-    from zoomy_core.model.models.ins_generator import Expression
+    from zoomy_core.model.models.legacy.ins_generator import Expression
     tagged: dict = {}
     for name, res in zip(eq_names, eq_residuals):
         res_func = sp.sympify(res).xreplace(sym_to_func)

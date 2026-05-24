@@ -209,7 +209,7 @@ class NumericalModel(Model):
         try:
             from zoomy_core.model.models.projected_model import ProjectedModel
             from zoomy_core.model.models.model_derivation import derive_shallow_moments
-            from zoomy_core.model.models.ins_generator import StateSpace, Newtonian
+            from zoomy_core.model.models.legacy.ins_generator import StateSpace, Newtonian
             state = StateSpace(dimension=self._analytical.dimension + 1)
             pre = derive_shallow_moments(state, material=Newtonian(state))
             proxy = ProjectedModel(

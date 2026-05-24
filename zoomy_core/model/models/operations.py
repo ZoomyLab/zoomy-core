@@ -10,7 +10,7 @@ derivation files free of the legacy 5800-line module's surface area.
 from __future__ import annotations
 
 # Re-exports from the library backend.
-from zoomy_core.model.models.ins_generator import (
+from zoomy_core.model.models.legacy.ins_generator import (
     # Core symbolic / dispatch layer.
     Expression,
     Operation,

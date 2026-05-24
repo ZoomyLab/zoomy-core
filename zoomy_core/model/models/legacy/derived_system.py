@@ -33,7 +33,7 @@ from typing import Iterator, Tuple
 import sympy as sp
 
 from zoomy_core.misc.misc import Zstruct
-from zoomy_core.model.models.ins_generator import (
+from zoomy_core.model.models.legacy.ins_generator import (
     StateSpace, FullINS, Expression,
     KinematicBCBottom, KinematicBCSurface, HydrostaticPressure,
     Newtonian, Inviscid,

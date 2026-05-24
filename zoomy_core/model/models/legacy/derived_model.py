@@ -204,7 +204,7 @@ class DerivedModel(Model):
         Mutates ``self._system`` in place and auto-registers the
         operation for ``describe()``.
         """
-        from zoomy_core.model.models.ins_generator import Relation, Operation
+        from zoomy_core.model.models.legacy.ins_generator import Relation, Operation
 
         if self._system is None:
             raise RuntimeError(

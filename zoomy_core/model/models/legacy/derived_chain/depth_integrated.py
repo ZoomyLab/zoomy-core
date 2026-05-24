@@ -13,7 +13,7 @@ Galerkin evaluations or numerical 3D-mesh quadrature.
 """
 from __future__ import annotations
 
-from zoomy_core.model.models.ins_generator import (
+from zoomy_core.model.models.legacy.ins_generator import (
     DepthIntegrate, ApplyKinematicBCs, StressFreeSurface,
     ZeroAtmosphericPressure, SimplifyIntegrals,
 )

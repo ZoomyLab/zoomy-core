@@ -6,7 +6,7 @@ eqs. (3.5)–(3.11).
 """
 import sympy as sp
 
-from zoomy_core.model.models.ins_generator import (
+from zoomy_core.model.models.legacy.ins_generator import (
     StateSpace, FullINS, SigmaTransform,
 )
 
@@ -139,7 +139,7 @@ def test_kinematic_bc_explicit_at():
     """``KinematicBC(state, interface, at=...)`` covers physical-z and
     σ-coord cases with one signature; back-compat aliases agree.
     """
-    from zoomy_core.model.models.ins_generator import (
+    from zoomy_core.model.models.legacy.ins_generator import (
         KinematicBC, KinematicBCBottom, KinematicBCSurface, InterfaceKBC,
     )
     s = _state_2d()

@@ -6,7 +6,7 @@ Two choices supported (``stress=`` kwarg):
 """
 from __future__ import annotations
 
-from zoomy_core.model.models.ins_generator import Inviscid, Newtonian
+from zoomy_core.model.models.legacy.ins_generator import Inviscid, Newtonian
 from .depth_integrated import DepthIntegrated
 
 

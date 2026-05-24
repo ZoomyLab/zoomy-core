@@ -42,7 +42,7 @@ import sympy as sp
 from zoomy_core.misc.misc import Zstruct, ZArray
 from zoomy_core.model.basemodel import Model
 from zoomy_core.model.models.basisfunctions import Legendre_shifted
-from zoomy_core.model.models.ins_generator import (
+from zoomy_core.model.models.legacy.ins_generator import (
     AffineProjection,
     EvaluateIntegrals,
     Expand,

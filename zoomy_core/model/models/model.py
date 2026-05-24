@@ -15,7 +15,7 @@ from __future__ import annotations
 import itertools
 import sympy as sp
 
-from zoomy_core.model.models.ins_generator import Expression, Operation
+from zoomy_core.model.models.legacy.ins_generator import Expression, Operation
 
 
 __all__ = [

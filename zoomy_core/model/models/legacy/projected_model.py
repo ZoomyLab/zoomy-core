@@ -89,7 +89,7 @@ class ProjectedModel(Model):
                  **kwargs):
         if pre_projected is None:
             # Auto-derive: run Phase 1 from config
-            from zoomy_core.model.models.ins_generator import (
+            from zoomy_core.model.models.legacy.ins_generator import (
                 StateSpace, Newtonian, Inviscid,
             )
             from zoomy_core.model.models.legacy.model_derivation import derive_shallow_moments

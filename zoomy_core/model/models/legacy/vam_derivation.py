@@ -23,7 +23,7 @@ from typing import List, Dict, Optional, Literal
 import sympy as sp
 from sympy import Symbol, Function, Derivative, Integral, Rational, S
 
-from zoomy_core.model.models.ins_generator import (
+from zoomy_core.model.models.legacy.ins_generator import (
     StateSpace, FullINS, Expression, IBPResult,
     materials, Newtonian, Inviscid,
     KinematicBCBottom, KinematicBCSurface,

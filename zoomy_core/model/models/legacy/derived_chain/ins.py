@@ -7,7 +7,7 @@ For 2D (x-z slice): ``y, v`` are absent.  For 3D: full state.
 """
 from __future__ import annotations
 
-from zoomy_core.model.models.ins_generator import StateSpace, FullINS
+from zoomy_core.model.models.legacy.ins_generator import StateSpace, FullINS
 from ._base import DerivationStep
 
 

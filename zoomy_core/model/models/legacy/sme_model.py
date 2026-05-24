@@ -47,7 +47,7 @@ class INSModel(DerivedModel):
     ins_dimension = 2  # override to 3 for 3D derivation
 
     def derive_model(self):
-        from zoomy_core.model.models.ins_generator import StateSpace, FullINS
+        from zoomy_core.model.models.legacy.ins_generator import StateSpace, FullINS
         self._system = FullINS(StateSpace(dimension=self.ins_dimension))
 
 
@@ -57,7 +57,7 @@ class SMEModel(INSModel):
     projectable = True
 
     def derive_model(self):
-        from zoomy_core.model.models.ins_generator import (
+        from zoomy_core.model.models.legacy.ins_generator import (
             HydrostaticPressure, Newtonian, DepthIntegrate,
             ApplyKinematicBCs, StressFreeSurface,
             ZeroAtmosphericPressure, SimplifyIntegrals,
@@ -90,7 +90,7 @@ class SMEInviscid(INSModel):
     projectable = True
 
     def derive_model(self):
-        from zoomy_core.model.models.ins_generator import (
+        from zoomy_core.model.models.legacy.ins_generator import (
             HydrostaticPressure, Inviscid, DepthIntegrate,
             ApplyKinematicBCs, StressFreeSurface,
             ZeroAtmosphericPressure, SimplifyIntegrals,

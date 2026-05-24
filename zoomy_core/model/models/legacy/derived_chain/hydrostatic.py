@@ -14,7 +14,7 @@ polynomial Galerkin ansatz).
 from __future__ import annotations
 
 from sympy import S
-from zoomy_core.model.models.ins_generator import HydrostaticPressure
+from zoomy_core.model.models.legacy.ins_generator import HydrostaticPressure
 from .simplify_stress import SimplifyStress
 
 

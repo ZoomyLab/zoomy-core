@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sympy as sp
 
-from zoomy_core.model.models.ins_generator import Operation
+from zoomy_core.model.models.legacy.ins_generator import Operation
 from zoomy_core.symbolic.domains import Domain
 
 

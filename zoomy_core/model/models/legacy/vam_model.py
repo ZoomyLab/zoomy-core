@@ -73,7 +73,7 @@ class VAMModel(INSModel):
     projectable = True
 
     def derive_model(self):
-        from zoomy_core.model.models.ins_generator import (
+        from zoomy_core.model.models.legacy.ins_generator import (
             Inviscid, DepthIntegrate,
             ApplyKinematicBCs, StressFreeSurface,
             ZeroAtmosphericPressure, SimplifyIntegrals,
@@ -607,7 +607,7 @@ class VAMNewtonian(VAMModel):
     """
 
     def derive_model(self):
-        from zoomy_core.model.models.ins_generator import (
+        from zoomy_core.model.models.legacy.ins_generator import (
             Newtonian, DepthIntegrate,
             ApplyKinematicBCs, StressFreeSurface,
             ZeroAtmosphericPressure, SimplifyIntegrals,

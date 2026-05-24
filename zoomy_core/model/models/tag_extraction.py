@@ -325,7 +325,7 @@ def auto_solver_tag(expr_or_leaf, *, state_funcs, t, x, gravity_param=None):
     Returns an :class:`Expression` carrying the grouped solver tags so
     :func:`collect_solver_tag` can extract operator matrices from it.
     """
-    from zoomy_core.model.models.ins_generator import Expression
+    from zoomy_core.model.models.legacy.ins_generator import Expression
 
     raw = (expr_or_leaf.expr
            if isinstance(expr_or_leaf, Expression)
