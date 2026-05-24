@@ -1,33 +1,51 @@
-"""MLSME — Multi-Layer Shallow Moment Equations.
+"""MLSME — Multi-Layer Shallow Moment Equations (Audusse-style).
 
-Stack of ``N_layers`` SME(N) systems coupled through hydrostatic
-pressure and bottom topography:
+Derivation in the Audusse-Bristeau-Perthame-Sainte-Marie sense:
+a SINGLE coupled derivation from the 3D Euler/INS system,
+partitioning the water column ``z ∈ [b, b+H]`` into ``N_layers``
+*geometric* layers (NOT material columns).  Layer thicknesses are
+fixed fractions of the total depth, ``h_ℓ = α_ℓ · H`` with ``α_ℓ``
+constant and ``Σ_ℓ α_ℓ = 1``.
 
-* Layer ℓ bottom:            ``b + Σ_{m<ℓ} h_m``
-* Layer ℓ top pressure:      ``ρ·g·Σ_{m>ℓ} h_m``   (0 for the surface layer)
+Variables (state vector size ``1 + L·(N+1)``):
 
-Construction:
+    Q = [H,  q_1_0..q_1_N,  q_2_0..q_2_N,  ...,  q_L_0..q_L_N]ᵀ
 
-    >>> mlsme = MLSME(
-    ...     N_layers=2,
-    ...     N=2,
-    ...     parameters={"g": (9.81, "positive"),
-    ...                 "rho": (1.0, "positive")},
-    ...     boundary_conditions=...,
-    ... )
-    >>> sm = SystemModel.from_model(mlsme)
+Equations (``1 + L·(N+1)`` rows):
 
-In the limit ``N = 0`` (no shear moments, piecewise-constant
-velocity profile), ``MLSME(N_layers=L, N=0)`` recovers the
-ML-SWE system.
+* one global continuity ``∂_t H + ∂_x Q = 0`` where ``Q = Σ q_m_0``
+  (the L per-layer continuities reduce to the same global statement
+  under the fixed-α closure);
+* L·(N+1) momentum equations — each is the standard single-layer SME
+  pipeline run with the layer-local geometry
+  ``h_ℓ = α_ℓ·H``, ``bottom_ℓ = b + (Σ_{m<ℓ} α_m)·H``,
+  ``top-pressure_ℓ = ρ·g·(Σ_{m>ℓ} α_m)·H``, PLUS the mass-exchange
+  transfer terms:
 
-Internally each layer runs the full SME(N) pipeline with a
-layer-specific bottom + top-pressure; per-layer equations are
-merged into one flat ``self._equations`` dict with layer-suffixed
-names.
+      + u*_{ℓ+1/2} · G_{ℓ+1/2}  −  (−1)^k · u*_{ℓ-1/2} · G_{ℓ-1/2}
 
-Reference: ml_sme_clean.py (canonical notebook in
-``thesis/notebooks/legacy/modeling/transparent_derivations/``).
+  carrying momentum across interfaces along with the inter-layer
+  mass flux.
+
+Interface mass flux (closed form under fixed α):
+
+    G_{ℓ+1/2}  =  (Σ_{m≤ℓ} α_m) · ∂_x Q  −  Σ_{m≤ℓ} ∂_x q_m_0
+    G_{1/2}    =  0      (impermeable bottom)
+    G_{L+1/2}  =  0      (impermeable free surface — automatic since Σα = 1)
+
+Interface velocity (upwind via Piecewise):
+
+    u*_{ℓ+1/2}  =  Piecewise( (u_ℓ(σ=1),    G_{ℓ+1/2} > 0),
+                              (u_{ℓ+1}(σ=0), True             ) )
+
+with shifted-Legendre evaluations
+``u_ℓ(σ=1) = Σ_k q_ℓ_k / h_ℓ`` and
+``u_ℓ(σ=0) = Σ_k (−1)^k · q_ℓ_k / h_ℓ``.
+
+In the limit ``N = 0`` (constant velocity profile per layer),
+``MLSME(N_layers=L, N=0)`` recovers Audusse's ML-SWE
+(``F = q²/h, P = α·g·H²/2``, plus the upwinded mass-exchange
+transfers).
 """
 
 from __future__ import annotations
@@ -55,25 +73,58 @@ __all__ = ["MLSME"]
 
 
 class MLSME(Model):
-    """Multi-layer SME at level ``N`` over ``N_layers`` layers."""
+    """Multi-layer SME at level ``N`` over ``N_layers`` layers
+    (Audusse-style mass-exchange).
 
-    # Equations leave ``derive_model`` in Function form (h_layer_ℓ
-    # as Function calls).  ``SystemModel.from_model`` auto-triggers
-    # the Function → Symbol substitution + tagging.
+    Parameters
+    ----------
+    N_layers
+        Number of layers.
+    N
+        Per-layer Galerkin level (number of velocity modes is ``N+1``).
+    alphas
+        Layer fractions ``(α_1, …, α_{N_layers})``.  Default: uniform
+        ``1/N_layers``.  Must sum to 1.
+    """
+
+    # Equations leave ``derive_model`` in Function form so the
+    # ``H_pre`` and ``q_ℓ`` placeholders can be xreplace'd to Model
+    # Symbols in ``_prepare_for_systemmodel``; SystemModel.from_model
+    # auto-triggers that pass.
     _finalize_lazy = True
 
-    def __init__(self, N_layers: int = 2, N: int = 2, **kwargs):
+    def __init__(self, N_layers: int = 2, N: int = 2,
+                 *, alphas=None, **kwargs):
         self.N_layers = N_layers
         self.N = N
 
-        # Variable layout: per layer, [h_layer_ℓ, q_layer_ℓ_0..N].
-        var_names = []
+        # Layer fractions — default uniform.
+        if alphas is None:
+            alphas = [sp.Rational(1, N_layers)] * N_layers
+        else:
+            alphas = [sp.sympify(a) for a in alphas]
+            if len(alphas) != N_layers:
+                raise ValueError(
+                    f"alphas must have length N_layers={N_layers}, "
+                    f"got {len(alphas)}")
+            total = sum(alphas)
+            try:
+                if abs(float(total) - 1.0) > 1e-12:
+                    raise ValueError(
+                        f"alphas must sum to 1, got {float(total)}")
+            except (TypeError, ValueError):
+                # Symbolic alphas — trust the user.
+                pass
+        self._alphas = alphas
+
+        # Variable layout: [H, q_ℓ_0..N for ℓ = 1..N_layers].
+        var_names = ["H"]
         for ell in range(1, N_layers + 1):
-            var_names.append(f"h_layer_{ell}")
             for k in range(N + 1):
                 var_names.append(f"q_layer_{ell}_{k}")
 
-        kwargs.setdefault("name", f"MLSME-L={N}-{N_layers}layers")
+        kwargs.setdefault("name",
+                           f"MLSME-L={N}-{N_layers}layers-Audusse")
         kwargs.setdefault("variables", var_names)
         kwargs.setdefault("parameters", {
             "g":   (9.81, "positive"),
@@ -84,126 +135,184 @@ class MLSME(Model):
 
     # ── Derivation hook ─────────────────────────────────────────────
     def derive_model(self):
-        """Run the per-layer SME pipeline for each of ``N_layers``
-        layers, unify the layer-h placeholders, then merge."""
-        # Shared coordinate scaffold across all layers.  Each layer's
-        # pipeline still gets its own ``MassMomentum`` (h, b, u, p, …
-        # are layer-local Function objects until the END substitution
-        # rewires them to the layer's actual h/b/q), but ``state.t``,
-        # ``state.x``, ``state.zeta_ref`` are global so MLSME's
-        # ``_assert_parameter_values_supplied`` can skip ``zeta_ref``
-        # cleanly via the standard ``self.state`` mechanism.
+        """Drive the per-layer SME pipeline, add the global continuity
+        equation, then splice in the mass-exchange transfer terms."""
+        # Strict required-parameter check.
+        missing = [k for k in ("g", "rho")
+                   if not hasattr(self.parameters, k)]
+        if missing:
+            raise ValueError(
+                f"symbol {missing[0]!r} required by MLSME but not in "
+                f"parameters={{...}}; supply via "
+                f"`MLSME(..., parameters={{'g': 9.81, 'rho': 1.0, ...}})`."
+            )
+
+        # Shared coordinate scaffold across all layers (so MLSME.state
+        # exposes zeta_ref for the parameter-values assertion).
         self.state = StateSpace(dimension=2)
         t_sym, x_sym = self.state.t, self.state.x
-        h_pres = [
-            sp.Function(f"h_layer_{ell}_pre", positive=True)(t_sym, x_sym)
-            for ell in range(1, self.N_layers + 1)
-        ]
-        # Global bathymetry — shared across layers.
+
+        # Total water depth as a Function placeholder — replaced with
+        # self.variables.H in ``_prepare_for_systemmodel``.
+        H_pre = sp.Function("H_pre", positive=True)(t_sym, x_sym)
         b_global = sp.Function("b", real=True)(t_sym, x_sym)
 
+        alphas = self._alphas
         rho_sym = self.parameters.rho
         g_sym = self.parameters.g
 
+        # ── Per-layer SME pipelines ────────────────────────────────
         per_layer = []
-        h_actuals = []
-        q_fns = []
+        layer_q_fns = []
         for ell in range(1, self.N_layers + 1):
-            # Layer ℓ sits ABOVE layers 1..ℓ-1 and BELOW layers ℓ+1..N_layers.
-            bottom_expr = b_global + sum(h_pres[:ell - 1], sp.S.Zero)
-            # Top pressure: 0 for the surface (top) layer, otherwise
-            # ρ·g·(sum of heights of layers above).
+            cumul_below = sum(alphas[:ell - 1], sp.S.Zero)
+            cumul_above = sum(alphas[ell:], sp.S.Zero)
+            # Layer-ℓ geometry — all expressed in terms of H_pre.
+            h_layer_expr = alphas[ell - 1] * H_pre
+            bottom_expr = b_global + cumul_below * H_pre
+            # Top pressure = weight of layers above (= 0 for surface).
             if ell < self.N_layers:
-                top_p_expr = rho_sym * g_sym * sum(h_pres[ell:], sp.S.Zero)
+                top_p_expr = rho_sym * g_sym * cumul_above * H_pre
             else:
                 top_p_expr = sp.S.Zero
-            sub_model, h_layer, q_fn = self._derive_layer_sme(
+
+            sub_model, q_fn = self._derive_layer_sme(
                 layer_label=f"_layer_{ell}",
+                h_layer_expr=h_layer_expr,
                 bottom_expr=bottom_expr,
                 top_pressure_expr=top_p_expr,
             )
             per_layer.append(sub_model)
-            h_actuals.append(h_layer)
-            q_fns.append(q_fn)
+            layer_q_fns.append(q_fn)
 
-        # Unify placeholders ↔ actuals.
-        unify = dict(zip(h_pres, h_actuals))
-        for sub in per_layer:
-            for eq in sub.values():
-                eq.expr = eq.expr.xreplace(unify)
-                eq.simplify()
-
-        # Merge per-layer equations into ``self._equations``.  Only the
-        # dynamic equations matter for the SystemModel (continuity_ell_0
-        # for h_layer_ell; momentum_x_ell_k for q_layer_ell_k).  The
-        # scratch dict also holds momentum_z and higher-mode continuity
-        # branches (continuity_ell_1..continuity_ell_{N+1}) — these are
-        # pipeline residue (pressure-elimination scaffold, w-closure
-        # auxiliary) and are not part of the dynamic system.  Drop them.
+        # ── Merge per-layer momentum equations into self ───────────
+        # Drop per-layer continuities — replaced with the single
+        # global continuity below (under fixed-α, the L per-layer
+        # depth-mean continuities reduce to the same statement).
         for ell, sub in zip(range(1, self.N_layers + 1), per_layer):
             label = f"_layer_{ell}"
-            keep = (f"continuity{label}_0",
-                    *[f"momentum_x{label}_{k}" for k in range(self.N + 1)])
-            for name in keep:
+            for k in range(self.N + 1):
+                name = f"momentum_x{label}_{k}"
                 if name in sub:
                     self.add_equation(name, sub[name].expr)
 
-        # Stash bookkeeping for downstream / inspection.
-        self._layer_h = h_actuals
-        self._layer_q_fns = q_fns
+        # ── Global continuity:  ∂_t H + ∂_x Q = 0 ──────────────────
+        Q_total = sum(q_fn(0, t_sym, x_sym) for q_fn in layer_q_fns)
+        self.add_equation(
+            "continuity_global",
+            sp.Derivative(H_pre, t_sym) + sp.Derivative(Q_total, x_sym),
+        )
+
+        # ── Interface mass fluxes G_{ℓ+1/2} ────────────────────────
+        # Closed form under fixed-α:
+        #   G_{ℓ+1/2} = (Σ_{m≤ℓ} α_m)·∂_x Q − Σ_{m≤ℓ} ∂_x q_m_0
+        # Index convention: G[ℓ] = G_{ℓ+1/2} for ℓ = 0..N_layers,
+        # so G[0] = G_{1/2} = 0 (bottom) and G[N_layers] = 0 (top).
+        G_interfaces = [sp.S.Zero]   # G[0] = bottom
+        for ell in range(1, self.N_layers):
+            cumul_alpha = sum(alphas[:ell], sp.S.Zero)
+            cumul_q = sum(layer_q_fns[m - 1](0, t_sym, x_sym)
+                          for m in range(1, ell + 1))
+            G_interfaces.append(
+                cumul_alpha * sp.Derivative(Q_total, x_sym)
+                - sp.Derivative(cumul_q, x_sym)
+            )
+        G_interfaces.append(sp.S.Zero)  # G[N_layers] = free surface
+
+        # ── Interface velocities u*_{ℓ+1/2} (upwind via Piecewise) ──
+        # u_ℓ(σ=1) = Σ_k q_ℓ_k / h_ℓ            (Legendre φ_k(1) = 1)
+        # u_ℓ(σ=0) = Σ_k (−1)^k · q_ℓ_k / h_ℓ   (Legendre φ_k(0) = (−1)^k)
+        def u_top_of_layer(ell):
+            q_fn = layer_q_fns[ell - 1]
+            return sum(q_fn(k, t_sym, x_sym)
+                       for k in range(self.N + 1)) / (alphas[ell - 1] * H_pre)
+
+        def u_bot_of_layer(ell):
+            q_fn = layer_q_fns[ell - 1]
+            return sum((-1)**k * q_fn(k, t_sym, x_sym)
+                       for k in range(self.N + 1)) / (alphas[ell - 1] * H_pre)
+
+        u_interfaces = [sp.S.Zero]   # bottom: no transfer (G=0)
+        for ell in range(1, self.N_layers):
+            G = G_interfaces[ell]
+            u_interfaces.append(sp.Piecewise(
+                (u_top_of_layer(ell), G > 0),
+                (u_bot_of_layer(ell + 1), True),
+            ))
+        u_interfaces.append(sp.S.Zero)  # surface: no transfer (G=0)
+
+        # ── Mass-exchange transfer terms in each momentum equation ─
+        # The σ-frame Galerkin boundary terms produce, with the SHARED
+        # upwind interface velocity:
+        #
+        #   RHS contribution to mom_x_ℓ_k:
+        #       + u*_{ℓ+1/2} · G_{ℓ+1/2}  −  (−1)^k · u*_{ℓ-1/2} · G_{ℓ-1/2}
+        #
+        # Equations are stored in LHS = 0 form, so we add the NEGATIVE
+        # of the RHS contribution:
+        #
+        #   transfer_ℓ_k  =  − u*_{ℓ+1/2}·G_{ℓ+1/2}  +  (−1)^k·u*_{ℓ-1/2}·G_{ℓ-1/2}
+        for ell in range(1, self.N_layers + 1):
+            G_top = G_interfaces[ell]      # G_{ℓ+1/2}
+            G_bot = G_interfaces[ell - 1]  # G_{ℓ-1/2}
+            u_top = u_interfaces[ell]
+            u_bot = u_interfaces[ell - 1]
+            for k in range(self.N + 1):
+                name = f"momentum_x_layer_{ell}_{k}"
+                if name not in self._equations:
+                    continue
+                transfer = (-u_top * G_top
+                            + (-1)**k * u_bot * G_bot)
+                eq = self._equations[name]
+                eq.expr = eq.expr + transfer
+                eq.simplify()
+
+        # Stash bookkeeping for downstream / inspection / debugging.
+        self._H_pre = H_pre
         self._b_global = b_global
+        self._layer_q_fns = layer_q_fns
+        self._G_interfaces = G_interfaces
+        self._u_interfaces = u_interfaces
 
     # ── Per-layer SME pipeline ───────────────────────────────────
-    def _derive_layer_sme(self, *, layer_label, bottom_expr,
-                          top_pressure_expr):
-        """Inline port of ml_sme_clean.py's ``derive_layer_sme``
-        factory.  Runs the full SME-N pipeline for one layer with
-        layer-specific bottom / top-pressure coupling; returns the
-        layer's tagged equation set plus the per-layer ``h_layer``
-        symbol and ``q_fn`` Function.
+    def _derive_layer_sme(self, *, layer_label, h_layer_expr,
+                          bottom_expr, top_pressure_expr):
+        """Inline port of the single-layer SME pipeline, parameterised
+        for one layer of the Audusse stack.  Runs the GENERIC SME
+        derivation (with placeholder ``state.h`` and ``state.b``); at
+        the end substitutes the layer-specific geometry
+        (``state.b → bottom_expr``, ``state.h → h_layer_expr``).
 
-        The pipeline uses the GENERIC ``state.b`` / ``state.h``
-        throughout (so the algebraic structure is identical to a
-        single-layer SME); the layer-specific substitutions
-        (``state.b → bottom_expr``, ``state.h → h_layer``) are
-        applied to every equation at the END of the pipeline.
+        ``h_layer_expr`` here is the *Audusse-scaled* thickness
+        ``α_ℓ · H_pre`` — an EXPRESSION, not a fresh placeholder
+        Function, so derivatives like ``∂_x h_ℓ`` automatically
+        propagate the ``α_ℓ`` factor.
         """
         N = self.N
-        state = StateSpace(dimension=2)
+        state = self.state
         src = MassMomentum(state, self.parameters)
         s, t, x = state, state.t, state.x
 
-        # ``equations``: dict[str, Equation] populated as we go.
-        # We use a plain dict (not a Model) since the per-layer set
-        # is internal scaffolding — merged into MLSME at the end.
         equations: dict[str, Equation] = {}
 
         def _new_eq(name, expression):
             equations[name] = Equation(expression, name=name, model=None)
 
         def _apply_all(op):
-            """Broadcast an operation across every equation in the
-            scratch dict — mimics ``Model.apply`` without registering
-            a parent Model."""
             for eq in equations.values():
                 eq.apply(op, _no_history=True)
 
-        # ── Setup: 3 INS equations + bottom placeholder ────────────
+        # ── Setup: 3 INS equations (continuity, mom_x, mom_z) ─────
         _new_eq(f"continuity{layer_label}",  src.continuity.expr)
         _new_eq(f"momentum_x{layer_label}",  src.momentum.x.expr)
         _new_eq(f"momentum_z{layer_label}",  src.momentum.z.expr)
-        # tau_xx → 0
         _apply_all({src.tau.xx: 0})
 
-        # ── Pre-σ hydrostatic + p-elimination with layer top BC ──
+        # ── Pre-σ hydrostatic + p-elimination ─────────────────────
         eq_mz = equations[f"momentum_z{layer_label}"]
-        eq_mz.apply({src.w: 0,
-                     src.tau.zx: 0,
-                     src.tau.zz: 0,
+        eq_mz.apply({src.w: 0, src.tau.zx: 0, src.tau.zz: 0,
                      src.tau.xz: 0}).simplify()
         eq_mz.apply(Integrate(s.z, s.z, src.eta, method="analytical"))
-        # Layer-specific top pressure (= 0 for the surface layer,
-        # ρ·g·Σ_{m>ℓ} h_m otherwise).
         eq_mz.apply({src.p.subs(s.z, src.eta): top_pressure_expr}).simplify()
         p_subst = Expression(eq_mz.expr,
                               f"momentum_z{layer_label}").solve_for(src.p)
@@ -214,7 +323,7 @@ class MLSME(Model):
         _apply_all(KinematicBC(s, src.b,   src, at=sp.S.Zero))
         _apply_all(KinematicBC(s, src.eta, src, at=sp.S.One))
 
-        # ── × h and inverse-ProductRule conservative folds ─────────
+        # ── × h, inverse-ProductRule conservative folds ───────────
         _apply_all(Multiply(src.h))
         for eq in equations.values():
             eq.simplify()
@@ -244,13 +353,11 @@ class MLSME(Model):
             src.w.xreplace({s.z: sigma}): w_ansatz,
         })
 
-        # ── Galerkin projection ──────────────────────────────────
+        # ── Galerkin + σ-integrate ────────────────────────────────
         equations[f"continuity{layer_label}"].apply(
             Multiply(psi_w(sigma) * omega(sigma)))
         equations[f"momentum_x{layer_label}"].apply(
             Multiply(psi_u(sigma) * omega(sigma)))
-
-        # ── σ-integrate ──────────────────────────────────────────
         equations[f"continuity{layer_label}"].apply(
             Integrate(sigma, sp.S.Zero, sp.S.One, method="auto"))
         equations[f"momentum_x{layer_label}"].apply(
@@ -298,32 +405,34 @@ class MLSME(Model):
 
         _apply_all(ResolveDummy(omega, lambda arg: sp.S.One))
         _apply_all(ResolveDummy(
-            phi_u_fn, lambda k, sg, _b=legendre_u: basis_value(_b, k, sg)))
+            phi_u_fn,
+            lambda k, sg, _b=legendre_u: basis_value(_b, k, sg)))
         _apply_all(ResolveDummy(
-            phi_w_fn, lambda k, sg, _b=legendre_w: basis_value(_b, k, sg)))
+            phi_w_fn,
+            lambda k, sg, _b=legendre_w: basis_value(_b, k, sg)))
 
-        # ResolveDummy with list value branches each equation that
-        # contains the dummy.  We need to manually branch here since
-        # _apply_all uses per-equation dispatch.
-        equations = _resolve_dummy_list(equations, psi_u,
-                                         [legendre_value(legendre_u, k) for k in range(N + 1)])
-        equations = _resolve_dummy_list(equations, psi_w,
-                                         [legendre_value(legendre_w, k) for k in range(N + 2)])
+        equations = _resolve_dummy_list(
+            equations, psi_u,
+            [legendre_value(legendre_u, k) for k in range(N + 1)])
+        equations = _resolve_dummy_list(
+            equations, psi_w,
+            [legendre_value(legendre_w, k) for k in range(N + 2)])
 
         # ── Evaluate integrals ───────────────────────────────────
         _apply_all_dict(equations, EvaluateIntegrals(state))
         for eq in equations.values():
             eq.simplify()
 
-        # ── Gravity self-pair fold ───────────────────────────────
+        # ── Gravity self-pair fold (K&T flux folding) ───────────
         g = self.parameters.g
         mom0_name = f"momentum_x{layer_label}_0"
         if mom0_name in equations:
             mom0 = equations[mom0_name]
             grav = next(
-                (t for t in mom0
-                 if t.expr.has(g) and t.expr.has(sp.Derivative(src.h, s.x))
-                 and not t.expr.has(src.b)),
+                (term for term in mom0
+                 if term.expr.has(g)
+                 and term.expr.has(sp.Derivative(src.h, s.x))
+                 and not term.expr.has(src.b)),
                 None)
             if grav is not None:
                 grav.apply(Symmetrize(ProductRule(variables=[s.x])))
@@ -347,50 +456,37 @@ class MLSME(Model):
             eq.expr = (2 * k + 1) * eq.expr
             eq.simplify()
 
-        # ── Layer-local substitution ─────────────────────────────
-        # Replace the GENERIC ``state.b`` with the layer's
-        # ``bottom_expr`` (which depends on the GLOBAL bathymetry +
-        # any layers below), and the GENERIC ``state.h`` with the
-        # layer's own height ``h_layer = Function("h_layer_ℓ")(t, x)``.
-        h_layer = sp.Function(f"h{layer_label}", positive=True)(t, x)
-        sub = {src.b: bottom_expr, src.h: h_layer}
+        # ── Layer-local substitution (Audusse geometry) ──────────
+        # Replace the GENERIC ``state.b`` with the layer's bottom
+        # (global b + cumulative thickness of layers below) and the
+        # GENERIC ``state.h`` with the layer's α-scaled thickness
+        # ``α_ℓ · H_pre``.  Critically, ``h_layer_expr`` is an
+        # EXPRESSION (not a fresh Function), so derivatives of h_ℓ
+        # propagate the α_ℓ factor automatically.
+        sub = {src.b: bottom_expr, src.h: h_layer_expr}
         for eq in equations.values():
             eq.expr = eq.expr.xreplace(sub)
             eq.simplify()
-        return equations, h_layer, q_fn
+        return equations, q_fn
 
     # ── Lazy finalization hook ────────────────────────────────────
     def _prepare_for_systemmodel(self):
-        """Substitute the layer-h Functions with their Model Symbol
-        equivalents and set ``_variable_map``."""
-        # The merged equations reference per-layer h_layer_ℓ Function
-        # calls + per-layer q_layer_ℓ_k(t, x) Function calls.  Map
-        # each to its corresponding Model Symbol.
-        # Pull (t, x) from the first layer's h.
-        h0 = self._layer_h[0]
-        t_sym, x_sym = h0.args[0], h0.args[1]
-        subs = {}
-        # Layer h's.
-        for ell_idx, h_layer in enumerate(self._layer_h):
-            ell = ell_idx + 1
-            subs[h_layer] = self.variables[f"h_layer_{ell}"]
-        # Layer q's.
+        """Substitute the H_pre placeholder + per-layer q Functions
+        with their Model Symbol equivalents and set ``_variable_map``."""
+        t_sym, x_sym = self.state.t, self.state.x
+        subs = {self._H_pre: self.variables.H}
         for ell_idx, q_fn in enumerate(self._layer_q_fns):
             ell = ell_idx + 1
             for k in range(self.N + 1):
                 subs[q_fn(k, t_sym, x_sym)] = self.variables[f"q_layer_{ell}_{k}"]
         for eq in self:
             eq.expr = eq.expr.xreplace(subs)
-        # Variable map: per layer, continuity_0 → h_layer row;
-        # momentum_x_k → q_layer_k row.
         self._variable_map = self._build_variable_map()
 
     def _build_variable_map(self):
-        m = {}
-        row = 0
+        m = {"continuity_global": [0]}
+        row = 1
         for ell in range(1, self.N_layers + 1):
-            m[f"continuity_layer_{ell}_0"] = [row]
-            row += 1
             for k in range(self.N + 1):
                 m[f"momentum_x_layer_{ell}_{k}"] = [row]
                 row += 1
@@ -401,28 +497,28 @@ class MLSME(Model):
 
 def _resolve_dummy_list(equations: dict, dummy, value_list):
     """ResolveDummy(value=list) branches each equation containing the
-    dummy into one sub-equation per list element.  Mimics the legacy
-    ``Model.resolve_dummy`` branching path on a plain dict of
-    Equations (since our per-layer scratch isn't a Model)."""
+    dummy into one sub-equation per list element.  Mimics
+    ``ResolveDummy._apply_branched`` on a plain dict of Equations
+    (the per-layer scratch dict isn't a Model, so we can't use the
+    standard ``model.apply(...)`` whole-model dispatch path)."""
+    import sympy as sp
     new_eqs = {}
     for name, eq in equations.items():
         if not eq.expr.has(dummy):
             new_eqs[name] = eq
             continue
         for i, v in enumerate(value_list):
-            replace = (lambda expr, dum=dummy, vv=v:
-                       expr.replace(dum, vv)
-                       if callable(vv) and not isinstance(vv, sp.Basic)
-                       else expr.replace(dum,
-                                          lambda *args, _v=vv: _v))
-            new_expr = replace(eq.expr)
+            if callable(v) and not isinstance(v, sp.Basic):
+                new_expr = eq.expr.replace(dummy, v)
+            else:
+                new_expr = eq.expr.replace(dummy, lambda *args, _v=v: _v)
             sub_name = f"{name}_{i}"
             new_eqs[sub_name] = Equation(new_expr, name=sub_name, model=None)
     return new_eqs
 
 
 def _apply_all_dict(equations: dict, op):
-    """Broadcast an operation/substitution across every equation in
-    a plain dict (used during per-layer scratch construction)."""
+    """Broadcast an operation / substitution across every equation in a
+    plain dict (used during the per-layer scratch construction)."""
     for eq in equations.values():
         eq.apply(op, _no_history=True)
