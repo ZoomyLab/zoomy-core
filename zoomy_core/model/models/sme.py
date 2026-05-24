@@ -38,9 +38,15 @@ from zoomy_core.model.operations import (
 __all__ = ["SME"]
 
 
-def _default_basis_factory(level):
-    """Default basis used by SME / VAM — shifted Legendre on σ ∈ [0, 1]."""
-    return Legendre_shifted(level=level)
+def _default_basis_factory(level, symbol="phi"):
+    """Default basis used by SME / VAM — shifted Legendre on σ ∈ [0, 1].
+
+    ``symbol`` names the opaque Function class associated with the
+    basis (``basis.phi_fn.__name__``).  SME passes distinct symbols
+    ("phi_u", "phi_w") for the two bases so their atoms live in
+    different sympy Function classes.
+    """
+    return Legendre_shifted(level=level, symbol=symbol)
 
 
 class SME(SigmaReference):
@@ -73,20 +79,33 @@ class SME(SigmaReference):
     def __init__(self, N: int = 2, *, basis_factory=None, **kwargs):
         self.N = N
         # Basis instances — drive everything downstream (modal mode
-        # count, Galerkin branching count, cached mass matrix).  The
-        # factory is per-level so subclasses can vary inner_level
-        # without changing other layer kwargs.
+        # count, Galerkin branching count, cached mass matrix).
+        # Distinct ``symbol`` for the two bases so ``basis_u.phi_fn``
+        # and ``basis_w.phi_fn`` are different sympy Function classes
+        # (atoms from one basis don't accidentally substitute through
+        # the other's ``resolve_atoms``).
         self.basis_factory = basis_factory or _default_basis_factory
-        self.basis_u = self.basis_factory(N)
-        self.basis_w = self.basis_factory(N + 1)
+        self.basis_u = self.basis_factory(N, "phi_u")
+        self.basis_w = self.basis_factory(N + 1, "phi_w")
         # Indexed modal-coefficient Functions (declared before super()
         # so the derive_model pipeline can reference them).
         self.u_fn = sp.Function("u", real=True)
         self.w_fn = sp.Function("w", real=True)
         self.q_fn = sp.Function("q", real=True)
-        # Opaque basis / test / weight dummies — resolved at the end.
-        self.phi_u_fn = sp.Function("phi_u", real=True)
-        self.phi_w_fn = sp.Function("phi_w", real=True)
+        # Modal-ansatz basis Function classes.  Use the basis-owned
+        # phi_fn (which carries ``_basis`` back-ref) so EvaluateIntegrals'
+        # ``_resolve_integral`` automatically routes phi-atom integrals
+        # through ``basis.resolve_atoms`` at integration time — the atoms
+        # stay opaque through Galerkin / σ-integrate / KBC closure
+        # (where their symbolic shape lets sp.solve treat them as
+        # constants) and resolve INSIDE small per-Integral scopes, where
+        # the cache reuse is highest.
+        self.phi_u_fn = self.basis_u.phi_fn
+        self.phi_w_fn = self.basis_w.phi_fn
+        # Galerkin test-function dummies — branched in _resolve_dummies
+        # to one sub-equation per test index k.  Substituted with the
+        # opaque ``basis.phi_fn(k, σ)`` atom (NOT the resolved polynomial)
+        # so the test-side also enjoys the integrand-isolated cache.
         self.psi_u    = sp.Function("psi_u", real=True)
         self.psi_w    = sp.Function("psi_w", real=True)
         self.omega    = sp.Function("omega", real=True)
@@ -221,34 +240,37 @@ class SME(SigmaReference):
             eq.simplify()
 
     def _resolve_dummies(self):
+        """Resolve omega → 1 and branch the equation on the Galerkin
+        test indices (psi_u, psi_w).  Phi atoms are deliberately LEFT
+        OPAQUE — :class:`EvaluateIntegrals` resolves them per-Integral
+        via ``basis.resolve_atoms``, which lets the integration cache
+        hit on basis-product SHAPES across many equations instead of on
+        full polynomial integrands.
+
+        The branching lambdas substitute ``psi_u(σ) → basis_u.phi_fn(k, σ)``
+        (still opaque) rather than the resolved Legendre polynomial,
+        so the integrand stays in basis-atom form for EvaluateIntegrals
+        to recognise.
+        """
         n_u = self.basis_u.level + 1
         n_w = self.basis_w.level + 1
 
-        def basis_value(basis, k_arg, sigma_arg):
-            if k_arg.is_Integer:
-                return basis.eval(int(k_arg), sigma_arg)
-            return sp.Function("phi_unresolved")(k_arg, sigma_arg)
-
-        def basis_lambda(basis, k):
-            return lambda arg, _b=basis, _k=k: _b.eval(_k, arg)
+        def opaque_atom(basis, k):
+            return lambda arg, _b=basis, _k=k: _b.phi_fn(_k, arg)
 
         # Back-compat aliases (some downstream code reads these).
         self.legendre_u = self.basis_u
         self.legendre_w = self.basis_w
 
         self.apply(ResolveDummy(self.omega, lambda arg: sp.S.One))
-        self.apply(ResolveDummy(
-            self.phi_u_fn,
-            lambda k, sig, _b=self.basis_u: basis_value(_b, k, sig)))
-        self.apply(ResolveDummy(
-            self.phi_w_fn,
-            lambda k, sig, _b=self.basis_w: basis_value(_b, k, sig)))
+        # NB: NO ResolveDummy on phi_u_fn / phi_w_fn — they carry the
+        # basis._basis back-ref and get resolved inside EvaluateIntegrals.
         self.apply(ResolveDummy(
             self.psi_u,
-            [basis_lambda(self.basis_u, k) for k in range(n_u)]))
+            [opaque_atom(self.basis_u, k) for k in range(n_u)]))
         self.apply(ResolveDummy(
             self.psi_w,
-            [basis_lambda(self.basis_w, k) for k in range(n_w)]))
+            [opaque_atom(self.basis_w, k) for k in range(n_w)]))
 
     def _evaluate_integrals(self):
         self.apply(EvaluateIntegrals(self.state))

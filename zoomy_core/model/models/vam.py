@@ -32,9 +32,9 @@ from zoomy_core.model.operations import (
 __all__ = ["VAM"]
 
 
-def _default_basis_factory(level):
+def _default_basis_factory(level, symbol="phi"):
     """Default basis used by VAM — shifted Legendre on σ ∈ [0, 1]."""
-    return Legendre_shifted(level=level)
+    return Legendre_shifted(level=level, symbol=symbol)
 
 
 class VAM(SigmaReference):
@@ -61,9 +61,11 @@ class VAM(SigmaReference):
         self.basis_factory = basis_factory or _default_basis_factory
         # u-basis carries N+1 modes; w-basis carries N+2 (one extra for
         # the optional KBC closure — VAM uses only the first N+1, but
-        # the level=N+1 convention matches SME).
-        self.basis_u = self.basis_factory(N)
-        self.basis_w = self.basis_factory(N + 1)
+        # the level=N+1 convention matches SME).  Distinct ``symbol``
+        # per basis so the phi_fn classes are distinct and atoms route
+        # to the correct ``basis.resolve_atoms`` inside EvaluateIntegrals.
+        self.basis_u = self.basis_factory(N, "phi_u")
+        self.basis_w = self.basis_factory(N + 1, "phi_w")
         # Indexed modal-coefficient Functions (declared before super()
         # so the derive_model pipeline can reference them).
         self.u_fn = sp.Function("u", real=True)
@@ -71,10 +73,17 @@ class VAM(SigmaReference):
         self.p_fn = sp.Function("p", real=True)
         self.q_fn = sp.Function("q", real=True)
         self.r_fn = sp.Function("r", real=True)
-        # Opaque basis / test / weight dummies — resolved at the end.
-        self.phi_u_fn = sp.Function("phi_u", real=True)
-        self.phi_w_fn = sp.Function("phi_w", real=True)
-        self.phi_p_fn = sp.Function("phi_p", real=True)
+        # Use basis-owned phi_fn (carries ``_basis`` back-ref) so the
+        # atoms stay opaque through the pipeline and resolve INSIDE
+        # each Integral via ``basis.resolve_atoms`` — gives the biggest
+        # cache hit on basis-product shapes.
+        self.phi_u_fn = self.basis_u.phi_fn
+        self.phi_w_fn = self.basis_w.phi_fn
+        # Pressure ansatz uses the same family as the velocity ansatz
+        # (Galerkin-on-u-test); a distinct ``phi_p_fn`` would force an
+        # unnecessary second basis.  Reuse basis_u's phi_fn.
+        self.phi_p_fn = self.basis_u.phi_fn
+        # Galerkin test dummies — branched in _resolve_dummies.
         self.psi_u    = sp.Function("psi_u", real=True)
         self.psi_w    = sp.Function("psi_w", real=True)
         self.omega    = sp.Function("omega", real=True)
@@ -201,40 +210,34 @@ class VAM(SigmaReference):
             eq.simplify()
 
     def _resolve_dummies(self):
+        """Resolve omega → 1 and branch on Galerkin test indices,
+        leaving phi atoms opaque for EvaluateIntegrals to resolve
+        per-Integral via ``basis.resolve_atoms``.  See SME._resolve_dummies
+        for the rationale.
+        """
         N = self.N
 
-        def basis_value(basis, k_arg, sigma_arg):
-            if k_arg.is_Integer:
-                return basis.eval(int(k_arg), sigma_arg)
-            return sp.Function("phi_unresolved")(k_arg, sigma_arg)
-
-        def basis_lambda(basis, k):
-            return lambda arg, _b=basis, _k=k: _b.eval(_k, arg)
+        def opaque_atom(basis, k):
+            return lambda arg, _b=basis, _k=k: _b.phi_fn(_k, arg)
 
         # Back-compat aliases (some downstream code reads these).
         self.legendre_u = self.basis_u
         self.legendre_w = self.basis_w
 
         self.apply(ResolveDummy(self.omega, lambda arg: sp.S.One))
-        self.apply(ResolveDummy(
-            self.phi_u_fn,
-            lambda k, sig, _b=self.basis_u: basis_value(_b, k, sig)))
-        self.apply(ResolveDummy(
-            self.phi_w_fn,
-            lambda k, sig, _b=self.basis_w: basis_value(_b, k, sig)))
-        self.apply(ResolveDummy(
-            self.phi_p_fn,
-            lambda k, sig, _b=self.basis_u: basis_value(_b, k, sig)))
-        # Galerkin test counts: VAM uses N+1 test functions for both
-        # psi_u and psi_w (matching the N+1 dynamic equations per
-        # block).  This deliberately uses only the first N+1 modes of
-        # basis_w even though basis_w.level + 1 = N + 2.
+        # NB: NO ResolveDummy on phi_u_fn / phi_w_fn / phi_p_fn — they
+        # all carry the basis ``_basis`` back-ref and get resolved
+        # inside EvaluateIntegrals.  Galerkin test counts: VAM uses
+        # N+1 test functions for both psi_u and psi_w (matching the
+        # N+1 dynamic equations per block).  This deliberately uses
+        # only the first N+1 modes of basis_w even though
+        # basis_w.level + 1 = N + 2.
         self.apply(ResolveDummy(
             self.psi_u,
-            [basis_lambda(self.basis_u, k) for k in range(N + 1)]))
+            [opaque_atom(self.basis_u, k) for k in range(N + 1)]))
         self.apply(ResolveDummy(
             self.psi_w,
-            [basis_lambda(self.basis_w, k) for k in range(N + 1)]))
+            [opaque_atom(self.basis_w, k) for k in range(N + 1)]))
 
     def _evaluate_integrals(self):
         self.apply(EvaluateIntegrals(self.state))
