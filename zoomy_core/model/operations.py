@@ -1206,12 +1206,10 @@ class Expression(SymbolicBase):
         Expression
             With all depth integrals replaced by basis matrix products.
         """
-        from zoomy_core.model.models.symbolic_integrator import SymbolicIntegrator
-        from zoomy_core.model.models.legacy.projected_model import get_cached_matrices
+        from zoomy_core.model.models.basis_cache import get_basis_matrices
 
         basis_obj = basis(level=level)
-        integrator = SymbolicIntegrator(basis_obj)
-        matrices = get_cached_matrices(basis, level, integrator)
+        matrices = get_basis_matrices(basis_obj, level)
 
         M = matrices["M"]
         A = matrices["A"]

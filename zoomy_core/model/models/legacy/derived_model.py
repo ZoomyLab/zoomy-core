@@ -43,31 +43,25 @@ from zoomy_core.model.basemodel import Model
 from zoomy_core.misc.misc import ZArray, Zstruct
 from zoomy_core.model.models.basisfunctions import Legendre_shifted, Basisfunction
 from zoomy_core.model.models.symbolic_integrator import SymbolicIntegrator
+from zoomy_core.model.models.basis_cache import (
+    get_basis_matrices, clear_basis_matrix_cache,
+)
 from zoomy_core.model.models.legacy.derived_system import DerivedSystem
 
 
-# ── Basis matrix cache ────────────────────────────────────────────────────────
-
-_basis_matrix_cache: dict = {}
-
-
-def _cache_key(basis_type, level):
-    if isinstance(basis_type, type):
-        name = getattr(basis_type, "name", basis_type.__name__)
-    else:
-        name = getattr(basis_type, "name", str(basis_type))
-    return (name, level)
-
-
+# Back-compat shim — legacy callers used to import these from this module.
+# Routed to the canonical non-legacy basis_cache.  Do not use in new code.
 def get_cached_matrices(basis, level, integrator):
-    key = _cache_key(basis, level)
-    if key not in _basis_matrix_cache:
-        _basis_matrix_cache[key] = integrator.compute_all_matrices(level)
-    return _basis_matrix_cache[key]
+    """Deprecated — call ``get_basis_matrices(basis_instance, level)``
+    from ``zoomy_core.model.models.basis_cache`` instead."""
+    basis_obj = basis(level=level) if isinstance(basis, type) else basis
+    return get_basis_matrices(basis_obj, level)
 
 
 def clear_matrix_cache():
-    _basis_matrix_cache.clear()
+    """Deprecated — call ``clear_basis_matrix_cache()`` from
+    ``zoomy_core.model.models.basis_cache`` instead."""
+    clear_basis_matrix_cache(in_memory=True, disk=False)
 
 
 class DerivedModel(Model):

@@ -151,3 +151,67 @@ class BasisMatrixCache:
         import shutil
         if os.path.exists(self._abs_root):
             shutil.rmtree(self._abs_root)
+
+
+# ── One-stop entrypoint for downstream pipelines ───────────────────
+#
+# Combines in-memory + on-disk caching: compute once per (basis, level)
+# in a Python session, persist via BasisMatrixCache for cross-session
+# reuse.  SME / VAM / MLSME and any other consumer should reach for
+# this — they don't construct a SymbolicIntegrator themselves.
+
+_INMEM_BASIS_MATRICES: dict = {}
+_DEFAULT_CACHE: "BasisMatrixCache | None" = None
+
+
+def _default_cache() -> "BasisMatrixCache":
+    global _DEFAULT_CACHE
+    if _DEFAULT_CACHE is None:
+        _DEFAULT_CACHE = BasisMatrixCache()
+    return _DEFAULT_CACHE
+
+
+def get_basis_matrices(basis, level=None, *, cache=None):
+    """Return the dict ``{phib, M, A, B, D, Dxi, Dxi2, DD, D1, DT}`` for
+    a given ``(basis, level)``.
+
+    Computation is done by :class:`SymbolicIntegrator` and persisted on
+    disk via :class:`BasisMatrixCache`.  An in-memory dict cache wraps
+    that path so the second call in the same session is a constant-time
+    lookup.
+
+    Parameters
+    ----------
+    basis : Basisfunction
+        Concrete basis instance.  Must expose ``name``, ``level``,
+        ``bounds()``, ``weight(z)``, ``get(k)`` and ``eval(k, z)``.
+    level : int, optional
+        Polynomial level.  Defaults to ``basis.level`` if not given.
+    cache : BasisMatrixCache, optional
+        Override the default disk cache (mostly useful for tests).
+    """
+    if level is None:
+        level = basis.level
+    key = (basis.name, int(level), _basis_fingerprint(basis))
+    cached = _INMEM_BASIS_MATRICES.get(key)
+    if cached is not None:
+        return cached
+
+    # Lazy import to avoid circulars during package init.
+    from zoomy_core.model.models.symbolic_integrator import SymbolicIntegrator
+
+    integrator = SymbolicIntegrator(basis)
+    disk_cache = cache if cache is not None else _default_cache()
+    matrices = disk_cache.get_or_compute(
+        basis, level, integrator.compute_all_matrices
+    )
+    _INMEM_BASIS_MATRICES[key] = matrices
+    return matrices
+
+
+def clear_basis_matrix_cache(*, in_memory: bool = True, disk: bool = False):
+    """Drop the in-memory cache (and optionally the on-disk cache)."""
+    if in_memory:
+        _INMEM_BASIS_MATRICES.clear()
+    if disk:
+        _default_cache().clear()

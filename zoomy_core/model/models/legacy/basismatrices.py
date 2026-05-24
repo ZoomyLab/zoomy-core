@@ -12,7 +12,7 @@ from scipy.optimize import least_squares as lsq
 
 from zoomy_core.model.models.basisfunctions import Legendre_shifted
 from zoomy_core.misc import misc as misc
-from zoomy_core.model.models.legacy.basis_cache import BasisMatrixCache, MATRIX_NAMES
+from zoomy_core.model.models.basis_cache import BasisMatrixCache, MATRIX_NAMES
 
 
 class Basismatrices:
