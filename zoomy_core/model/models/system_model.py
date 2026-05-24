@@ -1965,10 +1965,12 @@ class SystemModelDescription:
     def _repr_markdown_(self) -> str:
         sm = self._sm
         parts = [
-            f"**SystemModel** — {sm.n_equations} equations, "
-            f"{sm.n_dim} spatial dimension{'s' if sm.n_dim != 1 else ''}",
-            f"**State:** {', '.join(str(s) for s in sm.state)}",
+            f"**SystemModel** — {sm.n_equations} equation"
+            f"{'s' if sm.n_equations != 1 else ''}, "
+            f"{sm.n_dim} spatial dimension{'s' if sm.n_dim != 1 else ''}"
         ]
+        state_syms = ", ".join(f"${sp.latex(s)}$" for s in sm.state)
+        parts.append(f"**State $Q$:** {state_syms}")
         if sm.parameters.length():
             parts.append(
                 "**Parameters:** "

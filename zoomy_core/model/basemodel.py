@@ -270,22 +270,17 @@ class Model(param.Parameterized, SymbolicRegistrar):
         return self
 
     def describe(self, *, show_history=False, include_minor=False):
-        """Human-readable inspection of the derivation state."""
-        lines = [f"{type(self).__name__}({self.name!r}) — "
-                 f"{len(self._equations)} equations, "
-                 f"{len(self.history)} ops"]
-        for name, eq in self._equations.items():
-            lines.append(f"  {name}  :  {eq.expr}  =  0")
-        text = "\n".join(lines)
-        print(text)
-        if show_history:
-            print("\nhistory:")
-            for h in self.history:
-                if not include_minor and h.get("level") == "minor":
-                    continue
-                desc = f" — {h['description']}" if h.get("description") else ""
-                print(f"  [{h['op']}] target={h['target']}{desc}")
-        return self
+        """Return a :class:`ModelDescription` rendering the equation set.
+
+        In a Jupyter cell, returning the description as the last
+        expression triggers ``_repr_markdown_`` and the equations
+        render as LaTeX.  In a plain Python REPL or via ``print(...)``
+        / ``str(...)``, the plain-text form is shown."""
+        return ModelDescription(
+            self,
+            show_history=show_history,
+            include_minor=include_minor,
+        )
 
     def _history(self, op_label, target, *, level="major", description=None):
         self.history.append({
@@ -1108,4 +1103,84 @@ class Model(param.Parameterized, SymbolicRegistrar):
             "config": config,
         }
         return result
-    
+
+
+class ModelDescription:
+    """Markdown / plain-text description of a :class:`Model`.
+
+    Returned by :meth:`Model.describe`.  Renders LaTeX equations via
+    ``_repr_markdown_`` in Jupyter; ``str(...)``  /  ``print(...)`` give
+    the plain-text fallback.
+    """
+
+    def __init__(self, model, *, show_history=False, include_minor=False):
+        self._model = model
+        self._show_history = show_history
+        self._include_minor = include_minor
+
+    # ── Jupyter LaTeX path ──────────────────────────────────────────
+    def _repr_markdown_(self):
+        m = self._model
+        n_eq = len(m._equations)
+        n_ops = len(m.history)
+        parts = [
+            f"**{type(m).__name__}** `{m.name}` — "
+            f"{n_eq} equation{'s' if n_eq != 1 else ''}, "
+            f"{n_ops} op{'s' if n_ops != 1 else ''}"
+        ]
+        # State + parameters one-line summaries (only if non-empty).
+        if hasattr(m, "variables") and m.variables.length():
+            state_syms = ", ".join(
+                f"${sp.latex(v)}$" for v in m.variables.values()
+            )
+            parts.append(f"**State $Q$:** {state_syms}")
+        if hasattr(m, "parameters") and m.parameters.length():
+            param_kv = ", ".join(
+                f"${sp.latex(m.parameters[k])} = "
+                f"{getattr(m.parameter_values, k, '?')}$"
+                for k in m.parameters.keys()
+            )
+            parts.append(f"**Parameters:** {param_kv}")
+        # Equations as LaTeX, one per line.
+        if n_eq:
+            parts.append("**Equations:**")
+            for name, eq in m._equations.items():
+                latex = sp.latex(eq.expr)
+                parts.append(
+                    f"- `{name}`: $\\displaystyle {latex} \\;=\\; 0$"
+                )
+        # Optional history.
+        if self._show_history and m.history:
+            parts.append("**History:**")
+            for h in m.history:
+                if not self._include_minor and h.get("level") == "minor":
+                    continue
+                desc = (f" — {h['description']}"
+                        if h.get("description") else "")
+                parts.append(
+                    f"- `[{h['op']}]` target=`{h['target']}`{desc}"
+                )
+        return "\n\n".join(parts)
+
+    # ── Plain-text fallback ─────────────────────────────────────────
+    def __str__(self):
+        m = self._model
+        lines = [f"{type(m).__name__}({m.name!r}) — "
+                 f"{len(m._equations)} equations, "
+                 f"{len(m.history)} ops"]
+        for name, eq in m._equations.items():
+            lines.append(f"  {name}  :  {eq.expr}  =  0")
+        if self._show_history and m.history:
+            lines.append("")
+            lines.append("history:")
+            for h in m.history:
+                if not self._include_minor and h.get("level") == "minor":
+                    continue
+                desc = (f" — {h['description']}"
+                        if h.get("description") else "")
+                lines.append(f"  [{h['op']}] target={h['target']}{desc}")
+        return "\n".join(lines)
+
+    def __repr__(self):
+        return self.__str__()
+
