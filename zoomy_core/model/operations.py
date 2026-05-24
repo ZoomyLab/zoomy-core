@@ -2192,29 +2192,73 @@ def _try_integration_rules(integrand, limits):
 def _cached_integrate(integrand, limits):
     """Cached wrapper around the Zoomy-rule + ``sympy.integrate`` pair.
 
-    Keyed on ``(integrand, limits)``; both are hashable sympy objects.
-    Across a full SME derivation — many leaves, many ``test_k`` clones
-    — most ``∫_0^1 polynomial(ζ) dζ`` integrands appear repeatedly, so a
-    hash cache cuts integration work by an order of magnitude.
+    Implements **integrand isolation**: each additive term of the
+    integrand is split into a ``var``-independent coefficient and a
+    ``var``-dependent factor; only the ``var``-dependent factor is
+    keyed into the integration cache.  This dramatically increases
+    cache reuse across the SME / VAM derivations, where the same
+    basis-product integral (e.g. ``∫ φ_i(σ) · φ_j(σ) dσ``) recurs
+    inside many different equations with different ``c(t, x)``
+    multipliers.
 
-    Resolution order: (1) consult ``_INTEGRATION_RULES`` — if a Zoomy
-    rule matches, use its result; (2) otherwise fall back to
-    ``sympy.integrate(integrand, limits)``.  Returns the original
-    (possibly-unevaluated) ``Integral`` on failure; caller can detect
-    "not evaluated" via ``isinstance(..., Integral)``.
+    Two cache layers:
+      * outer cache on the whole ``(integrand, limits)`` — short-circuits
+        identical-integrand repeats with one dict lookup.
+      * inner cache on each per-term ``var``-dependent factor — what
+        captures the basis-product reuse.
+
+    Resolution order for each var-dependent factor: (1) ``_INTEGRATION_RULES``;
+    (2) ``sympy.integrate`` fallback.  Returns the original Integral
+    on failure (caller can detect via ``isinstance(..., Integral)``).
     """
+    # Outer cache — whole integrand match (most common hit).
     key = (integrand, limits)
     hit = _integrate_cache.get(key)
     if hit is not None:
         _integrate_cache_stats["hits"] += 1
         return hit
+
+    var = limits[0]
+    # Per-additive-term integrand isolation.
+    if isinstance(integrand, sp.Add):
+        result = sp.S.Zero
+        for arg in integrand.args:
+            indep, dep = arg.as_independent(var, as_Add=False)
+            result = result + indep * _integrate_var_factor(dep, limits)
+    else:
+        indep, dep = integrand.as_independent(var, as_Add=False)
+        result = indep * _integrate_var_factor(dep, limits)
+
+    _integrate_cache[key] = result
+    return result
+
+
+def _integrate_var_factor(dep, limits):
+    """Inner integration of a single ``var``-dependent factor.
+
+    ``dep`` must not contain summands with mixed ``var``-dependence —
+    callers split via :func:`sp.Expr.as_independent` first.  The cache
+    is keyed on ``(dep, limits)`` only, so identical basis-product
+    shapes across different equations share the same cached scalar.
+    """
+    var, lo, hi = limits[0], limits[1], limits[2]
+    if not dep.has(var):
+        # Pure constant factor — integral is (hi − lo) · dep.
+        return dep * (hi - lo)
+
+    key = (dep, limits)
+    hit = _integrate_cache.get(key)
+    if hit is not None:
+        _integrate_cache_stats["hits"] += 1
+        return hit
     _integrate_cache_stats["misses"] += 1
-    result = _try_integration_rules(integrand, limits)
+
+    result = _try_integration_rules(dep, limits)
     if result is None:
         try:
-            result = sp.integrate(integrand, limits)
+            result = sp.integrate(dep, limits)
         except Exception:
-            result = Integral(integrand, limits)
+            result = Integral(dep, limits)
     _integrate_cache[key] = result
     return result
 
@@ -5937,7 +5981,7 @@ class ResolveDummy(Operation):
         )
 
     def _leaf_sp(self, expr):
-        """Per-term substitution for the scalar / callable case."""
+        """Substitute ``dummy(*args) → value(*args)`` over the leaf."""
         replace = self._make_replace(self.value)
         return replace(expr, self.dummy)
 
