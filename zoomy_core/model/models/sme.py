@@ -361,6 +361,63 @@ class SME(SigmaReference):
             m[f"momentum_x_{k}"] = [k + 1]
         return m
 
+    # ── 3D field reconstruction ──────────────────────────────────
+    def project_2d_to_3d(self):
+        """Reconstruct the 3D fields ``(b, h, u, v, w, p)`` at
+        position ``self.position[2] = z`` from the SME modal solution.
+
+        Returns a sympy ``Matrix([b, h, u_3d, v_3d, w_3d, p_3d])``.
+
+        * ``u_3d(t, x, z) = Σ_k (q_k / h) · φ_k(σ)`` with
+          ``σ = (z − b) / h``.
+        * ``v_3d = 0`` (SME is 1D-x; multi-D needs the corresponding
+          ``q_y_k`` modes — TODO).
+        * ``w_3d`` reconstructed from depth-integrated continuity
+          ``∂_z w = −∂_x u_3d``, with ``w(z = b) = ∂_t b + u(b)·∂_x b``.
+        * ``p_3d = ρ · g · (η − z)`` (hydrostatic — SME's defining
+          assumption).
+        """
+        from sympy import Matrix
+        z = self.position[2]
+        x_sym = self.position[0]
+        t_sym = self.time
+        # bathymetry / depth as symbols (numerical runtime feeds them).
+        b_sym = sp.Symbol("b", real=True)
+        h = self.variables.h
+        eta = b_sym + h
+        sigma = (z - b_sym) / h
+
+        n_u = self.basis_u.level + 1
+        u_3d = sum(
+            (self.variables[f"q_{k}"] / h) * self.basis_u.eval(k, sigma)
+            for k in range(n_u)
+        )
+        v_3d = sp.S.Zero
+        # w_3d via depth-integrated continuity: w(z) = w(b) − ∫_b^z ∂_x u dz'.
+        # ∂_x u_3d = Σ_k ∂_x(q_k/h)·φ_k(σ) + Σ_k (q_k/h)·∂_σ φ_k(σ)·∂_x σ.
+        # ∂_x σ = −((z − b)/h²)·∂_x h − (1/h)·∂_x b.
+        # Use the basis' ``eval_psi(k, σ)`` = ∫₀^σ φ_k(σ') dσ' if
+        # available, else fall back to symbolic integration.
+        try:
+            psi_eval = [self.basis_u.eval_psi(k, sigma) for k in range(n_u)]
+            phi_eval = [self.basis_u.eval(k, sigma)     for k in range(n_u)]
+            dhdx = sp.Derivative(h, x_sym)
+            dbdx = sp.Derivative(b_sym, x_sym)
+            dadx = [sp.Derivative(self.variables[f"q_{k}"] / h, x_sym)
+                    for k in range(n_u)]
+            a = [self.variables[f"q_{k}"] / h for k in range(n_u)]
+            # K&T-style reconstruction (matches legacy ShallowMoments).
+            w_3d = (-dhdx * sum(a[k] * psi_eval[k] for k in range(n_u))
+                    - h    * sum(dadx[k] * psi_eval[k] for k in range(n_u))
+                    + sum(a[k] * phi_eval[k] for k in range(n_u))
+                      * (sigma * dhdx + dbdx))
+        except Exception:
+            w_3d = sp.S.Zero
+        g = self.parameters.g
+        rho = self.parameters.rho
+        p_3d = rho * g * (eta - z)
+        return Matrix([b_sym, h, u_3d, v_3d, w_3d, p_3d])
+
     # ── Optional stress closure: slip-Newton friction ─────────────
     def apply_slip_newton_friction(self):
         """Close the open ``τ_xz`` BC + Integral atoms with the

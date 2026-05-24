@@ -492,6 +492,59 @@ class MLSME(Model):
                 row += 1
         return m
 
+    # ── 3D field reconstruction ──────────────────────────────────
+    def project_2d_to_3d(self):
+        """Reconstruct 3D fields from the multi-layer SME modal state.
+
+        For each layer ℓ, the local σ-coordinate is
+        ``σ_ℓ = (z − z_{ℓ-1/2}) / h_ℓ`` with
+        ``z_{ℓ-1/2} = b + (Σ_{m<ℓ} α_m)·H``.  Inside layer ℓ
+        (``z_{ℓ-1/2} ≤ z ≤ z_{ℓ+1/2}``):
+
+        * ``u_3d = Σ_k (q_layer_ℓ_k / h_ℓ) · φ_k(σ_ℓ)``
+        * ``v_3d = 0``
+        * ``p_3d = ρ·g·(η − z)``   (hydrostatic)
+
+        Outside all layers: zero.  Layer membership is encoded as a
+        sympy ``Piecewise``.
+
+        Returns ``Matrix([b, H, u_3d, v_3d, w_3d, p_3d])``.
+        """
+        from sympy import Matrix
+        z = self.position[2]
+        b_sym = sp.Symbol("b", real=True)
+        H = self.variables.H
+        eta = b_sym + H
+        N = self.N
+        alphas = self._alphas
+        # Use Legendre directly for the polynomial evaluation (basis_u
+        # in this Audusse implementation is single-layer Legendre per
+        # _derive_layer_sme).
+        basis = Legendre_shifted(level=N)
+
+        u_branches = []
+        for ell in range(1, self.N_layers + 1):
+            cumul_below = sum(alphas[:ell - 1], sp.S.Zero)
+            cumul_at_top = cumul_below + alphas[ell - 1]
+            z_bot = b_sym + cumul_below * H
+            z_top = b_sym + cumul_at_top * H
+            h_layer = alphas[ell - 1] * H
+            sigma_ell = (z - z_bot) / h_layer
+            u_layer = sum(
+                (self.variables[f"q_layer_{ell}_{k}"] / h_layer)
+                * basis.eval(k, sigma_ell)
+                for k in range(N + 1)
+            )
+            u_branches.append((u_layer, (z >= z_bot) & (z <= z_top)))
+        u_branches.append((sp.S.Zero, True))
+        u_3d = sp.Piecewise(*u_branches)
+        v_3d = sp.S.Zero
+        w_3d = sp.S.Zero  # ML-SME doesn't carry w as state; defer.
+        g = self.parameters.g
+        rho = self.parameters.rho
+        p_3d = rho * g * (eta - z)
+        return Matrix([b_sym, H, u_3d, v_3d, w_3d, p_3d])
+
 
 # ── Helpers ────────────────────────────────────────────────────────
 

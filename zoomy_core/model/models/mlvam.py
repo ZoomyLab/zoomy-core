@@ -514,6 +514,70 @@ class MLVAM(Model):
                 m[f"momentum_z_layer_{ell}_{k}"] = [base + (N + 1) + k]
         return m
 
+    # ── 3D field reconstruction ──────────────────────────────────
+    def project_2d_to_3d(self):
+        """Reconstruct 3D fields from the multi-layer VAM modal state.
+
+        Inside layer ℓ (``z_{ℓ-1/2} ≤ z ≤ z_{ℓ+1/2}``):
+
+        * ``u_3d = Σ_k (q_layer_ℓ_k / h_ℓ) · φ_u(k, σ_ℓ)``
+        * ``v_3d = 0``
+        * ``w_3d = Σ_k (r_layer_ℓ_k / h_ℓ) · φ_w(k, σ_ℓ)``
+        * ``p_3d = Σ_k p_layer_ℓ_k · φ_p(k, σ_ℓ)``
+
+        Outside all layers: zero.  Layer membership is encoded as a
+        sympy ``Piecewise``.  Unlike :class:`MLSME`, w and p come
+        directly from their modal expansions (state variables).
+
+        Returns ``Matrix([b, H, u_3d, v_3d, w_3d, p_3d])``.
+        """
+        from sympy import Matrix
+        z = self.position[2]
+        b_sym = sp.Symbol("b", real=True)
+        H = self.variables.H
+        N = self.N
+        alphas = self._alphas
+        basis_u = Legendre_shifted(level=N)
+        basis_w = Legendre_shifted(level=N + 1)
+
+        u_branches = []
+        w_branches = []
+        p_branches = []
+        for ell in range(1, self.N_layers + 1):
+            cumul_below = sum(alphas[:ell - 1], sp.S.Zero)
+            cumul_at_top = cumul_below + alphas[ell - 1]
+            z_bot = b_sym + cumul_below * H
+            z_top = b_sym + cumul_at_top * H
+            h_layer = alphas[ell - 1] * H
+            sigma_ell = (z - z_bot) / h_layer
+            inside = (z >= z_bot) & (z <= z_top)
+            u_ell = sum(
+                (self.variables[f"q_layer_{ell}_{k}"] / h_layer)
+                * basis_u.eval(k, sigma_ell)
+                for k in range(N + 1)
+            )
+            w_ell = sum(
+                (self.variables[f"r_layer_{ell}_{k}"] / h_layer)
+                * basis_w.eval(k, sigma_ell)
+                for k in range(N + 1)
+            )
+            p_ell = sum(
+                self.variables[f"p_layer_{ell}_{k}"]
+                * basis_u.eval(k, sigma_ell)
+                for k in range(N + 1)
+            )
+            u_branches.append((u_ell, inside))
+            w_branches.append((w_ell, inside))
+            p_branches.append((p_ell, inside))
+        u_branches.append((sp.S.Zero, True))
+        w_branches.append((sp.S.Zero, True))
+        p_branches.append((sp.S.Zero, True))
+        u_3d = sp.Piecewise(*u_branches)
+        v_3d = sp.S.Zero
+        w_3d = sp.Piecewise(*w_branches)
+        p_3d = sp.Piecewise(*p_branches)
+        return Matrix([b_sym, H, u_3d, v_3d, w_3d, p_3d])
+
 
 # ── Helpers (shared shape with mlsme.py) ──────────────────────────
 

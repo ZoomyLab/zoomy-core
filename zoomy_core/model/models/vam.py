@@ -347,3 +347,33 @@ class VAM(SigmaReference):
             if mz in self._equations:
                 m[mz] = [1 + (N + 1) + k]
         return m
+
+    # ── 3D field reconstruction ──────────────────────────────────
+    def project_2d_to_3d(self):
+        """Reconstruct 3D fields from the VAM modal state.
+
+        Returns ``Matrix([b, h, u_3d, v_3d, w_3d, p_3d])`` where
+        u / w / p come directly from their modal expansions (VAM keeps
+        w and p as state, so no continuity-reconstruction needed for w).
+        """
+        from sympy import Matrix
+        z = self.position[2]
+        b_sym = sp.Symbol("b", real=True)
+        h = self.variables.h
+        sigma = (z - b_sym) / h
+        N = self.N
+
+        u_3d = sum(
+            (self.variables[f"q_{k}"] / h) * self.basis_u.eval(k, sigma)
+            for k in range(N + 1)
+        )
+        v_3d = sp.S.Zero
+        w_3d = sum(
+            (self.variables[f"r_{k}"] / h) * self.basis_w.eval(k, sigma)
+            for k in range(N + 1)
+        )
+        p_3d = sum(
+            self.variables[f"p_{k}"] * self.basis_u.eval(k, sigma)
+            for k in range(N + 1)
+        )
+        return Matrix([b_sym, h, u_3d, v_3d, w_3d, p_3d])
