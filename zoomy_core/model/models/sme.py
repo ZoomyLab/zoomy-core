@@ -512,7 +512,13 @@ class SME(SigmaReference):
                        for k in range(n_u))
 
         def newton(t_arg, x_arg, sig):
-            return (nu / src.h) * sp.diff(u_at(sig), sig)
+            # Newton's law for the stress: τ_xz = ρ · ν · ∂_z u
+            # where ν is the KINEMATIC viscosity (m²/s).  The
+            # σ-frame ∂_z → (1/h)·∂_σ.  The depth-integrated
+            # momentum equation later divides τ by ρ, so the ρ here
+            # cancels and the friction source picks up the canonical
+            # ν · 1/h · ∂_σ u form (no extra 1/ρ).
+            return (rho * nu / src.h) * sp.diff(u_at(sig), sig)
 
         from zoomy_core.model.operations import (
             Expression, ProductRule, EvaluateIntegrals,
@@ -527,7 +533,11 @@ class SME(SigmaReference):
                         for piece in sp.Add.make_args(rewritten)),
                        sp.S.Zero)
 
-        tau_at_0_slip = (nu / lam) * u_at(sp.S.Zero)
+        # Navier-slip:  τ_bed = (μ/λ) · u(σ=0) = ρ·ν/λ · u(σ=0).
+        # The ρ here cancels the τ/ρ in the equation, so the friction
+        # source coefficient on the q_k row becomes ν/(λ·h) (kinematic
+        # ν, no spurious 1/ρ).
+        tau_at_0_slip = (rho * nu / lam) * u_at(sp.S.Zero)
         tau_at_1_free = sp.S.Zero
 
         for eq in self:

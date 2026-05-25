@@ -342,10 +342,23 @@ class Legendre_shifted(Basisfunction):
     name = "Legendre_shifted"
 
     def basis_definition(self):
-        """Basis definition."""
+        """Standard shifted Legendre on σ ∈ [0, 1].
+
+        ``phi_k(σ) = legendre(k, 2σ − 1)`` — the canonical convention:
+
+        * ``phi_k(σ=0) = (−1)^k``    (BOTTOM of the layer)
+        * ``phi_k(σ=1) = 1``         (TOP / FREE SURFACE)
+
+        Removed the historical ``(−1)^k`` pre-factor that swapped these
+        endpoint values — it had inverted the physical interpretation of
+        odd modes (q_1 > 0 meant u(bottom) > u(top), opposite to the
+        intuitive "shear" direction).  The new convention matches K&T
+        2019 §3 directly and makes the multi-layer upwind formulas
+        ``u_ℓ(σ=1) = Σ q_ℓ_k / h_ℓ`` (top of layer = sum of modes)
+        used in MLSME / MLVAM correct without any further changes.
+        """
         z = Symbol("z")
-        b = lambda k, z: legendre(k, 2 * z - 1) * (-1) ** (k)
-        return [b(k, z) for k in range(self.level + 1)]
+        return [legendre(k, 2 * z - 1) for k in range(self.level + 1)]
 
     def analytical_weighted_integral(self, poly_expr, var):
         """
