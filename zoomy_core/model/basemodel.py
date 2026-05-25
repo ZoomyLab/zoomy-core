@@ -831,6 +831,45 @@ class Model(param.Parameterized, SymbolicRegistrar):
             return ZArray.zeros(self.n_variables)
         return ZArray(raw)
 
+    def mass_matrix(self):
+        """Mass matrix ``M(Q, Qaux, p)`` — rank-2 ZArray
+        ``(n_eq, n_state)``.
+
+        Extracted from ``time_derivative``-tagged terms.  Each equation
+        row ``i`` contributes ``M[i, j] = coefficient of ∂_t Q[j]``
+        for ``j = 0..n_state-1``.  Rows with no ``time_derivative``
+        term (e.g. elliptic constraint equations for pressure modes
+        in VAM, or trivial conservation that lost its ∂_t coefficient)
+        come out as all-zero rows — a singular M flags the constraint
+        to the solver, which must use a DAE-aware time-stepper or a
+        split formulation.
+
+        The mass matrix arises naturally from the symbolic derivation;
+        every ``∂_t Q[j]`` atom on the LHS of an equation contributes
+        to its row.  There is NO fallback — if the derivation didn't
+        produce time-derivative terms, the model genuinely has no
+        time-evolution slot, and the solver gets a singular M as the
+        honest answer.
+        """
+        raw = self._extract_via_tag("time_derivative")
+        if raw is None:
+            return ZArray.zeros(self.n_variables, self.n_variables)
+        state_atoms = [v for v in self.variables.values()
+                       if isinstance(v, sp.Symbol)]
+        n_eq = self.n_variables
+        n_state = len(state_atoms)
+        M = sp.zeros(n_eq, n_state)
+        t = self.time
+        for i, row_expr in enumerate(raw):
+            if row_expr == 0:
+                continue
+            expanded = sp.expand(row_expr)
+            for j, q_j in enumerate(state_atoms):
+                coef = expanded.coeff(sp.Derivative(q_j, t))
+                if coef != 0:
+                    M[i, j] = coef
+        return ZArray(M)
+
     def residual(self):
         """Residual."""
         return ZArray.zeros(self.n_variables)

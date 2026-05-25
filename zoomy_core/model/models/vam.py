@@ -89,8 +89,11 @@ class VAM(SigmaReference):
         self.omega    = sp.Function("omega", real=True)
 
         kwargs.setdefault("name", f"VAM-L={N}")
+        # State layout: [b, h, q_0..q_N, r_0..r_N, p_0..p_N].
+        # Bathymetry b is a state variable with ``∂_t b = 0`` (the
+        # ``bottom`` equation, added by SigmaReference).
         var_names = (
-            ["h"]
+            ["b", "h"]
             + [f"q_{k}" for k in range(N + 1)]
             + [f"r_{k}" for k in range(N + 1)]
             + [f"p_{k}" for k in range(N + 1)]
@@ -319,33 +322,47 @@ class VAM(SigmaReference):
     # ── final: Function → Symbol substitution ─────────────────────
     def _substitute_to_model_symbols(self):
         s, src = self.state, self.src
-        subs = {src.h: self.variables.h}
+        subs = {src.h: self.variables.h, src.b: self.variables.b}
         for k in range(self.N + 1):
             subs[self.q_fn(k, s.t, s.x)] = self.variables[f"q_{k}"]
             subs[self.r_fn(k, s.t, s.x)] = self.variables[f"r_{k}"]
             subs[self.p_fn(k, s.t, s.x)] = self.variables[f"p_{k}"]
         for eq in self:
             eq.expr = eq.expr.xreplace(subs)
+        # Force the bottom equation to clean ``∂_t b = 0`` form.
+        if "bottom" in self._equations:
+            self._equations["bottom"].expr = sp.Derivative(
+                self.variables.b, s.t,
+            )
+        # ``∂_t b = 0`` cleanup elsewhere (no simplify — see SME).
+        zero_dt_b = {sp.Derivative(self.variables.b, s.t): sp.S.Zero}
+        for name, eq in self._equations.items():
+            if name == "bottom":
+                continue
+            eq.expr = eq.expr.xreplace(zero_dt_b)
 
     def _build_variable_map(self):
         """``{eq_name: [row_index]}`` for tag extraction.
 
-        Layout: ``[h, q_0..q_N, r_0..r_N, p_0..p_N]``.
+        Layout: ``[b, h, q_0..q_N, r_0..r_N, p_0..p_N]``.
 
-        * ``continuity_0`` → row 0 (h).
-        * ``momentum_x_k`` → row ``1 + k`` for ``k = 0..N``.
-        * ``momentum_z_k`` → row ``1 + (N+1) + k`` for ``k = 0..N``.
-        * Pressure rows (``p_0..p_N``) are not dynamic equations at
-          this stage — they remain auxiliary closures.
+        * ``bottom`` → row 0 (b).
+        * ``continuity_0`` → row 1 (h).
+        * ``momentum_x_k`` → row ``2 + k``.
+        * ``momentum_z_k`` → row ``2 + (N+1) + k``.
+        * Pressure rows (``p_0..p_N``) are NOT in the variable map —
+          they're elliptic constraints handled by the Chorin-split
+          solver, and the mass matrix shows them as singular rows
+          (M[p_row, *] = 0) to flag the constraint to downstream code.
         """
         N = self.N
-        m = {"continuity_0": [0]}
+        m = {"bottom": [0], "continuity_0": [1]}
         for k in range(N + 1):
-            m[f"momentum_x_{k}"] = [1 + k]
+            m[f"momentum_x_{k}"] = [2 + k]
         for k in range(N + 1):
             mz = f"momentum_z_{k}"
             if mz in self._equations:
-                m[mz] = [1 + (N + 1) + k]
+                m[mz] = [2 + (N + 1) + k]
         return m
 
     # ── 3D field reconstruction ──────────────────────────────────
@@ -358,7 +375,8 @@ class VAM(SigmaReference):
         """
         from sympy import Matrix
         z = self.position[2]
-        b_sym = sp.Symbol("b", real=True)
+        # Bathymetry is a state variable; use the state Symbol.
+        b_sym = self.variables.b
         h = self.variables.h
         sigma = (z - b_sym) / h
         N = self.N

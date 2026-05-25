@@ -117,8 +117,10 @@ class MLSME(Model):
                 pass
         self._alphas = alphas
 
-        # Variable layout: [H, q_ℓ_0..N for ℓ = 1..N_layers].
-        var_names = ["H"]
+        # Variable layout: [b, H, q_ℓ_0..N for ℓ = 1..N_layers].
+        # Bathymetry b is a state variable with ``∂_t b = 0``
+        # (the ``bottom`` equation added in derive_model).
+        var_names = ["b", "H"]
         for ell in range(1, N_layers + 1):
             for k in range(N + 1):
                 var_names.append(f"q_layer_{ell}_{k}")
@@ -195,6 +197,11 @@ class MLSME(Model):
                 name = f"momentum_x{label}_{k}"
                 if name in sub:
                     self.add_equation(name, sub[name].expr)
+
+        # ── Bottom equation ∂_t b = 0 ─────────────────────────────
+        # b_global is a Function(b)(t, x); will be substituted to
+        # self.variables.b in _prepare_for_systemmodel.
+        self.add_equation("bottom", sp.Derivative(b_global, t_sym))
 
         # ── Global continuity:  ∂_t H + ∂_x Q = 0 ──────────────────
         Q_total = sum(q_fn(0, t_sym, x_sym) for q_fn in layer_q_fns)
@@ -471,21 +478,42 @@ class MLSME(Model):
 
     # ── Lazy finalization hook ────────────────────────────────────
     def _prepare_for_systemmodel(self):
-        """Substitute the H_pre placeholder + per-layer q Functions
-        with their Model Symbol equivalents and set ``_variable_map``."""
+        """Substitute the H_pre, b_global placeholders + per-layer q
+        Functions with their Model Symbol equivalents and set
+        ``_variable_map``."""
         t_sym, x_sym = self.state.t, self.state.x
-        subs = {self._H_pre: self.variables.H}
+        subs = {
+            self._H_pre:    self.variables.H,
+            self._b_global: self.variables.b,
+        }
         for ell_idx, q_fn in enumerate(self._layer_q_fns):
             ell = ell_idx + 1
             for k in range(self.N + 1):
                 subs[q_fn(k, t_sym, x_sym)] = self.variables[f"q_layer_{ell}_{k}"]
         for eq in self:
             eq.expr = eq.expr.xreplace(subs)
+        # Force the bottom equation to clean ``∂_t b = 0`` form.
+        if "bottom" in self._equations:
+            self._equations["bottom"].expr = sp.Derivative(
+                self.variables.b, t_sym,
+            )
+        # ``∂_t b = 0`` cleanup elsewhere (no simplify — see SME).
+        zero_dt_b = {sp.Derivative(self.variables.b, t_sym): sp.S.Zero}
+        for name, eq in self._equations.items():
+            if name == "bottom":
+                continue
+            eq.expr = eq.expr.xreplace(zero_dt_b)
         self._variable_map = self._build_variable_map()
 
     def _build_variable_map(self):
-        m = {"continuity_global": [0]}
-        row = 1
+        """State layout: ``[b, H, q_layer_ℓ_k for ℓ=1..L, k=0..N]``.
+
+        * ``bottom`` → row 0 (b)
+        * ``continuity_global`` → row 1 (H)
+        * ``momentum_x_layer_ℓ_k`` → row ``2 + (ℓ-1)·(N+1) + k``
+        """
+        m = {"bottom": [0], "continuity_global": [1]}
+        row = 2
         for ell in range(1, self.N_layers + 1):
             for k in range(self.N + 1):
                 m[f"momentum_x_layer_{ell}_{k}"] = [row]
@@ -512,7 +540,8 @@ class MLSME(Model):
         """
         from sympy import Matrix
         z = self.position[2]
-        b_sym = sp.Symbol("b", real=True)
+        # Bathymetry is a state variable; use the state Symbol.
+        b_sym = self.variables.b
         H = self.variables.H
         eta = b_sym + H
         N = self.N

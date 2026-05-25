@@ -281,6 +281,23 @@ class SystemModel:
     # When set, the solver dispatches this substep as in-place assignment
     # rather than residual semantics (mass_matrix is implicitly zero).
     state_update: Optional[ZArray] = None
+    # ``project_2d_to_3d``: depth-averaged → 3D reconstruction.  Vector of
+    # 3D physical quantities (typically ``[u, v, w, p, ...]``) evaluated at
+    # ``(x, y, z)`` given the cell-mean state.  The symbolic expression
+    # references ``self.position`` (x, y, z) so the runtime evaluates it
+    # at a caller-supplied ``z`` per cell.  Used by post-processing /
+    # sensitivity analyses that need to lift the 2D solution back to a
+    # 3D velocity profile (Manning friction sensitivity at the bed, max
+    # velocity over depth, etc.).  Default ``None`` ⇒ no projection
+    # defined; the runtime exposes ``None`` and callers handle absence.
+    project_2d_to_3d: Optional[ZArray] = None        # (n_3d_components,)
+    # 3D position symbols used by ``project_2d_to_3d`` (and any future
+    # 3D-aware operator).  Default ``None`` → SystemModel constructed
+    # without a model context; the project_2d_to_3d slot then carries
+    # no position dependence (and runtime treats it as a pure cell-
+    # local expression).  When set from ``Model.position`` it is a
+    # Zstruct ``Zstruct(X0=…, X1=…, X2=…)`` even for 2D models.
+    position: Optional[Any] = None
     history: List[Dict[str, str]] = field(default_factory=list)
 
     def __post_init__(self):
@@ -301,6 +318,7 @@ class SystemModel:
         self.state_update               = _to_zarray(self.state_update)
         self.reconstruction_variables   = _to_zarray(self.reconstruction_variables)
         self.state_from_reconstruction  = _to_zarray(self.state_from_reconstruction)
+        self.project_2d_to_3d           = _to_zarray(self.project_2d_to_3d)
 
         if self.equation_to_state_index is None:
             self.equation_to_state_index = list(range(self.n_equations))
@@ -739,13 +757,15 @@ class SystemModel:
         else:
             S_expl_mat = sp.zeros(n_eq, 1)
 
-        # Mass matrix: prefer ``model.mass_matrix()`` if the model
-        # exposes one (chain-derived models do); otherwise default to
-        # identity (canonical form for operator-API-only models).
-        if hasattr(model, "mass_matrix") and callable(model.mass_matrix):
-            M_mat = _to_matrix(model.mass_matrix(), n_eq, n_eq)
-        else:
-            M_mat = sp.eye(n_eq)
+        # Mass matrix: ALWAYS extracted from the model via
+        # ``model.mass_matrix()`` (which tag-extracts ``time_derivative``
+        # contributions from the derivation).  No identity fallback —
+        # if the derivation didn't produce ``∂_t`` terms, the resulting
+        # row of M is genuinely zero (constraint equation), and the
+        # solver must use a DAE-aware time-stepper.  This is the
+        # honest formulation: the mass matrix arises NATURALLY from
+        # the derivation, not from a default override.
+        M_mat = _to_matrix(model.mass_matrix(), n_eq, n_eq)
 
         equation_names = getattr(model, "equation_names", None)
         # Carry the *indexed symbolic BC function* ``_boundary_conditions``
@@ -796,6 +816,12 @@ class SystemModel:
                 model.reconstruction_variables()),
             state_from_reconstruction=_to_zarray(
                 model.state_from_reconstruction()),
+            project_2d_to_3d=(
+                _to_zarray(model.project_2d_to_3d())
+                if (hasattr(model, "project_2d_to_3d")
+                    and callable(model.project_2d_to_3d))
+                else None),
+            position=getattr(model, "position", None),
         )
         if equation_names is not None:
             sm.equation_names = list(equation_names)

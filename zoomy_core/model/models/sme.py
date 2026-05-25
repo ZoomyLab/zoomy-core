@@ -112,8 +112,13 @@ class SME(SigmaReference):
 
         n_u_modes = self.basis_u.level + 1
         kwargs.setdefault("name", f"SME-L={N}")
+        # State layout: [b, h, q_0..q_N].  Bathymetry b is a state
+        # variable with the trivial conservation equation ``∂_t b = 0``
+        # (added by SigmaReference as the ``bottom`` equation).
         kwargs.setdefault(
-            "variables", ["h"] + [f"q_{k}" for k in range(n_u_modes)])
+            "variables",
+            ["b", "h"] + [f"q_{k}" for k in range(n_u_modes)],
+        )
         kwargs.setdefault("parameters", {"g": 9.81, "rho": 1.0})
         kwargs.setdefault("eigenvalue_mode", "numerical")
         super().__init__(**kwargs)
@@ -339,26 +344,57 @@ class SME(SigmaReference):
 
     # ── final: Function → Symbol substitution ─────────────────────
     def _substitute_to_model_symbols(self):
-        """Replace derivation Function calls (h(t,x), q_fn(k,t,x))
-        with their Model Symbol equivalents (self.variables.h,
-        self.variables.q_k) so the equations are Symbol-based ready
-        for tag extraction."""
+        """Replace derivation Function calls (h(t,x), b(t,x),
+        q_fn(k,t,x)) with their Model Symbol equivalents
+        (self.variables.h, self.variables.b, self.variables.q_k) so
+        the equations are Symbol-based, ready for tag extraction.
+
+        Then apply ``Derivative(b, t) → 0`` to every non-``bottom``
+        equation — this cleans up the chain-rule cruft produced by
+        the σ-transform (terms like
+        ``Derivative(h·Derivative(b, t), t)`` collapse to 0).
+        """
         s, src = self.state, self.src
         n_u = self.basis_u.level + 1
-        subs = {src.h: self.variables.h}
+        subs = {src.h: self.variables.h, src.b: self.variables.b}
         for k in range(n_u):
             subs[self.q_fn(k, s.t, s.x)] = self.variables[f"q_{k}"]
         for eq in self:
             eq.expr = eq.expr.xreplace(subs)
+        # Force the bottom equation to the clean ``∂_t b = 0`` form
+        # — overriding the ``× h`` multiplication the pipeline
+        # propagated through it (which would make M[0, 0] = h
+        # instead of 1).
+        if "bottom" in self._equations:
+            self._equations["bottom"].expr = sp.Derivative(
+                self.variables.b, s.t,
+            )
+        # ``∂_t b = 0`` cleanup on all non-``bottom`` rows.  Use
+        # plain ``xreplace`` (no simplify) — sympy's simplify would
+        # call ``_pull_constants_out`` which incorrectly zeroes
+        # ``Derivative(Symbol, t)`` for STATE Symbols that are still
+        # time-dependent in the PDE sense (they look var-independent
+        # to ``as_independent`` because they're free Symbols, not
+        # Function calls).
+        zero_dt_b = {sp.Derivative(self.variables.b, s.t): sp.S.Zero}
+        for name, eq in self._equations.items():
+            if name == "bottom":
+                continue
+            eq.expr = eq.expr.xreplace(zero_dt_b)
 
     def _build_variable_map(self):
-        """``{eq_name: [row_index]}`` for tag extraction.  For
-        SME(N=L): ``continuity_0 → row 0 (h)``, ``momentum_x_k → row
-        k+1 (q_k)``."""
+        """``{eq_name: [row_index]}`` for tag extraction.
+
+        State layout: ``[b, h, q_0..q_N]``.
+
+        * ``bottom`` → row 0 (b)
+        * ``continuity_0`` → row 1 (h)
+        * ``momentum_x_k`` → row ``2 + k`` (q_k)
+        """
         n_u = self.basis_u.level + 1
-        m = {"continuity_0": [0]}
+        m = {"bottom": [0], "continuity_0": [1]}
         for k in range(n_u):
-            m[f"momentum_x_{k}"] = [k + 1]
+            m[f"momentum_x_{k}"] = [2 + k]
         return m
 
     # ── 3D field reconstruction ──────────────────────────────────
@@ -381,8 +417,11 @@ class SME(SigmaReference):
         z = self.position[2]
         x_sym = self.position[0]
         t_sym = self.time
-        # bathymetry / depth as symbols (numerical runtime feeds them).
-        b_sym = sp.Symbol("b", real=True)
+        # Bathymetry b is a STATE variable (added by SigmaReference
+        # as the ``bottom`` equation with ``∂_t b = 0``).  Use the
+        # state Symbol directly — do NOT invent a fresh symbol that
+        # detaches from the runtime state.
+        b_sym = self.variables.b
         h = self.variables.h
         eta = b_sym + h
         sigma = (z - b_sym) / h

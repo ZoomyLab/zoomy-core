@@ -113,8 +113,8 @@ class MLVAM(Model):
                 pass
         self._alphas = alphas
 
-        # Variable layout: [H, (q, r, p)_ℓ_k for ℓ = 1..N_layers].
-        var_names = ["H"]
+        # Variable layout: [b, H, (q, r, p)_ℓ_k for ℓ = 1..N_layers].
+        var_names = ["b", "H"]
         for ell in range(1, N_layers + 1):
             for k in range(N + 1):
                 var_names.append(f"q_layer_{ell}_{k}")
@@ -180,6 +180,9 @@ class MLVAM(Model):
                              f"momentum_z{label}_{k}"):
                     if slot in sub:
                         self.add_equation(slot, sub[slot].expr)
+
+        # ── Bottom equation ∂_t b = 0 ─────────────────────────────
+        self.add_equation("bottom", sp.Derivative(b_global, t_sym))
 
         # ── Global continuity ──────────────────────────────────────
         Q_total = sum(q_fn(0, t_sym, x_sym) for q_fn in layer_q_fns)
@@ -475,10 +478,14 @@ class MLVAM(Model):
 
     # ── Lazy finalization hook ────────────────────────────────────
     def _prepare_for_systemmodel(self):
-        """Substitute the H_pre placeholder + per-layer q/r/p Functions
-        with their Model Symbol equivalents and set ``_variable_map``."""
+        """Substitute the H_pre, b_global placeholders + per-layer
+        q/r/p Functions with their Model Symbol equivalents and set
+        ``_variable_map``."""
         t_sym, x_sym = self.state.t, self.state.x
-        subs = {self._H_pre: self.variables.H}
+        subs = {
+            self._H_pre:    self.variables.H,
+            self._b_global: self.variables.b,
+        }
         for ell_idx in range(self.N_layers):
             ell = ell_idx + 1
             q_fn = self._layer_q_fns[ell_idx]
@@ -490,24 +497,36 @@ class MLVAM(Model):
                 subs[p_fn(k, t_sym, x_sym)] = self.variables[f"p_layer_{ell}_{k}"]
         for eq in self:
             eq.expr = eq.expr.xreplace(subs)
+        # Force ``bottom`` to clean form + ``∂_t b = 0`` cleanup elsewhere.
+        if "bottom" in self._equations:
+            self._equations["bottom"].expr = sp.Derivative(
+                self.variables.b, t_sym,
+            )
+        zero_dt_b = {sp.Derivative(self.variables.b, t_sym): sp.S.Zero}
+        for name, eq in self._equations.items():
+            if name == "bottom":
+                continue
+            eq.expr = eq.expr.xreplace(zero_dt_b)
         self._variable_map = self._build_variable_map()
 
     def _build_variable_map(self):
-        """Layout: ``[H, (q_ℓ_k, r_ℓ_k, p_ℓ_k) for ℓ=1..L, k=0..N]``.
+        """Layout: ``[b, H, (q_ℓ_k, r_ℓ_k, p_ℓ_k) for ℓ=1..L, k=0..N]``.
 
-        Continuity_global → row 0 (H).
-        momentum_x_layer_ℓ_k → row ``1 + (ℓ-1)·3(N+1) + k``.
-        momentum_z_layer_ℓ_k → row ``1 + (ℓ-1)·3(N+1) + (N+1) + k``.
+        * ``bottom`` → row 0 (b).
+        * ``continuity_global`` → row 1 (H).
+        * ``momentum_x_layer_ℓ_k`` → row ``2 + (ℓ-1)·3(N+1) + k``.
+        * ``momentum_z_layer_ℓ_k`` → row ``2 + (ℓ-1)·3(N+1) + (N+1) + k``.
 
-        Pressure rows have no dynamic equation at this stage and are
-        skipped — they're auxiliary closures handled by the downstream
-        solver.
+        Pressure rows are NOT in the variable_map — they're elliptic
+        constraints handled by the Chorin-split solver; the mass
+        matrix shows them as singular rows (M[p_row, *] = 0) so
+        downstream code can detect the constraint.
         """
         N = self.N
-        m = {"continuity_global": [0]}
+        m = {"bottom": [0], "continuity_global": [1]}
         per_layer_block = 3 * (N + 1)
         for ell in range(1, self.N_layers + 1):
-            base = 1 + (ell - 1) * per_layer_block
+            base = 2 + (ell - 1) * per_layer_block
             for k in range(N + 1):
                 m[f"momentum_x_layer_{ell}_{k}"] = [base + k]
             for k in range(N + 1):
@@ -533,7 +552,8 @@ class MLVAM(Model):
         """
         from sympy import Matrix
         z = self.position[2]
-        b_sym = sp.Symbol("b", real=True)
+        # Bathymetry is a state variable; use the state Symbol.
+        b_sym = self.variables.b
         H = self.variables.H
         N = self.N
         alphas = self._alphas
