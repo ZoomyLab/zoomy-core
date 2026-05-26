@@ -30,6 +30,68 @@ from zoomy_core.model.operations import Expression
 __all__ = ["StateSpace", "MassMomentum"]
 
 
+class _MomentumProxy:
+    """Vector-of-equations view over a :class:`Model`'s flat
+    ``momentum_x`` / ``momentum_y`` / ``momentum_z`` equation entries.
+
+    Restores the legacy ``model.momentum.x`` access from the old
+    ``System`` API without changing how the Model stores equations
+    internally (which remains flat under ``_equations``).  Exposes
+    ``.remove(axis)`` so a caller can drop a single component — e.g.
+    ``model.momentum.remove("z")`` after the hydrostatic pressure
+    elimination, where ``momentum_z`` has served its purpose.
+    """
+
+    __slots__ = ("_m", "_axes")
+
+    def __init__(self, model, *, has_y):
+        self._m = model
+        self._axes = ("x", "y", "z") if has_y else ("x", "z")
+
+    def __repr__(self):
+        live = [a for a in self._axes
+                if f"momentum_{a}" in self._m._equations]
+        return f"momentum<{', '.join(live)}>"
+
+    def __iter__(self):
+        for a in self._axes:
+            key = f"momentum_{a}"
+            if key in self._m._equations:
+                yield self._m._equations[key]
+
+    def _get(self, axis):
+        key = f"momentum_{axis}"
+        if key not in self._m._equations:
+            raise AttributeError(
+                f"momentum.{axis} — equation {key!r} is not on the model "
+                f"(was it removed, or never registered?)."
+            )
+        return self._m._equations[key]
+
+    @property
+    def x(self):
+        return self._get("x")
+
+    @property
+    def y(self):
+        return self._get("y")
+
+    @property
+    def z(self):
+        return self._get("z")
+
+    def remove(self, axis):
+        """Drop the ``momentum_{axis}`` equation from the model.
+
+        Calls through to :meth:`Model.remove_equation` — the legacy
+        feature is preserved on the basemodel; this proxy just spells
+        the axis-component lookup so callers can write
+        ``m.momentum.remove("z")``.
+        """
+        self._m.remove_equation(f"momentum_{axis}")
+        return self
+
+
 class StateSpace:
     """Coordinate scaffold — t, x, [y,] z.
 
@@ -135,6 +197,40 @@ class MassMomentum:
         # Build balance equations.
         self.continuity = self._build_continuity()
         self.momentum = self._build_momentum()
+
+    # ── Model attachment helper ────────────────────────────────────
+    def register_on(self, model):
+        """Register continuity, ``momentum.x`` (and ``.y`` if 3D),
+        ``momentum.z``, and the trivial ``∂_t b = 0`` bottom equation
+        on ``model`` — and expose ``model.momentum`` as a vector-of-
+        equations proxy so the legacy ``model.momentum.x`` /
+        ``model.momentum.z`` access pattern (from the old
+        :class:`System` API in ``models/legacy/derived_system.py``)
+        keeps working.
+
+        After ``register_on(model)``:
+
+        * ``model.continuity`` — :class:`Equation` for the continuity
+          balance.
+        * ``model.momentum.x`` / ``model.momentum.z`` (and ``.y`` in
+          3D) — :class:`Equation` per axis.
+        * ``model.momentum.remove("z")`` — drop a single axis (calls
+          through to :meth:`Model.remove_equation`).
+        * ``model.bottom`` — trivial ``∂_t b = 0`` leaf.
+
+        Returns ``self`` so the construction chains:
+
+            m.src = MassMomentum(state, params, h_positive=True).register_on(m)
+        """
+        s = self.state
+        model.add_equation("continuity", self.continuity.expr)
+        model.add_equation("momentum_x", self.momentum.x.expr)
+        if s.has_y:
+            model.add_equation("momentum_y", self.momentum.y.expr)
+        model.add_equation("momentum_z", self.momentum.z.expr)
+        model.add_equation("bottom",     sp.Derivative(self.b, s.t))
+        model.momentum = _MomentumProxy(model, has_y=s.has_y)
+        return self
 
     @staticmethod
     def _build_stress(s):
