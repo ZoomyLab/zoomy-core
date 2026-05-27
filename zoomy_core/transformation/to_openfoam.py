@@ -258,8 +258,54 @@ class FoamSystemModelPrinter(GenericCppBase):
             self._kernel("source", sm.source, (n_eq, 1), ["Q", "Qaux", "p"])
         )
 
+        blocks.append(self._emit_boundary_conditions())
+
         blocks.append("} // namespace Model")
         return "\n".join(blocks)
+
+    def _emit_boundary_conditions(self):
+        """Emit ``Model::boundary_conditions(bc_idx, time, X, dX, Q,
+        Qaux, p, n)`` from the SystemModel's symbolic Piecewise kernel.
+
+        Returns a ``Foam::List<scalar>`` of size ``n_eq`` — the
+        boundary state for the branch matching ``bc_idx``.
+        """
+        bc = self.sm.boundary_conditions
+        # The Q / Qaux / p / n symbols are already mapped via __init__'s
+        # register_map (they share Symbol identity with sm.state etc.).
+        # Add scalar / position symbols specific to the BC kernel.
+        extra_map = {}
+        if bc.args.contains("idx"):
+            extra_map[bc.args["idx"]] = "bc_idx"
+        if bc.args.contains("time"):
+            extra_map[bc.args["time"]] = "time"
+        if bc.args.contains("distance"):
+            extra_map[bc.args["distance"]] = "dX"
+        if bc.args.contains("position"):
+            pos = bc.args["position"]
+            for axis in ("x", "y", "z"):
+                if hasattr(pos, axis):
+                    extra_map[getattr(pos, axis)] = f"X.{axis}()"
+
+        self.symbol_maps.append(extra_map)
+        try:
+            shape = (self.sm.n_equations,)
+            body = self.convert_expression_body(bc.definition, shape)
+            sig = ",\n    ".join([
+                "const int bc_idx",
+                "const Foam::scalar& time",
+                "const Foam::vector& X",
+                "const Foam::scalar& dX",
+                "const Foam::List<Foam::scalar>& Q",
+                "const Foam::List<Foam::scalar>& Qaux",
+                "const Foam::List<Foam::scalar>& p",
+                "const Foam::vector& n",
+            ])
+            return self.wrap_function_signature(
+                "boundary_conditions", sig, body, shape
+            )
+        finally:
+            self.symbol_maps.pop()
 
     @classmethod
     def write_code(cls, sm, output_path, **opts):
