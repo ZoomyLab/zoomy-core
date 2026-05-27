@@ -463,3 +463,88 @@ class FoamNumericsPrinter(GenericCppBase):
         with open(output_path, "w") as f:
             f.write(cls(numerics, **opts).create_code())
         return output_path
+
+
+# ── Aux-variables updater (Phase 3) ─────────────────────────────────────
+
+
+class FoamUpdateAuxPrinter:
+    """Emit ``numerics::update_aux_variables(Q, Qaux, mesh)`` from
+    ``sm.aux_registry``.
+
+    The output is a flat sequence of ``numerics::compute_derivative(...)``
+    calls — one ``volScalarField`` assignment per derivative-kind aux.
+    The solver-side ``compute_derivative`` helper does the actual LSQ
+    / Gauss-grad computation on the OpenFOAM mesh.
+    """
+
+    def __init__(self, sm):
+        self.sm = sm
+        # aux_state names so we can resolve target_name → index.
+        self._aux_names = [str(s) for s in sm.aux_state]
+        self._state_names = [str(s) for s in sm.state]
+
+    def _resolve_source(self, entry):
+        """Return ``(container_str, idx)`` for the source field of an
+        aux-registry entry.  ``container_str`` is ``"Q"`` or ``"Qaux"``."""
+        name = entry["target_name"]
+        if name in self._state_names:
+            return "Q", self._state_names.index(name)
+        if name in self._aux_names:
+            return "Qaux", self._aux_names.index(name)
+        raise KeyError(
+            f"aux_registry entry {entry['name']!r} references unknown "
+            f"target {name!r} — not found in state or aux_state."
+        )
+
+    def create_code(self):
+        lines = [
+            "#pragma once",
+            '#include "List.H"',
+            '#include "volFields.H"',
+            '#include "fvMesh.H"',
+            '#include "Model.H"',
+            "",
+            "namespace numerics",
+            "{",
+            "",
+            "inline void update_aux_variables(",
+            "    const Foam::List<Foam::volScalarField*>& Q,",
+            "    const Foam::List<Foam::volScalarField*>& Qaux,",
+            "    const Foam::fvMesh& mesh)",
+            "{",
+        ]
+        for entry in self.sm.aux_registry:
+            row = entry["row"]
+            name = entry["name"]
+            if entry["kind"] in ("derivative", "limited_derivative"):
+                src_container, src_idx = self._resolve_source(entry)
+                mi = entry["multi_index"]
+                # Pad to 3D so the C++ helper always sees (dx, dy, dz).
+                pad = tuple(mi) + (0,) * (3 - len(mi))
+                lines.append(
+                    f"    // Qaux[{row}] ({name}) = "
+                    f"D^{mi} {src_container}[{src_idx}]"
+                )
+                lines.append(
+                    f"    numerics::compute_derivative"
+                    f"(*Qaux[{row}], *{src_container}[{src_idx}], "
+                    f"{pad[0]}, {pad[1]}, {pad[2]}, mesh);"
+                )
+            elif entry["kind"] == "function":
+                lines.append(
+                    f"    // Qaux[{row}] ({name}) — user-supplied function "
+                    f"loaded by the case directory; no computation."
+                )
+        lines.extend([
+            "}",
+            "",
+            "}  // namespace numerics",
+        ])
+        return "\n".join(lines)
+
+    @classmethod
+    def write_code(cls, sm, output_path):
+        with open(output_path, "w") as f:
+            f.write(cls(sm).create_code())
+        return output_path
