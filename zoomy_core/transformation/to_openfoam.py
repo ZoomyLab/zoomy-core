@@ -262,3 +262,134 @@ class FoamSystemModelPrinter(GenericCppBase):
         with open(output_path, "w") as f:
             f.write(cls(sm, **opts).create_code())
         return output_path
+
+
+# ── Numerics (Riemann) printer ───────────────────────────────────────────
+
+
+# Args carried by symbolic Riemann functions → Foam parameter declaration.
+# Keys match ``func_obj.args.keys()`` for the Numerics-registered functions.
+_FOAM_NUMERICS_ARG = {
+    "q_minus": "const Foam::List<Foam::scalar>& Q_minus",
+    "q_plus": "const Foam::List<Foam::scalar>& Q_plus",
+    "aux_minus": "const Foam::List<Foam::scalar>& Qaux_minus",
+    "aux_plus": "const Foam::List<Foam::scalar>& Qaux_plus",
+    "Q": "const Foam::List<Foam::scalar>& Q",
+    "Qaux": "const Foam::List<Foam::scalar>& Qaux",
+    "p": "const Foam::List<Foam::scalar>& p",
+    "normal": "const Foam::vector& n",
+    "n": "const Foam::vector& n",
+}
+
+
+class FoamNumericsPrinter(GenericCppBase):
+    """Foam printer for a symbolic :class:`Numerics` object (Rusanov,
+    HLL, NonconservativeRusanov, …).
+
+    Emits ``Numerics.H`` with one kernel per entry in
+    ``numerics.functions`` — typically ``numerical_flux``,
+    ``numerical_fluctuations``, ``local_max_abs_eigenvalue``.  Body
+    expressions are CSE-optimised by the inherited
+    :meth:`convert_expression_body`; signatures use the Foam type
+    aliases above.
+    """
+
+    _output_subdir = ".foam_interface"
+    real_type = "Foam::scalar"
+    math_namespace = "Foam::"
+    # Override the inherited expansion of max_wavespeed (which prints
+    # nested ``max(abs(args))``).  In the Foam backend max_wavespeed
+    # is opaque — the solver provides the C++ implementation in
+    # numerics.H, mirroring numpy/jax (``max_wavespeed: None``).
+    c_functions = {
+        **GenericCppBase.c_functions,
+        "max_wavespeed": lambda p, *args: (
+            f"numerics::max_wavespeed({', '.join(p.doprint(a) for a in args)})"
+        ),
+    }
+
+    def __init__(self, numerics, **opts):
+        super().__init__()
+        self.numerics = numerics
+        sm = numerics.model
+        self.sm = sm
+        # State / aux / parameter / normal symbol maps.
+        self.register_map("Q", list(sm.state))
+        self.register_map("Qaux", list(sm.aux_state))
+        self.register_map("n", list(sm.normal.values()))
+        self.register_map("p", list(sm.parameters.values()))
+        # Face-state symbols carried by the symbolic Numerics — wired
+        # into the printer so they print as ``Q_minus[i]`` etc.
+        self.register_map("Q_minus", list(numerics.variables_minus))
+        self.register_map("Q_plus", list(numerics.variables_plus))
+        self.register_map("Qaux_minus", list(numerics.aux_variables_minus))
+        self.register_map("Qaux_plus", list(numerics.aux_variables_plus))
+        self.register_map("flux_minus", list(numerics.flux_minus))
+        self.register_map("flux_plus", list(numerics.flux_plus))
+        for k, v in opts.items():
+            setattr(self, k, v)
+
+    # ── Foam syntax (shared with the SystemModel printer) ────────────────
+
+    def format_accessor(self, var, idx):
+        if var in ("n", "X") and idx < 3:
+            return f"{var}.{('x()', 'y()', 'z()')[idx]}"
+        return f"{var}[{idx}]"
+
+    def format_assignment(self, target, indices, value, shape):
+        return f"{target}{''.join(f'[{i}]' for i in indices)} = {value};"
+
+    def _foam_type(self, shape):
+        if not shape:
+            return self.real_type
+        return f"Foam::List<{self._foam_type(shape[1:])}>"
+
+    def _foam_init(self, shape):
+        if len(shape) == 1:
+            return f"Foam::List<{self.real_type}>({shape[0]}, 0.0)"
+        return (
+            f"Foam::List<{self._foam_type(shape[1:])}>"
+            f"({shape[0]}, {self._foam_init(shape[1:])})"
+        )
+
+    def get_array_declaration(self, target, shape, init_zero=False):
+        return f"auto {target} = {self._foam_init(shape)};"
+
+    def wrap_function_signature(self, name, args_str, body_str, shape):
+        return (
+            f"\ninline {self._foam_type(shape)} {name}(\n"
+            f"    {args_str})\n"
+            f"{{\n"
+            f"{body_str}\n"
+            f"}}\n"
+        )
+
+    # ── Emission ─────────────────────────────────────────────────────────
+
+    def _generate_signature_from_function(self, func_obj):
+        """Foam-typed parameter list built from ``func_obj.args.keys()``."""
+        return ",\n    ".join(_FOAM_NUMERICS_ARG[k] for k in func_obj.args.keys())
+
+    def create_code(self):
+        sm = self.sm
+        blocks = [
+            "#pragma once",
+            '#include "List.H"',
+            '#include "vector.H"',
+            '#include "scalar.H"',
+            '#include "Model.H"',
+            "",
+            "namespace Numerics",
+            "{",
+            f"constexpr int n_dof_q = {sm.n_equations};",
+        ]
+        for _name, func_obj in self.numerics.functions.items():
+            blocks.extend(self._process_kernel_from_function(func_obj))
+        blocks.append("} // namespace Numerics")
+        return "\n".join(blocks)
+
+    @classmethod
+    def write_code(cls, numerics, output_path, **opts):
+        with open(output_path, "w") as f:
+            f.write(cls(numerics, **opts).create_code())
+        return output_path
