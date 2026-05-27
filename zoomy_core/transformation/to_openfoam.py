@@ -360,14 +360,18 @@ class FoamNumericsPrinter(GenericCppBase):
     # Named without the ``_print_`` prefix to avoid sympy's
     # automatic ``_print_<funcname>`` dispatch (which would call this
     # with the whole Function expr instead of via c_functions).
+    #
+    # The symbolic ``max_wavespeed`` is invoked with the flattened
+    # ``*Q, *Qaux, *p, *n`` for some side (cell-centre, minus, plus, or
+    # an HR-reconstructed mix).  We emit a variadic call
+    # ``numerics::max_wavespeed(args...)``; the C++ helper unpacks the
+    # flat args back into Q/Qaux/p/n using Model::n_dof_q etc., then
+    # forwards to Model::eigenvalues.
     @staticmethod
     def _emit_max_wavespeed(printer, *args):
-        first = str(args[0])
-        if first.startswith("Q_minus"):
-            return "numerics::max_wavespeed(Q_minus, Qaux_minus, p, n)"
-        if first.startswith("Q_plus"):
-            return "numerics::max_wavespeed(Q_plus, Qaux_plus, p, n)"
-        return "numerics::max_wavespeed(Q, Qaux, p, n)"
+        return "numerics::max_wavespeed(" + ", ".join(
+            printer.doprint(a) for a in args
+        ) + ")"
 
     c_functions = {
         **GenericCppBase.c_functions,
