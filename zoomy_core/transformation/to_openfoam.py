@@ -1,42 +1,47 @@
-"""Module `zoomy_core.transformation.to_openfoam`."""
+"""Foam printer for the SystemModel contract.
 
-from zoomy_core.transformation.generic_c import GenericCppModel
+Trusts that the incoming :class:`SystemModel` is complete and well-shaped
+(emitted by Zoomy's own pipeline) — no defensive checks, no fallback
+machinery.  Options that affect the *content* of the emitted C++ live as
+printer flags, not as branching in the printer's plumbing.
+"""
+
+from __future__ import annotations
+
+import itertools
+
+import sympy as sp
+
+from zoomy_core.transformation.generic_c import GenericCppBase, GenericCppModel
+
+
+# ── Legacy printer (unchanged) ───────────────────────────────────────────
 
 
 class FoamModel(GenericCppModel):
-    """FoamModel. (class)."""
+    """Legacy Foam printer — consumes a pre-SystemModel ``Model``."""
+
     _output_subdir = ".foam_interface"
     _is_template_class = False
 
     def __init__(self, model, *args, **kwargs):
-        """Initialize the instance."""
         self.real_type = "Foam::scalar"
         self.math_namespace = "Foam::"
         super().__init__(model, *args, **kwargs)
 
     def get_includes(self):
-        """Get includes."""
-        return """#include "List.H"
-#include "vector.H"
-#include "scalar.H" """
+        return '#include "List.H"\n#include "vector.H"\n#include "scalar.H" '
 
     def format_accessor(self, var_name, index):
-        """Format accessor."""
-        if var_name in ["n", "X"] and index < 3:
-            return f"{var_name}.{['x()', 'y()', 'z()'][index]}"
+        if var_name in ("n", "X") and index < 3:
+            return f"{var_name}.{('x()', 'y()', 'z()')[index]}"
         return f"{var_name}[{index}]"
 
     def format_assignment(self, target_name, indices, value, shape):
-        # Recursive access [i][j]
-        """Format assignment."""
-        access_str = "".join([f"[{i}]" for i in indices])
-        return f"{target_name}{access_str} = {value};"
+        return f"{target_name}{''.join(f'[{i}]' for i in indices)} = {value};"
 
     def get_variable_declaration(self, v):
-        """Get variable declaration."""
-        if v == "res":
-            return ""
-        mapping = {
+        return {
             "Q": "const Foam::List<Foam::scalar>& Q",
             "Qaux": "const Foam::List<Foam::scalar>& Qaux",
             "n": "const Foam::vector& n",
@@ -44,31 +49,216 @@ class FoamModel(GenericCppModel):
             "time": "const Foam::scalar& time",
             "dX": "const Foam::scalar& dX",
             "bc_idx": "const int bc_idx",
-        }
-        return mapping.get(v, "")
+        }.get(v, "")
 
     def _get_foam_type(self, dims):
-        """Internal helper `_get_foam_type`."""
-        if len(dims) == 0:
+        if not dims:
             return "Foam::scalar"
         return f"Foam::List<{self._get_foam_type(dims[1:])}>"
 
     def wrap_function_signature(self, name, args_str, body_str, shape):
-        """Wrap function signature."""
-        def gen_init(dims):
-            """Gen init."""
+        def init(dims):
             if len(dims) == 1:
                 return f"Foam::List<Foam::scalar>({dims[0]}, 0.0)"
-            return f"Foam::List<{self._get_foam_type(dims[1:])}>({dims[0]}, {gen_init(dims[1:])})"
+            return (
+                f"Foam::List<{self._get_foam_type(dims[1:])}>"
+                f"({dims[0]}, {init(dims[1:])})"
+            )
 
-        ret_type = self._get_foam_type(shape)
-        # We manually indent the auto res = ... line to 4 spaces
-        return f"""
-    static inline {ret_type} {name}(
-        {args_str})
-    {{
-        auto res = {gen_init(shape)};
-{body_str}
-        return res;
-    }}
-"""
+        return (
+            f"\n    static inline {self._get_foam_type(shape)} {name}(\n"
+            f"        {args_str})\n"
+            f"    {{\n"
+            f"        auto res = {init(shape)};\n"
+            f"{body_str}\n"
+            f"        return res;\n"
+            f"    }}\n"
+        )
+
+
+# ── SystemModel printer ──────────────────────────────────────────────────
+
+
+_FOAM_ARG = {
+    "Q": "const Foam::List<Foam::scalar>& Q",
+    "Qaux": "const Foam::List<Foam::scalar>& Qaux",
+    "p": "const Foam::List<Foam::scalar>& p",
+    "n": "const Foam::vector& n",
+    "X": "const Foam::vector& X",
+    "time": "const Foam::scalar& time",
+    "dX": "const Foam::scalar& dX",
+    "bc_idx": "const int bc_idx",
+}
+
+_AXIS = ("x", "y", "z")
+
+
+class FoamSystemModelPrinter(GenericCppBase):
+    """Foam printer for a frozen :class:`SystemModel`.
+
+    Emits ``Model.H`` with one kernel per operator matrix.  Per-direction
+    kernels (``flux_x`` / ``_y`` / ``_z`` etc.) match the calling
+    convention of the existing hand-written ``numerics.H``.
+
+    Options
+    -------
+    analytical_eigenvalues : bool, default False
+        If True, emit the SystemModel's symbolic eigenvalue spectrum.
+        If False, emit a zero placeholder — the solver computes
+        eigenvalues numerically from ``quasilinear_matrix``.
+    """
+
+    _output_subdir = ".foam_interface"
+    real_type = "Foam::scalar"
+    math_namespace = "Foam::"
+    analytical_eigenvalues = False
+
+    def __init__(self, sm, **opts):
+        super().__init__()
+        self.sm = sm
+        self.register_map("Q", list(sm.state))
+        self.register_map("Qaux", list(sm.aux_state))
+        self.register_map("n", list(sm.normal.values()))
+        self.register_map("p", list(sm.parameters.values()))
+        for k, v in opts.items():
+            setattr(self, k, v)
+
+    # ── Foam syntax hooks ────────────────────────────────────────────────
+
+    def format_accessor(self, var, idx):
+        if var in ("n", "X") and idx < 3:
+            return f"{var}.{('x()', 'y()', 'z()')[idx]}"
+        return f"{var}[{idx}]"
+
+    def format_assignment(self, target, indices, value, shape):
+        return f"{target}{''.join(f'[{i}]' for i in indices)} = {value};"
+
+    def _foam_type(self, shape):
+        if not shape:
+            return self.real_type
+        return f"Foam::List<{self._foam_type(shape[1:])}>"
+
+    def _foam_init(self, shape):
+        if len(shape) == 1:
+            return f"Foam::List<{self.real_type}>({shape[0]}, 0.0)"
+        return (
+            f"Foam::List<{self._foam_type(shape[1:])}>"
+            f"({shape[0]}, {self._foam_init(shape[1:])})"
+        )
+
+    def get_array_declaration(self, target, shape, init_zero=False):
+        """Foam-flavoured ``auto res = Foam::List<...>(...);`` decl, used
+        by the inherited :meth:`convert_expression_body` in place of the
+        base's ``SimpleArray<T, N>`` declaration."""
+        return f"auto {target} = {self._foam_init(shape)};"
+
+    def wrap_function_signature(self, name, args_str, body_str, shape):
+        """Signature wrapper — the body already declares ``res`` and
+        returns it, so we only emit the surrounding function."""
+        return (
+            f"\ninline {self._foam_type(shape)} {name}(\n"
+            f"    {args_str})\n"
+            f"{{\n"
+            f"{body_str}\n"
+            f"}}\n"
+        )
+
+    # ── Emission ─────────────────────────────────────────────────────────
+
+    def _kernel(self, name, expr, shape, args):
+        body = self.convert_expression_body(expr, shape)
+        sig = ",\n    ".join(_FOAM_ARG[a] for a in args)
+        return self.wrap_function_signature(name, sig, body, shape)
+
+    def _slice(self, tensor, axis_idx, out_shape):
+        """``tensor[..., axis_idx]`` reshaped to ``out_shape``.  If
+        ``out_shape`` has a trailing ``1`` padding (the ``flux_x`` column
+        convention), walk one fewer axis when collecting source values."""
+        walk = (
+            out_shape[:-1]
+            if (len(out_shape) == len(tensor.shape) and out_shape[-1] == 1)
+            else out_shape
+        )
+        flat = [
+            tensor[(*idx, axis_idx)]
+            for idx in itertools.product(*(range(s) for s in walk))
+        ]
+        return sp.Array(flat).reshape(*out_shape)
+
+    def _per_direction(self, base, tensor, out_shape, args):
+        return [
+            self._kernel(
+                f"{base}_{_AXIS[d]}",
+                self._slice(tensor, d, out_shape),
+                out_shape,
+                args,
+            )
+            for d in range(self.sm.dimension)
+        ]
+
+    def create_code(self):
+        sm = self.sm
+        n_eq, n_state = sm.n_equations, len(sm.state)
+        bc_tags = sorted(sm._bc_source.boundary_conditions_list_dict.keys())
+        bc_str = ", ".join(f'"{t}"' for t in bc_tags)
+        p_names = ", ".join(f'"{k}"' for k in sm.parameters.keys())
+        p_vals = ", ".join(str(v) for v in sm.parameters._values.values()) \
+            if hasattr(sm.parameters, "_values") else ""
+
+        blocks = [
+            "#pragma once",
+            '#include "List.H"',
+            '#include "vector.H"',
+            '#include "scalar.H"',
+            '#include "word.H"',
+            "",
+            "namespace Model",
+            "{",
+            f"constexpr int n_dof_q    = {n_eq};",
+            f"constexpr int n_dof_qaux = {len(sm.aux_state)};",
+            f"constexpr int n_parameters = {len(list(sm.parameters.keys()))};",
+            f"constexpr int dimension  = {sm.dimension};",
+            f"const Foam::List<Foam::word> map_boundary_tag_to_function_index{{ {bc_str} }};",
+            f"const Foam::List<Foam::word> parameter_names{{ {p_names} }};",
+        ]
+
+        # Every operator takes (Q, Qaux, p, …) — parameters are always in the interface.
+        blocks += self._per_direction(
+            "flux", sm.flux, (n_eq, 1), ["Q", "Qaux", "p"]
+        )
+        blocks += self._per_direction(
+            "nonconservative_matrix",
+            sm.nonconservative_matrix,
+            (n_eq, n_state),
+            ["Q", "Qaux", "p"],
+        )
+        blocks += self._per_direction(
+            "quasilinear_matrix",
+            sm.quasilinear_matrix,
+            (n_eq, n_state),
+            ["Q", "Qaux", "p"],
+        )
+
+        eig_expr = (
+            sm.eigenvalues
+            if self.analytical_eigenvalues
+            else sp.Array([[0]] * n_eq)
+        )
+        blocks.append(
+            self._kernel(
+                "eigenvalues", eig_expr, (n_eq, 1), ["Q", "Qaux", "p", "n"]
+            )
+        )
+
+        blocks.append(
+            self._kernel("source", sm.source, (n_eq, 1), ["Q", "Qaux", "p"])
+        )
+
+        blocks.append("} // namespace Model")
+        return "\n".join(blocks)
+
+    @classmethod
+    def write_code(cls, sm, output_path, **opts):
+        with open(output_path, "w") as f:
+            f.write(cls(sm, **opts).create_code())
+        return output_path
