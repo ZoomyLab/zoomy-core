@@ -133,6 +133,10 @@ class FoamSystemModelPrinter(GenericCppBase):
     def format_assignment(self, target, indices, value, shape):
         return f"{target}{''.join(f'[{i}]' for i in indices)} = {value};"
 
+    def _print_Abs(self, expr):
+        """Foam has no ``Foam::fabs``; canonical abs is ``Foam::mag``."""
+        return f"Foam::mag({self._print(expr.args[0])})"
+
     def _foam_type(self, shape):
         if not shape:
             return self.real_type
@@ -202,8 +206,7 @@ class FoamSystemModelPrinter(GenericCppBase):
         bc_tags = sorted(sm._bc_source.boundary_conditions_list_dict.keys())
         bc_str = ", ".join(f'"{t}"' for t in bc_tags)
         p_names = ", ".join(f'"{k}"' for k in sm.parameters.keys())
-        p_vals = ", ".join(str(v) for v in sm.parameters._values.values()) \
-            if hasattr(sm.parameters, "_values") else ""
+        p_vals = ", ".join(str(v) for v in sm.parameter_values.values())
 
         blocks = [
             "#pragma once",
@@ -220,6 +223,7 @@ class FoamSystemModelPrinter(GenericCppBase):
             f"constexpr int dimension  = {sm.dimension};",
             f"const Foam::List<Foam::word> map_boundary_tag_to_function_index{{ {bc_str} }};",
             f"const Foam::List<Foam::word> parameter_names{{ {p_names} }};",
+            f"inline Foam::List<Foam::scalar> default_parameters() {{ return {{ {p_vals} }}; }}",
         ]
 
         # Every operator takes (Q, Qaux, p, …) — parameters are always in the interface.
@@ -301,11 +305,27 @@ class FoamNumericsPrinter(GenericCppBase):
     # nested ``max(abs(args))``).  In the Foam backend max_wavespeed
     # is opaque — the solver provides the C++ implementation in
     # numerics.H, mirroring numpy/jax (``max_wavespeed: None``).
+    #
+    # The symbolic ``max_wavespeed`` always receives the flattened
+    # (Q, Qaux, p, normal) for a given side.  We detect the side from
+    # the first arg's symbol name and emit a fixed-signature call
+    # ``numerics::max_wavespeed(Q_side, Qaux_side, p, n)`` that the
+    # solver implements once (wrapping ``Model::eigenvalues``).
+    # Named without the ``_print_`` prefix to avoid sympy's
+    # automatic ``_print_<funcname>`` dispatch (which would call this
+    # with the whole Function expr instead of via c_functions).
+    @staticmethod
+    def _emit_max_wavespeed(printer, *args):
+        first = str(args[0])
+        if first.startswith("Q_minus"):
+            return "numerics::max_wavespeed(Q_minus, Qaux_minus, p, n)"
+        if first.startswith("Q_plus"):
+            return "numerics::max_wavespeed(Q_plus, Qaux_plus, p, n)"
+        return "numerics::max_wavespeed(Q, Qaux, p, n)"
+
     c_functions = {
         **GenericCppBase.c_functions,
-        "max_wavespeed": lambda p, *args: (
-            f"numerics::max_wavespeed({', '.join(p.doprint(a) for a in args)})"
-        ),
+        "max_wavespeed": _emit_max_wavespeed.__func__,
     }
 
     def __init__(self, numerics, **opts):
@@ -338,6 +358,10 @@ class FoamNumericsPrinter(GenericCppBase):
 
     def format_assignment(self, target, indices, value, shape):
         return f"{target}{''.join(f'[{i}]' for i in indices)} = {value};"
+
+    def _print_Abs(self, expr):
+        """Foam has no ``Foam::fabs``; canonical abs is ``Foam::mag``."""
+        return f"Foam::mag({self._print(expr.args[0])})"
 
     def _foam_type(self, shape):
         if not shape:
