@@ -768,6 +768,47 @@ class NonconservativeRusanov(Rusanov):
         return ZArray([Dp_matrix, Dm_matrix])
 
 
+class WellBalancedNonconservativeRusanov(NonconservativeRusanov):
+    """Path-conservative Rusanov with equilibrium-variable fluctuation
+    viscosity for free-surface (lake-at-rest) well-balancing.
+
+    Both the bed-slope ``g·h·∂_x b`` and the hydrostatic pressure
+    ``g·h·∂_x h`` live in the nonconservative product (the "Malaga"
+    formulation; ``hydrostatic_pressure`` is empty, ``b`` is a trivial
+    conserved state with ``∂_t b = 0``).  The base
+    :meth:`NonconservativeRusanov.get_viscosity_identity_fluctuations`
+    already zeros the stationary-bed row.  This subclass additionally
+    couples the depth-continuity row to the bed column so the Rusanov
+    dissipation acts on the free-surface jump ``Δη = Δh + Δb`` instead
+    of ``Δh``.  At lake-at-rest ``Δη = 0`` while ``Δh = −Δb ≠ 0``, so
+    only the coupled form vanishes — giving exact well-balancing for
+    both Rusanov *and* HLL-flavoured path integrals.
+
+    For ``Q = [b, h, hu]`` the fluctuation viscosity becomes::
+
+        [[0, 0, 0],
+         [1, 1, 0],     # continuity dissipates on Δη = Δh + Δb
+         [0, 0, 1]]
+
+    Model-derived — the coupling is added only when both ``h`` and
+    ``b`` resolve to conservative-state fields via
+    :meth:`Numerics.find_field`.  A plain SWE model with no bed gets the
+    unmodified identity (no bed-indexed term at all), as required.
+    """
+
+    name = param.String(default="WellBalancedNonconservativeRusanovV2")
+
+    def get_viscosity_identity_fluctuations(self):
+        """Get viscosity identity fluctuations (equilibrium-coupled)."""
+        Id = super().get_viscosity_identity_fluctuations()
+        h = self.find_field("h", required=False)
+        b = self.find_field("b", required=False)
+        if (h is not None and b is not None
+                and h.container == "q" and b.container == "q"):
+            Id[h.index, b.index] = 1
+        return Id
+
+
 class PositiveHLL(HLL):
     """HLL with Audusse-Bristeau-Klein hydrostatic reconstruction.
 
