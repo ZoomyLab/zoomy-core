@@ -152,6 +152,40 @@ class Extrapolation(BoundaryCondition):
         return np.zeros_like(np.asarray(Q_inner, dtype=float))
 
 
+class Coupled(BoundaryCondition):
+    """preCICE-coupled boundary patch.
+
+    The kernel is a regular symbolic fallback (default: extrapolation —
+    copy the inner state), printed into ``Model.H`` like any other BC.
+    At runtime the solver intercepts this patch and overwrites its
+    boundary values with the preCICE-exchanged data; the fallback is
+    used before preCICE delivers data (initial step, decoupled runs).
+
+    The interface always exchanges the **full** ``project_2d_to_3d``
+    field set ``[b, h, u, v, w, p]`` sampled on a uniform vertical
+    ``z``-grid — no per-field selection.  Direction, mapping and
+    coupling scheme live entirely in ``precice-config.xml``; the BC only
+    binds the patch to a named preCICE mesh.
+
+    Parameters
+    ----------
+    tag : str
+        OpenFOAM patch name (matches ``constant/polyMesh/boundary``).
+    mesh_name : str
+        preCICE mesh name (matches an entry in ``precice-config.xml``).
+    """
+
+    mesh_name = param.String(default="")
+
+    def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
+        """Fallback (extrapolation) — overwritten by preCICE at runtime."""
+        return ZArray(Q)
+
+    def face_value(self, Q_inner, Qaux_inner, normal, d_face, time, parameters):
+        """Fallback face value = interior cell (extrapolation)."""
+        return np.asarray(Q_inner, dtype=float).copy()
+
+
 class InflowOutflow(BoundaryCondition):
     """Inflow / outflow boundary — prescribe selected state fields,
     extrapolate the rest.

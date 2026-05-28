@@ -202,12 +202,20 @@ class FoamSystemModelPrinter(GenericCppBase):
         ]
 
     def create_code(self):
+        from zoomy_core.model.boundary_conditions import Coupled
         sm = self.sm
         n_eq, n_state = sm.n_equations, len(sm.state)
-        bc_tags = sorted(sm._bc_source.boundary_conditions_list_dict.keys())
+        bc_dict = sm._bc_source.boundary_conditions_list_dict
+        bc_tags = sorted(bc_dict.keys())
         bc_str = ", ".join(f'"{t}"' for t in bc_tags)
         p_names = ", ".join(f'"{k}"' for k in sm.parameters.keys())
         p_vals = ", ".join(str(v) for v in sm.parameter_values.values())
+        # preCICE-coupled patches (Phase 7): a patch↔mesh-name binding for
+        # every Coupled BC.  Empty for models with no coupling.
+        precice = [(t, bc_dict[t].mesh_name) for t in bc_tags
+                   if isinstance(bc_dict[t], Coupled)]
+        precice_patch_str = ", ".join(f'"{t}"' for t, _ in precice)
+        precice_mesh_str = ", ".join(f'"{m}"' for _, m in precice)
 
         blocks = [
             "#pragma once",
@@ -225,6 +233,9 @@ class FoamSystemModelPrinter(GenericCppBase):
             f"const Foam::List<Foam::word> map_boundary_tag_to_function_index{{ {bc_str} }};",
             f"const Foam::List<Foam::word> parameter_names{{ {p_names} }};",
             f"inline Foam::List<Foam::scalar> default_parameters() {{ return {{ {p_vals} }}; }}",
+            f"constexpr int n_precice_patches = {len(precice)};",
+            f"const Foam::List<Foam::word> precice_patch_names{{ {precice_patch_str} }};",
+            f"const Foam::List<Foam::word> precice_mesh_names{{ {precice_mesh_str} }};",
         ]
 
         # Every operator takes (Q, Qaux, p, …) — parameters are always in the interface.
