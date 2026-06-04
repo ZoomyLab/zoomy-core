@@ -2,6 +2,7 @@
 
 import os
 import json
+import xml.etree.ElementTree as ET
 import meshio
 import numpy as np
 import matplotlib.pyplot as plt
@@ -12,45 +13,97 @@ from matplotlib.collections import PolyCollection
 
 
 def read_vtk_or_series(path, index=0, verbose=True):
-    """Read either .vtk or .vtk.series (relative paths handled)."""
+    """Read a single mesh or one frame from a series.
+
+    Supported extensions:
+      * ``.vtk`` / ``.vtu`` — read directly via meshio.
+      * ``.vtk.series`` — Paraview's JSON-flavoured series.
+      * ``.pvd``         — Paraview's XML collection (``<DataSet ... file="..."/>``).
+
+    For the series formats, ``index`` selects which frame to load and the
+    function also returns a single ``meshio.Mesh``; use
+    :func:`list_series_frames` to iterate.
+    """
     path = os.path.abspath(path)
 
-    if path.endswith(".vtk"):
+    if path.endswith((".vtk", ".vtu")):
         if verbose:
-            print(f"📁 Reading single VTK file: {path}")
+            print(f"📁 Reading single mesh file: {path}")
         return meshio.read(path)
 
     if path.endswith(".vtk.series"):
-        with open(path, "r") as f:
-            series = json.load(f)
+        files, times = _parse_vtk_series(path)
+    elif path.endswith(".pvd"):
+        files, times = _parse_pvd(path)
+    else:
+        raise ValueError(
+            "Expected a .vtk, .vtu, .vtk.series, or .pvd file"
+        )
 
-        entries = series.get("files", [])
-        files, times = [], []
-        for e in entries:
-            fname = e.get("name") or e.get("filename") or e.get("file")
-            if fname:
-                files.append(fname)
-                times.append(e.get("time", None))
+    n_files = len(files)
+    if verbose:
+        print(f"📂 Loaded series: {path}")
+        print(f"   • Available indices: {n_files}")
+        if any(t is not None for t in times):
+            print(
+                "   • Time values:",
+                [t for t in times if t is not None][:5],
+                "..." if n_files > 5 else "",
+            )
+        print(f"   • Reading index {index}")
 
-        if not files:
-            raise ValueError("No valid file entries found in .vtk.series.")
+    if not (0 <= index < n_files):
+        raise IndexError(f"Index {index} out of range (0..{n_files - 1})")
 
-        n_files = len(files)
-        if verbose:
-            print(f"📂 Loaded VTK series: {path}")
-            print(f"   • Available indices: {n_files}")
-            if any(t is not None for t in times):
-                print("   • Time values:", [t for t in times if t is not None])
-            print(f"   • Reading index {index}")
+    base_dir = os.path.dirname(path)
+    return meshio.read(os.path.join(base_dir, files[index]))
 
-        if not (0 <= index < n_files):
-            raise IndexError(f"Index {index} out of range (0..{n_files - 1})")
 
-        base_dir = os.path.dirname(path)
-        file_path = os.path.join(base_dir, files[index])
-        return meshio.read(file_path)
+def list_series_frames(path):
+    """Return ``(filenames, times)`` for a ``.vtk.series`` or ``.pvd`` index.
 
-    raise ValueError("Expected a .vtk or .vtk.series file")
+    Use this to drive an animation loop:
+
+        files, times = list_series_frames("foo.pvd")
+        for fname, t in zip(files, times):
+            m = meshio.read(os.path.join(os.path.dirname(path), fname))
+            ...
+    """
+    path = os.path.abspath(path)
+    if path.endswith(".vtk.series"):
+        return _parse_vtk_series(path)
+    if path.endswith(".pvd"):
+        return _parse_pvd(path)
+    raise ValueError("Expected a .vtk.series or .pvd file")
+
+
+def _parse_vtk_series(path):
+    with open(path, "r") as f:
+        series = json.load(f)
+    entries = series.get("files", [])
+    files, times = [], []
+    for e in entries:
+        fname = e.get("name") or e.get("filename") or e.get("file")
+        if fname:
+            files.append(fname)
+            times.append(e.get("time"))
+    if not files:
+        raise ValueError("No valid file entries found in .vtk.series.")
+    return files, times
+
+
+def _parse_pvd(path):
+    root = ET.parse(path).getroot()
+    files, times = [], []
+    for ds in root.iter("DataSet"):
+        fname = ds.get("file")
+        if fname:
+            files.append(fname)
+            t = ds.get("timestep")
+            times.append(float(t) if t is not None else None)
+    if not files:
+        raise ValueError("No <DataSet> entries found in .pvd.")
+    return files, times
 
 
 # ---------- Field listing ----------
@@ -164,11 +217,32 @@ def plot_2d_mesh(
     show_legend=True,
     legend_location="right",
     cmap="viridis",
+    vmin=None,
+    vmax=None,
+    edgecolors="k",
+    linewidths=0.2,
+    colorbar_label=None,
 ):
     """
     Plot a 2D mesh (unstructured) using meshio connectivity.
     Adds polygons to the provided Axes.
-    Returns (vmin, vmax).
+
+    Parameters
+    ----------
+    vmin, vmax : float, optional
+        Override the color scale.  When animating a series, pass the
+        global min/max so every frame uses the same colorbar.
+    edgecolors, linewidths : color, float
+        Mesh-line styling.  Pass ``edgecolors=None`` (or ``"none"``) to
+        disable cell outlines — useful for dense meshes where the lines
+        otherwise dominate the image.
+    colorbar_label : str, optional
+        Override the colorbar label (defaults to ``field_name``).
+
+    Returns
+    -------
+    (vmin, vmax) : tuple of float
+        The color limits actually used.
     """
     points = mesh.points[:, :2]
     cell_block = get_cell_block(mesh, ("triangle", "quad", "polygon"))
@@ -182,7 +256,10 @@ def plot_2d_mesh(
         field_name = field_name or "default"
 
     polygons = [points[cell] for cell in connectivity]
-    vmin, vmax = float(field_data.min()), float(field_data.max())
+    if vmin is None:
+        vmin = float(field_data.min())
+    if vmax is None:
+        vmax = float(field_data.max())
     if vmin == vmax:
         vmin, vmax = vmin - 0.5, vmax + 0.5
 
@@ -191,8 +268,8 @@ def plot_2d_mesh(
         array=field_data,
         cmap=cmap,
         norm=plt.Normalize(vmin=vmin, vmax=vmax),
-        edgecolors="k",
-        linewidths=0.2,
+        edgecolors=edgecolors,
+        linewidths=linewidths,
     )
     ax.add_collection(coll)
     ax.autoscale()
@@ -205,7 +282,7 @@ def plot_2d_mesh(
             )
         else:  # right
             cbar = plt.colorbar(coll, ax=ax)
-        cbar.set_label(field_name)
+        cbar.set_label(colorbar_label if colorbar_label is not None else field_name)
 
     return vmin, vmax
 
