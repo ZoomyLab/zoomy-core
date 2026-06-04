@@ -100,6 +100,24 @@ def _compute_bf_face_gradients(Q, Qaux, bc_indices, bc_grad_fn, bf_cells,
     return bf_grads
 
 
+# -- Helpers -------------------------------------------------------------------
+
+def _coerce_to_system_model(model):
+    """Return a :class:`SystemModel` view of ``model``.
+
+    Accepts a :class:`Model` (calls :meth:`SystemModel.from_model`),
+    a :class:`SystemModel` (returned unchanged), or a
+    :class:`NumericalSystemModel` (returns ``nsm.sm``). This is the
+    canonical source of truth for ``state`` / ``aux_state`` sizing
+    after :meth:`SystemModel.from_model.expose_aux_atoms` has run.
+    """
+    if isinstance(model, NumericalSystemModel):
+        return model.sm
+    if isinstance(model, SystemModel):
+        return model
+    return SystemModel.from_model(model)
+
+
 # -- Base Solver ---------------------------------------------------------------
 
 class Solver(param.Parameterized):
@@ -117,9 +135,27 @@ class Solver(param.Parameterized):
             self.settings = defaults
 
     def initialize(self, mesh, model):
-        n_variables = model.n_variables
+        """Allocate (Q, Qaux) of shape ``(n_state, n_inner_cells)``
+        and ``(n_aux_state, n_inner_cells)``.
+
+        The aux size MUST come from the SystemModel's ``aux_state``,
+        not from the source Model's ``aux_variables``. Canonical
+        derivation classes (SME, VAM, MLME, MLVAM) leave
+        ``aux_variables`` empty and rely on
+        :meth:`SystemModel.from_model` ``expose_aux_atoms`` to
+        auto-promote bathymetry / derivative / function atoms into
+        ``sm.aux_state``. The Model-side count is therefore wrong
+        for any model that uses auto-promotion. We normalize to a
+        SystemModel here so the allocation matches the runtime's
+        view (which is also SystemModel-based).
+        """
         nc = mesh.n_inner_cells
-        n_aux_variables = model.aux_variables.length()
+        # Resolve the SystemModel-side view of state + aux. Accepts a
+        # Model (auto-promote), a SystemModel (use directly), or an NSM
+        # (unwrap to ``nsm.sm``).
+        sm = _coerce_to_system_model(model)
+        n_variables = len(sm.state)
+        n_aux_variables = len(sm.aux_state)
         Q = np.empty((n_variables, nc), dtype=float)
         Qaux = np.empty((n_aux_variables, nc), dtype=float)
         return Q, Qaux

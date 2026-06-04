@@ -267,6 +267,7 @@ class LSQMesh(FVMMesh):
                 n_inner_cells=self.n_inner_cells,
                 boundary_face_centers=bdy_face_centers,
                 cell_boundary_faces=cell_boundary_faces,
+                cell_vertices=self.cell_vertices,
             )
         )
         self._lsq_scale_factors = scale_lsq_derivative(
