@@ -79,6 +79,38 @@ def expand_neighbors(neighbors_list, initial_neighbors, n_valid=None):
     return list(expanded)
 
 
+def build_vertex_to_cells(cell_vertices, n_inner_cells):
+    """Inverse of ``cell_vertices``: for each vertex, the list of inner
+    cells that touch it.  ``cell_vertices`` has shape
+    ``(verts_per_cell, n_cells)``.  Ghost cells (``ic >= n_inner_cells``)
+    are excluded — the LSQ stencil only samples interior cells."""
+    n_cells = cell_vertices.shape[1]
+    # Vertex ids are dense from 0..n_vertices-1.  Use the max ID as size.
+    n_v = int(cell_vertices[:, :n_inner_cells].max()) + 1 if n_inner_cells > 0 else 0
+    v2c = [[] for _ in range(n_v)]
+    for ic in range(min(n_cells, n_inner_cells)):
+        for v in cell_vertices[:, ic]:
+            v_int = int(v)
+            if 0 <= v_int < n_v:
+                v2c[v_int].append(ic)
+    return v2c
+
+
+def vertex_one_ring(ic, cell_vertices, vertex_to_cells, n_inner_cells):
+    """All inner cells sharing at least one vertex with ``ic``.
+    Excludes ``ic`` itself.  On a structured 2D quad/triangle mesh
+    this is the geometrically symmetric stencil around ``ic``."""
+    ring = set()
+    for v in cell_vertices[:, ic]:
+        v_int = int(v)
+        if v_int < 0 or v_int >= len(vertex_to_cells):
+            continue
+        for jc in vertex_to_cells[v_int]:
+            if jc != ic and jc < n_inner_cells:
+                ring.add(jc)
+    return sorted(ring)
+
+
 def compute_gaussian_weights(dX, sigma=1.0):
     distances = np.linalg.norm(dX, axis=1)
     return np.exp(-((distances / sigma) ** 2))
@@ -91,6 +123,7 @@ def least_squares_reconstruction_local(
     n_inner_cells=None,
     boundary_face_centers=None,
     cell_boundary_faces=None,
+    cell_vertices=None,
 ):
     """Build per-cell LSQ gradient operators.
 
@@ -105,6 +138,20 @@ def least_squares_reconstruction_local(
     in 1D, vs. dx for the legacy ghost-cell convention), so the
     boundary-face stencil is also tighter and more accurate.
 
+    Stencil selection
+    -----------------
+    * When ``cell_vertices`` is provided (recommended for ≥2D),
+      the per-cell stencil is the **full vertex-1-ring**: every
+      inner cell sharing at least one vertex with the current cell.
+      On a structured quad/triangle mesh this is geometrically
+      symmetric around the cell centre (offset sum ≈ 0), giving
+      O(h²) gradient accuracy at the cell centre on smooth fields.
+    * When ``cell_vertices`` is None, the legacy face-neighbour +
+      ``expand_neighbors`` iteration is used to fill the stencil.
+      That path is symmetric in 1D but biased in 2D/3D — only kept
+      for backward compatibility with callers that lack vertex
+      topology.
+
     Parameters
     ----------
     boundary_face_centers : ndarray, shape ``(n_boundary_faces, dim)``, optional
@@ -114,6 +161,11 @@ def least_squares_reconstruction_local(
         For each cell, the list of boundary-face indices touching that
         cell.  Empty list for interior cells.  When omitted, the
         stencil reduces to the legacy interior-only form.
+    cell_vertices : ndarray, shape ``(verts_per_cell, n_cells)``, optional
+        Vertex topology used to build a symmetric vertex-1-ring
+        stencil.  Strongly recommended for 2D/3D meshes — without
+        it the stencil is biased and gradient convergence drops to
+        O(h).
 
     Returns
     -------
@@ -142,16 +194,51 @@ def least_squares_reconstruction_local(
     degree = get_polynomial_degree(mon_indices)
     required_neighbors = get_required_monomials_count(degree, dim)
 
+    use_vertex_ring = cell_vertices is not None and dim >= 2
+    if use_vertex_ring:
+        cell_vertices = np.asarray(cell_vertices)
+        # ``cell_vertices`` covers the inner cells only on most
+        # FVMMesh-derived meshes (shape[1] == n_inner_cells); the
+        # vertex-ring branch is bypassed for indices that fall
+        # outside that range.
+        n_inner_for_vring = min(n_inner_cells, cell_vertices.shape[1])
+        vertex_to_cells = build_vertex_to_cells(
+            cell_vertices, n_inner_for_vring)
+
     neighbors_all = []
     for i_c in range(n_cells):
-        # Start with valid (interior) neighbors only
-        current_neighbors = [n for n in neighbors_list[i_c] if n < n_inner_cells]
-        while len(current_neighbors) < required_neighbors:
-            new_neighbors = expand_neighbors(
-                neighbors_list, current_neighbors, n_valid=n_inner_cells)
-            current_neighbors = list(set(new_neighbors) - {i_c})
-            if len(current_neighbors) == 0:
-                break
+        if use_vertex_ring and i_c < n_inner_for_vring:
+            # Symmetric vertex-1-ring stencil.
+            current_neighbors = vertex_one_ring(
+                i_c, cell_vertices, vertex_to_cells, n_inner_cells)
+            # Top-up with face-neighbour expansion only if the ring
+            # itself is somehow too small (degenerate corner cells
+            # on irregular meshes); on a structured grid this branch
+            # is never taken for interior cells.
+            if len(current_neighbors) < required_neighbors:
+                fill = [n for n in neighbors_list[i_c]
+                        if n < n_inner_cells and n != i_c
+                        and n not in current_neighbors]
+                current_neighbors = current_neighbors + fill
+                while len(current_neighbors) < required_neighbors:
+                    extended = expand_neighbors(
+                        neighbors_list, current_neighbors,
+                        n_valid=n_inner_cells)
+                    new = [n for n in extended
+                           if n != i_c and n not in current_neighbors]
+                    if not new:
+                        break
+                    current_neighbors.extend(new)
+        else:
+            # Legacy path: face-neighbour expansion.
+            current_neighbors = [n for n in neighbors_list[i_c]
+                                 if n < n_inner_cells]
+            while len(current_neighbors) < required_neighbors:
+                new_neighbors = expand_neighbors(
+                    neighbors_list, current_neighbors, n_valid=n_inner_cells)
+                current_neighbors = list(set(new_neighbors) - {i_c})
+                if len(current_neighbors) == 0:
+                    break
         neighbors_all.append(current_neighbors)
 
     max_neighbors = max(len(nbrs) for nbrs in neighbors_all)
@@ -163,16 +250,25 @@ def least_squares_reconstruction_local(
         current_neighbors = list(neighbors_all[i_c])
         n_nbr = len(current_neighbors)
 
-        while n_nbr < max_neighbors:
-            extended_neighbors = expand_neighbors(
-                neighbors_list, current_neighbors, n_valid=n_inner_cells)
-            extended_neighbors = list(set(extended_neighbors) - {i_c})
-            new_neighbors = [n for n in extended_neighbors
-                             if n not in current_neighbors and n < n_inner_cells]
-            current_neighbors.extend(new_neighbors)
-            n_nbr = len(current_neighbors)
-            if n_nbr >= max_neighbors:
-                break
+        if use_vertex_ring:
+            # Keep the stencil exactly as the vertex-1-ring (symmetric
+            # by construction).  Pad shorter stencils with the cell
+            # itself — those rows have zero offset and are zeroed
+            # out in V below, contributing nothing to the LSQ fit.
+            # Do NOT expand via expand_neighbors here: that would
+            # re-introduce the centroid bias the vertex ring removed.
+            pass
+        else:
+            while n_nbr < max_neighbors:
+                extended_neighbors = expand_neighbors(
+                    neighbors_list, current_neighbors, n_valid=n_inner_cells)
+                extended_neighbors = list(set(extended_neighbors) - {i_c})
+                new_neighbors = [n for n in extended_neighbors
+                                 if n not in current_neighbors and n < n_inner_cells]
+                current_neighbors.extend(new_neighbors)
+                n_nbr = len(current_neighbors)
+                if n_nbr >= max_neighbors:
+                    break
 
         if len(current_neighbors) >= max_neighbors:
             trimmed_neighbors = current_neighbors[:max_neighbors]
