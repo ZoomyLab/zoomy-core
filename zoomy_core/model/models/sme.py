@@ -170,8 +170,8 @@ class SME(SigmaReference):
         self.apply(Multiply(src.h))
         for eq in self:
             eq.simplify()
-        self.momentum_x[[0, 1]].apply(ProductRule(variables=[t, x]))
-        self.continuity[[0]].apply(ProductRule(variables=[x]))
+        self.momentum_x.term[[0, 1]].apply(ProductRule(variables=[t, x]))
+        self.continuity.term[[0]].apply(ProductRule(variables=[x]))
         for eq in self:
             eq.simplify()
 

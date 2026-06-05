@@ -81,9 +81,9 @@ def derive_layer_sme(*, layer_label: str, bottom_expr, top_pressure_expr,
     for eq in model.equations.values():
         eq.simplify()
 
-    model.equations[f"momentum_x{layer_label}"][[0, 1]].apply(
+    model.equations[f"momentum_x{layer_label}"].term[[0, 1]].apply(
         ProductRule(variables=[t, x]))
-    model.equations[f"continuity{layer_label}"][[0]].apply(
+    model.equations[f"continuity{layer_label}"].term[[0]].apply(
         ProductRule(variables=[x]))
     for eq in model.equations.values():
         eq.simplify()

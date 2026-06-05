@@ -99,6 +99,25 @@ class Basisfunction:
             for k in range(level + 1)
         ]
 
+    # ``weight_name`` is the name of the opaque test-weight Function family
+    # ``c(ζ)`` the derivation framework's brackets carry.  Default ``"c"``;
+    # the modal-projection brackets render ``⟨φ_i, c φ_l⟩`` etc.
+    weight_name = "c"
+
+    def closed_form_bracket(self, name, args):
+        """Closed-form value of a named Galerkin bracket in its SYMBOLIC
+        indices, or ``None`` when the basis has no closed form.
+
+        ``name`` is the bracket family (``"Gram"`` / ``"Weight"`` / …) and
+        ``args`` its index tuple.  The default base supplies no closed form
+        (every bracket stays opaque / resolves numerically); orthogonal bases
+        override this (see :class:`Legendre_shifted`).  Returning a symbolic
+        ``KroneckerDelta`` expression lets the surrounding ``sp.Sum`` collapse
+        analytically under ``.doit()`` with the test index ``l`` kept
+        symbolic.
+        """
+        return None
+
     def resolve_atoms(self, expr):
         """Replace every ``phi_fn(k_concrete, arg)`` atom of this basis
         with the concrete polynomial ``self.eval(int(k_concrete), arg)``.
@@ -370,6 +389,23 @@ class Legendre_shifted(Basisfunction):
         """
         anti = sympy.integrate(poly_expr, var)
         return anti.subs(var, 1) - anti.subs(var, 0)
+
+    def closed_form_bracket(self, name, args):
+        """Shifted-Legendre orthogonality closed forms (test weight ``c≡1``):
+
+        * ``Gram(i, l)   = ⟨φ_i, φ_l⟩ = δ_{il} / (2l + 1)``
+        * ``Weight(l)    = ⟨1, φ_l⟩   = δ_{l0}``
+
+        Any other bracket (e.g. the triple product) has no single-δ closed
+        form here → ``None`` (left as an evaluated finite Sum / opaque).
+        """
+        if name == "Gram" and len(args) == 2:
+            i, l = args
+            return sympy.KroneckerDelta(i, l) / (2 * l + 1)
+        if name == "Weight" and len(args) == 1:
+            (l,) = args
+            return sympy.KroneckerDelta(l, 0)
+        return None
     
 class Chebyshevu(Basisfunction):
     """Chebyshevu. (class)."""

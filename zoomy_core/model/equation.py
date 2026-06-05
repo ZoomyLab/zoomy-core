@@ -22,6 +22,7 @@ from zoomy_core.model.operations import Expression
 __all__ = [
     "Term",
     "_TermGroup",
+    "_TermAccessor",
     "Equation",
     "_pull_constants_out",
     "_recover_fluxes",
@@ -111,10 +112,10 @@ class Term:
 
 
 class _TermGroup:
-    """Returned by ``eq[[i, j, k]]``.  Forwards ``apply`` to each
-    term in the held sub-list — enables
-    ``model.momentum_x[[0, 1, 7]].apply(ProductRule(...))`` over a
-    hand-picked index list."""
+    """Returned by ``eq.term[[i, j, k]]`` / ``eq.term[i, j]``.  Forwards
+    ``apply`` to each term in the held sub-list — enables
+    ``eq.term[[0, 1, 7]].apply(ProductRule(...))`` over a hand-picked index
+    list, writing the rewrites back into the parent equation."""
 
     def __init__(self, terms):
         self._terms = list(terms)
@@ -123,6 +124,44 @@ class _TermGroup:
         for t in self._terms:
             t.apply(*args, **kwargs)
         return self
+
+    @property
+    def expr(self):
+        """The Add of the held terms' expressions (read-only view)."""
+        return sum((t.expr for t in self._terms), sp.S.Zero)
+
+
+class _TermAccessor:
+    """The ``eq.term`` accessor — ADDITIVE-TERM selection on a scalar
+    :class:`Equation`.
+
+    Disambiguated from moment/component ``[...]`` access (which lives on
+    :class:`MomentFamily` / ``VectorEquation``): ``eq.term[i]`` is a single
+    additive term, ``eq.term[i, j]`` / ``eq.term[[i, j]]`` a hand-picked term
+    group.  Both return a term-view whose ``.apply(op)`` rewrites ONLY those
+    additive terms and writes the result back into the parent equation, and
+    whose ``.expr`` reads the selected sub-expression.
+    """
+
+    __slots__ = ("_equation",)
+
+    def __init__(self, equation):
+        self._equation = equation
+
+    def __getitem__(self, i):
+        terms = self._equation._terms
+        if isinstance(i, (list, tuple)):
+            return _TermGroup([terms[k] for k in i])
+        return terms[i]
+
+    def __setitem__(self, i, value):
+        self._equation[i] = value
+
+    def __iter__(self):
+        return iter(self._equation._terms)
+
+    def __len__(self):
+        return len(self._equation._terms)
 
 
 class Equation:
@@ -189,11 +228,22 @@ class Equation:
     def terms(self):
         return self._terms
 
+    @property
+    def term(self):
+        """ADDITIVE-TERM accessor — ``eq.term[i]`` (one term),
+        ``eq.term[i, j]`` / ``eq.term[[i, j]]`` (a term group).  Each view's
+        ``.apply(op)`` rewrites ONLY those terms back into this equation.
+
+        Disambiguated from ``[l]`` MOMENT access (``MomentFamily`` /
+        ``VectorEquation``): a scalar ``Equation`` is no longer term-indexable
+        via bare ``eq[i]`` — use ``eq.term[i]``."""
+        return _TermAccessor(self)
+
     # ── indexing + iteration ─────────────────────────────────────
     def __getitem__(self, i):
-        if isinstance(i, (list, tuple)):
-            return _TermGroup([self._terms[k] for k in i])
-        return self._terms[i]
+        raise TypeError(
+            "index a scalar Equation's terms via `.term[i]`; "
+            "`[l]` is reserved for moment rows")
 
     def __setitem__(self, i, value):
         if isinstance(value, Term):
@@ -244,6 +294,59 @@ class Equation:
         expr = _recover_fluxes(expr)
         self.expr = expr
         return self
+
+    # ── solve / remove (derivation-core operations) ──────────────────
+    def solve_for(self, symbol):
+        """Algebraically isolate ``symbol`` from this equation's residual
+        (``self.expr == 0``); returns a
+        :class:`~zoomy_core.derivation.operations.Substitution` mapping
+        ``symbol -> solved-expr``.
+
+        Pure algebra — ``solve_for`` does **not** integrate.  If ``symbol``
+        appears under a ``Derivative`` the residual is *differential* in it;
+        integrate the balance first (e.g. ``eq.apply(Integrate(var, lo, hi))``
+        followed by a boundary-condition ``Substitution``) and then
+        ``solve_for`` the resulting algebraic relation.
+        """
+        from zoomy_core.derivation.operations import Substitution
+
+        residual = sp.expand(self.expr)
+        if any(der.has(symbol) for der in residual.atoms(sp.Derivative)):
+            raise ValueError(
+                f"solve_for({symbol}) is algebraic, but {self.name!r} is "
+                f"differential in {symbol} (it appears under a Derivative). "
+                f"Integrate the balance first (e.g. `.apply(Integrate(var, "
+                f"lo, hi))` + a boundary-condition `Substitution`), then "
+                f"solve_for the resulting algebraic relation.")
+        solutions = sp.solve(residual, symbol)
+        if not solutions:
+            raise ValueError(f"Cannot solve {self.name!r} for {symbol}.")
+        return Substitution({symbol: solutions[0]},
+                            name=f"solve[{self.name}->{symbol}]")
+
+    def remove(self):
+        """Delete this equation from its parent model (triggers Q refresh)."""
+        if self._model is None:
+            raise RuntimeError(
+                f"Equation {self.name!r} has no parent model to remove from.")
+        self._model._remove_equation(self.name)
+        return None
+
+    # ── describe ─────────────────────────────────────────────────────
+    def describe(self, strip_args=False, header=True):
+        """Render this equation as a :class:`Description`.
+
+        Delegates to :meth:`Expression.describe` so a scalar equation and a
+        model's per-equation render share one path.
+        """
+        return Expression(self.expr, self.name).describe(
+            header=header, strip_args=strip_args)
+
+    def describe_line(self, strip_args=False, bullet=False):
+        """One-line markdown render (used by ``Model.describe``)."""
+        tex = Expression(self.expr, self.name).latex(strip_args=strip_args)
+        prefix = "- " if bullet else ""
+        return f"{prefix}**{self.name}:** ${tex} = 0$"
 
     def __repr__(self):
         return f"Equation({self.name!r}, {len(self._terms)} terms)"

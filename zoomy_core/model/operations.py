@@ -1528,6 +1528,20 @@ class _StripArgsLatexPrinter(_LatexPrinter):
             return True
         return False
 
+    def _print_Integral(self, expr):
+        # Render a Galerkin ``∫_0^1 (…) dζ`` as the bracket ``⟨ … ⟩`` — the
+        # universal "ζ-dependent body stays inside" representation for a modal
+        # coupling that has no closed form.  Any other integral falls back to
+        # the default ``\int … d…`` rendering.
+        if (len(expr.limits) == 1
+                and len(expr.limits[0]) == 3
+                and expr.limits[0][1] == sp.S.Zero
+                and expr.limits[0][2] == sp.S.One
+                and self._is_canonical_zeta(expr.limits[0][0])):
+            inner = self._print(expr.function)
+            return r"\langle %s \rangle" % inner
+        return super()._print_Integral(expr)
+
     def _print_Function(self, expr, exp=None):
         # Custom-rendering atoms (e.g. ``BoundaryIntegral`` /
         # ``NormalVector`` from ``zoomy_core.symbolic.domains``) attach

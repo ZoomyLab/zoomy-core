@@ -334,9 +334,9 @@ class MLSME(Model):
         _apply_all(Multiply(src.h))
         for eq in equations.values():
             eq.simplify()
-        equations[f"momentum_x{layer_label}"][[0, 1]].apply(
+        equations[f"momentum_x{layer_label}"].term[[0, 1]].apply(
             ProductRule(variables=[t, x]))
-        equations[f"continuity{layer_label}"][[0]].apply(
+        equations[f"continuity{layer_label}"].term[[0]].apply(
             ProductRule(variables=[x]))
         for eq in equations.values():
             eq.simplify()

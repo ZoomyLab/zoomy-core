@@ -642,21 +642,73 @@ class SystemModel:
     # ── from_model factory ────────────────────────────────────────────
 
     @classmethod
-    def from_model(cls, model) -> "SystemModel":
-        """Build a SystemModel from a Model by reading its operator API.
+    def _from_derivation_model(cls, model, Q=None, Qaux=None) -> "SystemModel":
+        """Build a SystemModel from a declarative
+        :class:`zoomy_core.derivation.model.Model` by structurally extracting
+        the operators from its untagged residuals (see
+        :func:`zoomy_core.derivation.system_extract.extract_system_operators`).
+        ``Q`` (one applied field per evolution row) is required; ``Qaux`` is
+        auto-populated when ``None``."""
+        from zoomy_core.derivation.system_extract import (
+            extract_system_operators,
+        )
+        if Q is None:
+            raise TypeError(
+                "SystemModel.from_model(declarative_model, Q=...) requires Q — "
+                "the state fields, one per evolution row (e.g. "
+                "Q=[b, h, q(0,t,x), q(1,t,x), q(2,t,x)]).")
+        ops = extract_system_operators(model, Q, Qaux)
+        normal = Zstruct(n0=sp.Symbol("n0", real=True))
+        normal._symbolic_name = "n"
+        sm = cls(
+            aux_state=ops["aux_state"],
+            time=ops["time"], space=ops["space"], state=ops["state"],
+            parameters=ops["parameters"],
+            flux=ops["flux"], hydrostatic_pressure=ops["hydrostatic_pressure"],
+            nonconservative_matrix=ops["nonconservative_matrix"],
+            source=ops["source"], mass_matrix=ops["mass_matrix"],
+            diffusion_matrix=ops.get("diffusion_matrix"),
+            eigenvalues=None, normal=normal,
+            parameter_values=ops["parameter_values"],
+        )
+        sm.history.append({
+            "name": "from_model",
+            "description": f"structural extraction from {type(model).__name__}",
+        })
+        # Auto-scan: route every non-state Function atom (e.g. the open
+        # viscous-stress boundary trace ``tau_xz(t, x, 0)``) and every
+        # Derivative atom into ``aux_state`` — the SAME aux-exposure the
+        # production ``from_model`` path performs.  This collapses the open
+        # stress boundary atoms (``tau_xz(t, x, 0)``, ``tau_xz(t, x, 1)``,
+        # ``tau_xz(t, x, ẑ)``) onto a single ``tau_xz`` aux Symbol, so the
+        # open-SME source vanishes (the stress is an auxiliary field, computed
+        # separately) exactly as production reports.
+        sm.expose_aux_atoms()
+        return sm
 
-        Calls ``model.flux()``, ``model.nonconservative_matrix()``,
-        ``model.source()``, ``model.hydrostatic_pressure()`` once and
-        freezes the matrices.  ``state`` / ``aux_state`` /
-        ``parameters`` come from the model's Zstructs.
+    @classmethod
+    def from_model(cls, model, Q=None, Qaux=None) -> "SystemModel":
+        """Build a SystemModel from a Model.
 
-        Lazy-finalised models (e.g. SME, VAM whose ``derive_model``
-        leaves equations in Function form so optional closures can
-        manipulate them) are *auto-finalised* here — the Function →
-        Symbol substitution, ``_variable_map`` setup, auto-tagging
-        and ``_initialize_functions`` run now, just before the
-        operator-API matrices are read.
+        Two input kinds are dispatched on the *Model class*:
+
+        * the **declarative** clean-redesign
+          :class:`zoomy_core.derivation.model.Model` (whose equations are plain
+          untagged sympy residuals) — the operators are extracted
+          STRUCTURALLY from the residuals via
+          :func:`zoomy_core.derivation.system_extract.extract_system_operators`.
+          ``Q`` (and optionally ``Qaux``) are supplied HERE, at the transition,
+          one ``Q`` entry per evolution row; the field coverage ``Q ∪ Qaux`` is
+          validated (a ``ValueError`` names any uncovered field).
+        * the **production** :class:`zoomy_core.model.basemodel.Model` — the
+          operator-API methods (``model.flux()`` / ``model.source()`` / …,
+          backed by solver-tag extraction) are read once and frozen.  ``Q`` /
+          ``Qaux`` are ignored (the state vector is baked into the model).
         """
+        from zoomy_core.derivation.model import Model as _DerivationModel
+        if isinstance(model, _DerivationModel):
+            return cls._from_derivation_model(model, Q=Q, Qaux=Qaux)
+
         if hasattr(model, "_finalize_for_systemmodel") \
                 and not getattr(model, "_finalized", True):
             model._finalize_for_systemmodel()

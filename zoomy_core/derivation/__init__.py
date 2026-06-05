@@ -1,87 +1,98 @@
-"""Shared building blocks for Galerkin-projection model derivations.
+"""Clean-redesign derivation framework.
 
-This package consolidates the pieces that every shallow-water-family
-model (SWE, SME, ML-SWE, VAM, ML-VAM, …) duplicates: the σ-coord
-coordinate symbols, the shifted Legendre basis, polynomial integration
-in ``ξ ∈ [0, 1]``, and the σ-coord NS equations themselves.
+The derivation spine: build a symbolic PDE derivation as a computational graph
+of :class:`Model` operations.
 
-Class structure (composable, not deeply inherited):
+    from zoomy_core import coords
+    import zoomy_core.derivatives as d
+    from zoomy_core.derivation import Model, Substitution, ChangeOfVariables
 
-    FlowSetup                    — σ-coord NS in (t, x, ξ): continuity,
-                                    x-momentum, z-momentum (each is a
-                                    sympy expression returned by a
-                                    method).  Stresses retained as
-                                    user-supplied symbolic functions.
-    HydrostaticFlow(FlowSetup)   — sets non-hydrostatic p = 0 and
-                                    declares the z-momentum equation
-                                    "absent" (callers should not project
-                                    it).
-    NonHydrostaticFlow(FlowSetup) — keeps z-momentum + non-hydrostatic
-                                    pressure split.
+    t, x, z = coords.t, coords.x, coords.z
+    model = Model(coords=(t, x, z), parameters={"g": 9.81, "rho": 1.0})
+    model.Q = [h, u, w, p]
+    model.add_equation("mass", d.x(u) + d.z(w))
 
-    PolynomialAnsatz             — chooses which fields are polynomial
-                                    in ξ at what degrees; provides the
-                                    expanded ``u(ξ), w(ξ), p(ξ)``.
-    GalerkinProjection           — projects the σ-coord momentum
-                                    equations against ``φ_j(ξ)`` over
-                                    [0, 1]; handles the ω(ξ)
-                                    construction (depth-integrated for
-                                    SME, opaque-w-as-state for VAM).
-
-    KBCClosures                  — symbolic algebraic closures: KBC at
-                                    ξ=0 (solve for ``w_N``) and surface
-                                    BC ``p|_{ξ=1}=0`` (solve for ``p_N``).
-
-Specific models become **compositions** of these pieces.  See
-``tutorials/sme/sme_builder.py`` and ``tutorials/vam/escalante2024_generic.py``
-for how the SME and VAM builders use them.
+``Model`` and the operations reuse the existing
+:class:`zoomy_core.model.operations.Operation` /
+:class:`zoomy_core.model.equation.Equation` spine — the redesign is the
+model/unknown contract (declared-and-present ``Q``, derived ``Qaux``, ops that
+carry their own unknown bookkeeping), not a fresh operator surface.
 """
-from .coords import (
-    default_coords,
-    default_h,
-    default_b,
+
+from .model import Model, VectorEquation, MomentFamily, resolve_modes
+from .operations import (
+    Substitution,
+    ChangeOfVariables,
+    Granularity,
+    granularity_of,
 )
-from .basis import (
-    shifted_legendre_basis,
-    polynomial_integrate,
-)
-from .flow import (
-    FlowSetup,
-    HydrostaticFlow,
-    NonHydrostaticFlow,
-)
-from .ansatz import (
-    PolynomialAnsatz,
+from .transformations import PDETransformation, kinematic_bc
+from .basis import Basis
+from .modal import (
+    ModalIndexRegistry,
+    reset_modal_indices,
+    separation_of_variables,
+    SeparationOfVariables,
+    build_modal_sum,
+    modal_bound,
+    modal_index,
 )
 from .projection import (
-    GalerkinProjection,
+    Gram,
+    Weight,
+    bracket_atoms,
+    ExpandSums,
+    Integrate,
+    Project,
+    ExtractBrackets,
+    ResolveBasis,
 )
-from .closures import (
-    kbc_bottom_solve_w_N,
-    surface_bc_solve_p_N,
+from .closure import (
+    Resolve,
+    ResolveIntegral,
+    Simplify,
+    kinematic_modal_closure,
+    mass_relation,
+    fold_to_conservative_form,
+    is_conservative_diffusion,
+    project_conservative_diffusion,
 )
-from .eliminate_constraints import (
-    eliminate_constraints,
-)
+from .system_extract import extract_system_operators
 
 __all__ = [
-    # coords
-    "default_coords",
-    "default_h",
-    "default_b",
-    # basis
-    "shifted_legendre_basis",
-    "polynomial_integrate",
-    # flow setups
-    "FlowSetup",
-    "HydrostaticFlow",
-    "NonHydrostaticFlow",
-    # ansatz + projection
-    "PolynomialAnsatz",
-    "GalerkinProjection",
-    # closures
-    "kbc_bottom_solve_w_N",
-    "surface_bc_solve_p_N",
-    # constraint elimination
-    "eliminate_constraints",
+    "Model",
+    "VectorEquation",
+    "MomentFamily",
+    "resolve_modes",
+    "Substitution",
+    "ChangeOfVariables",
+    "Granularity",
+    "granularity_of",
+    "PDETransformation",
+    "kinematic_bc",
+    "Basis",
+    "ModalIndexRegistry",
+    "reset_modal_indices",
+    "separation_of_variables",
+    "SeparationOfVariables",
+    "build_modal_sum",
+    "modal_bound",
+    "modal_index",
+    "Gram",
+    "Weight",
+    "bracket_atoms",
+    "ExpandSums",
+    "Integrate",
+    "Project",
+    "ExtractBrackets",
+    "ResolveBasis",
+    "Resolve",
+    "ResolveIntegral",
+    "Simplify",
+    "kinematic_modal_closure",
+    "mass_relation",
+    "fold_to_conservative_form",
+    "is_conservative_diffusion",
+    "project_conservative_diffusion",
+    "extract_system_operators",
 ]
