@@ -1906,11 +1906,23 @@ class Operation(SymbolicBase):
 
     Every Operation carries ``name`` + ``description`` so
     ``System.apply`` can record what was done in the derivation history.
+
+    ``log_level`` (1–5) is the operation's VERBOSITY in the derivation graph:
+    ``1`` = major (always reported — the default for every op), rising to ``5``
+    = minor bookkeeping (e.g. :class:`~zoomy_core.derivation.closure.Simplify`
+    canonicalisation).  A history view can then filter, e.g. ``describe(...,
+    max_log_level=1)`` shows only the major steps.  Set it per class
+    (``log_level = 5``) or per instance (``Op(..., log_level=3)``).
     """
 
-    def __init__(self, name="", description=None):
+    #: Default verbosity level (1 = major / always shown).  Subclasses override.
+    log_level = 1
+
+    def __init__(self, name="", description=None, log_level=None):
         super().__init__(name)
         self.description = description or name
+        if log_level is not None:
+            self.log_level = log_level
 
     def __call__(self, node):
         """Dispatch: leaf Expression → ``_apply_leaf``; Zstruct → recurse."""
@@ -4222,9 +4234,16 @@ class ProductRule(Operation):
 
       * Bare ``Derivative(Π f_i, v)`` outer → **forward**:
         ``∂_v(Π f_i) → Σ_i (Π_{j≠i} f_j) · ∂_v(f_i)``.
-      * ``Mul`` with exactly one ``Derivative(f, v)`` factor → **inverse**:
+      * ``Mul`` carrying a first-order ``Derivative(f, v)`` factor → **inverse**:
         ``coeff · ∂_v(f) → ∂_v(coeff · f) − ∂_v(coeff).doit() · f``
-        (gets us into divergence form for the integration step).
+        (gets us into divergence form for the integration step).  When the term
+        carries MORE THAN ONE derivative factor — e.g. a σ-metric coefficient
+        ``∂_x(ζh)`` multiplying the field derivative ``∂_x ũ`` — the rule pulls
+        out the **field-bearing** outermost first-order derivative and keeps the
+        other derivative factors inside the conserved flux ``coeff``.  (The old
+        rule bailed whenever a second derivative factor was present, so the
+        conservative fold no-op'd on exactly the raw-field σ-metric terms the
+        pre-ansatz Galerkin projection needs.)
       * Anything else → unchanged (no-op).
 
     Use ``direction="inverse"`` / ``direction="forward"`` to force one
@@ -4234,6 +4253,12 @@ class ProductRule(Operation):
     ``Symbol`` named ``t``, ``x``, ``y``, or ``z``.  Pass
     ``variables=[state.t, state.x, ...]`` for an explicit whitelist
     by Symbol identity.
+
+    ``fields=None`` (default) — when a term carries several allowed first-order
+    derivatives, the field-bearing one (the derivative whose argument contains a
+    user field application) is pulled out; pass ``fields=[u, w, ...]`` (heads or
+    applications) to disambiguate explicitly against geometry fields (``h``,
+    ``b``).
 
     Cross-term combinations (``h·∂_t α + α·∂_t h → ∂_t(h·α)``) are
     not the operation's job — apply ProductRule once on the leaf and
@@ -4246,7 +4271,7 @@ class ProductRule(Operation):
     # Apply per term automatically — no caller-side ``apply_to_term`` needed.
     single_term_only = False
 
-    def __init__(self, variables=None, direction="inverse"):
+    def __init__(self, variables=None, direction="inverse", fields=None):
         if direction not in self._DIRECTIONS:
             raise ValueError(
                 f"ProductRule direction must be one of "
@@ -4254,6 +4279,11 @@ class ProductRule(Operation):
             )
         self._direction = direction
         self._vars = tuple(variables) if variables is not None else None
+        self._field_heads = None
+        if fields is not None:
+            self._field_heads = frozenset(
+                f if isinstance(f, type) else getattr(f, "func", f)
+                for f in fields)
         if variables is None:
             desc = (f"Product rule ({direction}) on d/d{{t,x,y,z}} "
                     "by default coord-name match")
@@ -4266,6 +4296,32 @@ class ProductRule(Operation):
         if self._vars is not None:
             return var in self._vars
         return getattr(var, "name", None) in self._DEFAULT_COORD_NAMES
+
+    def _inner_has_field(self, expr):
+        """True if ``expr`` carries a user field application — an explicit
+        ``fields`` head if given, else any ``AppliedUndef``."""
+        from sympy.core.function import AppliedUndef
+        if self._field_heads is not None:
+            return any(getattr(a, "func", None) in self._field_heads
+                       for a in expr.atoms(sp.Function))
+        return any(isinstance(a, AppliedUndef) for a in expr.atoms(sp.Function))
+
+    def _pick_inverse_deriv(self, factors):
+        """Among the term's factors, choose the ONE first-order derivative (in
+        an allowed variable) to pull out: the field-bearing one, tie-broken by
+        the largest inner subtree.  Returns ``None`` when there is no allowed
+        first-order derivative factor."""
+        cands = [f for f in factors
+                 if isinstance(f, Derivative)
+                 and len(f.variables) == 1
+                 and self._var_allowed(f.variables[0])]
+        if not cands:
+            return None
+        if len(cands) == 1:
+            return cands[0]
+        field_cands = [f for f in cands if self._inner_has_field(f.args[0])]
+        pool = field_cands or cands
+        return max(pool, key=lambda f: sp.count_ops(f.args[0]))
 
     def _leaf_sp(self, expr):
         # Auto-route per additive term.  Each term's outermost shape
@@ -4299,21 +4355,19 @@ class ProductRule(Operation):
                     n = int(exp)
                     return n * base**(n - 1) * Derivative(base, var)
             return term
-        # Inverse: Mul with exactly one Derivative factor.  Unconditional —
-        # if coeff is free of var the residual ∂_v(coeff) is zero and the
-        # rewrite reduces to ∂_v(coeff · f); we don't pre-decide.
+        # Inverse: a Mul carrying a first-order Derivative factor in an allowed
+        # variable.  Pull the OUTERMOST field-bearing such derivative out into
+        # divergence form; any OTHER derivative factors (e.g. a σ-metric
+        # ∂_x(ζh) coefficient) ride inside the conserved flux ``coeff``.  If
+        # ``coeff`` is free of ``var`` the residual ∂_v(coeff) is zero and the
+        # rewrite reduces to ∂_v(coeff · f).
         if (self._direction in ("inverse", "both")
                 and isinstance(term, Mul)):
             factors = list(term.args)
-            derivs = [f for f in factors if isinstance(f, Derivative)]
-            if len(derivs) != 1:
-                return term
-            d = derivs[0]
-            if len(d.variables) != 1:
+            d = self._pick_inverse_deriv(factors)
+            if d is None:
                 return term
             var = d.variables[0]
-            if not self._var_allowed(var):
-                return term
             inner = d.args[0]
             coeff_factors = [f for f in factors if f is not d]
             coeff = Mul(*coeff_factors) if coeff_factors else S.One

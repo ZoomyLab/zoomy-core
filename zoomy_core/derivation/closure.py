@@ -49,12 +49,15 @@ from __future__ import annotations
 
 import sympy as sp
 
+from zoomy_core import coords as _coords
 from zoomy_core.model.operations import Operation, Multiply
 
 
 __all__ = [
     "Resolve",
     "ResolveIntegral",
+    "InvertMassMatrix",
+    "FoldConservative",
     "Simplify",
     "kinematic_modal_closure",
     "mass_relation",
@@ -62,6 +65,47 @@ __all__ = [
     "is_conservative_diffusion",
     "project_conservative_diffusion",
 ]
+
+
+class InvertMassMatrix(Operation):
+    """Invert the Galerkin mass matrix by reading it off the equation.
+
+    After a moment row is projected and resolved it has the shape
+    ``M_kk·∂_t Q_k + (flux/source) = 0``, where ``M_kk`` — the (diagonal)
+    Galerkin mass-matrix entry ``⟨φ_k, c φ_k⟩`` (``1/(2k+1)`` for shifted
+    Legendre) — is EXACTLY the coefficient of the row's ``∂_t`` term.  This op
+    finds that ``∂_t`` term, divides the whole row by its coefficient, and so
+    normalises ``∂_t Q_k`` to unit coefficient — the "invert the mass matrix"
+    step, with the matrix read from the model rather than a passed basis.  For a
+    non-orthogonal basis the same idea generalises to a per-row linear solve;
+    for the diagonal SME it is a single division (``×(2k+1)``).
+
+    Apply it AFTER the stray ``∂_t h`` has been removed (``mass_relation``) so
+    the row carries the single diagonal ``∂_t`` term."""
+
+    whole_leaf_op = True
+
+    def __init__(self, time=None, name="invert_mass_matrix"):
+        self._t = time if time is not None else _coords.t
+        super().__init__(
+            name=name,
+            description="divide each row by its ∂_t coefficient (mass matrix)")
+
+    def _leaf_sp(self, sp_expr):
+        t = self._t
+        expr = sp.expand(sp_expr)
+        mass = None
+        for term in sp.Add.make_args(expr):
+            dts = [D for D in term.atoms(sp.Derivative)
+                   if D.variables == (t,)]
+            if len(dts) == 1:
+                cand = sp.simplify(term / dts[0])
+                if cand != 0 and not cand.has(t):     # a clean coefficient
+                    mass = cand
+                    break
+        if mass in (None, sp.S.Zero, sp.S.One):
+            return sp_expr
+        return sp.expand(expr / mass)
 
 
 # ── conservative fold (flux/pressure bundling, NCP-preserving) ─────────────
@@ -169,6 +213,42 @@ def fold_to_conservative_form(expr, flux_fields, *, h, b, x, gravity_param):
     if F != 0:
         out += sp.Derivative(F, x)
     return out
+
+
+class FoldConservative(Operation):
+    """Re-bundle a momentum row's spatial part into the K&T (4.17) conservative
+    decomposition, as a tracked ``.apply`` op (the loop-free form of pipeline
+    step 8b).
+
+    Per row: peel off the conservative DIFFUSION atoms ``∂_x(D·∂_x q)``
+    (:func:`is_conservative_diffusion`) and leave them untouched (the
+    SystemModel types them as ``diffusion_matrix``); ``.doit()`` + fold the
+    hyperbolic remainder via :func:`fold_to_conservative_form` (flux + pressure
+    → ``∂_x(F)`` / ``∂_x(g h²/2)``, bed/cross-mode couplings stay UNFOLDED as
+    NCP); reattach the diffusion.
+
+    Parameters mirror :func:`fold_to_conservative_form`: ``flux_fields`` (the
+    conserved modal ``q(k,t,x)``), ``h``, ``b``, ``x``, and ``gravity``."""
+
+    whole_leaf_op = True
+
+    def __init__(self, flux_fields, *, h, b, x, gravity=None,
+                 name="fold_conservative"):
+        self._flux = list(flux_fields)
+        self._h, self._b, self._x, self._g = h, b, x, gravity
+        super().__init__(
+            name=name, description="conservative flux/pressure fold")
+
+    def _leaf_sp(self, sp_expr):
+        x = self._x
+        diff_terms, base_terms = [], []
+        for term in sp.Add.make_args(sp_expr):
+            (diff_terms if is_conservative_diffusion(term, x)
+             else base_terms).append(term)
+        base = sp.expand(sp.Add(*base_terms).doit())
+        folded = fold_to_conservative_form(
+            base, self._flux, h=self._h, b=self._b, x=x, gravity_param=self._g)
+        return folded + sp.Add(*diff_terms)
 
 
 # ── Resolve (concrete-level project + in-place ζ-integration) ──────────────
@@ -319,7 +399,7 @@ class ResolveIntegral(Operation):
 
     whole_leaf_op = True
 
-    def __init__(self, *, var=None, method="basis", basis_cls=None, level=None,
+    def __init__(self, basis_cls=None, *, var=None, method="basis", level=None,
                  weight=None, classify=None, bounds=(0, 1),
                  name="resolve_integral"):
         self._var = var if var is not None else sp.Symbol("zeta", real=True)
@@ -343,24 +423,27 @@ class ResolveIntegral(Operation):
 
     def _resolve_one(self, integral):
         integrand = integral.function
-        lo, hi = self._bounds
-        for lim in integral.limits:
-            if lim[0] == self._var and len(lim) == 3:
-                lo, hi = lim[1], lim[2]
+        # Resolve using the integral's OWN bound variable (var-agnostic): the
+        # field-level KinematicBC alpha-renames bound ζ → fresh ``\hat{z}``
+        # Dummies, so the integration variable that actually appears is read off
+        # the integral itself rather than assumed to be ``self._var``.
+        lim = integral.limits[0]
+        var = lim[0]
+        lo, hi = (lim[1], lim[2]) if len(lim) == 3 else self._bounds
         method = self._method_for(integral)
         if method == "ftc":
-            return self._ftc(integrand, lo, hi)
+            return self._ftc(integrand, var, lo, hi)
         if method == "basis":
-            return self._resolve_basis(integrand, lo, hi)
+            return self._resolve_basis(integrand, var, lo, hi)
         if method == "numerical":
-            return sp.integrate(integrand, (self._var, lo, hi))
+            return sp.integrate(integrand, (var, lo, hi))
         raise ValueError(f"ResolveIntegral: unknown method {method!r}")
 
     # ── methods ──────────────────────────────────────────────────────────
-    def _ftc(self, integrand, lo, hi):
+    def _ftc(self, integrand, var, lo, hi):
         """``∫_lo^hi ∂_ζ g dζ → g|_{ζ=hi} − g|_{ζ=lo}`` on the
         ζ-independent-coefficient parts; ``sp.integrate`` fallback otherwise."""
-        z = self._var
+        z = var
         out = sp.S.Zero
         for term in sp.Add.make_args(sp.expand(integrand)):
             coeff, dep = term.as_independent(z, as_Add=False)
@@ -372,10 +455,10 @@ class ResolveIntegral(Operation):
                 out += sp.integrate(term, (z, lo, hi))
         return out
 
-    def _resolve_basis(self, integrand, lo, hi):
+    def _resolve_basis(self, integrand, var, lo, hi):
         """Substitute opaque ``φ(k,ζ)`` → concrete polynomial (and weight ``c``)
         and integrate the ζ-polynomial analytically."""
-        z = self._var
+        z = var
         if self._basis is None:
             return sp.integrate(integrand, (z, lo, hi))
         wv = self._weight_value
@@ -400,10 +483,10 @@ class ResolveIntegral(Operation):
             _is_phi,
             lambda a: (self._basis.eval(int(a.args[0]), a.args[1])
                        if a.args[0].is_Integer else a))
-        return self._integrate_poly(e.doit(), lo, hi)
+        return self._integrate_poly(e.doit(), z, lo, hi)
 
-    def _integrate_poly(self, expr, lo, hi):
-        z = self._var
+    def _integrate_poly(self, expr, var, lo, hi):
+        z = var
         out = sp.S.Zero
         for term in sp.Add.make_args(sp.expand(expr)):
             coeff, dep = term.as_independent(z, as_Add=False)
@@ -419,14 +502,47 @@ class ResolveIntegral(Operation):
                 out += sp.integrate(term, (z, lo, hi))
         return out
 
+    def _resolve_basis_atoms(self, expr):
+        """Substitute opaque ``φ(k, arg)`` → ``basis.eval(k, arg)`` for concrete
+        mode ``k`` and the weight ``c(arg)`` → weight value, EVERYWHERE the
+        atom survives outside an integral — i.e. the FTC boundary traces
+        ``φ(k, 0)`` / ``φ(k, 1)``."""
+        if self._basis is None:
+            return expr
+        bas = self._basis
+        wv = self._weight_value
+        expr = expr.replace(
+            lambda a: (isinstance(a, sp.Function)
+                       and getattr(a.func, "_is_basis_head", False)
+                       and len(a.args) == 2 and a.args[0].is_Integer),
+            lambda a: bas.eval(int(a.args[0]), a.args[1]))
+        expr = expr.replace(
+            lambda a: (isinstance(a, sp.Function)
+                       and getattr(a.func, "_is_basis_head", False)
+                       and len(a.args) == 1),
+            lambda a: (wv(a.args[0]) if callable(wv)
+                       else (sp.S.One if wv is None else wv)))
+        return expr
+
     def _leaf_sp(self, sp_expr):
         z = self._var
 
-        def _mine(a):
-            return (isinstance(a, sp.Integral)
-                    and any(lim[0] == z for lim in a.limits))
+        def _has_basis_atom(a):
+            return any(getattr(f.func, "_is_basis_head", False)
+                       for f in a.atoms(sp.Function))
 
-        return sp_expr.replace(_mine, self._resolve_one)
+        def _mine(a):
+            # Resolve any single-variable definite integral that is either over
+            # the configured var OR carries an opaque basis φ/weight (so the
+            # ``\hat{z}``-renamed φ-brackets from the KinematicBC are caught).
+            if not (isinstance(a, sp.Integral) and len(a.limits) == 1
+                    and len(a.limits[0]) == 3):
+                return False
+            return a.limits[0][0] == z or _has_basis_atom(a)
+
+        out = sp_expr.replace(_mine, self._resolve_one)
+        # close the remaining opaque φ-evals (FTC boundary traces) + weight.
+        return self._resolve_basis_atoms(out)
 
 
 # ── conservative second-order (diffusion) projection ───────────────────────
@@ -515,6 +631,7 @@ class Simplify(Operation):
     """
 
     whole_leaf_op = True
+    log_level = 5            # minor canonicalisation — hidden at low verbosity
 
     def __init__(self, name="simplify"):
         super().__init__(name=name, description="canonical simplify")

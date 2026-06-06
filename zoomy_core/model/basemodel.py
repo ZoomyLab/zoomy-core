@@ -282,10 +282,12 @@ class Model(param.Parameterized, SymbolicRegistrar):
             include_minor=include_minor,
         )
 
-    def _history(self, op_label, target, *, level="major", description=None):
+    def _history(self, op_label, target, *, level="major", description=None,
+                 log_level=1):
         self.history.append({
             "op": op_label, "target": target,
-            "level": level, "description": description or "",
+            "level": level, "log_level": log_level,
+            "description": description or "",
         })
 
     # ── Dunders ──────────────────────────────────────────────────

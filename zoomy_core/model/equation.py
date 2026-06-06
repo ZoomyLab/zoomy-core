@@ -266,6 +266,18 @@ class Equation:
         no_history = kwargs.pop("_no_history", False)
         level = kwargs.pop("level", "major")
         description = kwargs.pop("description", None)
+        op = args[0] if args else None
+        # Structural ops (e.g. ``ResolveModes``) restructure the parent model
+        # rather than transform this equation's leaf expression: route them
+        # through ``apply_to_equation`` and still record a history entry.
+        if op is not None and hasattr(op, "apply_to_equation"):
+            result = op.apply_to_equation(self)
+            if not no_history and self._model is not None:
+                self._model._history(
+                    getattr(op, "name", None) or type(op).__name__,
+                    self.name, level=level, description=description,
+                    log_level=getattr(op, "log_level", 1))
+            return result
         merged = Expression(self.expr, self.name)
         new = merged.apply(*args, **kwargs)
         self.expr = new.expr
@@ -274,6 +286,7 @@ class Equation:
             self._model._history(
                 getattr(op, "name", None) or type(op).__name__,
                 self.name, level=level, description=description,
+                log_level=getattr(op, "log_level", 1),
             )
         return self
 

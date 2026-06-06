@@ -40,6 +40,8 @@ __all__ = [
     "Weight",
     "bracket_atoms",
     "ExpandSums",
+    "EvaluateSums",
+    "Integrate",
     "Project",
     "ExtractBrackets",
     "ResolveBasis",
@@ -173,51 +175,101 @@ class ExpandSums(Operation):
         return _expand_sum_products(sp_expr)
 
 
+class EvaluateSums(Operation):
+    """Unroll every FINITE ``sp.Sum`` (a concrete integer bound) to its explicit
+    modes: ``Σ_{i=0}^{2} a_i φ_i → a_0 φ_0 + a_1 φ_1 + a_2 φ_2``.
+
+    The modal ansatz from :func:`~zoomy_core.derivation.modal.separation_of_variables`
+    is an UNEXPANDED ``sp.Sum`` with an abstract bound ``N_u``; after
+    ``Substitution({N_u: N})`` binds the bound, ``sympy`` still keeps the ``Sum``
+    node — ``.doit()`` is what expands it.  This op is the operation form of the
+    bind-then-expand step (replacing the raw ``for eq: eq.expr.replace(Sum,
+    doit)`` loop), and is deliberately NARROWER than a bare ``expr.doit()``: it
+    only fires on ``Sum`` atoms, leaving any deferred ``Integral`` / ``Derivative``
+    untouched (the pipeline defers those on purpose)."""
+
+    whole_leaf_op = True
+
+    def __init__(self, name="evaluate_sums"):
+        super().__init__(
+            name=name,
+            description="finite Sum.doit() → explicit modes",
+        )
+
+    def _leaf_sp(self, sp_expr):
+        return sp_expr.replace(lambda e: isinstance(e, sp.Sum),
+                               lambda e: e.doit())
+
+
 # ── Project (Multiply(test) → ∫ dζ through the Sum) ────────────────────────
 
 
-def _integrate_one_term(term, var, lo, hi, commute_deriv=True):
+def _integrate_one_term(term, var, lo, hi):
     """Integrate a single additive term over ``(var, lo, hi)``.
 
-    * A ``var``-independent ``Derivative`` factor (``∂_x``) commutes OUT of
-      the ζ-integral and we recurse on the inner residual — but ONLY at the
-      OUTERMOST level (``commute_deriv``).  An INNER ``∂_x`` (the diffusive
-      flux ``∂_x(D·∂_x q)`` left after a ProductRule) must stay INSIDE the
-      ζ-integral: commuting it past an ``x``-dependent coefficient (``h``)
-      would corrupt ``∂_x(−2ν h ∂_x q)`` into ``∂_xx(−2ν h q)``.  So the
-      recursion runs with ``commute_deriv=False`` and the inner derivative is
-      carried into the opaque ``sp.Integral`` for ``ResolveIntegral`` to
-      resolve by basis (keeping ``∂_x q`` intact).
-    * A single unexpanded ``Sum`` factor: pull its ``var``-independent
-      coefficient out, integrate ONLY the ``var``-dependent product (the
-      opaque ``φ`` bracket stays unevaluated), rebuild the Sum.
-    * Otherwise integrate directly with constants pulled out.
+    The ``var``-INDEPENDENT factor comes out front; the ``var``-dependent body
+    ``rest`` is then resolved by shape:
+
+    * a BARE outer ``Derivative(g, (var,))`` (``∂_ζ`` of the whole body) →
+      **fundamental theorem of calculus**: ``g|_{var=hi} − g|_{var=lo}`` (this is
+      how the vertical-velocity boundary traces ``w̃(·,0/1)`` surface, ready for a
+      :class:`~zoomy_core.model.operations.KinematicBC`);
+    * a BARE outer ``Derivative(g, (w,))`` in another variable ``w ≠ var`` (a
+      CONSERVATIVE flux ``∂_x(F)`` whose ``φ·h`` was moved INSIDE by a prior
+      ``ProductRule``) → the derivative **commutes OUT** of the ζ-integral:
+      ``∂_x(∫ g dζ)``;
+    * a single unexpanded ``Sum`` factor → push the integral inside, leaving the
+      opaque ``φ`` bracket unevaluated;
+    * everything else (incl. σ-metric coefficient-derivative factors like
+      ``∂_x(ζh)`` that must NOT commute, and ``coeff·∂_x F`` terms whose ``φ/h``
+      were NOT folded in) → left as an opaque ``sp.Integral`` for
+      :class:`~zoomy_core.derivation.closure.ResolveIntegral` to close by basis.
+
+    The conservative commute fires ONLY on a *bare* outer derivative: a generic
+    ``coeff·∂_x F`` is left abstract, because pulling ``∂_x`` past an
+    ``x``-dependent ``coeff`` (e.g. ``h``) would give the NON-conservative
+    ``h·∂_x(…)`` instead of ``∂_x(h·…)``.  Moving ``φ·h`` inside the derivative
+    (so the term is bare) is the job of the ``ProductRule`` that precedes
+    ``Integrate`` in the projection.
     """
-    factors = list(term.args) if isinstance(term, sp.Mul) else [term]
-    deriv = (next((f for f in factors
-                   if isinstance(f, sp.Derivative)
-                   and var not in f.variables), None)
-             if commute_deriv else None)
-    if deriv is not None:
-        rest = sp.Mul(*[f for f in factors if f is not deriv])
-        inner = sp.expand_mul(rest * deriv.expr)
-        integrated_inner = sp.S.Zero
-        for piece in sp.Add.make_args(inner):
-            integrated_inner += _integrate_one_term(
-                piece, var, lo, hi, commute_deriv=False)
-        return sp.Derivative(integrated_inner, *deriv.variables)
+    coeff, rest = term.as_independent(var, as_Add=False)
+    if rest == 1:
+        return coeff * (hi - lo)
+    # A bare outer Derivative as the whole var-dependent body.
+    if isinstance(rest, sp.Derivative) and len(rest.variables) == 1:
+        dvar = rest.variables[0]
+        g = rest.args[0]
+        if dvar == var:                       # FTC over the integration var
+            return coeff * (g.subs(var, hi) - g.subs(var, lo))
+        return coeff * sp.Derivative(         # conservative flux: ∂_x commutes out
+            _integrate_through_sum(g, var, lo, hi), dvar)
+    factors = list(rest.args) if isinstance(rest, sp.Mul) else [rest]
+    # A conservative ``∂_w`` (non-``var``) derivative FACTOR whose remaining
+    # factors + coefficient are ``w``-INDEPENDENT commutes OUT of the
+    # ζ-integral: ``∫ c φ_l ∂_x F dζ = ∂_x ∫ c φ_l F dζ``.  When the coefficient
+    # is ``w``-DEPENDENT (an ``h`` pulled out by ``Multiply(h)``) the pull-out
+    # is INVALID (``∂_x(h·…) ≠ h·∂_x(…)``) — leave the term abstract so a prior
+    # ``ProductRule`` folds ``h`` inside the derivative first.
+    for f in factors:
+        if (isinstance(f, sp.Derivative) and len(f.variables) == 1
+                and f.variables[0] != var):
+            dw = f.variables[0]
+            others = sp.Mul(*[g for g in factors if g is not f])
+            if not (coeff * others).has(dw):
+                inner = _integrate_through_sum(others * f.expr, var, lo, hi)
+                return coeff * sp.Derivative(inner, dw)
+            break
+    # A single unexpanded Sum factor: push the integral inside.
     sums = [f for f in factors if isinstance(f, sp.Sum)]
     if len(sums) == 1:
         the_sum = sums[0]
-        rest = sp.Mul(*[f for f in factors if f is not the_sum])
-        summand = the_sum.function
-        limits = the_sum.limits
-        coeff, dep = summand.as_independent(var, as_Add=False)
-        rest_coeff, rest_dep = rest.as_independent(var, as_Add=False)
-        inner = sp.Integral(rest_dep * dep, (var, lo, hi))
-        return rest_coeff * sp.Sum(coeff * inner, *limits)
-    coeff, dep = term.as_independent(var, as_Add=False)
-    return coeff * sp.Integral(dep, (var, lo, hi))
+        others = sp.Mul(*[f for f in factors if f is not the_sum])
+        cc, dep = the_sum.function.as_independent(var, as_Add=False)
+        oc, od = others.as_independent(var, as_Add=False)
+        return coeff * oc * sp.Sum(
+            cc * sp.Integral(od * dep, (var, lo, hi)), *the_sum.limits)
+    # Otherwise leave the var-dependent body as an opaque Integral.
+    return coeff * sp.Integral(rest, (var, lo, hi))
 
 
 def _integrate_through_sum(expr, var, lo, hi):

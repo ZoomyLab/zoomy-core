@@ -35,9 +35,11 @@ from zoomy_core import coords as _coords
 from zoomy_core.misc.misc import Zstruct
 from zoomy_core.misc.description import Description
 from zoomy_core.model.equation import Equation
+from zoomy_core.model.operations import Operation
 
 
-__all__ = ["Model", "VectorEquation", "MomentFamily", "resolve_modes"]
+__all__ = ["Model", "VectorEquation", "MomentFamily", "resolve_modes",
+           "ResolveModes"]
 
 
 # Component index → attribute name, by vector length.
@@ -279,11 +281,13 @@ class Model:
         return tuple(c for c in self._coords[1:] if c != vert)
 
     # ── history ──────────────────────────────────────────────────────
-    def _history(self, op_name, target, level="major", description=None):
+    def _history(self, op_name, target, level="major", description=None,
+                 log_level=1):
         self.history.append({
             "op": op_name,
             "target": target,
             "level": level,
+            "log_level": log_level,
             "description": description,
         })
 
@@ -440,19 +444,21 @@ class Model:
         * everything else → broadcast across every scalar equation via
           :meth:`Equation.apply`.
         """
+        lvl = getattr(op, "log_level", 1)
         if getattr(op, "system_level", False):
             result = op(self)
             self._history(getattr(op, "name", None) or type(op).__name__,
-                          "*system*")
+                          "*system*", log_level=lvl)
             return result if result is not None else self
         if getattr(op, "whole_model_op", False):
             op.apply_to_model(self)
             self._history(getattr(op, "name", None) or type(op).__name__,
-                          "*model*")
+                          "*model*", log_level=lvl)
             return self
         for eq in list(self._equations.values()):
             eq.apply(op, _no_history=True, **kwargs)
-        self._history(getattr(op, "name", None) or type(op).__name__, "*all*")
+        self._history(getattr(op, "name", None) or type(op).__name__, "*all*",
+                      log_level=lvl)
         self._refresh_unknowns()
         return self
 
@@ -577,6 +583,18 @@ class Model:
                 fields.add(atom)
         return fields
 
+    # ── index registration (Galerkin test / moment index) ────────────
+    def register_index(self, name):
+        """Mint and REGISTER a Galerkin test / moment index Symbol on this
+        model (``k = model.register_index("k")``).
+
+        The model's :class:`~zoomy_core.derivation.modal.ModalIndexRegistry`
+        records it, so a second ``register_index`` of the same name returns the
+        SAME symbol and a clash with an auto-assigned modal (trial) index
+        ``i``/``j`` raises — the user cannot accidentally create two colliding
+        indices.  Returns an ``integer, non-negative`` ``sp.Symbol``."""
+        return self._modal_registry.register(name)
+
     # ── modal-index / basis accessors (per-field Resolve) ─────────────
     def modal_index(self, target):
         """The modal-mode index assigned to a field or coefficient family.
@@ -616,10 +634,15 @@ class Model:
         return getattr(head, "__name__", None) or str(head)
 
     # ── describe ─────────────────────────────────────────────────────
-    def describe(self, strip_args=False, show_history=False):
+    def describe(self, strip_args=False, show_history=False, max_log_level=5):
         """Human-readable derivation state.  Header shows the model name +
         #equations + #ops; each equation delegates to its own
-        ``describe_line``."""
+        ``describe_line``.
+
+        ``max_log_level`` (1–5) filters the optional history view: only ops with
+        ``op.log_level <= max_log_level`` are listed, so ``max_log_level=1``
+        shows just the major steps and hides level-5 bookkeeping (e.g.
+        ``Simplify``)."""
         n_eq = len(self._equations)
         n_vec = len(self._vector_equations)
         n_ops = len(self.history)
@@ -668,9 +691,13 @@ class Model:
                 continue
             parts.append(eq.describe_line(strip_args=strip_args, bullet=True))
         if show_history and self.history:
-            parts.append("**History:**")
-            for h in self.history:
-                parts.append(f"- `{h['op']}` → {h['target']}")
+            shown = [h for h in self.history
+                     if h.get("log_level", 1) <= max_log_level]
+            parts.append(f"**History** (≤ level {max_log_level}, "
+                         f"{len(shown)}/{len(self.history)} ops):")
+            for h in shown:
+                parts.append(f"- `{h['op']}` (L{h.get('log_level', 1)}) "
+                             f"→ {h['target']}")
         return Description("\n".join(parts))
 
     def __repr__(self):
@@ -789,3 +816,26 @@ def resolve_modes(equation, *, index, modes, test_weight=None,
     model._history("resolve_modes", base)
     model._refresh_unknowns()
     return family
+
+
+class ResolveModes(Operation):
+    """Galerkin moment-axis SHAPE BUMP, as a tracked ``.apply`` op.
+
+    Applied to a row carrying the ABSTRACT test index ``index``
+    (``model.momentum.x.apply(ResolveModes(index=k, modes=range(N+1)))``), it
+    specialises ``index`` into the concrete moments ``modes`` (``k → 0..N``) and
+    bumps the scalar/vector-component row into a
+    :class:`MomentFamily` — the structural step previously written as the bare
+    ``resolve_modes(model.momentum.x, …)`` call, now a node in the operation
+    tree.  It does NOT close the φ-brackets; follow it with
+    ``model.apply(ResolveIntegral(...))``."""
+
+    def __init__(self, index, modes, name="resolve_modes"):
+        self._index = index
+        self._modes = list(modes)
+        super().__init__(
+            name=name,
+            description=f"moment shape-bump {index} → {self._modes}")
+
+    def apply_to_equation(self, equation):
+        return resolve_modes(equation, index=self._index, modes=self._modes)

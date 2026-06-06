@@ -42,6 +42,7 @@ __all__ = [
     "build_modal_sum",
     "modal_bound",
     "modal_index",
+    "test_index",
 ]
 
 
@@ -53,7 +54,20 @@ _INDEX_NAMES = ["i", "j", "k", "m", "n", "o", "p", "q", "r", "s"]
 
 
 def modal_index(name="i"):
-    """A single integer, non-negative summation-index Symbol."""
+    """A single integer, non-negative summation-index Symbol (a *trial*
+    summation dummy ``i`` / ``j`` in ``Σ_i a_i φ_i``)."""
+    return sp.Symbol(name, integer=True, nonnegative=True)
+
+
+def test_index(name="l"):
+    """A Galerkin **test / moment** index Symbol (integer, non-negative).
+
+    Distinct in intent from :func:`modal_index` (a trial summation dummy) and
+    :func:`modal_bound` (a truncation bound), though the Symbol shape is
+    identical.  Use it for the projection test weight ``c(ζ)·φ(l, ζ)`` so the
+    derivation reads ``l = test_index()`` instead of a raw ``sp.Symbol``.
+    Default ``"l"`` matches the codebase's test-index name (``_INDEX_NAMES``
+    reserves ``l`` for exactly this)."""
     return sp.Symbol(name, integer=True, nonnegative=True)
 
 
@@ -92,6 +106,7 @@ class ModalIndexRegistry:
         self._entries = {}          # coeff_name → {"index": Symbol, "basis": …}
         self._field_to_coeff = {}   # field head class → coeff_name
         self._order = []            # mode letters handed out, in order
+        self._registered = {}       # user-registered test/moment index → Symbol
 
     def _mint_index(self):
         nm = next((n for n in _INDEX_NAMES if n not in self._order), None)
@@ -146,10 +161,25 @@ class ModalIndexRegistry:
         name = self.coeff_name_for(target)
         return self._entries[name]["basis"] if name else None
 
+    def register(self, name):
+        """Mint and register a user test/moment index Symbol, raising if the
+        name is already a registered index OR an auto-minted trial index — so
+        the user cannot accidentally create two colliding indices."""
+        if name in self._registered:
+            return self._registered[name]
+        if name in self._order:
+            raise ValueError(
+                f"index {name!r} is already an auto-assigned modal (trial) "
+                f"index on this model; pick another test-index name.")
+        sym = sp.Symbol(name, integer=True, nonnegative=True)
+        self._registered[name] = sym
+        return sym
+
     def reset(self):
         self._entries.clear()
         self._field_to_coeff.clear()
         self._order.clear()
+        self._registered.clear()
 
 
 def reset_modal_indices(model):
@@ -227,10 +257,6 @@ class SeparationOfVariables(Operation):
         # the original head is used.
         deco = model._field_decoration or {}
         head = deco.get(self._field.func, self._field.func)
-        z_old, zeta = model._sigma_from, model._vertical
-        repl = ({z_old: zeta}
-                if (z_old is not None and zeta is not None) else {})
-        target = head(*[a.xreplace(repl) for a in self._field.args])
 
         coeff_name = _coeff_key(self._coeff)
         idx = model._modal_registry.assign(
@@ -242,19 +268,32 @@ class SeparationOfVariables(Operation):
             model._modal_registry.assign(
                 coeff_name, field_head=self._field.func)
 
-        ansatz = build_modal_sum(target, self._coeff, self._basis,
-                                 self._order, idx)
-
-        # Structural substitution across every equation.
-        for eq in model._equations.values():
-            eq.expr = eq.expr.xreplace({target: ansatz})
-
-        # Swap the unknown family: the field's head leaves Q, the coeff
-        # family (``a(i, *coords)``) enters.
+        # The coefficient family head + its (horizontal) coords.
         coeff_head = (self._coeff if isinstance(self._coeff, type)
                       else getattr(self._coeff, "func", self._coeff))
         coords = (tuple(self._coeff.args) if getattr(self._coeff, "args", None)
                   else tuple(self._field.args[:-1]))
+        phi = (getattr(self._basis, "phi", None)
+               or getattr(self._basis, "phi_fn", self._basis))
+        order = self._order
+
+        # Replace EVERY application of the (decorated) field head — at ANY
+        # argument list — with the modal sum ``Σ_i a_i(coords)·φ(i, <basis arg>)``.
+        # Using a HEAD-level ``replace`` (not ``xreplace`` on a single ``ũ(t,x,ζ)``
+        # target) is what lets the ansatz be inserted AFTER a field-level
+        # ``KinematicBC``: the BC substitutes boundary evaluations ``ũ(t,x,0)`` /
+        # ``ũ(t,x,1)`` whose last arg is the concrete boundary value, and those
+        # must expand to ``Σ_i a_i·φ(i, 0/1)`` too.  ``call_args[-1]`` is the
+        # separation (basis) coordinate of each application — ζ in the bulk, 0/1
+        # at a boundary.
+        def _expand(*call_args):
+            return sp.Sum(coeff_head(idx, *coords) * phi(idx, call_args[-1]),
+                          (idx, 0, order))
+        for eq in model._equations.values():
+            eq.expr = eq.expr.replace(head, _expand)
+
+        # Swap the unknown family: the field's head leaves Q, the coeff
+        # family (``a(i, *coords)``) enters.
         coeff_applied = coeff_head(idx, *coords)
         model.redeclare_unknown(head, coeff_applied)
         model._refresh_unknowns()

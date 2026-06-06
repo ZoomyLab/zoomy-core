@@ -19,7 +19,9 @@ model/unknown contract (declared-and-present ``Q``, derived ``Qaux``, ops that
 carry their own unknown bookkeeping), not a fresh operator surface.
 """
 
-from .model import Model, VectorEquation, MomentFamily, resolve_modes
+from .model import (
+    Model, VectorEquation, MomentFamily, resolve_modes, ResolveModes,
+)
 from .operations import (
     Substitution,
     ChangeOfVariables,
@@ -36,12 +38,14 @@ from .modal import (
     build_modal_sum,
     modal_bound,
     modal_index,
+    test_index,
 )
 from .projection import (
     Gram,
     Weight,
     bracket_atoms,
     ExpandSums,
+    EvaluateSums,
     Integrate,
     Project,
     ExtractBrackets,
@@ -50,6 +54,8 @@ from .projection import (
 from .closure import (
     Resolve,
     ResolveIntegral,
+    InvertMassMatrix,
+    FoldConservative,
     Simplify,
     kinematic_modal_closure,
     mass_relation,
@@ -64,6 +70,7 @@ __all__ = [
     "VectorEquation",
     "MomentFamily",
     "resolve_modes",
+    "ResolveModes",
     "Substitution",
     "ChangeOfVariables",
     "Granularity",
@@ -78,16 +85,20 @@ __all__ = [
     "build_modal_sum",
     "modal_bound",
     "modal_index",
+    "test_index",
     "Gram",
     "Weight",
     "bracket_atoms",
     "ExpandSums",
+    "EvaluateSums",
     "Integrate",
     "Project",
     "ExtractBrackets",
     "ResolveBasis",
     "Resolve",
     "ResolveIntegral",
+    "InvertMassMatrix",
+    "FoldConservative",
     "Simplify",
     "kinematic_modal_closure",
     "mass_relation",
