@@ -28,6 +28,7 @@ class NumpyRuntimeModel:
         "clamp_positive": lambda x: np.maximum(x, 0.0),
         "clamp_momentum": lambda hu, h, u_max: np.clip(hu, -h * u_max, h * u_max),
         "max_wavespeed": None,  # must be provided by the solver before compilation
+        "roe_dissipation": None,  # provided by PathConservativeRoe.runtime_kernels
     }
     printer = "numpy"
     

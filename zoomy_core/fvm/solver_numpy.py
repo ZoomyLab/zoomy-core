@@ -470,6 +470,12 @@ class HyperbolicSolver(Solver):
 
         numerics = self._build_numerics(symbolic_model)
         NumpyRuntimeSymbolic.module["max_wavespeed"] = max_wavespeed_fn
+        # Let the numerics declare any extra backend kernels it needs (e.g.
+        # the Roe |A| dissipation), merged in before lambdification.
+        extra_kernels = getattr(numerics, "runtime_kernels", None)
+        if callable(extra_kernels):
+            for _kname, _kfn in extra_kernels(symbolic_model).items():
+                NumpyRuntimeSymbolic.module[_kname] = _kfn
         runtime_numerics = numerics.to_runtime_numpy()
         runtime_numerics.local_max_abs_eigenvalue = (
             lambda Q, Qaux, p, n: max_wavespeed_fn(*Q, *Qaux, *p, *n)
@@ -847,3 +853,23 @@ class FreeSurfaceFlowSolver(HyperbolicSolver):
                 mesh, dim, h_index=h_idx, eps_wet=eps_wet,
                 limiter=self.nsm.reconstruction.limiter)
         return super()._build_reconstruction(mesh, symbolic_model)
+
+
+def _build_roe_numerics(symbolic_model):
+    """Path-conservative Roe (matrix |A| dissipation) for free-surface models;
+    auto-locates ``h``/``b`` and the depth-scaled momentum rows like the
+    Rusanov variant."""
+    from zoomy_core.fvm.riemann_solvers import PathConservativeRoe
+    scaled_q_indices = _detect_scaled_q_indices(symbolic_model)
+    return PathConservativeRoe(symbolic_model, scaled_q_indices=scaled_q_indices)
+
+
+class RoeFreeSurfaceFlowSolver(FreeSurfaceFlowSolver):
+    """:class:`FreeSurfaceFlowSolver` using the path-conservative Roe scheme
+    (matrix ``|A|`` dissipation via runtime numerical eigendecomposition)
+    instead of scalar Rusanov dissipation — sharper shocks/contacts at the
+    same reconstruction order.  Everything else (hydrostatic reconstruction,
+    wet/dry handling, time-stepping) is unchanged."""
+
+    def _build_numerics(self, symbolic_model):
+        return _build_roe_numerics(symbolic_model)
