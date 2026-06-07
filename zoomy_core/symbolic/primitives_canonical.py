@@ -97,9 +97,21 @@ def alpha_rename(expr):
         return expr
     canon_by_depth: dict[int, sp.Dummy] = {}
 
-    def _canon(depth):
+    def _hat_name(old_var):
+        # The canonical bound variable is the INPUT variable, hatted:
+        # ``∫ … dζ`` → ``\hat{\zeta}``, ``∫ … dz`` → ``\hat{z}``.  Already
+        # hatted vars (a fresh running-integral Dummy ``\hat{\zeta}``) are
+        # kept verbatim so re-canonicalisation never double-hats.
+        nm = getattr(old_var, "name", "")
+        if nm.startswith(r"\hat{") and nm.endswith("}"):
+            return nm
+        return rf"\hat{{{sp.latex(old_var)}}}"
+
+    def _canon(depth, old_var):
+        # One Dummy per nesting depth (alpha-equivalence of sibling
+        # integrals is preserved); the NAME follows the input variable.
         if depth not in canon_by_depth:
-            canon_by_depth[depth] = sp.Dummy(r"\hat{z}", positive=True)
+            canon_by_depth[depth] = sp.Dummy(_hat_name(old_var), positive=True)
         return canon_by_depth[depth]
 
     def _walk(e, depth=0):
@@ -108,7 +120,7 @@ def alpha_rename(expr):
             limits = e.args[1]
             if hasattr(limits, "__len__") and len(limits) == 3:
                 old_var, lo, hi = limits
-                new_var = _canon(depth)
+                new_var = _canon(depth, old_var)
                 if old_var is new_var:
                     if integrand is not e.args[0]:
                         return Integral(integrand, *e.args[1:])

@@ -286,30 +286,48 @@ def _integrate_through_sum(expr, var, lo, hi):
 
 
 class Integrate(Operation):
-    """Definite integral over ``(var, lo, hi)`` that pushes the integral THROUGH
-    any unexpanded ``sp.Sum`` and leaves the opaque ``φ``-integrals (and any
-    other ``var``-dependent body) as **abstract** ``sp.Integral`` atoms — for a
-    later :class:`~zoomy_core.derivation.closure.ResolveIntegral` to evaluate by
-    a chosen method (``basis`` / ``ftc`` / ``numerical``).
+    """PURELY ABSTRACT definite integral: wrap EACH additive term of the leaf in
+    an unevaluated ``sp.Integral(term, (var, lo, hi))`` and stop.  It performs NO
+    evaluation — no FTC, no ``∂_x``-commute, no Sum-push, no basis substitution.
+    All of that "smart" resolution is the job of
+    :class:`~zoomy_core.derivation.closure.ResolveIntegral` (the ``auto`` method
+    classifies each ``∫`` atom: ``∂_ζ`` → FTC, ``∂_x`` → commute, ``Sum`` → push,
+    ``φ``-bracket → basis matrix) or of
+    :class:`ExtractBrackets` (``∫c·φ_i φ_l → Gram(i,l)``).
 
-    A ``var``-independent ``∂_x`` derivative commutes OUT of the integral
-    (conservative flux).  This is the "slim" projection integral — it does NOT
-    evaluate the bracket; resolution is a separate, method-selectable step.
-    :class:`Project` is just ``Multiply(test)`` then this ``Integrate``.
+    Wrapping per additive term keeps the result readable — one ``∫`` per term —
+    and lets the resolution step decide each term's fate independently.
+
+    When ``var`` also appears in the bounds (a RUNNING integral, e.g.
+    ``bounds=(0, ζ)``) the integration variable would collide with the bound and
+    later ops would drag the σ-coordinate ζ into the rename.  In that case the
+    integrand is bound to a fresh ``\\hat{<var>}`` Dummy, leaving the bound ζ
+    free: ``∫_0^ζ ũ(\\hat ζ) d\\hat ζ``.  Pass ``dummy=`` to choose the symbol.
     """
 
     whole_leaf_op = True
 
-    def __init__(self, var=None, bounds=(0, 1), name="integrate"):
+    def __init__(self, var=None, bounds=(0, 1), dummy=None, name="integrate"):
         self._var = var if var is not None else sp.Symbol("zeta", real=True)
         self._bounds = tuple(bounds)
+        self._dummy = dummy
         super().__init__(
             name=name,
             description=f"∫ d{self._var} over {self._bounds} (abstract)")
 
     def _leaf_sp(self, sp_expr):
-        return _integrate_through_sum(sp_expr, self._var,
-                                      self._bounds[0], self._bounds[1])
+        var, (lo, hi) = self._var, self._bounds
+        # bind to a fresh dummy ONLY when var appears in the bounds (collision).
+        bound_syms = sp.sympify(lo).free_symbols | sp.sympify(hi).free_symbols
+        if self._dummy is not None:
+            bvar = self._dummy
+        elif var in bound_syms:
+            bvar = sp.Dummy(rf"\hat{{{sp.latex(var)}}}", real=True)
+        else:
+            bvar = var
+        return sp.Add(*[sp.Integral(term.subs(var, bvar) if bvar is not var else term,
+                                    (bvar, lo, hi))
+                        for term in sp.Add.make_args(sp.expand(sp_expr))])
 
 
 class Project(Operation):

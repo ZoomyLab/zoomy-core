@@ -5,10 +5,10 @@ Covers three building blocks:
 A. :class:`PDETransformation` — the explicit-geometry σ-map ``z = b + h·ζ``
    that mints decorated heads (``ũ``) of ``(t, x, ζ)`` and applies the σ
    chain rule with NO leftover ``Subs``.
-B. :func:`kinematic_bc` — a thin adapter that builds the production
-   :class:`zoomy_core.model.operations.KinematicBC` for a :class:`Model`,
-   reading coords from the model and decorated heads from the
-   PDETransformation's field-decoration map.
+B. :class:`~zoomy_core.model.operations.KinematicBC` — added to the model as an
+   oriented relation BEFORE the σ-map, σ-mapped in place by
+   :class:`PDETransformation` (``w(b) → w̃(0)`` …), then applied as a
+   substitution.
 C. the conservative fold — ``Multiply(h)`` + ``ProductRule()`` on a momentum
    row reaches divergence form (a ``∂_x(h·…)`` appears).
 """
@@ -17,7 +17,8 @@ import sympy as sp
 
 from zoomy_core import coords
 import zoomy_core.derivatives as d
-from zoomy_core.derivation import Model, PDETransformation, kinematic_bc
+from zoomy_core.derivation import Model, PDETransformation
+from zoomy_core.model.operations import KinematicBC
 
 
 t, x, z, zeta = coords.t, coords.x, coords.z, coords.zeta
@@ -164,14 +165,15 @@ def test_pde_stores_decoration_map_on_model():
     assert model._vertical == zeta
 
 
-# ── B. kinematic_bc ──────────────────────────────────────────────────────
+# ── B. KinematicBC (σ-mapped in place, then applied) ──────────────────────
 
 
 def test_kinematic_bc_substitutes_bed_relation():
-    """After the PDE-transform, applying the bed KBC replaces w̃|_{ζ=0}
-    with ∂_t b + ũ|_{ζ=0}·∂_x b."""
+    """A bed KBC added before the σ-map is σ-mapped in place; applying it
+    replaces w̃|_{ζ=0} with ∂_t b + ũ|_{ζ=0}·∂_x b."""
     model, s = _build()
     u, w, b = s["u"], s["w"], s["b"]
+    model.add_equation("kbc_bot", KinematicBC(w=w, u=u, interface=b))
     pde = PDETransformation({z: (zeta, sp.Eq(z, b + s["h"] * zeta))})
     model.apply(pde)
 
@@ -181,30 +183,29 @@ def test_kinematic_bc_substitutes_bed_relation():
     w_bed = w_tilde.subs(zeta, 0)
     model.mass.apply({sp.Derivative(w_tilde, zeta) / s["h"]: w_bed})
 
-    bc = kinematic_bc(model, w_field=w, u_field=u, interface=b, at=0)
-    model.mass.apply(bc)
+    model.apply(model.kbc_bot)            # apply the σ-mapped bed KBC
 
     mass = sp.expand(model.mass.expr)
-    expected = sp.Derivative(b, t) + u_tilde.subs(zeta, 0) * sp.Derivative(b, x)
     # w̃|_{ζ=0} is gone, replaced by the bed relation.
     assert not mass.has(w_bed)
     # The substituted relation's terms are present.
     assert mass.has(sp.Derivative(b, t))
     assert mass.has(u_tilde.subs(zeta, 0))
     # And the rest of the mass row (∂_x ũ) is untouched.
-    leftover = sp.expand(mass - expected)
-    assert leftover.has(sp.Derivative(u_tilde, x))
+    assert mass.has(sp.Derivative(u_tilde, x))
 
 
 def test_kinematic_bc_surface_interface():
+    """``PDETransformation`` σ-maps a stored surface KBC's ``{lhs: rhs}`` rule:
+    ``w(b+h) → w̃(1)``, ``u(b+h) → ũ(1)``."""
     model, s = _build()
     u, w, b, h = s["u"], s["w"], s["b"], s["h"]
+    model.add_equation("kbc_top", KinematicBC(w=w, u=u, interface=b + h))
     pde = PDETransformation({z: (zeta, sp.Eq(z, b + h * zeta))})
     model.apply(pde)
-    bc = kinematic_bc(model, w_field=w, u_field=u, interface=b + h, at=1)
     w_tilde = pde.decorated(w)
     u_tilde = pde.decorated(u)
-    (lhs, rhs), = bc.subs_map.items()
+    (lhs, rhs), = model.kbc_top.subs_map.items()
     assert lhs == w_tilde.subs(zeta, 1)
     expected_rhs = (sp.Derivative(b + h, t)
                     + u_tilde.subs(zeta, 1) * sp.Derivative(b + h, x))

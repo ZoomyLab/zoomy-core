@@ -17,7 +17,7 @@ import pytest
 
 from zoomy_core import coords
 import zoomy_core.derivatives as d
-from zoomy_core.derivation import Model, Substitution, ChangeOfVariables
+from zoomy_core.derivation import Model, ChangeOfVariables
 from zoomy_core.model.operations import Integrate
 from zoomy_core.misc.description import Description
 
@@ -97,10 +97,10 @@ def test_hydrostatic_elimination_removes_p_from_Q():
     # vertical (FTC: ∂_z p → p(η)−p(z)), impose the free-surface BC
     # p|_{z=b+h}=0, then solve_for the resulting ALGEBRAIC relation.
     model.momentum.z.apply(
-        Substitution({d.t(w): 0, d.x(u * w): 0, d.z(w * w): 0})
+        {d.t(w): 0, d.x(u * w): 0, d.z(w * w): 0}
     )
     model.momentum.z.apply(Integrate(z, z, b + h, method="analytical"))
-    model.momentum.z.apply(Substitution({p.subs(z, b + h): 0}))
+    model.momentum.z.apply({p.subs(z, b + h): 0})
     p_hydro = model.momentum.z.solve_for(p)
 
     # p_hydro maps the field p to its hydrostatic profile.
@@ -110,7 +110,7 @@ def test_hydrostatic_elimination_removes_p_from_Q():
     assert sp.simplify(sol - rho * g * (b + h - z)) == 0
 
     # Substitute into x-momentum, then remove the z-momentum row.
-    model.momentum.x.apply(Substitution(p_hydro))
+    model.momentum.x.apply(p_hydro)
     model.momentum.z.remove()
 
     # p no longer appears in any equation -> auto-dropped from Q.
@@ -134,7 +134,7 @@ def test_vector_equation_component_access():
 def test_vector_component_apply_is_isolated():
     model, s = _build_sme()
     before_x = model.momentum.x.expr
-    model.momentum.z.apply(Substitution({s["g"]: 0}))
+    model.momentum.z.apply({s["g"]: 0})
     # Touching z must not change x.
     assert model.momentum.x.expr == before_x
     assert not model.momentum.z.expr.has(s["g"])
@@ -149,7 +149,7 @@ def test_term_selection_restricts_apply():
     # mass = ∂_x u + ∂_z w  (two terms).  Zero out only term 0 via ``.term``.
     mass = model.mass
     assert len(mass) == 2
-    mass.term[0].apply(Substitution({d.x(u): 0}))
+    mass.term[0].apply({d.x(u): 0})
     assert sp.expand(model.mass.expr) == sp.expand(d.z(w))
 
 
@@ -210,7 +210,7 @@ def test_term_accessor_single_and_group():
     grp = model.mass.term[[0, 1]]
     assert sp.expand(grp.expr) == sp.expand(d.x(u) + d.z(w))
     # Group apply rewrites only those terms (here: zero both) back in place.
-    grp.apply(Substitution({d.x(u): 0, d.z(w): 0}))
+    grp.apply({d.x(u): 0, d.z(w): 0})
     assert sp.expand(model.mass.expr) == 0
 
 
@@ -222,7 +222,7 @@ def test_bare_equation_indexing_no_longer_returns_a_term():
     with pytest.raises(TypeError):
         _ = model.mass[0]
     with pytest.raises(TypeError):
-        model.mass[0].apply(Substitution({d.x(s["u"]): 0}))
+        model.mass[0].apply({d.x(s["u"]): 0})
 
 
 # ── (e) describe renders ─────────────────────────────────────────────────
@@ -245,12 +245,12 @@ def test_equation_describe_renders():
     assert "mass" in desc.to_markdown()
 
 
-# ── ChangeOfVariables vs bare Substitution (Q-swap semantics) ────────────
+# ── ChangeOfVariables vs a bare substitution (Q-swap semantics) ────────────
 
 
 def test_change_of_variables_swaps_unknown_family():
     """``ChangeOfVariables`` swaps the unknown family in Q; a bare
-    ``Substitution`` must NOT touch Q."""
+    A bare substitution must NOT touch Q."""
     model = Model(coords=(t, x), parameters={})
     a0 = sp.Function("a")(0, t, x)
     a1 = sp.Function("a")(1, t, x)
@@ -281,5 +281,5 @@ def test_bare_substitution_does_not_swap_Q():
     model.Q = [h, a0]
     model.add_equation("c0", d.t(a0))
     # A bare value substitution does not redeclare unknowns.
-    model.apply(Substitution({d.t(a0): d.x(a0)}))
+    model.apply({d.t(a0): d.x(a0)})
     assert set(model.Q.keys()) == {"h", "a"}

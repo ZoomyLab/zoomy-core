@@ -2,7 +2,7 @@
 
 ``resolve_modes`` takes a row carrying an ABSTRACT test index ``l`` (after a
 Galerkin ``Project(c·φ(l,ζ)) + ExtractBrackets`` style projection) and expands
-it, via the existing outer-product ``Substitution(over=range(N+1), target=l)``,
+it, via a per-mode index specialisation ``{l: k}``,
 into one row per ``l``, GROUPED UNDER THE PARENT as an indexed moment family.
 
 Shape algebra:
@@ -24,7 +24,7 @@ import zoomy_core.derivatives as d
 from zoomy_core.derivation import (
     Model, PDETransformation, Basis,
     separation_of_variables, reset_modal_indices, modal_bound,
-    Substitution, resolve_modes,
+    resolve_modes,
 )
 from zoomy_core.model.operations import Legendre_shifted
 
@@ -170,7 +170,7 @@ def test_resolve_modes_with_galerkin_close():
     model.apply(separation_of_variables(u, a(t, x), basis, N_u))
     model.apply(separation_of_variables(w, a_w(t, x), basis, N_u + 1))
     N = 2
-    model.apply(Substitution({N_u: N}))
+    model.apply({N_u: N})
     for eq in model._equations.values():
         eq.expr = eq.expr.replace(lambda e: isinstance(e, sp.Sum),
                                   lambda e: e.doit())

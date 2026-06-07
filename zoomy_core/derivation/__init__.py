@@ -23,12 +23,12 @@ from .model import (
     Model, VectorEquation, MomentFamily, resolve_modes, ResolveModes,
 )
 from .operations import (
-    Substitution,
+    SolveFor,
     ChangeOfVariables,
     Granularity,
     granularity_of,
 )
-from .transformations import PDETransformation, kinematic_bc
+from .transformations import PDETransformation
 from .basis import Basis
 from .modal import (
     ModalIndexRegistry,
@@ -56,9 +56,12 @@ from .closure import (
     ResolveIntegral,
     InvertMassMatrix,
     FoldConservative,
+    Split,
     Simplify,
-    kinematic_modal_closure,
-    mass_relation,
+    AutoTag,
+    SortByTag,
+    Sort,
+    TAG_ORDER,
     fold_to_conservative_form,
     is_conservative_diffusion,
     project_conservative_diffusion,
@@ -71,12 +74,11 @@ __all__ = [
     "MomentFamily",
     "resolve_modes",
     "ResolveModes",
-    "Substitution",
+    "SolveFor",
     "ChangeOfVariables",
     "Granularity",
     "granularity_of",
     "PDETransformation",
-    "kinematic_bc",
     "Basis",
     "ModalIndexRegistry",
     "reset_modal_indices",
@@ -99,9 +101,12 @@ __all__ = [
     "ResolveIntegral",
     "InvertMassMatrix",
     "FoldConservative",
+    "Split",
     "Simplify",
-    "kinematic_modal_closure",
-    "mass_relation",
+    "AutoTag",
+    "SortByTag",
+    "Sort",
+    "TAG_ORDER",
     "fold_to_conservative_form",
     "is_conservative_diffusion",
     "project_conservative_diffusion",

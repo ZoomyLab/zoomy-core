@@ -4,10 +4,12 @@ General-purpose INS equation framework with composable projection operations.
 Class hierarchy:
     StateSpace      — shared symbols (coordinates, fields, stress tensor, parameters)
     SymbolicBase    — name + display
-    ├── Expression  — PDE terms with .project(), .ibp(), .apply(), .terms, [i]
-    └── Relation    — lhs = rhs substitution rules with .apply_to()
-        ├── Assumption  — physical conditions (kinematic BCs, hydrostatic)
-        └── Material    — constitutive models (Newtonian, inviscid)
+    RelationMixin   — the {lhs: rhs} orientation surface (.lhs/.rhs/.subs_map)
+    └── Expression  — PDE terms with .project(), .ibp(), .apply(), .terms, [i];
+                      ORIENTED (from sp.Eq / .solve_for) it IS a relation/BC and
+                      applies as a substitution.  KinematicBC, Newtonian,
+                      HydrostaticPressure, … are oriented Expression subclasses —
+                      there is no separate Relation/Assumption/Material class.
 
     FullINS(state)  — builds INS equations from a StateSpace
 
@@ -128,10 +130,59 @@ class SymbolicBase:
 
 
 # ---------------------------------------------------------------------------
+# RelationMixin: the {lhs: rhs} orientation surface
+# ---------------------------------------------------------------------------
+
+class RelationMixin:
+    """Orientation surface shared by :class:`Expression` and
+    :class:`~zoomy_core.model.equation.Equation`.
+
+    An expression/equation OPTIONALLY carries a ``{lhs: rhs}`` relation in
+    ``_as_relation`` — set either by :meth:`Expression.solve_for` (which
+    isolates a symbol) or by constructing from ``sp.Eq(lhs, rhs)``.  When
+    present it acts as a substitution under ``.apply`` (the dispatcher reads
+    ``_as_relation``) and exposes a dict-like ``.lhs`` / ``.rhs`` /
+    ``.subs_map`` surface.  So a SOLVED equation *is* the relation — there is
+    no separate ``Relation`` / ``Substitution`` class.
+
+    When NOT oriented, the object is a plain residual ``expr == 0``: ``.lhs``
+    is the residual, ``.rhs`` is ``0``, ``.subs_map`` is empty.
+    """
+
+    #: Default (class-level): no relation attached.  ``solve_for`` / the
+    #: ``sp.Eq`` constructor set an instance-level dict.
+    _as_relation = None
+
+    @property
+    def oriented(self) -> bool:
+        """True when this carries a ``{lhs: rhs}`` relation."""
+        return bool(self._as_relation)
+
+    @property
+    def subs_map(self) -> dict:
+        """The ``{lhs: rhs}`` substitution rules (empty dict if not oriented)."""
+        return dict(self._as_relation) if self._as_relation else {}
+
+    @property
+    def lhs(self):
+        """Left side — the solved-for symbol when oriented, else the residual."""
+        if self._as_relation and len(self._as_relation) == 1:
+            return next(iter(self._as_relation))
+        return self.expr
+
+    @property
+    def rhs(self):
+        """Right side — the solution when oriented, else ``0``."""
+        if self._as_relation and len(self._as_relation) == 1:
+            return next(iter(self._as_relation.values()))
+        return S.Zero
+
+
+# ---------------------------------------------------------------------------
 # Expression: composable symbolic PDE term
 # ---------------------------------------------------------------------------
 
-class Expression(SymbolicBase):
+class Expression(RelationMixin, SymbolicBase):
     """
     Symbolic expression for PDE terms.
 
@@ -148,7 +199,16 @@ class Expression(SymbolicBase):
                  term_tags=None, tag_order=None):
         super().__init__(name)
         if isinstance(expr, Expression):
+            if expr._as_relation:
+                self._as_relation = dict(expr._as_relation)
             expr = expr.expr
+        # ``Expression(sp.Eq(lhs, rhs))`` builds an ORIENTED expression: the
+        # residual ``lhs - rhs`` is the source of truth (every op acts on it),
+        # while ``_as_relation`` records the ``{lhs: rhs}`` substitution that
+        # ``.apply`` consumes.  ``Expression(expr)`` stays the plain ``expr == 0``.
+        if isinstance(expr, sp.Equality):
+            self._as_relation = {expr.lhs: expr.rhs}
+            expr = expr.lhs - expr.rhs
         self.expr = sp.sympify(expr) if not isinstance(expr, sp.Basic) else expr
         # Physical tags: per-additive-term labels for the display view.
         # ``_term_tags`` maps each tagged term (sp.Expr) to the tag name it
@@ -660,15 +720,20 @@ class Expression(SymbolicBase):
                     f"from per-term apply; rank-changing Operations must be "
                     f"invoked at the tree level, not through Expression.apply."
                 )
+            # An ORIENTED Expression / Equation (or anything carrying a
+            # ``{lhs: rhs}`` relation) acts as a substitution — this is the
+            # single relation path now that Relation/Substitution are gone.
             rel = getattr(cond, "_as_relation", None)
             if isinstance(rel, dict) and rel:
                 expr = _resolve_subs(expr)
                 return expr.subs(rel)
-            if isinstance(cond, Relation) or hasattr(cond, 'apply_to'):
+            if isinstance(cond, dict):
                 expr = _resolve_subs(expr)
-                return cond.apply_to(expr)
-            elif isinstance(cond, dict):
-                expr = _resolve_subs(expr)
+                # Sympify both sides so a raw ``0`` rhs (``{∂_t b: 0}``) never
+                # leaks a Python ``int`` through ``xreplace`` — which would
+                # otherwise return the bare ``0`` and break the ``.has`` checks
+                # downstream (this is what the old ``Substitution`` did for us).
+                cond = {sp.sympify(k): sp.sympify(v) for k, v in cond.items()}
                 # ``xreplace`` is purely structural — no dummy-dependency
                 # safety check — so it handles the basis-expansion case
                 # where the RHS contains the integration variable (``ζ``
@@ -1384,7 +1449,17 @@ class Expression(SymbolicBase):
         if header:
             parts.append(f"**{self.name}** ({len(self)} terms)")
 
-        if final_equation:
+        if final_equation and self._as_relation:
+            # ORIENTED: render the substitution rules ``lhs = rhs`` (one per
+            # line) rather than the ``residual = 0`` form — this is the
+            # ``{a: b}`` view of a solved equation / kinematic BC.
+            _printer = _StripArgsLatexPrinter() if strip_args else None
+            _tex = (lambda e: _printer.doprint(e)) if _printer else sp.latex
+            rules = " \\\\ ".join(
+                f"{_tex(lhs)} = {_tex(rhs)}"
+                for lhs, rhs in self._as_relation.items())
+            parts.append(f"\n$$\n\\begin{{aligned}} {rules} \\end{{aligned}}\n$$")
+        elif final_equation:
             # Match System.describe: use multiline underbrace rendering when
             # term_groups are populated (otherwise model.describe and
             # model.<eq>.describe show the same equation differently).
@@ -1439,7 +1514,26 @@ def _append_subscript(tex_name: str, idx_tex: str) -> str:
     return f"{tex_name}_{{{idx_tex}}}"
 
 
-class _StripArgsLatexPrinter(_LatexPrinter):
+class _BracketLatexPrinter(_LatexPrinter):
+    """LaTeX printer that parenthesises a COMPOUND differentiation argument so a
+    conservative flux ``∂_x(h·b)`` is visually distinct from the
+    non-conservative ``∂_x(h)·b``.  sympy's default prints both as ``∂_x h b``
+    (no parens), which is ambiguous; here ``∂_x(h·b)`` keeps its bracket while a
+    bare ``∂_x h`` (single factor) stays bracket-free.  Base for the
+    arg-stripping printer so the rule applies with or without ``strip_args``."""
+
+    def _print_Derivative(self, expr):
+        tex = super()._print_Derivative(expr)
+        inner = expr.expr
+        if isinstance(inner, (sp.Add, sp.Mul)):
+            inner_tex = self._print(inner)
+            if tex.endswith(inner_tex):
+                return (tex[:-len(inner_tex)]
+                        + r"\left(" + inner_tex + r"\right)")
+        return tex
+
+
+class _StripArgsLatexPrinter(_BracketLatexPrinter):
     """LaTeX printer for function calls.
 
     One unified rule.  Each function shape has a *canonical* call —
@@ -1783,110 +1877,6 @@ class IBPResult:
 # Relation: lhs = rhs substitution rules
 # ---------------------------------------------------------------------------
 
-class Relation(SymbolicBase):
-    """
-    A symbolic relation: one or more substitution rules lhs_i = rhs_i.
-
-    Used as base for Assumption and Material. Can be applied to Expressions
-    via expr.apply(relation), which calls relation.apply_to(expr).
-
-    Displays as a system of equations in notebooks.
-    """
-
-    def __init__(self, substitutions, name=""):
-        """
-        Parameters
-        ----------
-        substitutions : dict {lhs_expr: rhs_expr} or list of (lhs, rhs) tuples
-        name : str
-        """
-        super().__init__(name)
-        if isinstance(substitutions, dict):
-            self.subs_map = dict(substitutions)
-        elif isinstance(substitutions, (list, tuple)):
-            self.subs_map = dict(substitutions)
-        else:
-            raise TypeError("substitutions must be a dict or list of (lhs, rhs) tuples")
-
-    def apply_to(self, expr):
-        """Substitute all lhs -> rhs in the given SymPy expression."""
-        result = expr
-        for lhs, rhs in self.subs_map.items():
-            result = result.subs(lhs, rhs)
-        return result
-
-    def solve_for(self, variable):
-        """Re-solve every rule ``lhs = rhs`` for ``variable`` and return a
-        new :class:`Relation` with substitution dict ``{variable: solution}``.
-
-        Pipeline-style counterpart to :meth:`Expression.solve_for`: lets a
-        chain author flip the substitution direction of a relation
-        without rewriting the relation by hand.  Example: a kinematic
-        BC ``w|_eta = ∂_t eta + u·∂_x eta`` re-solved for
-        ``Derivative(state.h, state.t)`` returns
-        ``{Derivative(h, t): w|_eta - Derivative(b, t) - u·∂_x eta}``,
-        which is exactly the substitution Leibniz boundary terms need to
-        cancel against the ∂_z fundamental-theorem boundaries.
-
-        Each rule contributes one substitution; if multiple rules
-        contain ``variable`` in their balance ``lhs - rhs``, all are
-        re-solved and merged into one dict (later wins on duplicate
-        keys, matching ``dict.update`` semantics).
-
-        Raises ``ValueError`` if no rule's balance contains ``variable``
-        (so the call is never silently a no-op).
-        """
-        new_map = {}
-        found = False
-        for lhs, rhs in self.subs_map.items():
-            balance = lhs - rhs
-            if variable not in balance.free_symbols and not balance.has(variable):
-                continue
-            solutions = sp.solve(balance, variable)
-            if not solutions:
-                continue
-            new_map[variable] = solutions[0]
-            found = True
-        if not found:
-            raise ValueError(
-                f"{type(self).__name__}.solve_for: no rule of "
-                f"{self.name or 'this relation'} contains {variable!r}; "
-                f"cannot expose that direction."
-            )
-        # Build the inverse-direction relation as a plain ``Relation``:
-        # specialised subclasses (``InterfaceKBC``, ``HydrostaticPressure``,
-        # ...) carry constructor signatures tied to physics inputs, not
-        # raw substitution dicts, so the inverse instance lives at the
-        # base level.  The substitution semantics are identical.
-        return Relation(new_map, name=f"{self.name}_for_{variable}")
-
-    def __len__(self):
-        return len(self.subs_map)
-
-    def __repr__(self):
-        lines = [f"{self.__class__.__name__}(name={self.name!r}, {len(self)} rules):"]
-        for lhs, rhs in self.subs_map.items():
-            lines.append(f"  {lhs} = {rhs}")
-        return "\n".join(lines)
-
-    def _repr_latex_(self):
-        lines = []
-        for lhs, rhs in self.subs_map.items():
-            lines.append(f"{sp.latex(lhs)} = {sp.latex(rhs)}")
-        body = " \\\\ ".join(lines)
-        return f"$\\begin{{aligned}} {body} \\end{{aligned}}$"
-
-
-class Assumption(Relation):
-    """Physical assumption (kinematic BC, hydrostatic, etc.)."""
-    pass
-
-
-class Material(Relation):
-    """Constitutive model (Newtonian, inviscid, etc.)."""
-    pass
-
-
 # ---------------------------------------------------------------------------
 # Operation: callable transformation applied to all equations
 # ---------------------------------------------------------------------------
@@ -2147,9 +2137,9 @@ class ApplyKinematicBCs(Operation):
         if expr.has(sp.Subs):
             subs_map = {s: s.doit() for s in expr.atoms(sp.Subs)}
             expr = expr.subs(subs_map)
-        # Apply both BCs
+        # Apply both BCs (oriented Expressions → substitute their {lhs: rhs}).
         for bc in [self._kbc_s, self._kbc_b]:
-            expr = bc.apply_to(expr)
+            expr = expr.subs(bc.subs_map)
         # Simplify (cancels d(b+h)/dt - db/dt → dh/dt)
         return _simplify_preserve_integrals(expr)
 
@@ -4530,13 +4520,30 @@ def FullINS(state, equations=None):
 # Material models library
 # ---------------------------------------------------------------------------
 
-class Newtonian(Material):
+def _init_relation_expr(obj, rules, name=""):
+    """Initialise ``obj`` (an :class:`Expression` subclass) as an ORIENTED
+    MULTI-RULE relation from a ``{lhs: rhs}`` dict.
+
+    The residual ``Σ(lhs − rhs)`` is the term-list source of truth; the
+    ``{lhs: rhs}`` rules are recorded in ``_as_relation`` so ``.apply``
+    substitutes every one.  This is how constitutive laws and multi-component
+    boundary conditions (Newtonian, HydrostaticPressure, …) are built now that
+    there is no ``Relation`` / ``Assumption`` / ``Material`` base — a relation
+    is simply an oriented Expression.
+    """
+    rules = {sp.sympify(k): sp.sympify(v) for k, v in dict(rules).items()}
+    residual = sp.Add(*[k - v for k, v in rules.items()])
+    Expression.__init__(obj, residual, name=name)
+    obj._as_relation = rules
+
+
+class Newtonian(Expression):
     """Newtonian fluid: tau_ij = mu * (du_i/dx_j + du_j/dx_i), mu = rho * nu."""
 
     def __init__(self, state: StateSpace, nu=None):
         self.nu = nu if nu is not None else Symbol("nu", positive=True)
         subs = self._build(state, self.nu)
-        super().__init__(subs, name="Newtonian")
+        _init_relation_expr(self, subs, name="Newtonian")
 
     @staticmethod
     def _build(s, nu):
@@ -4561,12 +4568,12 @@ class Newtonian(Material):
         return subs
 
 
-class Inviscid(Material):
+class Inviscid(Expression):
     """Inviscid fluid: all tau_ij = 0."""
 
     def __init__(self, state: StateSpace):
         subs = {v: S.Zero for v in state.tau.values()}
-        super().__init__(subs, name="Inviscid")
+        _init_relation_expr(self, subs, name="Inviscid")
 
 
 class materials:
@@ -4748,7 +4755,7 @@ class LayerMeanClosure(Operation):
 # Assumptions library
 # ---------------------------------------------------------------------------
 
-class KinematicBC(Assumption):
+class KinematicBC(Expression):
     """Kinematic boundary condition at a moving interface.
 
     One explicit signature covering every kinematic-BC pattern in the
@@ -4818,25 +4825,44 @@ class KinematicBC(Assumption):
             sys_layer_below.apply(KinematicBC(state_below, z_k, at=1, mass_flux=m_k))
     """
 
-    def __init__(self, state, interface, src=None, *, at=None,
+    def __init__(self, state=None, interface=None, src=None, *, at=None,
+                 w=None, u=None, v=None,
                  rho=None, mass_flux=None, name=None, description=None):
-        # In the new design, ``u, v, w`` live on MassMomentum (``src``)
-        # and ``rho`` on Model.parameters — not on StateSpace.  Accept
-        # both as kwargs; fall back to ``state.u / state.v / state.w /
-        # state.rho`` if not supplied (legacy StateSpace still has them).
-        s = state
-        flow = src if src is not None else state
+        # Two construction modes, same resulting relation:
+        #   • StateSpace (multilayer / production):
+        #       KinematicBC(state, interface, src, at=…)
+        #     — fields and coords read off the ``state``/``src`` namespaces.
+        #   • field-based (derivation Model — no StateSpace needed):
+        #       KinematicBC(w=w, u=u, interface=…)
+        #     — the applied velocity Functions are passed directly, and the
+        #     coords are INFERRED from ``w``'s argument list (t, x[, y], z =
+        #     last arg).  This is what lets a derivation write
+        #     ``model.add_equation("kbc", KinematicBC(w=w, u=u, interface=b))``
+        #     with no adapter.
+        if w is not None:
+            wf, uf, vf = w, u, v
+            a = wf.args
+            s_t, s_x, s_z = a[0], a[1], a[-1]
+            has_y = len(a) == 4
+            s_y = a[2] if has_y else None
+            rho_fallback = None
+        else:
+            s = state
+            flow = src if src is not None else state
+            wf, uf, vf = flow.w, flow.u, getattr(flow, "v", None)
+            s_t, s_x, s_z = s.t, s.x, s.z
+            has_y = getattr(s, "has_y", False)
+            s_y = getattr(s, "y", None)
+            rho_fallback = getattr(state, "rho", None)
         if at is None:
             at = interface
-        w_at = flow.w.subs(s.z, at)
-        u_at = flow.u.subs(s.z, at)
-        rhs = Derivative(interface, s.t) + u_at * Derivative(interface, s.x)
-        has_y = getattr(s, "has_y", False)
-        if has_y:
-            v_at = flow.v.subs(s.z, at)
-            rhs += v_at * Derivative(interface, s.y)
+        w_at = wf.subs(s_z, at)
+        u_at = uf.subs(s_z, at)
+        rhs = Derivative(interface, s_t) + u_at * Derivative(interface, s_x)
+        if has_y and vf is not None:
+            rhs += vf.subs(s_z, at) * Derivative(interface, s_y)
         if mass_flux is not None:
-            rho_sym = rho if rho is not None else getattr(state, "rho", None)
+            rho_sym = rho if rho is not None else rho_fallback
             if rho_sym is None:
                 raise ValueError(
                     "KinematicBC: `mass_flux` requires a `rho` kwarg "
@@ -4849,13 +4875,16 @@ class KinematicBC(Assumption):
             # ``kinematic_bc@interface|_{at=...}``.
             name = (f"kinematic_bc@{interface}" if at == interface
                     else f"kinematic_bc@{interface}|_{{at={at}}}")
-        super().__init__({w_at: rhs}, name=name)
-        # ``Relation.__init__`` doesn't carry a description; attach so
+        # A kinematic BC IS an oriented equation ``w|_at = rhs``: build it as
+        # an :class:`Expression` from ``sp.Eq`` so it carries ``_as_relation``
+        # ({w_at: rhs}) and applies as a substitution — no Relation class.
+        super().__init__(sp.Eq(w_at, rhs), name=name)
+        # ``Expression.__init__`` doesn't carry a description; attach so
         # history-mermaid labels stay readable.
         flux_tail = f" + {mass_flux}/ρ" if mass_flux is not None else ""
         self.description = description or (
             f"w|_{{at={at}}} = ∂_t {interface} + u|·∂_x {interface}"
-            f"{' + v|·∂_y ' + str(interface) if s.has_y else ''}"
+            f"{' + v|·∂_y ' + str(interface) if has_y else ''}"
             f"{flux_tail}"
         )
 
@@ -4890,7 +4919,7 @@ InterfaceKBC = KinematicBC
 # from the kinematic boundary condition.
 
 
-class NoTangentialBoundaryStress(Assumption):
+class NoTangentialBoundaryStress(Expression):
     """Zero tangential normal stress at both surface and bottom.
 
     Closes the Leibniz boundary terms ``tau_xx(z=b)``, ``tau_xx(z=eta)``
@@ -4912,20 +4941,20 @@ class NoTangentialBoundaryStress(Assumption):
             subs[s.tau["xy"].subs(s.z, s.eta)] = S.Zero
             subs[s.tau["yx"].subs(s.z, s.b)] = S.Zero
             subs[s.tau["yx"].subs(s.z, s.eta)] = S.Zero
-        super().__init__(subs, name="no_tangential_boundary_stress")
+        _init_relation_expr(self, subs, name="no_tangential_boundary_stress")
 
 
-class HydrostaticPressure(Assumption):
+class HydrostaticPressure(Expression):
     """p = p_atm + rho * g * (eta - z)"""
 
     def __init__(self, state: StateSpace):
         s = state
         p_atm = Function("p_atm", real=True)(s.t, *s.coords_h)
         p_hydro = p_atm + s.rho * s.g * (s.eta - s.z)
-        super().__init__({s.p: p_hydro}, name="hydrostatic_pressure")
+        _init_relation_expr(self, {s.p: p_hydro}, name="hydrostatic_pressure")
 
 
-class StressFreeSurface(Assumption):
+class StressFreeSurface(Expression):
     """Stress-free surface: τ·n|_{z=η} = 0.
 
     For a free surface with normal n ≈ (0,0,1), this gives:
@@ -4946,15 +4975,15 @@ class StressFreeSurface(Assumption):
             subs[s.tau["yz"].subs(s.z, s.eta)] = S.Zero
             if "zy" in s.tau:
                 subs[s.tau["zy"].subs(s.z, s.eta)] = S.Zero
-        super().__init__(subs, name="stress_free_surface")
+        _init_relation_expr(self, subs, name="stress_free_surface")
 
 
-class ZeroAtmosphericPressure(Assumption):
+class ZeroAtmosphericPressure(Expression):
     """p_atm = 0 (no atmospheric pressure)."""
 
     def __init__(self, state: StateSpace):
         p_atm = Function("p_atm", real=True)(state.t, *state.coords_h)
-        super().__init__({p_atm: S.Zero}, name="p_atm=0")
+        _init_relation_expr(self, {p_atm: S.Zero}, name="p_atm=0")
 
 
 class _FieldExpansion:
@@ -5374,9 +5403,21 @@ def _canonicalize_integral_dummies(expr):
         return expr
     canon_by_depth: dict[int, sp.Dummy] = {}
 
-    def _canon(depth):
+    def _hat_name(old_var):
+        # The canonical bound variable is the INPUT variable, hatted:
+        # ``∫ … dζ`` → ``\hat{\zeta}``, ``∫ … dz`` → ``\hat{z}``.  Already
+        # hatted vars (a fresh running-integral Dummy ``\hat{\zeta}``) are
+        # kept verbatim so re-canonicalisation never double-hats.
+        nm = getattr(old_var, "name", "")
+        if nm.startswith(r"\hat{") and nm.endswith("}"):
+            return nm
+        return rf"\hat{{{sp.latex(old_var)}}}"
+
+    def _canon(depth, old_var):
+        # One Dummy per nesting depth (alpha-equivalence of sibling
+        # integrals is preserved); the NAME follows the input variable.
         if depth not in canon_by_depth:
-            canon_by_depth[depth] = sp.Dummy(r"\hat{z}", positive=True)
+            canon_by_depth[depth] = sp.Dummy(_hat_name(old_var), positive=True)
         return canon_by_depth[depth]
 
     def _walk(e, depth=0):
@@ -5385,7 +5426,7 @@ def _canonicalize_integral_dummies(expr):
             limits = e.args[1]
             if hasattr(limits, "__len__") and len(limits) == 3:
                 old_var, lo, hi = limits
-                new_var = _canon(depth)
+                new_var = _canon(depth, old_var)
                 if old_var is new_var:
                     if integrand is not e.args[0]:
                         return Integral(integrand, *e.args[1:])

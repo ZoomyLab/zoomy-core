@@ -58,13 +58,55 @@ __all__ = [
     "ResolveIntegral",
     "InvertMassMatrix",
     "FoldConservative",
+    "Split",
     "Simplify",
-    "kinematic_modal_closure",
-    "mass_relation",
+    "AutoTag",
+    "SortByTag",
+    "Sort",
+    "TAG_ORDER",
     "fold_to_conservative_form",
     "is_conservative_diffusion",
     "project_conservative_diffusion",
 ]
+
+
+class Split(Operation):
+    """Fold a SELF-PRODUCT flux term ``c·f·∂_x f`` into the conservative form
+    ``∂_x(c·f²/2)`` by the HALF product rule.
+
+    A plain inverse :class:`~zoomy_core.model.operations.ProductRule` on
+    ``g·h·∂_x h`` only *recombines* it (``∂_x(g h²) − g·h·∂_x h = g·h·∂_x h``,
+    value-preserving) because the field ``h`` appears both as coefficient and
+    under the derivative.  The trick is to SPLIT the term in two and apply the
+    product rule to ONE half — whose residual exactly cancels the other half:
+
+    .. math::
+
+        g h\\,∂_x h
+          = \\tfrac12 g h\\,∂_x h + \\tfrac12 g h\\,∂_x h
+          \\;\\xrightarrow{\\text{PR on 1st half}}\\;
+          \\tfrac12\\big(∂_x(g h^2) - g h\\,∂_x h\\big) + \\tfrac12 g h\\,∂_x h
+          = ∂_x\\!\\big(\\tfrac{g h^2}{2}\\big).
+
+    So ``Split = ½·I + ½·ProductRule⁻¹`` — value-preserving, and the natural way
+    to recover the hydrostatic pressure ``∂_x(g h²/2)`` from ``g·h·∂_x h``
+    WITHOUT a post-hoc fold.  Apply it (via ``term[[i]].apply(Split())``) to the
+    self-product terms only."""
+
+    whole_leaf_op = True
+
+    def __init__(self, variables=None, name="split"):
+        self._vars = variables
+        desc = ("half product rule  c·f·∂f → ∂(c·f²/2)"
+                + (f" on {{{', '.join(str(v) for v in variables)}}}"
+                   if variables is not None else ""))
+        super().__init__(name=name, description=desc)
+
+    def _leaf_sp(self, sp_expr):
+        from zoomy_core.model.operations import ProductRule
+        pr = ProductRule(variables=self._vars, direction="inverse")
+        return sp.Rational(1, 2) * sp_expr \
+            + sp.Rational(1, 2) * pr._leaf_sp(sp_expr)
 
 
 class InvertMassMatrix(Operation):
@@ -100,7 +142,14 @@ class InvertMassMatrix(Operation):
                    if D.variables == (t,)]
             if len(dts) == 1:
                 cand = sp.simplify(term / dts[0])
-                if cand != 0 and not cand.has(t):     # a clean coefficient
+                # The mass-matrix diagonal is the PURELY NUMERIC Legendre factor
+                # ``1/(2k+1)`` multiplying the conserved ``∂_t Q_k``.  Apply this
+                # op AFTER the change of variables ``a→q/h``: the conservative
+                # ``(1/(2k+1))∂_t(h a_k)`` then reads ``(1/(2k+1))∂_t q_k`` with a
+                # t-FREE coefficient, while any leftover surface-trace ``∂_t h``
+                # keeps a t-bearing coefficient ``(Σq_k)/h`` — so the t-free guard
+                # selects exactly the mass-matrix term and ignores the traces.
+                if cand != 0 and not cand.has(t):
                     mass = cand
                     break
         if mass in (None, sp.S.Zero, sp.S.One):
@@ -399,7 +448,7 @@ class ResolveIntegral(Operation):
 
     whole_leaf_op = True
 
-    def __init__(self, basis_cls=None, *, var=None, method="basis", level=None,
+    def __init__(self, basis_cls=None, *, var=None, method="auto", level=None,
                  weight=None, classify=None, bounds=(0, 1),
                  name="resolve_integral"):
         self._var = var if var is not None else sp.Symbol("zeta", real=True)
@@ -431,6 +480,8 @@ class ResolveIntegral(Operation):
         var = lim[0]
         lo, hi = (lim[1], lim[2]) if len(lim) == 3 else self._bounds
         method = self._method_for(integral)
+        if method == "auto":
+            return self._auto_resolve(integrand, var, lo, hi)
         if method == "ftc":
             return self._ftc(integrand, var, lo, hi)
         if method == "basis":
@@ -438,6 +489,62 @@ class ResolveIntegral(Operation):
         if method == "numerical":
             return sp.integrate(integrand, (var, lo, hi))
         raise ValueError(f"ResolveIntegral: unknown method {method!r}")
+
+    # ── auto: classify each additive term by SHAPE (the "smart" resolution) ──
+    def _auto_resolve(self, integrand, var, lo, hi):
+        """Resolve ``∫_lo^hi integrand d(var)`` by classifying each additive term:
+        a bare ``∂_var`` body → FTC; a bare ``∂_w`` (``w≠var``) with a
+        ``w``-independent rest → the derivative COMMUTES OUT (conservative flux);
+        a single ``Sum`` factor → push the integral inside; a φ-basis bracket →
+        substitute the concrete basis and integrate the polynomial; anything
+        else stays an opaque ``∫`` atom.  This is the only smart integrator —
+        :class:`~zoomy_core.derivation.projection.Integrate` merely builds the
+        abstract ``∫`` for it to act on."""
+        out = sp.S.Zero
+        for term in sp.Add.make_args(sp.expand(integrand)):
+            out += self._auto_term(term, var, lo, hi)
+        return out
+
+    def _auto_term(self, term, var, lo, hi):
+        coeff, rest = term.as_independent(var, as_Add=False)
+        if rest == 1:                                       # constant in var
+            return coeff * (hi - lo)
+        # a bare outer derivative as the whole var-dependent body
+        if isinstance(rest, sp.Derivative) and len(rest.variables) == 1:
+            dvar = rest.variables[0]
+            g = rest.args[0]
+            if dvar == var:                                 # FTC over var
+                return coeff * (g.subs(var, hi) - g.subs(var, lo))
+            return coeff * sp.Derivative(                   # conservative commute
+                self._auto_resolve(g, var, lo, hi), dvar)
+        factors = list(rest.args) if isinstance(rest, sp.Mul) else [rest]
+        # a bare ``∂_w`` factor (w≠var) whose remaining factors+coeff are
+        # w-independent commutes OUT of the integral (conservative flux).
+        for f in factors:
+            if (isinstance(f, sp.Derivative) and len(f.variables) == 1
+                    and f.variables[0] != var):
+                dw = f.variables[0]
+                others = sp.Mul(*[g for g in factors if g is not f])
+                if not (coeff * others).has(dw):
+                    inner = self._auto_resolve(others * f.expr, var, lo, hi)
+                    return coeff * sp.Derivative(inner, dw)
+                break
+        # a single unexpanded Sum factor: push the integral inside.
+        sums = [f for f in factors if isinstance(f, sp.Sum)]
+        if len(sums) == 1:
+            the_sum = sums[0]
+            others = sp.Mul(*[f for f in factors if f is not the_sum])
+            cc, dep = the_sum.function.as_independent(var, as_Add=False)
+            oc, od = others.as_independent(var, as_Add=False)
+            return coeff * oc * sp.Sum(
+                cc * sp.Integral(od * dep, (var, lo, hi)), *the_sum.limits)
+        # a φ-basis bracket: substitute the concrete basis and integrate.
+        if self._basis is not None and any(
+                getattr(a.func, "_is_basis_head", False)
+                for a in rest.atoms(sp.Function)):
+            return coeff * self._resolve_basis(rest, var, lo, hi)
+        # otherwise leave the var-dependent body as an opaque Integral.
+        return coeff * sp.Integral(rest, (var, lo, hi))
 
     # ── methods ──────────────────────────────────────────────────────────
     def _ftc(self, integrand, var, lo, hi):
@@ -532,13 +639,18 @@ class ResolveIntegral(Operation):
                        for f in a.atoms(sp.Function))
 
         def _mine(a):
-            # Resolve any single-variable definite integral that is either over
-            # the configured var OR carries an opaque basis φ/weight (so the
-            # ``\hat{z}``-renamed φ-brackets from the KinematicBC are caught).
+            # Resolve any single-variable definite integral over the configured
+            # var, over a fresh ``\hat{<var>}`` integration Dummy (running
+            # integrals ``∫_0^ζ … d\hat ζ``, whose var is the Dummy not ζ), over
+            # the configured var as a BOUND (so the running integral is caught by
+            # its ζ upper limit), OR carrying an opaque basis φ/weight.
             if not (isinstance(a, sp.Integral) and len(a.limits) == 1
                     and len(a.limits[0]) == 3):
                 return False
-            return a.limits[0][0] == z or _has_basis_atom(a)
+            var, lo, hi = a.limits[0]
+            return (var == z or isinstance(var, sp.Dummy)
+                    or z in (sp.sympify(lo).free_symbols | sp.sympify(hi).free_symbols)
+                    or _has_basis_atom(a))
 
         out = sp_expr.replace(_mine, self._resolve_one)
         # close the remaining opaque φ-evals (FTC boundary traces) + weight.
@@ -622,12 +734,82 @@ def project_conservative_diffusion(visc_expr, test_weight, *, basis_cls,
 # ── Simplify (graph-recorded canonicalisation) ─────────────────────────────
 
 
-class Simplify(Operation):
-    """A whole-equation canonicalisation that records a step in the graph.
+def pull_consts(expr):
+    """``∂_v(c·f) → c·∂_v f`` for every factor ``c`` of the integrand that is
+    INDEPENDENT of the derivative variables — applied to fixpoint, recursively
+    through nested derivatives.
 
-    Routes through :meth:`zoomy_core.model.equation.Equation.simplify` (the
-    project's ``expand → pull-constants-out → recover-fluxes`` pipeline) when
-    applied to a full equation, and falls back to ``sp.expand`` on a bare leaf.
+    This is the GENTLE normalisation that makes cancellations surface WITHOUT
+    blowing fluxes apart: it never applies the product rule to a ``v``-dependent
+    product, so ``∂_x(g h²/2) → (g/2)∂_x(h²)`` (``h²`` stays grouped) while
+    ``∂_x(ζ h) → ζ ∂_x h`` (so ``∂_ζ(−ũ²∂_x(ζh))`` and ``∂_ζ(ζũ²∂_x h)`` become
+    syntactically equal-and-opposite and cancel)."""
+    def _pull(a):
+        if not a.variables:
+            return a
+        const, dep = a.expr.as_independent(*a.variables)
+        return a if const == sp.S.One else const * sp.Derivative(dep, *a.variables)
+    prev = None
+    while expr != prev:
+        prev = expr
+        expr = expr.replace(lambda a: isinstance(a, sp.Derivative), _pull)
+    return expr
+
+
+def _single_deriv_factor(term):
+    """``(coeff, deriv)`` when ``term`` has exactly ONE Derivative factor."""
+    factors = sp.Mul.make_args(term)
+    ds = [f for f in factors if isinstance(f, sp.Derivative)]
+    if len(ds) != 1:
+        return None
+    coeff = sp.Mul(*[f for f in factors if f is not ds[0]])
+    return coeff, ds[0]
+
+
+def fold_conservatives(expr):
+    """Recover conservative groupings ``g·∂_v f + f·∂_v g → ∂_v(f·g)`` by a
+    count-guarded pairwise fold: a pair is replaced by its single grouped form
+    ONLY when the fold is EXACT (value-preserving) — so it always reduces the
+    term count by one and never expands a flux.  Genuine non-conservative
+    couplings (no exact partner) are left untouched."""
+    terms = list(sp.Add.make_args(expr))
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(terms)):
+            for j in range(i + 1, len(terms)):
+                si, sj = _single_deriv_factor(terms[i]), _single_deriv_factor(terms[j])
+                if not (si and sj):
+                    continue
+                (ci, di), (cj, dj) = si, sj
+                if di.variables != dj.variables:
+                    continue
+                cand = sp.Derivative(ci * di.expr, *di.variables)     # ∂_v(coeff·field)
+                if pull_consts(sp.expand((cand - terms[i] - terms[j]).doit())) == 0:
+                    terms[i] = cand
+                    del terms[j]
+                    changed = True
+                    break
+            if changed:
+                break
+    return sp.Add(*terms)
+
+
+class Simplify(Operation):
+    """Canonicalisation that keeps fluxes as fluxes while exposing cancellations.
+
+    Two competing objectives — (1) keep conservative divergences ``∂_v(F)``
+    grouped (do NOT product-rule them) and (2) extract constants so cancelling
+    terms become visible — are reconciled in three passes:
+
+    1. :func:`pull_consts` — pull derivative-independent constants OUT of every
+       ``∂_v`` (gentle: never product-rules a ``v``-dependent product).  Equal-
+       and-opposite terms then cancel automatically in the ``Add``.
+    2. (cancellation is implicit in the ``Add`` once normalised.)
+    3. :func:`fold_conservatives` — count-guarded pairwise fold
+       ``g∂_v f + f∂_v g → ∂_v(fg)``: applied ONLY when exact, so it never
+       increases the term count and never breaks a genuine non-conservative
+       coupling apart.
     """
 
     whole_leaf_op = True
@@ -637,82 +819,118 @@ class Simplify(Operation):
         super().__init__(name=name, description="canonical simplify")
 
     def _leaf_sp(self, sp_expr):
-        return sp.expand(sp_expr)
+        return fold_conservatives(pull_consts(sp_expr))
 
 
-# ── kinematic modal closure (sp.solve on the two KBCs) ─────────────────────
+# ── term tagging + sorting ─────────────────────────────────────────────────
+
+#: Canonical physics order — the order terms are written by hand.
+TAG_ORDER = [
+    "time_derivative",        # ∂_t(…)            — the local time derivative
+    "flux",                   # ∂_x(…) / ∂_ζ(…)   — conservative flux
+    "diffusion",              # ∂_x(… ∂_x …)      — diffusive (2nd-order) flux
+    "nonconservative_flux",   # c(Q)·∂(Q)         — NCP
+    "source",                 # algebraic / ∂(known field) — source
+    "untagged",
+]
 
 
-def kinematic_modal_closure(model, *, u_field, w_field, h, b,
-                            basis_cls, n_u, name="kinematic_modal_closure"):
-    """Build the ``Substitution`` closing the lower w-modes from the two
-    kinematic BCs (surface ζ=1, bed ζ=0).
+def _classify_term(term, q_heads, t, spatial):
+    """Heuristic physics category for one additive ``term``.
 
-    Mirrors the production ``SME._kbc_modal_closure`` (and ``mlme.py``): the
-    modal ansatzes for ``u`` (modes ``0..n_u``) and ``w`` (modes ``0..n_u+1``)
-    are evaluated at the boundaries ``ζ ∈ {0, 1}`` via ``basis_cls.eval``, the
-    surface / bed kinematic relations
-
-    .. math::
-
-        w|_{ζ=1} &= ∂_t(b+h) + u|_{ζ=1}\\,∂_x(b+h), \\\\
-        w|_{ζ=0} &= ∂_t b      + u|_{ζ=0}\\,∂_x b,
-
-    are formed, and ``sp.solve`` closes for the two lowest free w-modes
-    ``aw_0(t,x), aw_1(t,x)``.  Returns a
-    :class:`~zoomy_core.derivation.operations.Substitution` ready for
-    ``model.apply(...)``.
-
-    Parameters
-    ----------
-    model : Model
-        The threaded model (after PDE-transform + SoV) — provides the modal
-        coefficient heads via its registry; the heads are passed explicitly to
-        keep Symbol identity unambiguous.
-    u_field, w_field : sympy Function head
-        The coefficient family heads ``a`` (u-modes) and ``aw`` (w-modes).
-    h, b : sympy applied Function
-        Depth ``h(t, x)`` and bed ``b(t, x)``.
-    basis_cls : type
-        The concrete basis providing ``.eval(k, point)``.
-    n_u : int
-        u truncation level (u modes ``0..n_u``; w modes ``0..n_u+1``).
-    """
-    from zoomy_core.derivation.operations import Substitution
-
-    t = h.args[0]
-    x = h.args[1]
-    basis = basis_cls(level=n_u + 1)
-    a_head = u_field
-    aw_head = w_field
-
-    def u_at(point):
-        return sum(a_head(k, t, x) * basis.eval(k, point)
-                   for k in range(n_u + 1))
-
-    def w_at(point):
-        return sum(aw_head(k, t, x) * basis.eval(k, point)
-                   for k in range(n_u + 2))
-
-    surface = w_at(sp.S.One) - (sp.Derivative(b + h, t)
-                                + u_at(sp.S.One) * sp.Derivative(b + h, x))
-    bed = w_at(sp.S.Zero) - (sp.Derivative(b, t)
-                             + u_at(sp.S.Zero) * sp.Derivative(b, x))
-    solution = sp.solve(
-        [surface, bed], [aw_head(0, t, x), aw_head(1, t, x)], dict=True,
-    )[0]
-    return Substitution(solution, name=name)
+    ``q_heads`` = the unknown family heads (so a field coefficient times a
+    derivative of an UNKNOWN is an NCP, but of a KNOWN field, e.g. the bed
+    ``b``, is a source).  ``t`` is the time coord, ``spatial`` the horizontal
+    coords.  Best-effort — the user pre-tags the cases the heuristic misses
+    (``AutoTag`` never overwrites an existing tag)."""
+    factors = list(term.args) if isinstance(term, sp.Mul) else [term]
+    derivs = [f for f in factors
+              if isinstance(f, sp.Derivative) and len(f.variables) == 1]
+    if len(derivs) != 1:
+        # No single outer derivative: a plain algebraic source, or — if it is
+        # a tangle of derivatives — left untagged for the user to resolve.
+        if any(isinstance(f, sp.Derivative) for f in factors):
+            return "untagged"
+        return "source"
+    dv = derivs[0]
+    var = dv.variables[0]
+    arg = dv.expr
+    coeff = sp.Mul(*[f for f in factors if f is not dv])
+    coeff_has_field = bool(coeff.atoms(sp.Function))
+    if var == t:
+        return "time_derivative"
+    if var in spatial and any(var in a.variables
+                              for a in arg.atoms(sp.Derivative)):
+        return "diffusion"
+    if coeff_has_field:
+        arg_has_unknown = any(getattr(a, "func", None) in q_heads
+                              for a in arg.atoms(sp.Function))
+        return "nonconservative_flux" if arg_has_unknown else "source"
+    return "flux"
 
 
-def mass_relation(h, a_head, *, name="mass_relation"):
-    """Build the ``Substitution`` ``∂_t h → −∂_x(h·a_0)`` from the depth-
-    averaged mass row, used to cancel the stray ``∂_t h`` the σ-metric
-    chain-rule injects into the momentum rows."""
-    from zoomy_core.derivation.operations import Substitution
+def _tag_context(eq):
+    """``(q_heads, t, spatial)`` read off the equation's parent model."""
+    m = getattr(eq, "_model", None)
+    if m is None:
+        return set(), None, set()
+    q_heads = {m._head(f) for v in m._Q.values()
+               for f in m._as_field_list(v)}
+    coords = m._coords
+    return q_heads, coords[0], set(coords[1:-1])
 
-    t = h.args[0]
-    x = h.args[1]
-    return Substitution(
-        {sp.Derivative(h, t): -sp.Derivative(h * a_head(0, t, x), x)},
-        name=name,
-    )
+
+class AutoTag(Operation):
+    """Tag each UNTAGGED additive term with its physics category
+    (``time_derivative`` / ``flux`` / ``diffusion`` / ``nonconservative_flux``
+    / ``source``), leaving already-tagged terms alone.
+
+    Tags live on the terms and are hidden in ``describe`` unless
+    ``describe(show_tags=True)`` is asked for.  Pairs with :class:`SortByTag`;
+    :class:`Sort` runs both."""
+
+    log_level = 5
+
+    def __init__(self, name="auto_tag"):
+        super().__init__(name=name, description="tag untagged terms by category")
+
+    def apply_to_equation(self, eq):
+        q_heads, t, spatial = _tag_context(eq)
+        for tm in eq._terms:
+            if tm.tag is None:
+                tm.tag = _classify_term(tm.expr, q_heads, t, spatial)
+        return eq
+
+
+class SortByTag(Operation):
+    """Reorder the equation's terms into the canonical :data:`TAG_ORDER`
+    (time derivative, flux, diffusion, NCP, source, untagged), stable within
+    each group.  Display order is honoured by ``describe`` (which renders the
+    terms in their current order, bypassing sympy's ``Add`` canonicalisation)."""
+
+    log_level = 5
+
+    def __init__(self, name="sort_by_tag"):
+        super().__init__(name=name, description="order terms by physics tag")
+
+    def apply_to_equation(self, eq):
+        rank = {tag: i for i, tag in enumerate(TAG_ORDER)}
+        eq._terms.sort(
+            key=lambda tm: rank.get(tm.tag or "untagged", len(TAG_ORDER)))
+        return eq
+
+
+class Sort(Operation):
+    """:class:`AutoTag` then :class:`SortByTag` — order the terms the way you
+    would write them by hand.  Apply it LAST (after the algebra is settled): a
+    later expression-level op rebuilds the term list and drops the ordering."""
+
+    log_level = 5
+
+    def __init__(self, name="sort"):
+        super().__init__(name=name, description="auto-tag + sort by physics tag")
+
+    def apply_to_equation(self, eq):
+        AutoTag().apply_to_equation(eq)
+        SortByTag().apply_to_equation(eq)
+        return eq

@@ -6,22 +6,17 @@ spine — same ``_leaf_sp`` / ``apply_to`` / ``whole_model_op`` /
 ``.apply`` and a :class:`~zoomy_core.derivation.Model`'s broadcast both dispatch
 through them unchanged.
 
-Two ops live here:
-
-``Substitution``
-    A general dict substitution that matches by *bare Function head* (rewrite
-    every application of ``u`` regardless of arguments) for head keys, and by
-    exact structural match for applied/expression keys.  It carries the
-    outer-product specialisation (``over=`` / ``for_=`` / ``target=`` /
-    ``into=`` / ``consume_parent=``) recovered from the lost session, which
-    clones one equation row per index value.
+Plain substitutions are now just oriented :class:`~zoomy_core.model.equation.Equation`
+objects (or bare ``{lhs: rhs}`` dicts) consumed by ``.apply`` — there is no
+``Substitution`` class.  What remains here is the one op that does MORE than a
+substitution:
 
 ``ChangeOfVariables``
     A coefficient-family rename (``a_i -> relation(q_i)``) that ALSO swaps the
     unknown family in the model's ``Q`` (``a -> q``) via
-    ``model.redeclare_unknown``.  A bare ``Substitution`` deliberately does
-    *not* do the Q-swap — that is the whole reason ``ChangeOfVariables`` is a
-    distinct op rather than a flag.
+    ``model.redeclare_unknown``.  That Q-swap is exactly why it is an Operation
+    and not a substitution: a substitution rewrites expressions but leaves the
+    declared-unknown bookkeeping alone.
 
 ``granularity``
     Every op exposes a ``granularity`` attribute (one of ``LEAF`` / ``TERM`` /
@@ -34,10 +29,41 @@ from __future__ import annotations
 
 import sympy as sp
 
-from zoomy_core.model.operations import Operation, Relation
+from zoomy_core.model.operations import Operation
 
 
-__all__ = ["Substitution", "ChangeOfVariables", "Granularity", "granularity_of"]
+__all__ = ["SolveFor", "ChangeOfVariables", "Granularity", "granularity_of"]
+
+
+# ── SolveFor ───────────────────────────────────────────────────────────────
+
+
+class SolveFor(Operation):
+    """Reorient the equation it is applied to into ``variable = solution``,
+    IN PLACE — the pipeline-style counterpart of ``equation.solve_for(var)``
+    (which returns a NEW equation and leaves the original untouched).
+
+    After ``eq.apply(SolveFor(x))`` the row IS the oriented relation ``x = …``:
+    it renders as ``x = …`` in ``describe`` and applies as the substitution
+    ``x → …`` wherever the equation is handed to ``.apply``.  Use it when you
+    want to rewrite a model row into solved form and keep it in the model::
+
+        m.add_equation("omega", h*omega - (wt - ...))
+        m.omega.apply(SolveFor(omega))      # m.omega is now  ω = (...)/h
+    """
+
+    def __init__(self, variable, name=None):
+        self._var = variable
+        super().__init__(name=name or f"solve_for[{variable}]")
+
+    def apply_to_equation(self, eq):
+        solved = eq.solve_for(self._var)        # oriented Equation
+        eq.expr = solved.expr                   # residual  var - solution
+        eq._as_relation = dict(solved._as_relation)
+        return eq
+
+    def __repr__(self):
+        return f"SolveFor({self._var})"
 
 
 # ── granularity ──────────────────────────────────────────────────────────
@@ -74,172 +100,6 @@ def granularity_of(op) -> str:
     if getattr(op, "single_term_only", False):
         return Granularity.TERM
     return Granularity.LEAF
-
-
-# ── Substitution ─────────────────────────────────────────────────────────
-
-
-class Substitution(Relation):
-    """General dict substitution ``{lhs: rhs}`` applied across a model.
-
-    Rule kinds (split once at construction):
-
-      * **head rule** — ``lhs`` is a bare ``sp.Function`` *class* (``a`` from
-        ``sp.Function("a")``).  Every application ``a(...)`` at any argument
-        list is rewritten via ``expr.replace(head, lambda *a: rhs)``.
-      * **exact rule** — ``lhs`` is an applied Function / Derivative / any
-        concrete expression.  Rewritten via ``expr.subs(lhs, rhs)``.
-
-    Outer-product mode (``over=`` / ``for_=`` + ``target=`` + ``into=``):
-        clone ``model._equations[target]`` once per value in ``over``, each
-        clone with the single placeholder specialised to that value.  This is
-        a model-level op (``whole_model_op = True``).  ``consume_parent=True``
-        (default) drops the template row after the clones are created.
-
-    A ``Substitution`` *is* a change of representation, so by default it
-    rewrites boundary conditions too (``transforms_bcs = True``); the
-    outer-product mode suppresses that (index specialisation is not a change
-    of variable).
-    """
-
-    # A substitution IS a change of variables → it transforms BCs.
-    transforms_bcs = True
-    # Default: per-equation broadcast (whole_model_op flipped on only for the
-    # outer-product specialisation).
-    whole_model_op = False
-
-    def __init__(self, substitutions, name="substitution", *,
-                 over=None, for_=None, target=None, into=None,
-                 consume_parent=True):
-        # A solved-for Relation may arrive as the mapping itself — accept any
-        # object exposing ``subs_map``.
-        if hasattr(substitutions, "subs_map") and not isinstance(
-                substitutions, (dict, list, tuple)):
-            substitutions = dict(substitutions.subs_map)
-
-        # ``for_`` is a sugar alias for ``over``; passing both is an ordering
-        # footgun, so reject early.
-        if for_ is not None and over is not None:
-            raise ValueError(
-                "Substitution: pass either `over=` or `for_=` (alias), "
-                "not both."
-            )
-        if for_ is not None:
-            over = for_
-
-        # Sympify both sides so a raw ``0`` rhs never leaks a Python int into
-        # the substitution (which would break the downstream ``.has`` checks).
-        substitutions = {sp.sympify(k): sp.sympify(v)
-                         for k, v in dict(substitutions).items()}
-
-        super().__init__(substitutions, name=name)
-
-        self._over = None
-        self._target = None
-        self._into = None
-        self._consume_parent = True
-        if over is not None:
-            if target is None:
-                raise ValueError(
-                    "Substitution(..., over=...) requires `target=` "
-                    "(the equation name to clone for each value)."
-                )
-            if len(self.subs_map) != 1:
-                raise ValueError(
-                    "Substitution(..., over=...) requires exactly one "
-                    "placeholder in the substitution map "
-                    f"(got {len(self.subs_map)})."
-                )
-            self._over = list(over)
-            self._target = target
-            self._into = into
-            self._consume_parent = bool(consume_parent)
-            # The instance grows the equation dict (one row per value), so it
-            # is a model-level op.  Per-row index specialisation is NOT a
-            # change of variable, so the BC-rewrite broadcast is suppressed.
-            self.whole_model_op = True
-            self.transforms_bcs = False
-
-        # Split the rules into head-keyed (replace every application) and
-        # applied/exact-keyed (structural match) once, up front.
-        self._head_rules: dict = {}
-        self._exact_rules: dict = {}
-        for lhs, rhs in self.subs_map.items():
-            if self._is_function_head(lhs):
-                self._head_rules[lhs] = rhs
-            else:
-                self._exact_rules[lhs] = rhs
-
-    @staticmethod
-    def _is_function_head(key) -> bool:
-        """True when ``key`` is a bare ``sp.Function`` head (an
-        undefined-function *class*, e.g. ``sp.Function("u")``) rather than an
-        application ``u(t, x, z)`` or any other expression."""
-        return isinstance(key, sp.FunctionClass)
-
-    # ── leaf substitution ────────────────────────────────────────────────
-
-    def apply_to(self, expr):
-        """Substitute every rule into ``expr``.
-
-        Head rules use ``expr.replace(head, lambda *a: rhs)`` so every
-        application of the head — at any argument list — is rewritten; applied
-        / exact rules use ``subs``."""
-        result = expr
-        for head, rhs in self._head_rules.items():
-            result = result.replace(head, lambda *a, _rhs=rhs: _rhs)
-        for lhs, rhs in self._exact_rules.items():
-            result = result.subs(lhs, rhs)
-        return result
-
-    # ── outer-product expansion (over=/for_=/target=/into=) ──────────────
-
-    def apply_to_model(self, model):
-        """Clone ``model._equations[target]`` once per value in ``over``, each
-        clone with the placeholder specialised to that value.
-
-        ``target`` may be a bare equation name (``"foo"``) or a dotted path
-        into a vector equation (``"momentum.x"``); the dotted form is resolved
-        by ``getattr``-walking the model.  Returns ``model``.
-        """
-        target = self._target
-        if "." in target:
-            head, *rest = target.split(".")
-            src = getattr(model, head)
-            for attr in rest:
-                src = getattr(src, attr)
-        else:
-            src = model._equations[target]
-
-        placeholder = next(iter(self.subs_map.keys()))
-        name_pattern = self._into or "{target}_{value}"
-        flat_target = target.replace(".", "_")
-
-        for v in self._over:
-            row_name = name_pattern.format(target=flat_target, value=v)
-            model.add_equation(row_name, src.expr)
-            row_sub = Substitution(
-                {placeholder: v}, name=f"{self.name}[{placeholder}={v}]")
-            model._equations[row_name].apply(row_sub, _no_history=True)
-
-        # Drop the parent template — the specialised rows ARE the state rows.
-        if self._consume_parent:
-            parent_key = flat_target
-            if parent_key in model._equations:
-                model._remove_equation(parent_key)
-
-        model._refresh_unknowns()
-        return model
-
-    @property
-    def bc_substitution_map(self) -> dict:
-        """The ``{lhs: rhs}`` rules used to rewrite BC expressions — the same
-        rules applied to the bulk equations."""
-        return dict(self.subs_map)
-
-    def __repr__(self):
-        body = ", ".join(f"{k} -> {v}" for k, v in self.subs_map.items())
-        return f"Substitution({self.name!r}: {body})"
 
 
 # ── ChangeOfVariables ────────────────────────────────────────────────────

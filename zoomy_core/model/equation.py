@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import sympy as sp
 
-from zoomy_core.model.operations import Expression
+from zoomy_core.model.operations import Expression, RelationMixin
 
 
 __all__ = [
@@ -164,14 +164,27 @@ class _TermAccessor:
         return len(self._equation._terms)
 
 
-class Equation:
-    """Linear list of :class:`Term` carrying the LHS of one PDE/algebraic
+class Equation(RelationMixin):
+    """Linear list of :class:`Term` carrying the residual of one PDE/algebraic
     equation.  ``apply`` delegates to ``Expression.apply`` (the library
     operation-dispatch layer) and auto-records a history entry on the
-    parent :class:`Model` if one is set."""
+    parent :class:`Model` if one is set.
+
+    Via :class:`~zoomy_core.model.operations.RelationMixin` an Equation can be
+    ORIENTED — built from ``sp.Eq(lhs, rhs)`` or produced by :meth:`solve_for`
+    — in which case it carries ``_as_relation = {lhs: rhs}`` and acts as a
+    substitution under ``.apply`` (with ``.lhs`` / ``.rhs`` / ``.subs_map``).
+    That is what replaces the former ``Substitution`` / ``Relation`` classes.
+    """
 
     def __init__(self, expression, name="eq", model=None):
         self.name = name
+        # ``Equation(sp.Eq(lhs, rhs))`` is an oriented relation: keep the
+        # residual ``lhs - rhs`` as the term-list source of truth, record the
+        # ``{lhs: rhs}`` rule so ``.apply`` consumes it as a substitution.
+        if isinstance(expression, sp.Equality):
+            self._as_relation = {expression.lhs: expression.rhs}
+            expression = expression.lhs - expression.rhs
         self._terms = [Term(t, parent=self)
                        for t in self.to_terms(expression)]
         self._model = model
@@ -311,31 +324,33 @@ class Equation:
     # ── solve / remove (derivation-core operations) ──────────────────
     def solve_for(self, symbol):
         """Algebraically isolate ``symbol`` from this equation's residual
-        (``self.expr == 0``); returns a
-        :class:`~zoomy_core.derivation.operations.Substitution` mapping
-        ``symbol -> solved-expr``.
+        (``self.expr == 0``); returns a NEW oriented :class:`Equation`
+        ``symbol = solved-expr`` (carrying ``_as_relation = {symbol: sol}``).
+
+        The result *stays an Equation* — pass it straight to ``.apply`` and it
+        acts as the substitution ``symbol -> sol`` (``.lhs`` / ``.rhs`` /
+        ``.subs_map`` expose the rule).  This is what the old ``Substitution``
+        return value did, with no separate class.
 
         Pure algebra — ``solve_for`` does **not** integrate.  If ``symbol``
         appears under a ``Derivative`` the residual is *differential* in it;
         integrate the balance first (e.g. ``eq.apply(Integrate(var, lo, hi))``
-        followed by a boundary-condition ``Substitution``) and then
-        ``solve_for`` the resulting algebraic relation.
+        followed by a boundary-condition substitution) and then ``solve_for``
+        the resulting algebraic relation.
         """
-        from zoomy_core.derivation.operations import Substitution
-
         residual = sp.expand(self.expr)
         if any(der.has(symbol) for der in residual.atoms(sp.Derivative)):
             raise ValueError(
                 f"solve_for({symbol}) is algebraic, but {self.name!r} is "
                 f"differential in {symbol} (it appears under a Derivative). "
                 f"Integrate the balance first (e.g. `.apply(Integrate(var, "
-                f"lo, hi))` + a boundary-condition `Substitution`), then "
+                f"lo, hi))` + a boundary-condition substitution), then "
                 f"solve_for the resulting algebraic relation.")
         solutions = sp.solve(residual, symbol)
         if not solutions:
             raise ValueError(f"Cannot solve {self.name!r} for {symbol}.")
-        return Substitution({symbol: solutions[0]},
-                            name=f"solve[{self.name}->{symbol}]")
+        return Equation(sp.Eq(symbol, solutions[0]),
+                        name=f"solve[{self.name}->{symbol}]")
 
     def remove(self):
         """Delete this equation from its parent model (triggers Q refresh)."""
@@ -346,20 +361,61 @@ class Equation:
         return None
 
     # ── describe ─────────────────────────────────────────────────────
-    def describe(self, strip_args=False, header=True):
+    def _ordered_tex(self, strip_args=False):
+        """LaTeX of the residual with the terms in their CURRENT order — sympy's
+        ``Add`` re-sorts to a canonical order, so an unevaluated ``Add`` is
+        printed with ``order='none'`` to honour a :class:`SortByTag` ordering."""
+        ordered = (sp.Add(*[tm.expr for tm in self._terms], evaluate=False)
+                   if self._terms else sp.S.Zero)
+        from zoomy_core.model.operations import (
+            _StripArgsLatexPrinter, _BracketLatexPrinter)
+        printer = (_StripArgsLatexPrinter if strip_args
+                   else _BracketLatexPrinter)(settings={"order": "none"})
+        return printer.doprint(ordered)
+
+    def _tag_summary(self):
+        return ", ".join(tm.tag or "untagged" for tm in self._terms)
+
+    def describe(self, strip_args=False, header=True, show_tags=False):
         """Render this equation as a :class:`Description`.
 
-        Delegates to :meth:`Expression.describe` so a scalar equation and a
-        model's per-equation render share one path.
-        """
-        return Expression(self.expr, self.name).describe(
-            header=header, strip_args=strip_args)
+        Terms print in their current order (so a :class:`SortByTag` shows).  An
+        oriented equation (from ``solve_for`` / ``sp.Eq``) renders ``lhs = rhs``
+        rather than ``residual = 0``.  ``show_tags=True`` appends the per-term
+        physics tags."""
+        from zoomy_core.misc.description import Description
+        parts = []
+        if header:
+            parts.append(f"**{self.name}** ({len(self._terms)} terms)")
+        if self._as_relation:
+            from zoomy_core.model.operations import _StripArgsLatexPrinter
+            pr = _StripArgsLatexPrinter() if strip_args else None
+            tex = (lambda e: pr.doprint(e)) if pr else sp.latex
+            body = " \\\\ ".join(f"{tex(l)} = {tex(r)}"
+                                 for l, r in self._as_relation.items())
+            parts.append(f"\n$$\n\\begin{{aligned}} {body} \\end{{aligned}}\n$$")
+        else:
+            parts.append(f"\n$$\n{self._ordered_tex(strip_args)} = 0\n$$")
+            if show_tags:
+                parts.append(f"\n**tags:** {self._tag_summary()}")
+        return Description("\n".join(parts))
 
-    def describe_line(self, strip_args=False, bullet=False):
-        """One-line markdown render (used by ``Model.describe``)."""
-        tex = Expression(self.expr, self.name).latex(strip_args=strip_args)
+    def describe_line(self, strip_args=False, bullet=False, show_tags=False):
+        """One-line markdown render (used by ``Model.describe``).  An oriented
+        equation renders as ``lhs = rhs``; a plain residual as ``… = 0`` with
+        terms in their current order.  ``show_tags`` appends the per-term tags."""
         prefix = "- " if bullet else ""
-        return f"{prefix}**{self.name}:** ${tex} = 0$"
+        if self._as_relation:
+            from zoomy_core.model.operations import _StripArgsLatexPrinter
+            pr = _StripArgsLatexPrinter() if strip_args else None
+            tex = (lambda e: pr.doprint(e)) if pr else sp.latex
+            body = " \\\\ ".join(f"{tex(l)} = {tex(r)}"
+                                 for l, r in self._as_relation.items())
+            return f"{prefix}**{self.name}:** ${body}$"
+        line = f"{prefix}**{self.name}:** ${self._ordered_tex(strip_args)} = 0$"
+        if show_tags:
+            line += f"  _[{self._tag_summary()}]_"
+        return line
 
     def __repr__(self):
         return f"Equation({self.name!r}, {len(self._terms)} terms)"

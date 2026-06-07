@@ -43,20 +43,20 @@ def subst(expr, rule):
     Accepted ``rule`` shapes:
 
     * ``dict`` of ``{lhs: rhs}``.
-    * Any object with an ``_as_relation`` attribute (a dict),
-      typically produced by :func:`solve_for`.
-    * Any object with an ``apply_to(expr)`` method, in which case the
-      method is delegated to (matches the legacy ``Relation`` /
-      ``Material`` protocol).
+    * An ORIENTED ``Expression`` / ``Equation`` carrying ``_as_relation``
+      (a ``{lhs: rhs}`` dict), typically produced by :func:`solve_for` or
+      ``sp.Eq``.
+    * Any legacy object exposing an ``apply_to(expr)`` method.
     """
-    if hasattr(rule, "apply_to"):
+    rel = getattr(rule, "_as_relation", None)
+    if rel:
+        rule = rel
+    elif hasattr(rule, "apply_to"):
         return rule.apply_to(expr)
-    if hasattr(rule, "_as_relation"):
-        rule = rule._as_relation
     if not isinstance(rule, dict):
         raise TypeError(
-            f"subst: rule must be a dict, Relation, or object with "
-            f"apply_to(); got {type(rule).__name__}"
+            f"subst: rule must be a dict, an oriented Expression/Equation, "
+            f"or an object with apply_to(); got {type(rule).__name__}"
         )
     return expr.xreplace(rule)
 

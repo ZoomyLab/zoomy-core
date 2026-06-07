@@ -1,7 +1,7 @@
 """The transformation + boundary-condition layer for the clean-redesign
 derivation framework.
 
-Two public pieces:
+One public piece:
 
 :class:`PDETransformation`
     The explicit-geometry σ-map ``z = b + h·ζ`` from the physical vertical
@@ -16,11 +16,11 @@ Two public pieces:
     decorated heads are *distinct* Function classes so the σ-mapped atoms
     cannot cross-substitute with their physical-z originals.
 
-:func:`kinematic_bc`
-    A thin adapter that builds the production
-    :class:`zoomy_core.model.operations.KinematicBC` for a :class:`Model`,
-    reading coords from the model and the decorated heads from the
-    PDETransformation's field-decoration map (``model._field_decoration``).
+    It also σ-maps any stored boundary conditions: a
+    :class:`~zoomy_core.model.operations.KinematicBC` added via
+    ``model.add_equation`` is an oriented ``Expression`` whose ``{lhs: rhs}``
+    relation is rewritten alongside the bulk equations (``w(b) → w̃(0)`` …),
+    ready to apply as a substitution.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ import sympy as sp
 from zoomy_core.model.operations import Operation
 
 
-__all__ = ["PDETransformation", "kinematic_bc"]
+__all__ = ["PDETransformation"]
 
 
 # ── PDETransformation ────────────────────────────────────────────────────
@@ -92,6 +92,13 @@ class PDETransformation(Operation):
         self._via_model = False
         # Head decoration cache (one decorated Function per original head).
         self._decorated: dict = {}
+        # ``{head: z_slot_index}`` for every field that appears with the vertical
+        # coord ``z`` SOMEWHERE in the model.  Populated by a pre-scan in
+        # ``apply_to_model`` so a BOUNDARY EVALUATION ``u(t,x,b)`` (whose z-slot
+        # holds an interface value, not the free ``z``) is mapped to
+        # ``ũ(t,x,(b−b)/h) = ũ(t,x,0)`` — i.e. evaluated at the σ-height of that
+        # interface — instead of being left untouched.
+        self._vertical_heads: dict = {}
 
         # The coords that receive the σ chain-rule jacobian = exactly the
         # coords the geometry depends on.  The metric correction is
@@ -209,8 +216,32 @@ class PDETransformation(Operation):
         self._via_model = True
         try:
             self._rewrite_model_coords(model)
+            # Pre-scan: record every field head that appears with the vertical
+            # coord ``z`` and the arg position it occupies — order-independent, so
+            # a KBC's boundary evaluation ``u(t,x,b)`` is mapped even when its
+            # equation is rewritten before the bulk one carrying ``u(t,x,z)``.
+            for eq in model._equations.values():
+                for f in eq.expr.atoms(sp.Function):
+                    if isinstance(f, sp.Sum) or self._z not in f.free_symbols:
+                        continue
+                    for i, a in enumerate(f.args):
+                        if a == self._z or self._z in a.free_symbols:
+                            self._vertical_heads.setdefault(f.func, i)
+                            break
             for eq in model._equations.values():
                 eq.apply(self, _no_history=True)
+            # Rewrite stored assumptions (KinematicBC, …) too: σ-map both sides
+            # of each rule so e.g. ``{w(b): ∂_t b + u(b)∂_x b}`` becomes
+            # ``{w̃(0): ∂_t b + ũ(0)∂_x b}`` — ready to apply as a substitution.
+            for asmpt in getattr(model, "_assumptions", {}).values():
+                new_rel = {self._rewrite(lhs): self._rewrite(rhs)
+                           for lhs, rhs in asmpt.subs_map.items()}
+                # Stored assumptions are oriented Expressions (KinematicBC, …):
+                # rewrite the ``{lhs: rhs}`` relation AND the residual term so
+                # both sides are σ-mapped (``subs_map`` is a read-only view).
+                asmpt._as_relation = new_rel
+                asmpt.expr = sum((lhs - rhs for lhs, rhs in new_rel.items()),
+                                 sp.S.Zero)
         finally:
             self._via_model = False
         # Publish the decoration map + σ-map metadata on the model so
@@ -261,6 +292,16 @@ class PDETransformation(Operation):
                             for a in e.args]
                 new_head = self._decorate_head(e.func)
                 return new_head(*new_args)
+            # BOUNDARY EVALUATION of a vertical field: ``u(t,x,Z)`` with ``Z`` an
+            # interface value (no free ``z``).  Evaluate the σ-field at the height
+            # of that interface, ζ = (Z − b)/h  (e.g. Z = b → ζ = 0, b+h → 1).
+            if e.func in self._vertical_heads:
+                slot = self._vertical_heads[e.func]
+                new_args = [self._rewrite(a) for a in e.args]
+                if slot < len(new_args):
+                    new_args[slot] = sp.simplify(
+                        (e.args[slot] - self._b) / self._h)
+                return self._decorate_head(e.func)(*new_args)
             # No z dependence — leave the head, but still recurse args.
             new_args = tuple(self._rewrite(a) for a in e.args)
             if any(n is not o for n, o in zip(new_args, e.args)):
@@ -302,83 +343,3 @@ class PDETransformation(Operation):
                 rf"\partial_{sp.latex(self._z)} u \mapsto "
                 rf"\tfrac{{1}}{{{sp.latex(self._h)}}}\partial_\zeta "
                 rf"{self._accent}{{u}}$")
-
-
-# ── kinematic_bc ─────────────────────────────────────────────────────────
-
-
-def kinematic_bc(model, *, w_field, u_field, interface, at,
-                 v_field=None, mass_flux=None, name=None):
-    """Build the production
-    :class:`zoomy_core.model.operations.KinematicBC` for a :class:`Model`.
-
-    Thin adapter that gives the production op the ``state`` / ``flow``
-    namespaces it expects (``s.t/.x/.y/.z/.has_y``, ``flow.u/.v/.w``) by
-    reading them off the :class:`Model` — coords from ``model.coords`` /
-    ``model.horizontal`` / ``model.vertical``, decorated post-PDE field heads
-    from ``model._field_decoration``.  Returns the
-    :class:`~zoomy_core.model.operations.KinematicBC` instance, ready to be
-    used with ``model.apply(...)`` (or to have its ``.subs_map`` consumed by a
-    modal-ansatz closure).
-
-    The kinematic boundary relation at the moving ``interface`` is
-
-    .. math::
-
-        \\tilde w\\big|_\\text{at}
-          = \\partial_t\\,\\text{interface}
-          + \\tilde u\\big|_\\text{at}\\,\\partial_x\\,\\text{interface}
-          \\;[\\,+\\, \\tilde v\\big|_\\text{at}\\,\\partial_y\\,\\text{interface}\\,]
-          \\;+\\; \\frac{\\text{mass\\_flux}}{\\rho}\\,.
-
-    Parameters
-    ----------
-    model : Model
-        After a :class:`PDETransformation` has run (so the decoration map is
-        populated).  Works pre-map too — then the original heads are used.
-    w_field, u_field : applied sympy ``Function``
-        The ORIGINAL pre-PDE field applications (``u(t, x, z)``,
-        ``w(t, x, z)``) — used to look up the decorated heads ``ũ``, ``w̃``.
-    interface : sympy.Expr
-        The moving surface — ``b`` (bed) or ``b + h`` (free surface).
-    at : sympy.Expr
-        The vertical-coord value at which to sample the velocities — typically
-        ``0`` (bed) or ``1`` (surface) after the σ-mapping.
-    v_field : applied sympy ``Function``, optional
-        The ORIGINAL ``v(t, x, y, z)`` for 3-D runs (``None`` for 2-D).
-    mass_flux, name : forwarded to :class:`KinematicBC`.
-    """
-    from zoomy_core.model.operations import KinematicBC
-
-    class _NS:
-        pass
-
-    coords = model.coords
-    horiz = list(model.horizontal)
-
-    s = _NS()
-    s.t = coords[0]
-    s.x = horiz[0] if horiz else None
-    s.y = horiz[1] if len(horiz) > 1 else None
-    s.has_y = len(horiz) > 1
-    # The vertical the velocity arg lists carry — ζ after the σ-map.
-    s.z = model.vertical
-
-    deco = model._field_decoration or {}
-    z_old = model._sigma_from
-    repl = {z_old: model.vertical} if z_old is not None else {}
-
-    def _decorated(orig_field):
-        head = deco.get(orig_field.func, orig_field.func)
-        new_args = [a.xreplace(repl) for a in orig_field.args]
-        return head(*new_args)
-
-    flow = _NS()
-    flow.u = _decorated(u_field)
-    flow.w = _decorated(w_field)
-    if v_field is not None:
-        flow.v = _decorated(v_field)
-
-    rho = getattr(model.parameters, "rho", None)
-    return KinematicBC(s, interface, flow, at=at, rho=rho,
-                       mass_flux=mass_flux, name=name)

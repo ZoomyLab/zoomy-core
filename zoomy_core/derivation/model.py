@@ -230,6 +230,18 @@ class Model:
         # resolves to the family.
         self._moment_families: dict[str, MomentFamily] = {}
 
+        # Stored ASSUMPTIONS / Relations (kinematic BCs, hydrostatic, …).  An
+        # Assumption holds a ``subs_map`` (not a single ``.expr``), so it lives
+        # in its own registry rather than ``_equations``.  ``PDETransformation``
+        # rewrites their subs_maps alongside the equations, and ``model.<name>``
+        # / ``model.apply(model.<name>)`` reach + apply them.
+        self._assumptions: dict = {}
+        # Names of equation rows flagged ``group="aux"`` — auxiliary relations
+        # (w-reconstruction, ω-definition, …) that are derived/used but are NOT
+        # part of the final PDE system handed to a SystemModel.  Oriented
+        # relations in ``_assumptions`` (KinematicBCs) are auxiliary too.
+        self._aux_names: set = set()
+
         # Derivation history + per-model modal-index registry.  The registry
         # hands out a distinct summation index per coefficient family and is
         # read back by ``separation_of_variables`` / ``ResolveBasis``.
@@ -292,7 +304,7 @@ class Model:
         })
 
     # ── equation registration ────────────────────────────────────────
-    def add_equation(self, name, shape_or_expr=None, expr=None):
+    def add_equation(self, name, shape_or_expr=None, expr=None, *, group="model"):
         """Register a scalar or vector equation.
 
         Scalar::
@@ -305,13 +317,47 @@ class Model:
 
         The shape argument is optional positionally — ``add_equation(name,
         expr)`` registers a scalar row.
+
+        An ORIENTED relation — a :class:`~zoomy_core.model.operations.KinematicBC`
+        or any oriented ``Expression`` / solved ``Equation`` carrying
+        ``_as_relation`` (a ``{lhs: rhs}`` rule) — may be passed in place of the
+        expression.  It is STORED as the object; ``PDETransformation`` σ-maps
+        its rule alongside the equations, and ``model.<name>`` /
+        ``model.apply(model.<name>)`` reach and apply it as a substitution::
+
+            model.add_equation("kbc_bot", KinematicBC(...))   # physical KBC
+            model.apply(PDETransformation(...))               # σ-maps it: w(b)→w̃(0)
+            model.apply(model.kbc_bot)                        # substitute w̃(0) = …
+
+        ``group`` tags the row: ``"model"`` (default) for the final PDE system,
+        or ``"aux"`` for auxiliary relations (``w``-reconstruction,
+        ``ω``-definition, …) that are derived/used but not handed to a
+        SystemModel.  ``describe(show="aux")`` lists them.  Oriented relations
+        (KinematicBCs) are auxiliary regardless.
         """
+        if group not in ("model", "aux"):
+            raise ValueError(
+                f"add_equation(group=...): 'model' | 'aux', got {group!r}.")
+        if group == "aux":
+            self._aux_names.add(name)
+        # Store an ORIENTED relation (KinematicBC / a solved Equation — anything
+        # carrying ``_as_relation``) AS the object: it holds ``{lhs: rhs}``, not
+        # a bare residual.  ``PDETransformation`` σ-maps its rule alongside the
+        # equations, and ``model.<name>`` / ``model.apply(model.<name>)`` reach
+        # and apply it as a substitution.
+        if expr is None and getattr(shape_or_expr, "_as_relation", None):
+            self._assumptions[name] = shape_or_expr
+            return shape_or_expr
+
         # Disambiguate the two-arg scalar call from the three-arg vector call.
         if expr is None and shape_or_expr is not None and not (
                 isinstance(shape_or_expr, tuple)
                 and all(isinstance(k, int) for k in shape_or_expr)):
-            # scalar: add_equation(name, expr)
-            scalar_expr = shape_or_expr
+            # scalar: add_equation(name, expr).  Accept an existing Equation /
+            # Expression and COPY its residual — e.g. duplicate continuity for
+            # the w-reconstruction: ``m.add_equation("w", m.mass)``.
+            scalar_expr = (shape_or_expr.expr
+                           if hasattr(shape_or_expr, "expr") else shape_or_expr)
             eq = Equation(scalar_expr, name=name, model=self)
             self._equations[name] = eq
             self._equation_shapes[name] = (1,)
@@ -432,6 +478,9 @@ class Model:
         eqs = self.__dict__.get("_equations", {})
         if item in eqs:
             return eqs[item]
+        asmpt = self.__dict__.get("_assumptions", {})
+        if item in asmpt:
+            return asmpt[item]
         raise AttributeError(
             f"{type(self).__name__!r} object has no attribute {item!r}")
 
@@ -481,11 +530,19 @@ class Model:
         self._Q = new_q
         self._refresh_unknowns()
 
+    @staticmethod
+    def _as_field_list(value):
+        """A Q value is either a single field or a LIST of fields (after a
+        family is split into modes, ``{u: [u_0, u_1, …]}``).  Normalise to a
+        list so the Q-bookkeeping can iterate uniformly."""
+        return list(value) if isinstance(value, (list, tuple)) else [value]
+
     @property
     def Qaux(self):
         """Derived: every field Function present in the equations that is not
         in ``Q``, not a coordinate, and not a parameter."""
-        q_heads = {self._head(f) for f in self._Q.values()}
+        q_heads = {self._head(f)
+                   for v in self._Q.values() for f in self._as_field_list(v)}
         out = Zstruct()
         seen = set()
         for f in sorted(self._collect_fields(), key=str):
@@ -511,28 +568,49 @@ class Model:
         """
         present_heads = {self._head(f) for f in self._collect_fields()}
         self._ever_seen_heads |= present_heads
+        # Keep a Q entry while ANY field in its value (single or list of modes)
+        # is still present, or while none of them has ever been seen.
         self._Q = {
-            nm: f for nm, f in self._Q.items()
-            if self._head(f) in present_heads
-            or self._head(f) not in self._ever_seen_heads
+            nm: v for nm, v in self._Q.items()
+            if any(self._head(f) in present_heads
+                   for f in self._as_field_list(v))
+            or all(self._head(f) not in self._ever_seen_heads
+                   for f in self._as_field_list(v))
         }
 
     def redeclare_unknown(self, old_field, new_fields):
-        """Transfer unknown-status from ``old_field`` to ``new_fields``.
+        """Transfer unknown-status from ``old_field`` to ``new_fields`` — a
+        change of the VALUE stored under the family's logical Q key, NOT of the
+        key itself.
 
-        ``old`` leaves ``Q``; each of ``new`` enters ``Q``.  ``old_field`` /
-        ``new_fields`` may be applied Functions or bare Function heads (the
-        family head is what matters for the Q registry).  Not user-facing —
-        ops (``ChangeOfVariables``) call this.
+        ``Q`` is ``{logical_name: value}``; ``redeclare_unknown`` rewrites the
+        value while keeping the key, so the handle survives every transform::
+
+            {u: u}  --σ-map-->  {u: ũ}  --basis ansatz-->  {u: [u_0, u_1, …]}
+
+        A single ``new`` becomes a single value (``m.Q.u`` → that field); a list
+        of ``new`` becomes a list value (``m.Q.u`` → ``[u_0, …]``, ``m.Q.u[1]``
+        → ``u_1``).  ``old_field`` / ``new_fields`` may be applied Functions or
+        bare heads.  Not user-facing — ops (``PDETransformation`` /
+        ``ChangeOfVariables``) call this.
         """
         old_head = self._head(old_field)
-        # Remove every Q entry whose head matches old.
-        self._Q = {nm: f for nm, f in self._Q.items()
-                   if self._head(f) != old_head}
+        # The LOGICAL key(s) the old family currently occupies.
+        old_keys = [nm for nm, v in self._Q.items()
+                    if any(self._head(f) == old_head
+                           for f in self._as_field_list(v))]
+        # Drop those entries; re-add the new value under the SAME logical key.
+        self._Q = {nm: v for nm, v in self._Q.items()
+                   if not any(self._head(f) == old_head
+                              for f in self._as_field_list(v))}
         if not isinstance(new_fields, (list, tuple)):
             new_fields = [new_fields]
-        for nf in new_fields:
-            self._Q[self._field_name(nf)] = nf
+        value = new_fields[0] if len(new_fields) == 1 else list(new_fields)
+        if len(old_keys) == 1:
+            self._Q[old_keys[0]] = value          # keep the logical key
+        else:
+            for nf in new_fields:                 # fallback: key by field name
+                self._Q[self._field_name(nf)] = nf
 
     # ── field introspection ──────────────────────────────────────────
     @staticmethod
@@ -634,15 +712,28 @@ class Model:
         return getattr(head, "__name__", None) or str(head)
 
     # ── describe ─────────────────────────────────────────────────────
-    def describe(self, strip_args=False, show_history=False, max_log_level=5):
+    def describe(self, strip_args=False, show="model", show_tags=False,
+                 show_history=False, max_log_level=5):
         """Human-readable derivation state.  Header shows the model name +
         #equations + #ops; each equation delegates to its own
         ``describe_line``.
+
+        ``show`` selects which rows are rendered:
+
+        * ``"model"`` (default) — the final PDE rows only.
+        * ``"aux"`` — only the auxiliary rows: ``group="aux"`` equations
+          (``w``-reconstruction, ``ω``-definition, …) and the oriented
+          relations / BCs in ``_assumptions`` (``KinematicBC`` …).
+        * ``"all"`` — both, under separate headings.
 
         ``max_log_level`` (1–5) filters the optional history view: only ops with
         ``op.log_level <= max_log_level`` are listed, so ``max_log_level=1``
         shows just the major steps and hides level-5 bookkeeping (e.g.
         ``Simplify``)."""
+        if show not in ("model", "aux", "all"):
+            raise ValueError(
+                f"describe(show=...): expected 'model' | 'aux' | "
+                f"'all', got {show!r}.")
         n_eq = len(self._equations)
         n_vec = len(self._vector_equations)
         n_ops = len(self.history)
@@ -662,34 +753,52 @@ class Model:
                          + ", ".join(f"`{k}`" for k in self._Q))
         # Equations: render vector proxies as a group, then any remaining
         # standalone scalar rows.
-        rendered = set()
-        parts.append("**Equations:**")
-        for vname, vec in self._vector_equations.items():
-            parts.append(f"- **{vname}** (vector):")
-            for comp in vec.components:
-                if isinstance(comp, MomentFamily):
-                    for row in comp.components:
-                        parts.append("  " + row.describe_line(
-                            strip_args=strip_args, bullet=True))
-                        rendered.add(row.name)
-                else:
-                    parts.append("  " + comp.describe_line(
-                        strip_args=strip_args, bullet=True))
-                    rendered.add(comp.name)
-        for base, fam in self._moment_families.items():
-            if base in self._vector_equations or any(
-                    fam is c for v in self._vector_equations.values()
-                    for c in v.components):
-                continue
-            parts.append(f"- **{base}** (moment family):")
-            for row in fam.components:
-                parts.append("  " + row.describe_line(
-                    strip_args=strip_args, bullet=True))
-                rendered.add(row.name)
-        for name, eq in self._equations.items():
-            if name in rendered:
-                continue
-            parts.append(eq.describe_line(strip_args=strip_args, bullet=True))
+        if show in ("model", "all"):
+            rendered = set()
+            parts.append("\n**Equations:**")
+            for vname, vec in self._vector_equations.items():
+                parts.append(f"- **{vname}** (vector):")
+                for comp in vec.components:
+                    if isinstance(comp, MomentFamily):
+                        for row in comp.components:
+                            parts.append("  " + row.describe_line(
+                                strip_args=strip_args, bullet=True))
+                            rendered.add(row.name)
+                    else:
+                        parts.append("  " + comp.describe_line(
+                            strip_args=strip_args, bullet=True, show_tags=show_tags))
+                        rendered.add(comp.name)
+            for base, fam in self._moment_families.items():
+                if base in self._vector_equations or any(
+                        fam is c for v in self._vector_equations.values()
+                        for c in v.components):
+                    continue
+                parts.append(f"- **{base}** (moment family):")
+                for row in fam.components:
+                    parts.append("  " + row.describe_line(
+                        strip_args=strip_args, bullet=True, show_tags=show_tags))
+                    rendered.add(row.name)
+            for name, eq in self._equations.items():
+                if name in rendered or name in self._aux_names:
+                    continue          # aux rows render under the Auxiliary heading
+                parts.append(eq.describe_line(strip_args=strip_args, bullet=True, show_tags=show_tags))
+        # Auxiliary: ``group="aux"`` equation rows (w, ω, …) PLUS the oriented
+        # relations / BCs in ``_assumptions`` (KinematicBC …, ``lhs = rhs``).
+        if show in ("aux", "all"):
+            aux_rows = [(nm, self._equations[nm]) for nm in self._equations
+                        if nm in self._aux_names]
+            if aux_rows or self._assumptions:
+                from zoomy_core.model.operations import _StripArgsLatexPrinter
+                pr = _StripArgsLatexPrinter() if strip_args else None
+                tex = (lambda e: pr.doprint(e)) if pr else sp.latex
+                parts.append("\n**Auxiliary:**")
+                for nm, eq in aux_rows:
+                    parts.append(eq.describe_line(strip_args=strip_args, bullet=True, show_tags=show_tags))
+                for name, a in self._assumptions.items():
+                    rules = getattr(a, "subs_map", {}) or {}
+                    body = " \\\\ ".join(f"{tex(l)} = {tex(r)}"
+                                         for l, r in rules.items())
+                    parts.append(f"- **{name}:** ${body}$")
         if show_history and self.history:
             shown = [h for h in self.history
                      if h.get("log_level", 1) <= max_log_level]
@@ -749,8 +858,6 @@ def resolve_modes(equation, *, index, modes, test_weight=None,
         consulted when the ``test_weight`` / ``basis_cls`` / ``level`` closing
         path is active.
     """
-    from zoomy_core.derivation.operations import Substitution
-
     model = equation._model
     base = equation.name                      # "mass" or "momentum_x"
     modes = list(modes)
@@ -780,9 +887,9 @@ def resolve_modes(equation, *, index, modes, test_weight=None,
         row_name = f"{base}_{k}"
         model.add_equation(row_name, src_expr)
         row = model._equations[row_name]
-        row.apply(Substitution({index: k},
-                               name=f"resolve_modes[{index}={k}]"),
-                  _no_history=True)
+        # Specialise the abstract test index ``l`` → concrete mode ``k`` — a
+        # plain exact substitution (no Substitution class needed).
+        row.apply({index: k}, _no_history=True)
         if do_close:
             tw = test_weight.xreplace({index: k})
             if resolver is not None:

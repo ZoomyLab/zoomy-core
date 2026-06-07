@@ -1,20 +1,9 @@
 """Declarative-framework reference models.
 
-These build a :class:`~zoomy_core.derivation.model.Model` end-to-end through the
-clean-redesign op surface (``PDETransformation`` → ``separation_of_variables``
-→ concrete-level ``Resolve`` → kinematic-BC modal closure) to a target
-analytical form, ready for ``SystemModel.from_model(model, Q, Qaux)``.
-
-:class:`SME` / :func:`build_sme` reproduce the Shallow Moment Equations of
-Kowalski & Torrilhon (2019), eq. (4.17), with the constitutive viscous stress
-left OPEN.  :class:`SlipSME` INHERITS :class:`SME` and inserts the slip-Newton
-shear-stress closure on top of the inherited open pipeline.
-:class:`NewtonianSME` INHERITS :class:`SlipSME` and additionally KEEPS the
-horizontal normal stress ``τ_xx = 2 μ ∂_x u`` (which the base SME drops),
-closing it as a DIFFUSIVE flux that lifts into the SystemModel's rank-4
-``diffusion_matrix``.
+The end-to-end Kowalski & Torrilhon (2019) SME build (``sme_kt19``) was
+retired together with the ``Substitution`` class.  The current, step-by-step
+derivation lives in ``zoomy_core/derivation/notebooks/sme_blocks.ipynb``
+(mass → h-evolution, continuity → w̃, x-momentum → hydrostatic + ω).
 """
 
-from .sme_kt19 import SME, SlipSME, NewtonianSME, build_sme
-
-__all__ = ["SME", "SlipSME", "NewtonianSME", "build_sme"]
+__all__ = []
