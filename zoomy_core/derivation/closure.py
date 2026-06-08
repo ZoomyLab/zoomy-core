@@ -50,7 +50,7 @@ from __future__ import annotations
 import sympy as sp
 
 from zoomy_core import coords as _coords
-from zoomy_core.model.operations import Operation, Multiply
+from zoomy_core.model.operations import Operation, Multiply, is_bracket
 
 
 __all__ = [
@@ -60,6 +60,10 @@ __all__ = [
     "FoldConservative",
     "Split",
     "Simplify",
+    "Consolidate",
+    "consolidate",
+    "fold_self_products",
+    "leibniz_fold",
     "AutoTag",
     "SortByTag",
     "Sort",
@@ -778,6 +782,12 @@ def fold_conservatives(expr):
         changed = False
         for i in range(len(terms)):
             for j in range(i + 1, len(terms)):
+                # Never attempt the fold across OPAQUE ζ-integrals: the exactness
+                # check below calls ``.doit()``, which would try (and fail, slowly
+                # / non-terminating) to evaluate ``∫c·φ·…dζ`` with symbolic
+                # basis/weight.  Integral-bearing terms are left untouched.
+                if terms[i].has(sp.Integral) or terms[j].has(sp.Integral):
+                    continue
                 si, sj = _single_deriv_factor(terms[i]), _single_deriv_factor(terms[j])
                 if not (si and sj):
                     continue
@@ -795,6 +805,246 @@ def fold_conservatives(expr):
     return sp.Add(*terms)
 
 
+# ── Consolidate: generalised Leibniz fold (incl. inside integrals) ─────────
+
+def _deriv_factor(term):
+    """``(coeff, arg, v)`` when ``term`` is ``coeff · ∂_v(arg)`` with EXACTLY one
+    single-variable Derivative factor; else ``None``."""
+    facs = list(term.args) if isinstance(term, sp.Mul) else [term]
+    ds = [f for f in facs
+          if isinstance(f, sp.Derivative) and len(f.variables) == 1]
+    if len(ds) != 1:
+        return None
+    dv = ds[0]
+    return sp.Mul(*[f for f in facs if f is not dv]), dv.expr, dv.variables[0]
+
+
+def leibniz_fold(expr):
+    """Pairwise Leibniz fold with a shared PASSIVE factor ``M``:
+
+    .. math::  M\\,a\\,∂_v b + M\\,b\\,∂_v a \\;\\to\\; M\\,∂_v(a\\,b)
+
+    ``M=1`` is the plain conservative fold (``∂_t h·ũ + h·∂_t ũ → ∂_t(hũ)``);
+    ``M=τ̃`` folds ``τ̃ c' φ + τ̃ c φ' → τ̃ ∂_ζ(cφ)``.  Found by setting
+    ``M = c_i / a_j`` and accepting only when ``M·a_i == c_j`` exactly (so it is
+    always value-preserving) and ``M`` carries no derivative/integral."""
+    terms = list(sp.Add.make_args(sp.expand(expr)))
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(terms)):
+            for j in range(i + 1, len(terms)):
+                if terms[i].has(sp.Integral) or terms[j].has(sp.Integral):
+                    continue
+                si, sj = _deriv_factor(terms[i]), _deriv_factor(terms[j])
+                if not (si and sj):
+                    continue
+                (ci, ai, vi), (cj, aj, vj) = si, sj
+                if vi != vj or aj == 0:
+                    continue
+                M = sp.cancel(ci / aj)
+                if M.has(sp.Derivative) or M.has(sp.Integral):
+                    continue
+                if sp.expand(M * ai - cj) == 0:
+                    terms[i] = M * sp.Derivative(ai * aj, vi)
+                    del terms[j]
+                    changed = True
+                    break
+            if changed:
+                break
+    return sp.Add(*terms)
+
+
+def fold_self_products(expr):
+    """SELF-product fold: a single term ``M·f·∂_v f → M·∂_v(f²/2)`` (with the
+    constant ``M`` pulled inside when it is ``v``-independent, so ``g·h·∂_x h``
+    becomes the conservative hydrostatic flux ``∂_x(g h²/2)``).
+
+    A pure ``½ + ½`` split can't do this — the two halves are identical and
+    recombine.  Detection: the differentiated ``arg`` must DIVIDE the
+    coefficient exactly (``M = coeff/arg`` has unit denominator)."""
+    out = []
+    for tm in sp.Add.make_args(sp.expand(expr)):
+        df = _deriv_factor(tm)
+        if df:
+            coeff, arg, v = df
+            if arg != 0 and not arg.is_number:
+                M = sp.cancel(coeff / arg)
+                if (sp.denom(M) == 1 and not M.has(sp.Derivative)
+                        and not M.has(sp.Integral)
+                        and sp.expand(M * arg - coeff) == 0):
+                    inner = (M * arg**2 / 2 if not M.has(v) else arg**2 / 2)
+                    folded = sp.Derivative(inner, v)
+                    out.append(folded if not M.has(v) else M * folded)
+                    continue
+        out.append(tm)
+    return sp.Add(*out)
+
+
+def _coord_symbols(expr):
+    """Coordinate-like symbols in ``expr``: the non-integer arguments of field
+    Functions plus derivative / integral binding variables.  A pure parameter
+    (``g``, ``ρ``, ``ν``) never appears as a function argument, so it is NOT a
+    coordinate — which is exactly what lets :func:`push_consts_into_flux` tell a
+    cancellation-driving coordinate from a flux-shattering constant."""
+    coords = set()
+    for f in expr.atoms(sp.Function):
+        for a in f.args:
+            coords |= {s for s in a.free_symbols if not s.is_integer}
+    for d in expr.atoms(sp.Derivative):
+        coords |= set(d.variables)
+    for ig in expr.atoms(sp.Integral):
+        coords |= {lim[0] for lim in ig.limits}
+    return coords
+
+
+def push_consts_into_flux(expr, coords=None):
+    """Recover a clean conservative flux by pushing every COORDINATE-FREE factor
+    BACK INTO a bare derivative — the targeted inverse of :func:`pull_consts`:
+
+    .. math::  \\tfrac{g}{2}\\,∂_x(h²)\\,⟨c,φ_k⟩ \\;\\to\\; ∂_x\\!\\bigl(\\tfrac{g}{2}h²\\,⟨c,φ_k⟩\\bigr)
+
+    A coordinate-free factor — a parameter ``g``, a number, or a Galerkin
+    BRACKET ``⟨…⟩`` (a pure number) — can go inside the derivative; a
+    coordinate-bearing factor (``h``, ``a_i``) cannot.  The push therefore fires
+    on a term with exactly ONE derivative factor ONLY when EVERY other factor is
+    coordinate-free — yielding a clean ``∂_v(F)`` (a flux).  A term with a
+    coordinate factor stranded outside (``g·h·∂_x b·⟨c,φ_k⟩``, or the
+    ω-coupling ``Σ a_i⟨…⟩∂_x(a_j h)``) is genuinely non-conservative and is left
+    untouched.  Applied to the top-level terms and inside every ``Sum``."""
+    if coords is None:
+        coords = _coord_symbols(expr)
+
+    def _push_one(term):
+        facs = list(sp.Mul.make_args(term))
+        derivs = [f for f in facs
+                  if isinstance(f, sp.Derivative) and f.variables]
+        if len(derivs) != 1:
+            return term
+        d = derivs[0]
+        rest = [f for f in facs if f is not d]
+        if not rest or any(f.free_symbols & coords for f in rest):
+            return term
+        return sp.Derivative(sp.Mul(*rest) * d.expr, *d.variables)
+
+    out = []
+    for term in sp.Add.make_args(expr):
+        term = term.replace(
+            lambda e: isinstance(e, sp.Sum),
+            lambda e: sp.Sum(push_consts_into_flux(e.function, coords),
+                             *e.args[1:]))
+        out.append(_push_one(term))
+    return sp.Add(*out)
+
+
+def _hide_brackets(expr):
+    """Replace every Galerkin BRACKET (an :func:`is_bracket` integral — an
+    x-independent NUMBER) by an opaque symbol that carries the bracket's free
+    integer indices, e.g. ``⟨…φ_i φ_j φ_k…⟩ → _Br_0(i, j, k)``.
+
+    Returns ``(hidden_expr, restore_map)``.  A bracket is a passive constant for
+    the conservative fold, so hiding it (i) lets ``∂_x(h a_j)`` fold AROUND it
+    even though the bracket body contains ``∫`` and (ii) stops the exactness
+    ``.doit()`` from trying to evaluate the opaque ``∫`` symbolically."""
+    brackets = sorted({ig for ig in expr.atoms(sp.Integral) if is_bracket(ig)},
+                      key=sp.srepr)
+    hide, restore = {}, {}
+    for n, ig in enumerate(brackets):
+        idxs = tuple(sorted((s for s in ig.free_symbols if s.is_integer),
+                            key=str))
+        sym = (sp.Function(f"_Br_{n}")(*idxs) if idxs
+               else sp.Symbol(f"_Br_{n}"))
+        hide[ig] = sym
+        restore[sym] = ig
+    return expr.xreplace(hide), restore
+
+
+def merge_sums_over_add(expr):
+    """Merge ``Sum(A, lims) + Sum(B, lims) → Sum(A + B, lims)`` for IDENTICAL
+    limits (linearity of the finite sum), pulling an index-independent outer
+    coefficient inside first — the ``Sum`` analogue of ``merge_integrals_over_add``,
+    so two same-index moment sums can be folded together term-by-term."""
+    groups, rest = {}, []
+    for tm in sp.Add.make_args(sp.expand(expr)):
+        facs = sp.Mul.make_args(tm)
+        sums = [f for f in facs if isinstance(f, sp.Sum)]
+        if len(sums) == 1:
+            s = sums[0]
+            coeff = sp.Mul(*[f for f in facs if f is not s])
+            idxs = {lim[0] for lim in s.limits}
+            if not (coeff.free_symbols & idxs):
+                key = tuple(sorted(s.limits, key=lambda l: str(l[0])))
+                groups.setdefault(key, []).append(coeff * s.function)
+                continue
+        rest.append(tm)
+    out = sp.Add(*rest)
+    for limits, summands in groups.items():
+        out += sp.Sum(sp.Add(*summands), *limits)
+    return out
+
+
+def consolidate(expr, fold_self=False, fold_sums=False):
+    """Unify terms under a common outer derivative — :func:`leibniz_fold` applied
+    to the top-level terms AND, after merging same-limit integrals (linearity),
+    to every INTEGRAND (and ``Sum`` summand) recursively.  So ``∫τ̃c'φ + ∫τ̃cφ'``
+    (two opaque integrals) merges and folds to ``∫τ̃·∂_ζ(cφ)``.
+
+    ``fold_self=True`` additionally folds SELF-products
+    (:func:`fold_self_products`, ``g·h·∂_x h → ∂_x(g h²/2)``).  Kept OFF inside
+    :class:`Simplify` (whose ``pull_consts`` would re-expand the square next
+    pass); the :class:`Consolidate` op turns it ON.
+
+    ``fold_sums=True`` additionally HIDES Galerkin brackets behind opaque
+    symbols (:func:`_hide_brackets`) and merges same-index sums
+    (:func:`merge_sums_over_add`) first, so a conservative pair split by
+    ``PullConstants`` — ``Σ_ij a_i⟨B⟩(h ∂_x a_j + a_j ∂_x h)`` — re-folds to
+    ``Σ_ij a_i⟨B⟩ ∂_x(h a_j)`` even though ``⟨B⟩`` carries an ``∫``."""
+    from zoomy_core.symbolic.primitives_canonical import merge_integrals_over_add
+    restore = {}
+    if fold_sums:
+        # Canonicalise integral dummies first so alpha-equivalent brackets
+        # (same body, different ``\hat ξ`` Dummy objects) hide to the SAME
+        # symbol — otherwise the conservative pair never pairs up.
+        from zoomy_core.model.operations import _canonicalize_integral_dummies
+        expr = _canonicalize_integral_dummies(expr)
+        expr, restore = _hide_brackets(expr)
+        expr = merge_sums_over_add(expr)
+    expr = merge_integrals_over_add(expr)
+
+    def _rec(e):
+        if isinstance(e, sp.Integral):
+            return e.func(leibniz_fold(_rec(e.function)), *e.args[1:])
+        if isinstance(e, sp.Sum):
+            return e.func(leibniz_fold(_rec(e.function)), *e.args[1:])
+        if e.args:
+            return e.func(*[_rec(a) for a in e.args])
+        return e
+
+    expr = leibniz_fold(_rec(expr))
+    if fold_self:
+        expr = fold_self_products(expr)
+        # Re-conservatise: push pure constants (``g``) back into a bare flux that
+        # ``pull_consts`` had split — but only when a clean ``∂_v(F)`` results.
+        expr = push_consts_into_flux(expr)
+    return expr.xreplace(restore) if restore else expr
+
+
+class Consolidate(Operation):
+    """Op form of :func:`consolidate` — fold ``M·a·∂b + M·b·∂a → M·∂(ab)`` over
+    the terms and inside integrals.  Part of :class:`Simplify`; also usable on
+    its own to recover a conservative grouping (or fold opaque-integral
+    integrands) without the rest of the simplify pipeline."""
+
+    whole_leaf_op = True
+    log_level = 5
+
+    def __init__(self, name="consolidate"):
+        super().__init__(name=name, description="leibniz fold (terms + integrands)")
+
+    def _leaf_sp(self, sp_expr):
+        return consolidate(sp_expr, fold_self=True, fold_sums=True)
+
+
 class Simplify(Operation):
     """Canonicalisation that keeps fluxes as fluxes while exposing cancellations.
 
@@ -810,16 +1060,31 @@ class Simplify(Operation):
        ``g∂_v f + f∂_v g → ∂_v(fg)``: applied ONLY when exact, so it never
        increases the term count and never breaks a genuine non-conservative
        coupling apart.
+
+    Applied to an :class:`~zoomy_core.model.equation.Equation` it ALSO runs
+    :class:`Sort` (auto-tag + order by physics category) as a final step, so a
+    simplified row comes out tagged and ordered.  ``Sort`` still exists as its
+    own op; pass ``sort=False`` to skip it.
     """
 
     whole_leaf_op = True
     log_level = 5            # minor canonicalisation — hidden at low verbosity
 
-    def __init__(self, name="simplify"):
+    def __init__(self, name="simplify", sort=True):
+        self._sort = sort
         super().__init__(name=name, description="canonical simplify")
 
     def _leaf_sp(self, sp_expr):
-        return fold_conservatives(pull_consts(sp_expr))
+        return consolidate(pull_consts(sp_expr))
+
+    def apply_to_equation(self, eq):
+        # Equation-level: canonicalise the residual, then tag + sort the terms
+        # (a leaf-only ``_leaf_sp`` would lose the ordering when ``eq.expr`` is
+        # rebuilt, so the sort has to happen here).
+        eq.expr = self._leaf_sp(eq.expr)
+        if self._sort:
+            Sort().apply_to_equation(eq)
+        return eq
 
 
 # ── term tagging + sorting ─────────────────────────────────────────────────
@@ -828,6 +1093,7 @@ class Simplify(Operation):
 TAG_ORDER = [
     "time_derivative",        # ∂_t(…)            — the local time derivative
     "flux",                   # ∂_x(…) / ∂_ζ(…)   — conservative flux
+    "pressure_flux",          # ∂_x(g h²/2 …)     — pressure flux (manual re-tag)
     "diffusion",              # ∂_x(… ∂_x …)      — diffusive (2nd-order) flux
     "nonconservative_flux",   # c(Q)·∂(Q)         — NCP
     "source",                 # algebraic / ∂(known field) — source
@@ -835,15 +1101,42 @@ TAG_ORDER = [
 ]
 
 
-def _classify_term(term, q_heads, t, spatial):
+def _strip_brackets_for_tagging(term):
+    """Replace every Galerkin bracket (a pure NUMBER — :func:`is_bracket`
+    Integral, or a ``Gram``/``Weight`` atom) by an opaque ``Dummy`` so the tagger
+    treats it as a constant: its internal ζ-derivatives are not physical fluxes
+    and it carries no unknown."""
+    reps = {}
+    for ig in term.atoms(sp.Integral):
+        if is_bracket(ig):
+            reps[ig] = sp.Dummy("B")
+    for fn in term.atoms(sp.Function):
+        if getattr(fn.func, "_is_bracket", False):
+            reps[fn] = sp.Dummy("B")
+    return term.xreplace(reps) if reps else term
+
+
+def _classify_term(term, q_heads, t, spatial, detect_ncp=True):
     """Heuristic physics category for one additive ``term``.
 
-    ``q_heads`` = the unknown family heads (so a field coefficient times a
-    derivative of an UNKNOWN is an NCP, but of a KNOWN field, e.g. the bed
-    ``b``, is a source).  ``t`` is the time coord, ``spatial`` the horizontal
-    coords.  Best-effort — the user pre-tags the cases the heuristic misses
-    (``AutoTag`` never overwrites an existing tag)."""
+    Galerkin brackets are first made opaque (a bracket is a number, not a flux),
+    then a single outer moment ``Sum`` is peeled so the per-mode summand is what
+    is classified — this is what lets the ``Σ_{ij} a_i⟨…⟩∂_x(a_j h)`` coupling be
+    seen as a nonconservative product rather than an opaque ``source``.
+
+    ``q_heads`` = unknown family heads; ``t`` the time coord; ``spatial`` the
+    horizontal coords.  A ``field·∂_v(…)`` term is a nonconservative product
+    (the conservative flux has NO field coefficient outside the derivative);
+    ``detect_ncp`` toggles that heuristic (off → ``source``).  Best-effort — the
+    user can always pre-/re-tag (``AutoTag`` never overwrites an existing tag)."""
+    term = _strip_brackets_for_tagging(term)
     factors = list(term.args) if isinstance(term, sp.Mul) else [term]
+    # Peel a single outer moment Sum: classify by its per-mode summand.
+    sums = [f for f in factors if isinstance(f, sp.Sum)]
+    if len(sums) == 1:
+        rest = sp.Mul(*[f for f in factors if f is not sums[0]])
+        return _classify_term(rest * sums[0].function, q_heads, t, spatial,
+                              detect_ncp)
     derivs = [f for f in factors
               if isinstance(f, sp.Derivative) and len(f.variables) == 1]
     if len(derivs) != 1:
@@ -863,9 +1156,7 @@ def _classify_term(term, q_heads, t, spatial):
                               for a in arg.atoms(sp.Derivative)):
         return "diffusion"
     if coeff_has_field:
-        arg_has_unknown = any(getattr(a, "func", None) in q_heads
-                              for a in arg.atoms(sp.Function))
-        return "nonconservative_flux" if arg_has_unknown else "source"
+        return "nonconservative_flux" if detect_ncp else "source"
     return "flux"
 
 
@@ -891,14 +1182,16 @@ class AutoTag(Operation):
 
     log_level = 5
 
-    def __init__(self, name="auto_tag"):
+    def __init__(self, name="auto_tag", detect_ncp=True):
+        self._detect_ncp = detect_ncp
         super().__init__(name=name, description="tag untagged terms by category")
 
     def apply_to_equation(self, eq):
         q_heads, t, spatial = _tag_context(eq)
         for tm in eq._terms:
             if tm.tag is None:
-                tm.tag = _classify_term(tm.expr, q_heads, t, spatial)
+                tm.tag = _classify_term(tm.expr, q_heads, t, spatial,
+                                        detect_ncp=self._detect_ncp)
         return eq
 
 
@@ -927,10 +1220,11 @@ class Sort(Operation):
 
     log_level = 5
 
-    def __init__(self, name="sort"):
+    def __init__(self, name="sort", detect_ncp=True):
+        self._detect_ncp = detect_ncp
         super().__init__(name=name, description="auto-tag + sort by physics tag")
 
     def apply_to_equation(self, eq):
-        AutoTag().apply_to_equation(eq)
+        AutoTag(detect_ncp=self._detect_ncp).apply_to_equation(eq)
         SortByTag().apply_to_equation(eq)
         return eq

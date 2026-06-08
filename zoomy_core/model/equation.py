@@ -339,7 +339,13 @@ class Equation(RelationMixin):
         the resulting algebraic relation.
         """
         residual = sp.expand(self.expr)
-        if any(der.has(symbol) for der in residual.atoms(sp.Derivative)):
+        # Block only when ``symbol`` sits under a DIFFERENT/higher derivative
+        # (genuinely differential).  Solving FOR a derivative (e.g. ``∂_t h``
+        # from a mass balance) is fine: ``∂_t h`` is itself a ``Derivative``
+        # atom, so ``der.has(symbol)`` would misfire on the ``der == symbol``
+        # case — exclude it.
+        if any(der != symbol and der.has(symbol)
+               for der in residual.atoms(sp.Derivative)):
             raise ValueError(
                 f"solve_for({symbol}) is algebraic, but {self.name!r} is "
                 f"differential in {symbol} (it appears under a Derivative). "
@@ -373,49 +379,75 @@ class Equation(RelationMixin):
                    else _BracketLatexPrinter)(settings={"order": "none"})
         return printer.doprint(ordered)
 
-    def _tag_summary(self):
-        return ", ".join(tm.tag or "untagged" for tm in self._terms)
+    def _tagged_tex(self, strip_args=False):
+        """Multiline ``\\underbrace{…}_{tag}`` render — consecutive same-tag
+        terms (the rest state after :class:`SortByTag`) grouped under one brace
+        labelled by their physics tag."""
+        from zoomy_core.model.operations import (
+            _StripArgsLatexPrinter, _BracketLatexPrinter)
+        printer = (_StripArgsLatexPrinter if strip_args
+                   else _BracketLatexPrinter)(settings={"order": "none"})
+        groups = []                                   # [(tag, [exprs])], in order
+        for tm in self._terms:
+            tag = tm.tag or "untagged"
+            if groups and groups[-1][0] == tag:
+                groups[-1][1].append(tm.expr)
+            else:
+                groups.append((tag, [tm.expr]))
+        lines = []
+        for i, (tag, exprs) in enumerate(groups):
+            tex = printer.doprint(sp.Add(*exprs, evaluate=False))
+            label = tag.replace("_", " ")
+            sign = "" if (i == 0 or tex.startswith("-")) else "+ "
+            lines.append(rf"  & {sign}\underbrace{{{tex}}}_{{\text{{{label}}}}}")
+        return ("\\begin{aligned}\n" + " \\\\\n".join(lines)
+                + "\n  &= 0\n\\end{aligned}")
+
+    def _describe_tex(self, strip_args=False, show_tags=False):
+        if show_tags and any(tm.tag for tm in self._terms):
+            return self._tagged_tex(strip_args)
+        return f"{self._ordered_tex(strip_args)} = 0"
 
     def describe(self, strip_args=False, header=True, show_tags=False):
         """Render this equation as a :class:`Description`.
 
         Terms print in their current order (so a :class:`SortByTag` shows).  An
         oriented equation (from ``solve_for`` / ``sp.Eq``) renders ``lhs = rhs``
-        rather than ``residual = 0``.  ``show_tags=True`` appends the per-term
-        physics tags."""
+        rather than ``residual = 0``.  ``show_tags=True`` underbraces each
+        physics-tag group."""
         from zoomy_core.misc.description import Description
         parts = []
         if header:
             parts.append(f"**{self.name}** ({len(self._terms)} terms)")
         if self._as_relation:
-            from zoomy_core.model.operations import _StripArgsLatexPrinter
-            pr = _StripArgsLatexPrinter() if strip_args else None
-            tex = (lambda e: pr.doprint(e)) if pr else sp.latex
+            from zoomy_core.model.operations import (
+                _StripArgsLatexPrinter, _BracketLatexPrinter)
+            pr = (_StripArgsLatexPrinter if strip_args
+                  else _BracketLatexPrinter)(settings={"order": "none"})
+            tex = lambda e: pr.doprint(e)
             body = " \\\\ ".join(f"{tex(l)} = {tex(r)}"
                                  for l, r in self._as_relation.items())
             parts.append(f"\n$$\n\\begin{{aligned}} {body} \\end{{aligned}}\n$$")
         else:
-            parts.append(f"\n$$\n{self._ordered_tex(strip_args)} = 0\n$$")
-            if show_tags:
-                parts.append(f"\n**tags:** {self._tag_summary()}")
+            parts.append(f"\n$$\n{self._describe_tex(strip_args, show_tags)}\n$$")
         return Description("\n".join(parts))
 
     def describe_line(self, strip_args=False, bullet=False, show_tags=False):
         """One-line markdown render (used by ``Model.describe``).  An oriented
         equation renders as ``lhs = rhs``; a plain residual as ``… = 0`` with
-        terms in their current order.  ``show_tags`` appends the per-term tags."""
+        terms in their current order.  ``show_tags`` underbraces each tag
+        group (same render as :meth:`describe`)."""
         prefix = "- " if bullet else ""
         if self._as_relation:
-            from zoomy_core.model.operations import _StripArgsLatexPrinter
-            pr = _StripArgsLatexPrinter() if strip_args else None
-            tex = (lambda e: pr.doprint(e)) if pr else sp.latex
+            from zoomy_core.model.operations import (
+                _StripArgsLatexPrinter, _BracketLatexPrinter)
+            pr = (_StripArgsLatexPrinter if strip_args
+                  else _BracketLatexPrinter)(settings={"order": "none"})
+            tex = lambda e: pr.doprint(e)
             body = " \\\\ ".join(f"{tex(l)} = {tex(r)}"
                                  for l, r in self._as_relation.items())
             return f"{prefix}**{self.name}:** ${body}$"
-        line = f"{prefix}**{self.name}:** ${self._ordered_tex(strip_args)} = 0$"
-        if show_tags:
-            line += f"  _[{self._tag_summary()}]_"
-        return line
+        return f"{prefix}**{self.name}:** ${self._describe_tex(strip_args, show_tags)}$"
 
     def __repr__(self):
         return f"Equation({self.name!r}, {len(self._terms)} terms)"

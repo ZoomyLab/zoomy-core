@@ -291,6 +291,15 @@ class SeparationOfVariables(Operation):
                           (idx, 0, order))
         for eq in model._equations.values():
             eq.expr = eq.expr.replace(head, _expand)
+            # An ORIENTED relation (e.g. ``ω = …`` after ``SolveFor``) keeps a
+            # separate ``_as_relation`` dict; rewrite its lhs/rhs too so the
+            # stored relation stays consistent with ``expr`` and a later
+            # ``apply(eq)`` substitutes the ansatz-expanded form, not the stale
+            # field head.
+            rel = getattr(eq, "_as_relation", None)
+            if rel:
+                eq._as_relation = {k.replace(head, _expand): v.replace(head, _expand)
+                                   for k, v in rel.items()}
 
         # Swap the unknown family: the field's head leaves Q, the coeff
         # family (``a(i, *coords)``) enters.

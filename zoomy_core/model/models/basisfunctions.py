@@ -98,6 +98,19 @@ class Basisfunction:
             (lambda arg, _k=k, _fn=self.phi_fn: _fn(_k, arg))
             for k in range(level + 1)
         ]
+        # ── ONE opaque weight Function head ``c(ζ)`` (1-arg), the counterpart
+        # of ``phi_fn`` for the test weight — so a derivation can build its
+        # brackets ``⟨c φ_i φ_l⟩`` from THIS basis's heads and resolve them
+        # against the same instance.  ``_is_basis_head`` marks both heads so
+        # :meth:`resolve` recognises them structurally.
+        self.phi_fn._is_basis_head = True
+        self.c_fn = type(
+            self.weight_name,
+            (sympy.Function,),
+            {"_basis": self, "_is_basis_head": True, "nargs": 1},
+        )
+        # Per-instance memo of evaluated brackets (antiderivative results).
+        self._bracket_cache: dict = {}
 
     # ``weight_name`` is the name of the opaque test-weight Function family
     # ``c(ζ)`` the derivation framework's brackets carry.  Default ``"c"``;
@@ -139,6 +152,99 @@ class Basisfunction:
             return self.phi_fn(k, z_arg)
 
         return expr.replace(self.phi_fn, _replace)
+
+    # ── Galerkin-bracket resolution: ⟨…⟩ → number (antiderivative + cache) ──
+
+    def _concretize_bracket(self, body):
+        """Replace this basis's opaque ``phi(k, ζ)`` by the polynomial
+        ``eval(k, ζ)`` and the weight ``c(ζ)`` by ``weight(ζ)`` — for INTEGER
+        indices only (a symbolic index stays opaque).  Recognises the heads
+        structurally (``_is_basis_head`` + arity), so a bracket built from ANY
+        compatible opaque basis (the derivation's symbolic ``Basis`` or this
+        instance's own ``phi_fn``/``c_fn``) resolves against this polynomial
+        basis."""
+        def _is_phi(e):
+            return (isinstance(e, sympy.Function)
+                    and getattr(e.func, "_is_basis_head", False)
+                    and len(e.args) == 2)
+
+        def _is_c(e):
+            return (isinstance(e, sympy.Function)
+                    and getattr(e.func, "_is_basis_head", False)
+                    and len(e.args) == 1)
+
+        body = body.replace(
+            _is_phi, lambda e: (self.eval(int(e.args[0]), e.args[1])
+                                if e.args[0].is_Integer else e))
+        body = body.replace(_is_c, lambda e: sympy.sympify(self.weight(e.args[0])))
+        return body
+
+    def evaluate_bracket(self, body, var, lower=0, upper=1):
+        """Evaluate ONE Galerkin bracket ``∫_lower^upper body d(var)`` to a
+        NUMBER against this basis.
+
+        ``body`` is a product of opaque ``phi(k, ζ)`` / ``c(ζ)``, their
+        ζ-derivatives, ζ-powers, and nested running integrals ``∫_0^ζ … dξ``.
+        Concretise → ``.doit()`` (derivatives and nested integrals collapse to a
+        polynomial in ``var``) → antiderivative evaluated at the bounds — the
+        fast path, no ``sympy.integrate`` on opaque φ.  Memoised per instance
+        (sympy hashes the integrand structurally, so reordered products share an
+        entry)."""
+        key = (sympy.sympify(body), var, lower, upper)
+        hit = self._bracket_cache.get(key)
+        if hit is not None:
+            return hit
+        concrete = sympy.expand(self._concretize_bracket(sympy.sympify(body)).doit())
+        val = sympy.simplify(
+            self.analytical_weighted_integral_bounds(concrete, var, lower, upper))
+        self._bracket_cache[key] = val
+        return val
+
+    def analytical_weighted_integral_bounds(self, poly_expr, var, lower, upper):
+        """``∫_lower^upper poly_expr d(var)`` by antiderivative (the integrand is
+        a polynomial after concretisation) — the general-bounds companion of
+        :meth:`analytical_weighted_integral`."""
+        try:
+            anti = sympy.Poly(poly_expr, var).integrate().as_expr()
+        except (sympy.GeneratorsNeeded, sympy.PolynomialError):
+            anti = sympy.integrate(poly_expr, var)
+        return anti.subs(var, upper) - anti.subs(var, lower)
+
+    def resolve(self, expr, var):
+        """Resolve EVERY Galerkin bracket in ``expr`` to a number against this
+        basis — the single entry point a derivation calls to make a bracket form
+        concrete:
+
+        * named ``Gram``/``Weight`` atoms → :meth:`closed_form_bracket` (the
+          orthogonality δ-form), falling back to evaluation when there is none;
+        * opaque ``⟨…⟩`` ``is_bracket`` integrals → :meth:`evaluate_bracket`.
+
+        Fast (antiderivative + cache) and basis-general — no ``sympy.integrate``
+        on the opaque φ, and the running-integral ``∫_0^ζ`` collapses under the
+        same concretise-then-``doit`` step."""
+        from zoomy_core.model.operations import is_bracket
+
+        def _named(e):
+            cf = self.closed_form_bracket(e.func.__name__, tuple(e.args))
+            return cf if cf is not None else e
+
+        expr = expr.replace(
+            lambda e: (isinstance(e, sympy.Function)
+                       and getattr(e.func, "_is_bracket", False)),
+            _named)
+
+        def _opaque(ig):
+            if not is_bracket(ig):
+                return ig
+            v, lo, hi = ig.limits[0]
+            return self.evaluate_bracket(ig.function, v, lo, hi)
+
+        expr = expr.replace(lambda e: isinstance(e, sympy.Integral), _opaque)
+        # Concretise any LOOSE φ/c left outside a bracket — the boundary
+        # evaluations ``φ_i(0)``, ``c(0)`` of the wall-friction term (``φ_i(0) =
+        # P_i(−1) = (−1)^i``).
+        expr = self._concretize_bracket(expr)
+        return sympy.expand(expr.doit())
 
     def get(self, k):
         """Get."""

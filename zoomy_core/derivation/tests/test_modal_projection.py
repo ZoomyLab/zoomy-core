@@ -19,7 +19,7 @@ import zoomy_core.derivatives as d
 from zoomy_core.derivation import (
     Model, PDETransformation, Basis,
     separation_of_variables, reset_modal_indices, modal_bound,
-    ExpandSums, Project, ExtractBrackets, ResolveBasis,
+    ExpandSums, Project, PullConstants, ExtractBrackets, ResolveBasis,
     bracket_atoms, Gram,
 )
 from zoomy_core.model.models.basisfunctions import Legendre_shifted
@@ -154,6 +154,9 @@ def test_project_then_extract_brackets_mass_row():
     # After Project the unexpanded ansatz Sum survives (no premature .doit()).
     assert model.mass.expr.atoms(sp.Sum)
 
+    # PullConstants pushes the Σ out and hoists the ζ-independent a_i, leaving a
+    # pure-ζ ∫ for ExtractBrackets to NAME (the extractor no longer pushes).
+    model.mass.apply(PullConstants())
     model.mass.apply(ExtractBrackets(basis, var=zeta))
     expr = model.mass.expr
 
@@ -185,11 +188,11 @@ def test_resolve_basis_closes_gram_to_delta_form():
     c = basis.weight
 
     model.mass.apply(Project(c(zeta) * basis.phi(l, zeta), var=zeta))
+    model.mass.apply(PullConstants())
     model.mass.apply(ExtractBrackets(basis, var=zeta))
     assert any(at.func.__name__ == "Gram" for at in bracket_atoms(model.mass.expr))
 
-    model.mass.apply(ResolveBasis(model.modal_index(s["u"]),
-                                  Legendre_shifted, N_u, model=model))
+    model.mass.apply(ResolveBasis(Legendre_shifted(level=0), var=zeta))
     expr = model.mass.expr
 
     # Gram is gone; the orthogonal term collapsed to a(l,…)/(2l+1) (Piecewise
@@ -212,9 +215,9 @@ def test_resolve_basis_symbolic_l_then_bind():
     c = basis.weight
 
     model.mass.apply(Project(c(zeta) * basis.phi(l, zeta), var=zeta))
+    model.mass.apply(PullConstants())
     model.mass.apply(ExtractBrackets(basis, var=zeta))
-    model.mass.apply(ResolveBasis(model.modal_index(s["u"]),
-                                  Legendre_shifted, N_u, model=model))
+    model.mass.apply(ResolveBasis(Legendre_shifted(level=0), var=zeta))
 
     # Bind the test mode l = 1 (N_u ≥ 1 branch) → a(1, t, x)/3 derivative.
     bound = model.mass.expr.subs(l, 1).doit()

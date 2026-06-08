@@ -726,28 +726,20 @@ class Expression(RelationMixin, SymbolicBase):
             rel = getattr(cond, "_as_relation", None)
             if isinstance(rel, dict) and rel:
                 expr = _resolve_subs(expr)
-                return expr.subs(rel)
+                # ``_apply_relation`` substitutes a FUNCTION DEFINITION
+                # ``f(…, ζ) = rhs`` at the head level (so ``ω(t,x,ζ)`` also
+                # rewrites the ``ω(t,x,\hat ζ)`` carried inside a bracket) and
+                # any other lhs by exact match — a plain ``eq.apply(m.omega)``
+                # therefore eliminates the operator with no bolt-on op.
+                return _resolve_subs(_apply_relation(expr, rel))
             if isinstance(cond, dict):
                 expr = _resolve_subs(expr)
-                # Sympify both sides so a raw ``0`` rhs (``{∂_t b: 0}``) never
-                # leaks a Python ``int`` through ``xreplace`` — which would
-                # otherwise return the bare ``0`` and break the ``.has`` checks
-                # downstream (this is what the old ``Substitution`` did for us).
-                cond = {sp.sympify(k): sp.sympify(v) for k, v in cond.items()}
-                # ``xreplace`` is purely structural — no dummy-dependency
-                # safety check — so it handles the basis-expansion case
-                # where the RHS contains the integration variable (``ζ``
-                # inside a zeta-integral).  All our dict keys are
-                # concrete Function applications or Subs-derived forms,
-                # both of which match exactly under structural equality.
-                expr = expr.xreplace(cond)
-                # Second ``_resolve_subs`` pass: the substitution may
-                # have closed running integrals / nested Subs that
-                # previously blocked resolution (the w-closure's
-                # ``∫_b^z ∂_x u dz'`` becomes a polynomial in ``z``
-                # once ``u`` is basis-expanded), so Subs around them
-                # now resolve cleanly.
-                return _resolve_subs(expr)
+                # Same relation semantics for a raw ``{lhs: rhs}`` dict.  The
+                # sympify inside ``_apply_relation`` keeps a raw ``0`` rhs
+                # (``{∂_t b: 0}``) from leaking a Python ``int`` and breaking
+                # downstream ``.has`` checks; exact lhs go through structural
+                # ``xreplace`` (basis-expansion-safe for a ``ζ``-in-rhs case).
+                return _resolve_subs(_apply_relation(expr, cond))
             elif isinstance(cond, (list, tuple)):
                 if len(cond) == 2 and isinstance(cond[0], sp.Basic):
                     return expr.subs(cond[0], cond[1])
@@ -1514,6 +1506,43 @@ def _append_subscript(tex_name: str, idx_tex: str) -> str:
     return f"{tex_name}_{{{idx_tex}}}"
 
 
+# ── Galerkin-bracket predicate (single source of truth) ────────────────────
+
+
+def is_bracket_body(integrand, var):
+    """``True`` iff ``integrand`` is a Galerkin BRACKET body — a pure function of
+    the integration variable ``var``, depending on NOTHING else (integer mode
+    indices ``i``/``k`` excepted, since they parametrise the bracket).
+
+    This is THE definition of "this ∫ is a bracket" and the single source of
+    truth reused everywhere it is needed:
+
+    * the LaTeX printer — render ``∫_0^1 (…) dζ`` as ``⟨…⟩`` only when this holds;
+    * :class:`~zoomy_core.derivation.projection.ExtractBrackets` — the naming
+      gate (a ``t``/``x``-bearing body is not yet a bracket);
+    * the bracket-quadrature step that turns ``⟨…⟩`` into NUMBERS — pick the
+      integrals to evaluate via the basis instead of sympy.
+
+    A factor that carries any non-index continuous symbol (``a_i(t,x)``, ``h``,
+    ``τ̃``, ``ω``, a parameter ``g``) disqualifies it."""
+    return all(s == var or getattr(s, "is_integer", False)
+               for s in integrand.free_symbols)
+
+
+def is_bracket(integral):
+    """``True`` iff ``integral`` is a Galerkin BRACKET: an ``sp.Integral`` over a
+    CONSTANT interval whose body satisfies :func:`is_bracket_body` — hence a pure
+    NUMBER, evaluable by basis quadrature.  A running ``∫_0^ζ`` (variable upper
+    limit) is therefore NOT a bracket; it is a ζ-function that may sit *inside*
+    one."""
+    if not (isinstance(integral, Integral)
+            and len(integral.limits) == 1 and len(integral.limits[0]) == 3):
+        return False
+    var, lo, hi = integral.limits[0]
+    return (getattr(lo, "is_number", False) and getattr(hi, "is_number", False)
+            and is_bracket_body(integral.function, var))
+
+
 class _BracketLatexPrinter(_LatexPrinter):
     """LaTeX printer that parenthesises a COMPOUND differentiation argument so a
     conservative flux ``∂_x(h·b)`` is visually distinct from the
@@ -1523,6 +1552,24 @@ class _BracketLatexPrinter(_LatexPrinter):
     arg-stripping printer so the rule applies with or without ``strip_args``."""
 
     def _print_Derivative(self, expr):
+        # PRIME notation for a derivative of a UNIVARIATE function — one whose
+        # only continuous dependence is the differentiation variable (mode
+        # indices excepted): ``∂_ζ φ_i → φ_i'``, ``∂_ζ(c φ_k) → (c φ_k)'``,
+        # ``∂_ζ² φ_i → φ_i''``.  A multivariate field (``∂_x h``, ``∂_ζ ũ``)
+        # keeps the ``∂`` form — there the variable matters.
+        variables = expr.variables
+        if len(set(variables)) == 1:
+            v = variables[0]
+            arg = expr.expr
+            if (v in arg.free_symbols
+                    and all(s == v or getattr(s, "is_integer", False)
+                            for s in arg.free_symbols)):
+                inner_tex = self._print(arg)
+                if isinstance(arg, (sp.Add, sp.Mul)):
+                    inner_tex = r"\left(" + inner_tex + r"\right)"
+                n = len(variables)
+                primes = "'" * n if n <= 3 else r"^{(%d)}" % n
+                return inner_tex + primes
         tex = super()._print_Derivative(expr)
         inner = expr.expr
         if isinstance(inner, (sp.Add, sp.Mul)):
@@ -1531,6 +1578,86 @@ class _BracketLatexPrinter(_LatexPrinter):
                 return (tex[:-len(inner_tex)]
                         + r"\left(" + inner_tex + r"\right)")
         return tex
+
+    def _is_bracket_factor(self, a):
+        """A factor that renders as a Galerkin bracket ``⟨…⟩`` — a named
+        ``Gram``/``Weight`` atom, a pure-ζ ``∫_0^1`` Integral, or a power of
+        either."""
+        if isinstance(a, Integral):
+            return is_bracket(a)
+        if isinstance(a, sp.Function) and getattr(a.func, "_is_bracket", False):
+            return True
+        if isinstance(a, sp.Pow):
+            return self._is_bracket_factor(a.base)
+        return False
+
+    def _print_Mul(self, expr):
+        # Render bracket factors (the pure-number ``⟨…⟩``) LAST in a product, so
+        # a term reads "coefficients … ⟨bracket⟩" rather than burying the bracket
+        # mid-term (``Σ h a_j ⟨…⟩ a_i`` → ``Σ h a_j a_i ⟨…⟩``).  Order-preserving
+        # (the ``order='none'`` printer keeps ``expr.args`` order), display-only.
+        if isinstance(expr, sp.Mul):
+            args = list(expr.args)
+            bset = [i for i, a in enumerate(args) if self._is_bracket_factor(a)]
+            if bset and len(bset) < len(args):
+                drop = set(bset)
+                rest = [a for i, a in enumerate(args) if i not in drop]
+                brk = [args[i] for i in bset]
+                return super()._print_Mul(sp.Mul(*rest, *brk, evaluate=False))
+        return super()._print_Mul(expr)
+
+    def _print_Function(self, expr, exp=None):
+        """An INTEGER (or integer-symbol) FIRST argument renders as a subscript
+        on the name: ``phi(k, ζ) → φ_k(ζ)``, ``phi(1, ζ) → φ_1(ζ)``,
+        ``a(i, t, x) → a_i(t, x)``.  A modal index ``k``/``i``/``l`` carries the
+        ``integer`` assumption; coordinates (``t``, ``x``, ``ζ``) do not, so
+        ordinary fields like ``u(t, x, z)`` are unaffected.  Rendering only —
+        the sympy object is unchanged."""
+        args = expr.args
+        if args and getattr(args[0], "is_integer", False):
+            name = self._deal_with_super_sub(expr.func.__name__)
+            base = _append_subscript(name, self._print(args[0]))
+            rest = args[1:]
+            if rest:
+                base += (r"\left(" + ", ".join(self._print(a) for a in rest)
+                         + r"\right)")
+            return f"{base}^{{{exp}}}" if exp is not None else base
+        return super()._print_Function(expr, exp=exp)
+
+    @staticmethod
+    def _is_canonical_zeta(bar_value):
+        """True for the reference-element ζ-symbol, the canonicalised
+        ``\\hat{ζ}`` integration Dummy, *or* the opaque ``state.zeta(...)``
+        Function-call head — all three name the σ reference coordinate and so
+        mark a definite ``∫_0^1`` as a Galerkin bracket."""
+        if bar_value == sp.Symbol("zeta", real=True):
+            return True
+        if isinstance(bar_value, sp.Dummy):
+            return True
+        if (isinstance(bar_value, sp.Function)
+                and getattr(bar_value.func, "__name__", "") == "zeta"):
+            return True
+        return False
+
+    def _print_Integral(self, expr):
+        # A definite ``∫_0^1 (…) dζ`` over ζ / the canonicalised ``\hat{ζ}``
+        # dummy is rendered as the Galerkin bracket ``⟨ … ⟩`` ONLY when its body
+        # is purely ζ-dependent (a computable number).  An integrand that still
+        # carries a ``t``/``x``-dependent factor is NOT a bracket and falls back
+        # to the default ``∫ … d…`` — so the bracket notation never lies about a
+        # term that has not yet had its coefficients pulled out.
+        if (len(expr.limits) == 1 and len(expr.limits[0]) == 3
+                and expr.limits[0][1] == sp.S.Zero
+                and expr.limits[0][2] == sp.S.One
+                and self._is_canonical_zeta(expr.limits[0][0])
+                and is_bracket_body(expr.function, expr.limits[0][0])):
+            body = expr.function.subs(expr.limits[0][0],
+                                      sp.Symbol("zeta", real=True))
+            inner = _StripArgsLatexPrinter(
+                settings={"order": self._settings.get("order", "none")}
+            ).doprint(body)
+            return r"\langle %s \rangle" % inner
+        return super()._print_Integral(expr)
 
 
 class _StripArgsLatexPrinter(_BracketLatexPrinter):
@@ -1609,33 +1736,6 @@ class _StripArgsLatexPrinter(_BracketLatexPrinter):
         )
         return r"\left. %s \right|_{%s}" % (latex_expr, latex_subs)
 
-    @staticmethod
-    def _is_canonical_zeta(bar_value):
-        """True for the reference-element ζ-symbol *or* the opaque
-        ``state.zeta(...)`` Function-call head — both render bare."""
-        if bar_value == _StripArgsLatexPrinter._zeta:
-            return True
-        if isinstance(bar_value, sp.Dummy):
-            return True
-        if (isinstance(bar_value, sp.Function)
-                and getattr(bar_value.func, "__name__", "") == "zeta"):
-            return True
-        return False
-
-    def _print_Integral(self, expr):
-        # Render a Galerkin ``∫_0^1 (…) dζ`` as the bracket ``⟨ … ⟩`` — the
-        # universal "ζ-dependent body stays inside" representation for a modal
-        # coupling that has no closed form.  Any other integral falls back to
-        # the default ``\int … d…`` rendering.
-        if (len(expr.limits) == 1
-                and len(expr.limits[0]) == 3
-                and expr.limits[0][1] == sp.S.Zero
-                and expr.limits[0][2] == sp.S.One
-                and self._is_canonical_zeta(expr.limits[0][0])):
-            inner = self._print(expr.function)
-            return r"\langle %s \rangle" % inner
-        return super()._print_Integral(expr)
-
     def _print_Function(self, expr, exp=None):
         # Custom-rendering atoms (e.g. ``BoundaryIntegral`` /
         # ``NormalVector`` from ``zoomy_core.symbolic.domains``) attach
@@ -1692,6 +1792,16 @@ class _StripArgsLatexPrinter(_BracketLatexPrinter):
             if exp is not None:
                 base = f"{base}^{{{exp}}}"
             return base
+
+        # A plain coefficient with an INTEGER first argument (a modal
+        # coefficient ``a(j, t, x)`` surfacing inside a bracket after a closure
+        # substitution) subscripts the index like the base printer —
+        # ``a(j, t, x) → a_j(t, x)`` — instead of falling through to the
+        # unknown-shape ``a(j, t, x)`` form.  Basis ``φ`` / ``c`` were already
+        # handled above by their ``_basis`` branch, so this only catches the
+        # genuine coefficient families.
+        if expr.args and getattr(expr.args[0], "is_integer", False):
+            return super()._print_Function(expr, exp=exp)
 
         name = expr.func.__name__
         tex = self._deal_with_super_sub(name)
@@ -5774,6 +5884,112 @@ def _simplify_preserve_integrals(expr):
     # pass inside ``IsolateBasisIntegrand``) merge internally and don't
     # rely on input being merged.
     return _split_integrals_expr(restored)
+
+
+# Mode-index letters for hygienic renaming (``l`` reserved as the test index).
+_MODE_LETTERS = ["i", "j", "k", "m", "n", "o", "p", "q", "r", "s"]
+# Alternative hatted dummy names for nested integration variables.
+_HAT_NAMES = [r"\hat{\xi}", r"\hat{\eta}", r"\hat{\chi}", r"\hat{\vartheta}"]
+
+
+def _bound_atoms(expr):
+    """Summation indices + integration dummies bound anywhere in ``expr``,
+    together with its free symbols — the names a fresh insertion must avoid."""
+    if not isinstance(expr, sp.Basic):
+        return set()
+    idx = {lim[0] for s in expr.atoms(sp.Sum) for lim in s.limits}
+    dum = {lim[0] for ig in expr.atoms(sp.Integral) for lim in ig.limits}
+    return idx | dum | set(expr.free_symbols)
+
+
+def _alpha_fresh(rhs, avoid):
+    """Alpha-rename ``rhs``'s OWN summation indices and integration dummies that
+    collide with ``avoid`` to fresh symbols, so substituting ``rhs`` inside a
+    sum / integral of the target can never capture the target's index or dummy.
+    Names that do NOT collide are kept verbatim."""
+    if not isinstance(rhs, sp.Basic):
+        return rhs
+    avoid = set(avoid)
+    avoid_names = {getattr(a, "name", None) for a in avoid}
+    renames: dict = {}
+
+    def _fresh_mode(idx):
+        for L in _MODE_LETTERS:
+            cand = sp.Symbol(L, integer=True, nonnegative=True)
+            if cand not in avoid and cand not in renames.values():
+                return cand
+        return sp.Dummy(getattr(idx, "name", "i") + "'",
+                        integer=True, nonnegative=True)
+
+    def _fresh_hat(dv):
+        taken = avoid_names | {getattr(v, "name", None)
+                               for v in renames.values()}
+        for nm in _HAT_NAMES:
+            if nm not in taken:
+                return sp.Dummy(nm, positive=True)
+        return sp.Dummy(getattr(dv, "name", r"\hat{\xi}") + "'", positive=True)
+
+    # Summation indices are named Symbols (compare by name) — an equality test
+    # against ``avoid`` catches a collision.
+    for s in rhs.atoms(sp.Sum):
+        for lim in s.limits:
+            idx = lim[0]
+            if idx in avoid and idx not in renames:
+                renames[idx] = _fresh_mode(idx)
+    # Integration dummies compare by IDENTITY, so a distinct-object ``\hat{ζ}``
+    # would print identically to the target's yet pass an ``in`` test — match on
+    # NAME instead, so a nested running integral gets its own readable dummy.
+    for ig in rhs.atoms(sp.Integral):
+        for lim in ig.limits:
+            dv = lim[0]
+            if (getattr(dv, "name", None) in avoid_names
+                    and dv not in renames):
+                renames[dv] = _fresh_hat(dv)
+    return rhs.xreplace(renames)
+
+
+def _is_function_definition(lhs):
+    """A relation lhs ``f(a1, …, an)`` is a FUNCTION DEFINITION — substitute the
+    head ``f`` at EVERY call — iff it is an applied Function whose LAST argument
+    is a bare ``Symbol`` (the function's variable).  A non-symbol last argument
+    (``f(t,x,b+h)``, ``f(t,x,0)``) is a boundary / point value, and a
+    ``Derivative`` lhs (``∂_t b``) is a specific atom — both substitute by exact
+    structural match instead.  (``sympy.Dummy`` subclasses ``Symbol``, so the
+    canonicalised ``\\hat{ζ}`` integration dummy also qualifies.)"""
+    return (isinstance(lhs, sp.Function)
+            and bool(lhs.args)
+            and isinstance(lhs.args[-1], sp.Symbol))
+
+
+def _apply_relation(expr, rel):
+    """Apply a ``{lhs: rhs}`` relation as a substitution.
+
+    A lhs that is a :func:`_is_function_definition` ``f(…, v)`` substitutes the
+    head ``f`` at EVERY call, binding the definition's arguments to each call's
+    arguments — so ``ω(t,x,ζ) = …`` also rewrites ``ω(t,x,\\hat ζ)`` carried
+    inside a Galerkin bracket (whose last arg is the bound integration dummy).
+    ``rhs``'s own summation indices / integration dummies are alpha-renamed
+    fresh first (:func:`_alpha_fresh`) so inserting a nonlocal closure inside a
+    sum / integral never captures the target's index or dummy.
+
+    Every other lhs (a boundary value, a derivative) substitutes by exact
+    structural ``xreplace`` — the basis-expansion-safe path that does not refuse
+    a ``ζ``-in-rhs substitution the way ``.subs`` would."""
+    out = expr
+    for lhs, rhs in rel.items():
+        lhs = sp.sympify(lhs)
+        rhs = sp.sympify(rhs)
+        if _is_function_definition(lhs):
+            head = lhs.func
+            rhs_fresh = _alpha_fresh(rhs, _bound_atoms(out))
+
+            def _expand(*call_args, _a=lhs.args, _r=rhs_fresh):
+                return _r.subs(dict(zip(_a, call_args)))
+
+            out = out.replace(head, _expand)
+        else:
+            out = out.xreplace({lhs: rhs})
+    return out
 
 
 def _resolve_subs_safe(expr):

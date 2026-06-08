@@ -120,7 +120,7 @@ class VectorEquation:
     def describe(self, strip_args=False):
         parts = [f"**{self.name}** (vector, {len(self)} components)"]
         for comp in self._components:
-            parts.append(comp.describe(strip_args=strip_args)
+            parts.append(str(comp.describe(strip_args=strip_args))
                          if isinstance(comp, MomentFamily)
                          else comp.describe_line(strip_args=strip_args,
                                                  bullet=True))
@@ -196,6 +196,51 @@ class MomentFamily:
     def __repr__(self):
         return (f"MomentFamily({self.name!r}, {len(self)} modes, "
                 f"index={self.index})")
+
+
+class FieldHandle:
+    """Ergonomic handle for a model field — the (decorated) applied form plus
+    convenience access, so a derivation never reaches into private model state.
+
+    ``m.functions.tau_xz`` returns one of these wrapping the CURRENT applied
+    form ``\\tilde{tau_xz}(t, x, ζ)`` (post-σ-map):
+
+    * ``.head``     — the Function class (``\\tilde{tau_xz}``), for a head-level
+                      ``replace`` / closure definition;
+    * ``.expr``     — the canonical applied field ``\\tilde{tau_xz}(t, x, ζ)``;
+    * ``.at(value)``— evaluate at a σ-boundary: ``m.functions.u.at(0)`` →
+                      ``\\tilde u(t, x, 0)`` (substitutes the LAST / vertical arg);
+    * calling it    — re-applies the head: ``m.functions.u(t, x, ζ)``.
+
+    It is sympifiable (``_sympy_`` returns ``.expr``) so it drops into sympy
+    arithmetic, but ``m.Q`` keeps returning raw fields — handles live on
+    ``m.functions`` only, so existing ``solve_for`` / ``apply`` paths are
+    unchanged."""
+
+    def __init__(self, applied):
+        self._applied = applied
+
+    @property
+    def head(self):
+        return self._applied.func
+
+    @property
+    def expr(self):
+        return self._applied
+
+    def at(self, value):
+        """Evaluate at a σ-coordinate value (the vertical / last argument):
+        ``ũ.at(0) → ũ(t,x,0)``, ``τ̃.at(1) → τ̃(t,x,1)``."""
+        return self._applied.subs(self._applied.args[-1], value)
+
+    def __call__(self, *args):
+        return self._applied.func(*args)
+
+    def _sympy_(self):
+        return self._applied
+
+    def __repr__(self):
+        return f"FieldHandle({self._applied})"
 
 
 class Model:
@@ -393,6 +438,17 @@ class Model:
         self._refresh_unknowns()
         return vec
 
+    def remove(self, name):
+        """Remove a named equation / vector row / assumption (KBC) from the
+        model — convenience for dropping a relation once it has been consumed
+        (``m.remove("kbc_top")``, ``m.remove("omega")``).  Returns ``self``."""
+        if name in self._assumptions:
+            del self._assumptions[name]
+            self._refresh_unknowns()
+        else:
+            self._remove_equation(name)
+        return self
+
     def _remove_equation(self, name):
         """Drop a scalar equation (or a vector proxy + its components).
 
@@ -555,6 +611,57 @@ class Model:
             seen.add(nm)
             setattr(out, nm, f)
         out._symbolic_name = "Qaux"
+        return out
+
+    @property
+    def functions(self):
+        """Registry of EVERY field by its ORIGINAL name → :class:`FieldHandle`.
+
+        The complement to ``Q`` (primary unknowns) and ``Qaux`` (derived): a
+        single lookup for any field — primary or auxiliary, decorated or not —
+        keyed by the name it was DECLARED with, so ``m.functions.tau_xz`` gives
+        the σ-mapped ``\\tilde{tau_xz}`` head without touching
+        ``m._field_decoration``::
+
+            tau = m.functions.tau_xz
+            mx.apply({tau.at(1): 0, tau.at(0): -lam * m.functions.u.at(0)})
+            mx.apply({tau.expr: rho*nu/h * d.zeta(m.functions.u.expr)})
+
+        The representative form per field is the BULK one (vertical arg a
+        Symbol), normalised so its last argument is the canonical σ-coordinate
+        ``ζ`` — so ``.expr`` reads ``\\tilde u(t, x, ζ)`` even when only the
+        boundary / dummy forms are literally present in the equations."""
+        zeta = sp.Symbol("zeta", real=True)
+        deco_to_orig = {deco: orig.__name__
+                        for orig, deco in self._field_decoration.items()}
+
+        def _rank(f):
+            # Prefer the canonical ζ form, then any Symbol/Dummy vertical arg,
+            # then boundary / numeric forms — so the handle wraps the bulk field.
+            last = f.args[-1] if f.args else None
+            if last == zeta:
+                return 2
+            return 1 if isinstance(last, sp.Symbol) else 0
+
+        reps: dict = {}
+        for f in self._collect_fields():
+            head = self._head(f)
+            name = deco_to_orig.get(head, getattr(head, "__name__", str(head)))
+            if name not in reps or _rank(f) > _rank(reps[name]):
+                reps[name] = f
+
+        out = Zstruct()
+        for name in sorted(reps):
+            f = reps[name]
+            head = self._head(f)
+            # σ-mapped fields: normalise the vertical arg to the canonical ζ so
+            # ``.expr`` / ``.at`` read off ``\tilde f(t, x, ζ)`` regardless of
+            # which form (``ζ`` / ``\hat ζ`` / ``0`` / ``1``) was present.
+            if (head in deco_to_orig and f.args
+                    and isinstance(f.args[-1], sp.Symbol)):
+                f = head(*f.args[:-1], zeta)
+            setattr(out, name, FieldHandle(f))
+        out._symbolic_name = "functions"
         return out
 
     def _refresh_unknowns(self):
