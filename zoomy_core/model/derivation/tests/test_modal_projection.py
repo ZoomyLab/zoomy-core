@@ -16,7 +16,7 @@ import pytest
 
 from zoomy_core import coords
 import zoomy_core.derivatives as d
-from zoomy_core.derivation import (
+from zoomy_core.model.derivation import (
     Model, PDETransformation, Basis,
     separation_of_variables, reset_modal_indices, modal_bound,
     ExpandSums, Project, PullConstants, ExtractBrackets, ResolveBasis,

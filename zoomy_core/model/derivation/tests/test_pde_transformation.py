@@ -17,7 +17,7 @@ import sympy as sp
 
 from zoomy_core import coords
 import zoomy_core.derivatives as d
-from zoomy_core.derivation import Model, PDETransformation
+from zoomy_core.model.derivation import Model, PDETransformation
 from zoomy_core.model.operations import KinematicBC
 
 

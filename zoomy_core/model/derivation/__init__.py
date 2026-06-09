@@ -5,7 +5,7 @@ of :class:`Model` operations.
 
     from zoomy_core import coords
     import zoomy_core.derivatives as d
-    from zoomy_core.derivation import Model, Substitution, ChangeOfVariables
+    from zoomy_core.model.derivation import Model, Substitution, ChangeOfVariables
 
     t, x, z = coords.t, coords.x, coords.z
     model = Model(coords=(t, x, z), parameters={"g": 9.81, "rho": 1.0})

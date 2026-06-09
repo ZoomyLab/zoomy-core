@@ -1,6 +1,6 @@
 """Modal projection operations for the clean-redesign framework.
 
-After :func:`~zoomy_core.derivation.modal.separation_of_variables` has put the
+After :func:`~zoomy_core.model.derivation.modal.separation_of_variables` has put the
 unexpanded ansatz ``Σ_i a(i, …)·φ(i, ζ)`` into every equation, these four ops
 carry the derivation to the Galerkin-projected, basis-resolved form:
 
@@ -194,7 +194,7 @@ class EvaluateSums(Operation):
     """Unroll every FINITE ``sp.Sum`` (a concrete integer bound) to its explicit
     modes: ``Σ_{i=0}^{2} a_i φ_i → a_0 φ_0 + a_1 φ_1 + a_2 φ_2``.
 
-    The modal ansatz from :func:`~zoomy_core.derivation.modal.separation_of_variables`
+    The modal ansatz from :func:`~zoomy_core.model.derivation.modal.separation_of_variables`
     is an UNEXPANDED ``sp.Sum`` with an abstract bound ``N_u``; after
     ``Substitution({N_u: N})`` binds the bound, ``sympy`` still keeps the ``Sum``
     node — ``.doit()`` is what expands it.  This op is the operation form of the
@@ -245,7 +245,7 @@ def _integrate_one_term(term, var, lo, hi):
     * everything else (incl. σ-metric coefficient-derivative factors like
       ``∂_x(ζh)`` that must NOT commute, and ``coeff·∂_x F`` terms whose ``φ/h``
       were NOT folded in) → left as an opaque ``sp.Integral`` for
-      :class:`~zoomy_core.derivation.closure.ResolveIntegral` to close by basis.
+      :class:`~zoomy_core.model.derivation.closure.ResolveIntegral` to close by basis.
 
     The conservative commute fires ONLY on a *bare* outer derivative: a generic
     ``coeff·∂_x F`` is left abstract, because pulling ``∂_x`` past an
@@ -312,7 +312,7 @@ class Integrate(Operation):
     an unevaluated ``sp.Integral(term, (var, lo, hi))`` and stop.  It performs NO
     evaluation — no FTC, no ``∂_x``-commute, no Sum-push, no basis substitution.
     All of that "smart" resolution is the job of
-    :class:`~zoomy_core.derivation.closure.ResolveIntegral` (the ``auto`` method
+    :class:`~zoomy_core.model.derivation.closure.ResolveIntegral` (the ``auto`` method
     classifies each ``∫`` atom: ``∂_ζ`` → FTC, ``∂_x`` → commute, ``Sum`` → push,
     ``φ``-bracket → basis matrix) or of
     :class:`ExtractBrackets` (``∫c·φ_i φ_l → Gram(i,l)``).
@@ -472,7 +472,7 @@ def pull_out(expr):
     "Constant" means INDEPENDENT OF THE OPERATOR'S VARIABLE.  It is the GENTLE
     normalisation: it NEVER applies the product rule to a ``v``-dependent product
     (so it can neither split ``∂_v(a·b)`` nor undo a Leibniz fold), which is what
-    keeps it from competing with :func:`~zoomy_core.derivation.closure.consolidate`.
+    keeps it from competing with :func:`~zoomy_core.model.derivation.closure.consolidate`.
     Applied bottom-up to a fixpoint."""
     from .closure import pull_consts
 
@@ -506,7 +506,7 @@ class PullConstants(Operation):
     legitimate to NAME it a bracket (a pure number).  It is basis-agnostic
     (knows nothing of ``φ``/``c``) and gentle (never splits a ζ-dependent
     product), so it neither competes with the Leibniz folder
-    (:class:`~zoomy_core.derivation.closure.Consolidate`) nor hard-codes ζ."""
+    (:class:`~zoomy_core.model.derivation.closure.Consolidate`) nor hard-codes ζ."""
 
     whole_leaf_op = True
 
@@ -667,7 +667,7 @@ class ResolveBasis(Operation):
     orthogonality forms, opaque ``⟨…⟩`` and the nested ω-coupling integrals by
     polynomial evaluation, loose ``φ_i(0)``/``c(0)`` boundary terms concretised).
 
-    Apply it AFTER :class:`~zoomy_core.derivation.model.ResolveModes` has
+    Apply it AFTER :class:`~zoomy_core.model.derivation.model.ResolveModes` has
     specialised the abstract test index to a concrete moment (and the modal sums
     are unrolled), so every bracket index is an integer::
 

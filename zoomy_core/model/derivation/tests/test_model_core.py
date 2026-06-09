@@ -17,7 +17,7 @@ import pytest
 
 from zoomy_core import coords
 import zoomy_core.derivatives as d
-from zoomy_core.derivation import Model, ChangeOfVariables
+from zoomy_core.model.derivation import Model, ChangeOfVariables
 from zoomy_core.model.operations import Integrate
 from zoomy_core.misc.description import Description
 
@@ -178,7 +178,7 @@ def test_single_term_only_op_raises_on_multiterm():
     multi-term equation — the framework forbids the op deciding which terms
     to rewrite."""
     from zoomy_core.model.operations import Operation
-    from zoomy_core.derivation.operations import granularity_of, Granularity
+    from zoomy_core.model.derivation.operations import granularity_of, Granularity
 
     class _TermOnly(Operation):
         single_term_only = True

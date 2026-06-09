@@ -11,11 +11,11 @@ sum ``Σ_i a(i, t, x)·φ(i, ζ)`` and keep the bookkeeping that lets a later
     ``field_head → coeff_name`` map.  Distinct indices are essential: when two
     expansions multiply (``u·w``) their dummies must differ, else ``sympy``
     keeps the two ``Sum``s sharing one index and silently drops the cross
-    terms.  Lives on every :class:`~zoomy_core.derivation.model.Model` as
+    terms.  Lives on every :class:`~zoomy_core.model.derivation.model.Model` as
     ``model._modal_registry``.
 
 :func:`separation_of_variables`
-    A :class:`~zoomy_core.derivation.model.Model` op (``whole_model_op``).  It
+    A :class:`~zoomy_core.model.derivation.model.Model` op (``whole_model_op``).  It
     looks up the field's DECORATED head (post-PDE, via
     ``model._field_decoration``), builds the unexpanded ``sp.Sum`` with a fresh
     distinct registry index, substitutes the decorated head → that Sum across

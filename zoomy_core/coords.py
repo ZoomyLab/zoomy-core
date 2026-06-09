@@ -1,6 +1,6 @@
 """Canonical independent coordinates for the derivation framework.
 
-These are *the* coordinate symbols every :class:`~zoomy_core.derivation.Model`
+These are *the* coordinate symbols every :class:`~zoomy_core.model.derivation.Model`
 and the :mod:`zoomy_core.derivatives` helper share, so that ``d.t(f)``
 differentiates with respect to the very same ``t`` the fields depend on.
 
@@ -20,7 +20,7 @@ y = sp.Symbol("y", real=True)
 z = sp.Symbol("z", real=True)
 
 # Reference (mapped) vertical coordinate on [0, 1] used after a
-# :class:`~zoomy_core.derivation.PDETransformation` (``z = b + h·zeta``).
+# :class:`~zoomy_core.model.derivation.PDETransformation` (``z = b + h·zeta``).
 zeta = sp.Symbol("zeta", real=True)
 
 #: The independent coordinates in canonical order.

@@ -305,7 +305,7 @@ class Model:
         # hands out a distinct summation index per coefficient family and is
         # read back by ``separation_of_variables`` / ``ResolveBasis``.
         self.history: list[dict] = []
-        from zoomy_core.derivation.modal import ModalIndexRegistry
+        from zoomy_core.model.derivation.modal import ModalIndexRegistry
         self._modal_registry = ModalIndexRegistry()
 
         # Coordinate-transformation state.  ``PDETransformation`` records the
@@ -871,7 +871,7 @@ class Model:
 
         This covers BOTH plain ``sp.Function("u")(...)`` applications
         (``AppliedUndef``) AND the dynamically-minted decorated heads a
-        :class:`~zoomy_core.derivation.transformations.PDETransformation`
+        :class:`~zoomy_core.model.derivation.transformations.PDETransformation`
         creates (``type("\\tilde{u}", (sp.Function,), …)`` — a direct
         ``Function`` subclass that is NOT ``AppliedUndef``).  A builtin like
         ``sin`` has ``sympy`` machinery (``eval`` / ``_imp_``) and a base
@@ -926,7 +926,7 @@ class Model:
         """Mint and REGISTER a Galerkin test / moment index Symbol on this
         model (``k = model.register_index("k")``).
 
-        The model's :class:`~zoomy_core.derivation.modal.ModalIndexRegistry`
+        The model's :class:`~zoomy_core.model.derivation.modal.ModalIndexRegistry`
         records it, so a second ``register_index`` of the same name returns the
         SAME symbol and a clash with an auto-assigned modal (trial) index
         ``i``/``j`` raises — the user cannot accidentally create two colliding
@@ -939,13 +939,13 @@ class Model:
 
         ``target`` may be the coefficient (head class / applied / name) OR the
         field (``u(t, x, z)`` / decorated head); both ends were registered by
-        :func:`~zoomy_core.derivation.modal.separation_of_variables`, so either
+        :func:`~zoomy_core.model.derivation.modal.separation_of_variables`, so either
         resolves to the same distinct index (``a → i``, ``aw → j``).  Used as
         ``ResolveBasis(model.modal_index(u), …)``.
         """
         idx = self._modal_registry.index_for(target)
         if idx is None:
-            from zoomy_core.derivation.modal import _coeff_key
+            from zoomy_core.model.derivation.modal import _coeff_key
             idx = self._modal_registry.fresh(_coeff_key(target))
         return idx
 
@@ -1095,7 +1095,7 @@ def resolve_modes(equation, *, index, modes, test_weight=None,
 
     When ``test_weight`` / ``basis_cls`` / ``level`` are given, each bumped row
     is additionally closed by the concrete-level Galerkin
-    :class:`~zoomy_core.derivation.closure.Resolve` (``φ(l, ζ) → φ(k, ζ)`` at
+    :class:`~zoomy_core.model.derivation.closure.Resolve` (``φ(l, ζ) → φ(k, ζ)`` at
     the bound mode), so no opaque basis brackets remain.
 
     Parameters
@@ -1140,7 +1140,7 @@ def resolve_modes(equation, *, index, modes, test_weight=None,
     do_close = (test_weight is not None and basis_cls is not None
                 and level is not None)
     if do_close:
-        from zoomy_core.derivation.closure import Resolve
+        from zoomy_core.model.derivation.closure import Resolve
 
     comps = []
     for k in modes:

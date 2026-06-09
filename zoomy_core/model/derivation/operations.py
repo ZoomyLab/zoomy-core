@@ -2,8 +2,8 @@
 
 These ops slot into the existing :class:`zoomy_core.model.operations.Operation`
 spine — same ``_leaf_sp`` / ``apply_to`` / ``whole_model_op`` /
-``transforms_bcs`` protocol — so an :class:`~zoomy_core.derivation.Equation`'s
-``.apply`` and a :class:`~zoomy_core.derivation.Model`'s broadcast both dispatch
+``transforms_bcs`` protocol — so an :class:`~zoomy_core.model.derivation.Equation`'s
+``.apply`` and a :class:`~zoomy_core.model.derivation.Model`'s broadcast both dispatch
 through them unchanged.
 
 Plain substitutions are now just oriented :class:`~zoomy_core.model.equation.Equation`
@@ -80,7 +80,7 @@ class SolveLinearSystem:
     ``SolveLinearSystem(equations, variables).solve()`` builds ``A·v = b``
     (``A[i][j]`` = coefficient of ``variables[j]`` in ``equations[i]``, ``b`` the
     remainder), solves it with :func:`sympy.linsolve`, and returns the solution
-    as a :class:`~zoomy_core.derivation.model.MomentFamily` whose component
+    as a :class:`~zoomy_core.model.derivation.model.MomentFamily` whose component
     ``i`` is the oriented row ``variables[i] = solution_i``.  Opaque Galerkin
     brackets are hidden behind symbols for the solve and restored after, so it
     works both post-``ResolveBasis`` (numeric coefficients — fast) and, in
@@ -110,7 +110,7 @@ class SolveLinearSystem:
         self.name = name
 
     def solve(self):
-        from zoomy_core.derivation.model import MomentFamily
+        from zoomy_core.model.derivation.model import MomentFamily
         from zoomy_core.model.equation import Equation
         from zoomy_core.model.operations import is_bracket
 

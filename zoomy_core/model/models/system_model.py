@@ -190,7 +190,7 @@ def _gradients_to_aux(expr, x):
 def _fields_to_state_symbols(expr, x):
     """Collapse applied state/aux fields ``q(i, t, x) → q_i``, ``h(t, x) → h``
     so the stored operator reads in the SystemModel's bare state symbols."""
-    from zoomy_core.derivation.system_extract import _state_symbol
+    from zoomy_core.model.derivation.system_extract import _state_symbol
 
     def _is_field(e):
         return (isinstance(e, sp.Function) and bool(e.args)
@@ -771,12 +771,12 @@ class SystemModel:
     @classmethod
     def _from_derivation_model(cls, model, Q=None, Qaux=None) -> "SystemModel":
         """Build a SystemModel from a declarative
-        :class:`zoomy_core.derivation.model.Model` by structurally extracting
+        :class:`zoomy_core.model.derivation.model.Model` by structurally extracting
         the operators from its untagged residuals (see
-        :func:`zoomy_core.derivation.system_extract.extract_system_operators`).
+        :func:`zoomy_core.model.derivation.system_extract.extract_system_operators`).
         ``Q`` (one applied field per evolution row) is required; ``Qaux`` is
         auto-populated when ``None``."""
-        from zoomy_core.derivation.system_extract import (
+        from zoomy_core.model.derivation.system_extract import (
             extract_system_operators,
         )
         if Q is None:
@@ -827,10 +827,10 @@ class SystemModel:
         Two input kinds are dispatched on the *Model class*:
 
         * the **declarative** clean-redesign
-          :class:`zoomy_core.derivation.model.Model` (whose equations are plain
+          :class:`zoomy_core.model.derivation.model.Model` (whose equations are plain
           untagged sympy residuals) — the operators are extracted
           STRUCTURALLY from the residuals via
-          :func:`zoomy_core.derivation.system_extract.extract_system_operators`.
+          :func:`zoomy_core.model.derivation.system_extract.extract_system_operators`.
           ``Q`` (and optionally ``Qaux``) are supplied HERE, at the transition,
           one ``Q`` entry per evolution row; the field coverage ``Q ∪ Qaux`` is
           validated (a ``ValueError`` names any uncovered field).
@@ -839,7 +839,7 @@ class SystemModel:
           backed by solver-tag extraction) are read once and frozen.  ``Q`` /
           ``Qaux`` are ignored (the state vector is baked into the model).
         """
-        from zoomy_core.derivation.model import Model as _DerivationModel
+        from zoomy_core.model.derivation.model import Model as _DerivationModel
         if isinstance(model, _DerivationModel):
             return cls._from_derivation_model(model, Q=Q, Qaux=Qaux)
 

@@ -1,6 +1,6 @@
 """Milestone-4 closure operations for the clean-redesign framework.
 
-After :class:`~zoomy_core.derivation.modal.separation_of_variables` has put
+After :class:`~zoomy_core.model.derivation.modal.separation_of_variables` has put
 every field into its unexpanded modal ansatz and the abstract truncation bound
 ``N_u`` has been bound to a concrete integer (so the finite ``sp.Sum`` expands),
 these ops carry the SME derivation to the Galerkin-projected, basis-resolved,
@@ -17,8 +17,8 @@ Three pieces live here:
     stays INSIDE the integral.
 
     This is the crucial distinction from the symbolic-level
-    :class:`~zoomy_core.derivation.projection.ExtractBrackets` /
-    :class:`~zoomy_core.derivation.projection.ResolveBasis` pair, which pull a
+    :class:`~zoomy_core.model.derivation.projection.ExtractBrackets` /
+    :class:`~zoomy_core.model.derivation.projection.ResolveBasis` pair, which pull a
     conservative ``∂_x`` OUT of the ζ-integral before resolving.  That pull-out
     is correct for the orthogonal flux brackets but corrupts the σ-metric mass
     closure: the ζ-dependent metric factor ``∂_x(ζh+b)`` left inside the
@@ -502,7 +502,7 @@ class ResolveIntegral(Operation):
         a single ``Sum`` factor → push the integral inside; a φ-basis bracket →
         substitute the concrete basis and integrate the polynomial; anything
         else stays an opaque ``∫`` atom.  This is the only smart integrator —
-        :class:`~zoomy_core.derivation.projection.Integrate` merely builds the
+        :class:`~zoomy_core.model.derivation.projection.Integrate` merely builds the
         abstract ``∫`` for it to act on."""
         out = sp.S.Zero
         for term in sp.Add.make_args(sp.expand(integrand)):
@@ -667,7 +667,7 @@ class ResolveIntegral(Operation):
 def is_conservative_diffusion(term, x):
     """True iff ``term`` is a conservative diffusive-flux atom
     ``coeff · ∂_x(F)`` whose flux ``F`` itself carries an inner ``∂_x`` — the
-    ``∂_x(D·∂_x q)`` shape the :func:`~zoomy_core.derivation.system_extract`
+    ``∂_x(D·∂_x q)`` shape the :func:`~zoomy_core.model.derivation.system_extract`
     classifier routes to the rank-4 ``diffusion_matrix``.
 
     Mirrors the extractor's ``_is_second_order_x`` test so the SME pipeline and
@@ -703,7 +703,7 @@ def project_conservative_diffusion(visc_expr, test_weight, *, basis_cls,
        ``∂_x(−2ν h φ_k ∂_x ũ)``;
     3. SPLIT — terms that are now a bare conservative diffusion atom
        (:func:`is_conservative_diffusion`) go through the abstract
-       :class:`~zoomy_core.derivation.projection.Integrate` (which commutes the
+       :class:`~zoomy_core.model.derivation.projection.Integrate` (which commutes the
        single OUTERMOST ``∂_x`` out, leaving the inner ``∂_x q`` intact) then
        :class:`ResolveIntegral` (basis); the σ-metric residual integrates in
        place via :class:`ResolveIntegral` (basis) on an explicit ``∫dζ``;
@@ -712,7 +712,7 @@ def project_conservative_diffusion(visc_expr, test_weight, *, basis_cls,
 
     Returns the resolved viscous moment (conservative flux + metric residual).
     """
-    from zoomy_core.derivation.projection import Integrate as _AbstractIntegrate
+    from zoomy_core.model.derivation.projection import Integrate as _AbstractIntegrate
     from zoomy_core.model.operations import Multiply, ProductRule, Expression
 
     scaled = Expression(visc_expr, "").apply(Multiply(test_weight)).expr

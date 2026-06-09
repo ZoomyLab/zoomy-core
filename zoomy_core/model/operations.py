@@ -1518,7 +1518,7 @@ def is_bracket_body(integrand, var):
     truth reused everywhere it is needed:
 
     * the LaTeX printer — render ``∫_0^1 (…) dζ`` as ``⟨…⟩`` only when this holds;
-    * :class:`~zoomy_core.derivation.projection.ExtractBrackets` — the naming
+    * :class:`~zoomy_core.model.derivation.projection.ExtractBrackets` — the naming
       gate (a ``t``/``x``-bearing body is not yet a bracket);
     * the bracket-quadrature step that turns ``⟨…⟩`` into NUMBERS — pick the
       integrals to evaluate via the basis instead of sympy.
@@ -2009,7 +2009,7 @@ class Operation(SymbolicBase):
 
     ``log_level`` (1–5) is the operation's VERBOSITY in the derivation graph:
     ``1`` = major (always reported — the default for every op), rising to ``5``
-    = minor bookkeeping (e.g. :class:`~zoomy_core.derivation.closure.Simplify`
+    = minor bookkeeping (e.g. :class:`~zoomy_core.model.derivation.closure.Simplify`
     canonicalisation).  A history view can then filter, e.g. ``describe(...,
     max_log_level=1)`` shows only the major steps.  Set it per class
     (``log_level = 5``) or per instance (``Op(..., log_level=3)``).

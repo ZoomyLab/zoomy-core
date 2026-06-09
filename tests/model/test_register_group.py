@@ -8,7 +8,7 @@ needs into a runtime gradient aux in ``Qaux``.
 import sympy as sp
 
 from zoomy_core import coords as C
-from zoomy_core.derivation import Model
+from zoomy_core.model.derivation import Model
 from zoomy_core.model.models.system_model import (
     SystemModel, register_function_slot, _FUNCTION_SLOTS,
 )

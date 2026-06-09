@@ -1,5 +1,5 @@
 """Residual → operator structural extraction for the declarative
-:class:`~zoomy_core.derivation.model.Model`.
+:class:`~zoomy_core.model.derivation.model.Model`.
 
 The clean-redesign :class:`Model` carries plain sympy residuals in Function
 form (``h(t, x)``, ``q(k, t, x)``) with NO solver tags.  Its equations are
@@ -88,7 +88,7 @@ def extract_system_operators(model, Q, Qaux=None):
 
     Parameters
     ----------
-    model : zoomy_core.derivation.model.Model
+    model : zoomy_core.model.derivation.model.Model
         The threaded model after the full closure pipeline.
     Q : list of applied field Functions
         The state fields, one per evolution row (``[b, h, q(0,…), q(1,…), …]``).

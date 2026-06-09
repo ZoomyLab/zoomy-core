@@ -9,7 +9,7 @@ A :class:`Basis` is the *symbolic* counterpart of a concrete
   single-class, ``(index, ζ)``-arity design the production
   :class:`Basisfunction` uses for its ``phi_fn`` — so an unexpanded modal
   ansatz reads ``Σ_k a(k, …)·φ(k, ζ)`` and a later concrete
-  :class:`~zoomy_core.derivation.operations.ResolveBasis` can swap in a real
+  :class:`~zoomy_core.model.derivation.operations.ResolveBasis` can swap in a real
   polynomial basis.
 * ``basis.weight`` — the test weight ``c(ζ)`` (a one-argument Function head).
 

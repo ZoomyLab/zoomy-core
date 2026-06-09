@@ -21,7 +21,7 @@ import pytest
 
 from zoomy_core import coords
 import zoomy_core.derivatives as d
-from zoomy_core.derivation import (
+from zoomy_core.model.derivation import (
     Model, PDETransformation, Basis,
     separation_of_variables, reset_modal_indices, modal_bound,
     resolve_modes,
@@ -125,7 +125,7 @@ def test_collapse_to_single_mode_keeps_moment_family():
         model._remove_equation(f"mass_{k}")
     fam = model._collapse_moment_family("mass", keep=[0])
 
-    from zoomy_core.derivation.model import MomentFamily
+    from zoomy_core.model.derivation.model import MomentFamily
     from zoomy_core.model.equation import _TermAccessor
 
     # `[l]` is still moment-uniform — model.mass is a MomentFamily of one mode.
