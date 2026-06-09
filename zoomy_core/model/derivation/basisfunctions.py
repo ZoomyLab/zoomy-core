@@ -252,14 +252,16 @@ class Basisfunction:
         expr = expr.replace(lambda e: isinstance(e, sympy.Sum),
                             lambda e: e.doit())
         expr = sympy.expand(expr)
-        # A bracket that resolves to 0 INSIDE ``∂_v(coeff·⟨…⟩)`` (a vanishing
-        # Gram/Weight or an odd φ-moment) leaves an unevaluated ``Derivative(0, v)``:
-        # ``replace`` rebuilds the derivative wrapper around the new ``0`` without
-        # collapsing it, and ``expand`` does not touch it.  These are identically
-        # zero — drop them so the resolved row carries no zombie ``2·∂_t(0)`` /
-        # ``3·∂_x(0)`` terms downstream (they would otherwise reach SystemModel).
+        # A basis bracket / mode that resolves to a CONSTANT inside ``∂_v(…)`` —
+        # a vanishing Gram/Weight (``0``) or the constant 0th mode ``φ_0 = 1`` —
+        # leaves an unevaluated ``Derivative(const, v)``: ``replace`` rebuilds the
+        # derivative wrapper around the new constant without collapsing it, and
+        # ``expand`` does not touch it.  ``∂_v(const) ≡ 0`` for ANY constant, so
+        # drop them all (``Derivative(0, t)`` AND ``Derivative(1, ζ̂)``) — otherwise
+        # zombie ``2·∂_t(0)`` / ``∫ w̃·∂_ζ(1)`` terms would reach SystemModel.
         expr = expr.replace(
-            lambda e: isinstance(e, sympy.Derivative) and e.expr == 0,
+            lambda e: (isinstance(e, sympy.Derivative)
+                       and getattr(e.expr, "is_number", False)),
             lambda e: sympy.S.Zero)
         return expr
 
