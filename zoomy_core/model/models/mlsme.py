@@ -521,7 +521,7 @@ class MLSME(Model):
         return m
 
     # ── 3D field reconstruction ──────────────────────────────────
-    def project_2d_to_3d(self):
+    def interpolate_3d(self):
         """Reconstruct 3D fields from the multi-layer SME modal state.
 
         For each layer ℓ, the local σ-coordinate is

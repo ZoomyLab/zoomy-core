@@ -366,7 +366,7 @@ class VAM(SigmaReference):
         return m
 
     # ── 3D field reconstruction ──────────────────────────────────
-    def project_2d_to_3d(self):
+    def interpolate_3d(self):
         """Reconstruct 3D fields from the VAM modal state.
 
         Returns ``Matrix([b, h, u_3d, v_3d, w_3d, p_3d])`` where

@@ -526,7 +526,7 @@ class ShallowMomentsTopo(Model):
 
     # --- 6. Visualization ---
 
-    def project_2d_to_3d(self):
+    def interpolate_3d(self):
         """
         Maps state vector to 3D visualization.
         """

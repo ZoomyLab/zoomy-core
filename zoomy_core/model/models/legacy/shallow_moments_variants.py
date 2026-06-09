@@ -1049,7 +1049,7 @@ class ShallowMoments2d(Model):
 
 
 
-    def project_2d_to_3d(self):
+    def interpolate_3d(self):
         """Project 2d to 3d."""
         out = Matrix([0 for i in range(5)])
         level = self.level

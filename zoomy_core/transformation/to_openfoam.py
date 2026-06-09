@@ -96,7 +96,7 @@ _FOAM_ARG = {
 _AXIS = ("x", "y", "z")
 
 # Canonical 3D-field profile exchanged across a preCICE interface (Phase 7).
-# ``project_2d_to_3d`` emits these in order; ``project_3d_to_2d`` consumes
+# ``interpolate_3d`` emits these in order; ``project_3d`` consumes
 # them via fresh ``P3_<field>`` symbols mapped to ``profile[i]``.
 _PROFILE_3D_FIELDS = ("b", "h", "u", "v", "w", "p")
 
@@ -122,8 +122,8 @@ class FoamSystemModelPrinter(GenericCppBase):
     analytical_eigenvalues = False
     # Phase 7 coupling: the inverse 3D→2D map.  Not a SystemModel field
     # (system_model.py is owned elsewhere), so the case's run.py passes
-    # ``model.project_3d_to_2d()`` here.  Default None ⇒ not emitted.
-    project_3d_to_2d = None
+    # ``model.project_3d()`` here.  Default None ⇒ not emitted.
+    project_3d = None
 
     def __init__(self, sm, **opts):
         super().__init__()
@@ -344,16 +344,16 @@ class FoamSystemModelPrinter(GenericCppBase):
     def _emit_projection_kernels(self):
         """Emit the Phase-7 coupling projections, when defined:
 
-        * ``Model::project_2d_to_3d(Q, Qaux, p, z)`` → the canonical 3D
+        * ``Model::interpolate_3d(Q, Qaux, p, z)`` → the canonical 3D
           field vector ``[b, h, u, v, w, p]`` at vertical coordinate ``z``.
-          Taken from ``sm.project_2d_to_3d`` (frozen by ``from_model``).
+          Taken from ``sm.interpolate_3d`` (frozen by ``from_model``).
           The only non-state symbol is ``sm.position[2]`` → mapped to the
           scalar arg ``z``.
-        * ``Model::project_3d_to_2d(profile, p)`` → the model's 2D state
+        * ``Model::project_3d(profile, p)`` → the model's 2D state
           ``Q`` from a depth-representative 3D ``profile[0..5]`` in the
           canonical field order.  Parameterised by fresh ``P3_<field>``
-          symbols → ``profile[i]``.  Taken from the ``project_3d_to_2d``
-          printer option (``model.project_3d_to_2d()``); omitted if None.
+          symbols → ``profile[i]``.  Taken from the ``project_3d``
+          printer option (``model.project_3d()``); omitted if None.
 
         A model with neither defined emits nothing here, so uncoupled
         cases are unchanged.
@@ -361,7 +361,7 @@ class FoamSystemModelPrinter(GenericCppBase):
         sm = self.sm
         blocks = []
 
-        p2 = sm.project_2d_to_3d
+        p2 = sm.interpolate_3d
         # The base model returns zeros(6); only emit a real reconstruction.
         if p2 is not None and any(e != 0 for e in sp.flatten(p2)):
             shape = (len(sp.flatten(p2)),)
@@ -371,13 +371,13 @@ class FoamSystemModelPrinter(GenericCppBase):
             self.symbol_maps.append(z_map)
             try:
                 blocks.append(self._kernel(
-                    "project_2d_to_3d", p2, shape,
+                    "interpolate_3d", p2, shape,
                     ["Q", "Qaux", "p", "z"],
                 ))
             finally:
                 self.symbol_maps.pop()
 
-        p3 = self.project_3d_to_2d
+        p3 = self.project_3d
         if p3 is not None and len(sp.flatten(p3)) > 0:
             shape = (len(sp.flatten(p3)),)
             free = set()
@@ -393,7 +393,7 @@ class FoamSystemModelPrinter(GenericCppBase):
             self.symbol_maps.append(prof_map)
             try:
                 blocks.append(self._kernel(
-                    "project_3d_to_2d", p3, shape, ["profile", "p"],
+                    "project_3d", p3, shape, ["profile", "p"],
                 ))
             finally:
                 self.symbol_maps.pop()

@@ -398,7 +398,7 @@ class SME(SigmaReference):
         return m
 
     # ── 3D field reconstruction ──────────────────────────────────
-    def project_2d_to_3d(self):
+    def interpolate_3d(self):
         """Reconstruct the 3D fields ``(b, h, u, v, w, p)`` at
         position ``self.position[2] = z`` from the SME modal solution.
 

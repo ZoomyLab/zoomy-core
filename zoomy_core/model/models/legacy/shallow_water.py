@@ -164,7 +164,7 @@ class ShallowWaterEquations(Model):
 
     # --- 5. Visualization ---
 
-    def project_2d_to_3d(self):
+    def interpolate_3d(self):
         """
         Maps state vector to 3D visualization vector.
         Out: [b, h, u, v, w, pressure]
