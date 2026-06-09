@@ -281,7 +281,7 @@ class SystemModel:
     # When set, the solver dispatches this substep as in-place assignment
     # rather than residual semantics (mass_matrix is implicitly zero).
     state_update: Optional[ZArray] = None
-    # ``interpolate_3d``: depth-averaged → 3D reconstruction.  Vector of
+    # ``interpolate_to_3d``: depth-averaged → 3D reconstruction.  Vector of
     # 3D physical quantities (typically ``[u, v, w, p, ...]``) evaluated at
     # ``(x, y, z)`` given the cell-mean state.  The symbolic expression
     # references ``self.position`` (x, y, z) so the runtime evaluates it
@@ -290,10 +290,10 @@ class SystemModel:
     # 3D velocity profile (Manning friction sensitivity at the bed, max
     # velocity over depth, etc.).  Default ``None`` ⇒ no projection
     # defined; the runtime exposes ``None`` and callers handle absence.
-    interpolate_3d: Optional[ZArray] = None        # (n_3d_components,)
-    # 3D position symbols used by ``interpolate_3d`` (and any future
+    interpolate_to_3d: Optional[ZArray] = None        # (n_3d_components,)
+    # 3D position symbols used by ``interpolate_to_3d`` (and any future
     # 3D-aware operator).  Default ``None`` → SystemModel constructed
-    # without a model context; the interpolate_3d slot then carries
+    # without a model context; the interpolate_to_3d slot then carries
     # no position dependence (and runtime treats it as a pure cell-
     # local expression).  When set from ``Model.position`` it is a
     # Zstruct ``Zstruct(X0=…, X1=…, X2=…)`` even for 2D models.
@@ -318,7 +318,7 @@ class SystemModel:
         self.state_update               = _to_zarray(self.state_update)
         self.reconstruction_variables   = _to_zarray(self.reconstruction_variables)
         self.state_from_reconstruction  = _to_zarray(self.state_from_reconstruction)
-        self.interpolate_3d           = _to_zarray(self.interpolate_3d)
+        self.interpolate_to_3d           = _to_zarray(self.interpolate_to_3d)
 
         if self.equation_to_state_index is None:
             self.equation_to_state_index = list(range(self.n_equations))
@@ -901,10 +901,10 @@ class SystemModel:
                 model.reconstruction_variables()),
             state_from_reconstruction=_to_zarray(
                 model.state_from_reconstruction()),
-            interpolate_3d=(
-                _to_zarray(model.interpolate_3d())
-                if (hasattr(model, "interpolate_3d")
-                    and callable(model.interpolate_3d))
+            interpolate_to_3d=(
+                _to_zarray(model.interpolate_to_3d())
+                if (hasattr(model, "interpolate_to_3d")
+                    and callable(model.interpolate_to_3d))
                 else None),
             position=getattr(model, "position", None),
         )

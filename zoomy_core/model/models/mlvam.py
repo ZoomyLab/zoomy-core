@@ -534,7 +534,7 @@ class MLVAM(Model):
         return m
 
     # ── 3D field reconstruction ──────────────────────────────────
-    def interpolate_3d(self):
+    def interpolate_to_3d(self):
         """Reconstruct 3D fields from the multi-layer VAM modal state.
 
         Inside layer ℓ (``z_{ℓ-1/2} ≤ z ≤ z_{ℓ+1/2}``):

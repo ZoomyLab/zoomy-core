@@ -209,7 +209,7 @@ class SMET(Model):
         return self.aux_variables[2*gradient_offset]
 
 
-    def interpolate_3d(self):
+    def interpolate_to_3d(self):
         """Project 2d to 3d."""
         out = Matrix([0 for i in range(6)])
         level = self.level

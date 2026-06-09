@@ -569,8 +569,8 @@ class Model(param.Parameterized, SymbolicRegistrar):
                 self.source_jacobian_wrt_aux_variables,
                 std_sig,
             ),
-            ("interpolate_3d", self.interpolate_3d, proj_sig),
-            ("project_3d", self.project_3d, std_sig),
+            ("interpolate_to_3d", self.interpolate_to_3d, proj_sig),
+            ("project_from_3d", self.project_from_3d, std_sig),
             ("residual", self.residual, res_sig),
             ("interpolate", self.interpolate, std_sig),
             ("initial_condition", self.initial_condition, ic_sig),
@@ -881,11 +881,11 @@ class Model(param.Parameterized, SymbolicRegistrar):
         """Interpolate."""
         return ZArray(self.variables)
 
-    def interpolate_3d(self):
+    def interpolate_to_3d(self):
         """Project 2d to 3d."""
         return ZArray.zeros(6)
 
-    def project_3d(self):
+    def project_from_3d(self):
         """Project 3d to 2d."""
         return ZArray.zeros(self.n_variables)
 

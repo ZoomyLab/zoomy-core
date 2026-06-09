@@ -161,7 +161,7 @@ class Coupled(BoundaryCondition):
     boundary values with the preCICE-exchanged data; the fallback is
     used before preCICE delivers data (initial step, decoupled runs).
 
-    The interface always exchanges the **full** ``interpolate_3d``
+    The interface always exchanges the **full** ``interpolate_to_3d``
     field set ``[b, h, u, v, w, p]`` sampled on a uniform vertical
     ``z``-grid — no per-field selection.  Direction, mapping and
     coupling scheme live entirely in ``precice-config.xml``; the BC only

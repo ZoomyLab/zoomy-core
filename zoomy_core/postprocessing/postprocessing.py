@@ -17,12 +17,12 @@ from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
 from zoomy_core.misc import misc as misc
 
 
-def vtk_interpolate_3d(
+def vtk_interpolate_to_3d(
     model, settings, start_at_time=0, scale_h=1.0, filename='out_3d'
 ):
     """Vtk project 2d to 3d."""
     if not _HAVE_H5PY:
-        raise ImportError("h5py is required for vtk_interpolate_3d function.")
+        raise ImportError("h5py is required for vtk_interpolate_to_3d function.")
     Nz = model.number_of_points_3d
     main_dir = misc.get_main_directory()
 
@@ -56,17 +56,17 @@ def vtk_interpolate_3d(
 
         #for i_elem, (q, qaux) in enumerate(zip(Q.T, Qaux.T)):
         #    for iz, z in enumerate(Z):
-        #        rhoUVWP[i_elem + (iz * mesh.n_cells), :] = pde.interpolate_3d(np.array([0, 0, z]), q, qaux, parameters)
+        #        rhoUVWP[i_elem + (iz * mesh.n_cells), :] = pde.interpolate_to_3d(np.array([0, 0, z]), q, qaux, parameters)
 
         for iz, z in enumerate(Z):
-            Qnew = pde.interpolate_3d(
+            Qnew = pde.interpolate_to_3d(
                 Q[:, : mesh.n_inner_cells],
                 Qaux[:, : mesh.n_inner_cells],
                 np.array(list(model.parameters.values()), dtype=float),
                 z,
             ).T
 
-            #rhoUVWP[i_elem + (iz * mesh.n_cells), :] = pde.interpolate_3d(np.array([0, 0, z]), q, qaux, parameters)
+            #rhoUVWP[i_elem + (iz * mesh.n_cells), :] = pde.interpolate_to_3d(np.array([0, 0, z]), q, qaux, parameters)
             # rhoUVWP[(iz * mesh.n_inner_cells):((iz+1) * mesh.n_inner_cells), 0] = Q[0, :mesh.n_inner_cells]
             rhoUVWP[(iz * mesh.n_inner_cells):((iz+1) * mesh.n_inner_cells), :] = Qnew[:, :]
 
