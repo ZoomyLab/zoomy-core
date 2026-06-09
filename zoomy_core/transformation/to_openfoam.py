@@ -100,6 +100,46 @@ _AXIS = ("x", "y", "z")
 # them via fresh ``P3_<field>`` symbols mapped to ``profile[i]``.
 _PROFILE_3D_FIELDS = ("b", "h", "u", "v", "w", "p")
 
+# Column wrappers around the per-position / per-profile coupling kernels.  They
+# make interpolate_to_3d and project_from_3d operate on one full interface
+# COLUMN (the higher-dim solver dictates the column; the lower-dim solver lifts
+# to / reduces from it), and they are inverse: interpolate_to_3d(state) -> a
+# column of canonical [b,h,u,v,w,p] field vectors; project_from_3d(column) ->
+# state.  project_from_3d derives its integration weights from z (cell heights);
+# the average is exact for a flat (SWE) profile.
+_INTERPOLATE_COLUMN_WRAPPER = """inline Foam::List<Foam::List<Foam::scalar>> interpolate_to_3d(
+    const Foam::List<Foam::scalar>& Q,
+    const Foam::List<Foam::scalar>& Qaux,
+    const Foam::List<Foam::scalar>& p,
+    const Foam::List<Foam::scalar>& z)
+{
+    Foam::List<Foam::List<Foam::scalar>> out(z.size());
+    forAll(z, k) out[k] = interpolate_to_3d_at(Q, Qaux, p, z[k]);
+    return out;
+}"""
+
+_PROJECT_COLUMN_WRAPPER = """inline Foam::List<Foam::scalar> project_from_3d(
+    const Foam::List<Foam::List<Foam::scalar>>& field,
+    const Foam::List<Foam::scalar>& z,
+    const Foam::List<Foam::scalar>& p)
+{
+    const Foam::label N = field.size();
+    Foam::List<Foam::scalar> profile(6, Foam::scalar(0));   // canonical [b,h,u,v,w,p]
+    Foam::scalar W = 0;
+    forAll(field, k)
+    {
+        const Foam::scalar w =
+            (N == 1)     ? Foam::scalar(1)
+          : (k == 0)     ? Foam::mag(z[1]     - z[0])
+          : (k == N - 1) ? Foam::mag(z[N - 1] - z[N - 2])
+          :                Foam::scalar(0.5)*Foam::mag(z[k + 1] - z[k - 1]);
+        W += w;
+        forAll(profile, c) profile[c] += w*field[k][c];
+    }
+    forAll(profile, c) profile[c] /= W;
+    return project_from_3d_at(profile, p);
+}"""
+
 
 class FoamSystemModelPrinter(GenericCppBase):
     """Foam printer for a frozen :class:`SystemModel`.
@@ -342,21 +382,20 @@ class FoamSystemModelPrinter(GenericCppBase):
         return [fwd, inv]
 
     def _emit_projection_kernels(self):
-        """Emit the Phase-7 coupling projections, when defined:
+        """Emit the coupling projections on one interface COLUMN, when defined:
 
-        * ``Model::interpolate_to_3d(Q, Qaux, p, z)`` → the canonical 3D
-          field vector ``[b, h, u, v, w, p]`` at vertical coordinate ``z``.
-          Taken from ``sm.interpolate_to_3d`` (frozen by ``from_model``).
-          The only non-state symbol is ``sm.position[2]`` → mapped to the
-          scalar arg ``z``.
-        * ``Model::project_from_3d(profile, p)`` → the model's 2D state
-          ``Q`` from a depth-representative 3D ``profile[0..5]`` in the
-          canonical field order.  Parameterised by fresh ``P3_<field>``
-          symbols → ``profile[i]``.  Taken from the ``project_from_3d``
-          printer option (``model.project_from_3d()``); omitted if None.
+        * ``Model::interpolate_to_3d(Q, Qaux, p, z[N]) -> field[N][6]`` — the
+          canonical 3D field ``[b,h,u,v,w,p]`` evaluated at every z of the
+          column.  Loops the per-position kernel ``interpolate_to_3d_at``
+          (from ``sm.interpolate_to_3d``; ``sm.position[2]`` → scalar ``z``).
+        * ``Model::project_from_3d(field[N][6], z[N], p) -> Q`` — the inverse:
+          reduce one full column back to the 2D state.  Weighted depth-average
+          (cell heights from ``z``) → the per-profile map ``project_from_3d_at``
+          (``P3_<field>`` → ``profile[i]``, from the ``project_from_3d`` printer
+          option).  Exact for a flat (SWE) profile.
 
-        A model with neither defined emits nothing here, so uncoupled
-        cases are unchanged.
+        interpolate_to_3d and project_from_3d are inverse on a column.  A model
+        with neither defined emits nothing (uncoupled cases unchanged).
         """
         sm = self.sm
         blocks = []
@@ -371,11 +410,12 @@ class FoamSystemModelPrinter(GenericCppBase):
             self.symbol_maps.append(z_map)
             try:
                 blocks.append(self._kernel(
-                    "interpolate_to_3d", p2, shape,
+                    "interpolate_to_3d_at", p2, shape,
                     ["Q", "Qaux", "p", "z"],
                 ))
             finally:
                 self.symbol_maps.pop()
+            blocks.append(_INTERPOLATE_COLUMN_WRAPPER)        # column wrapper
 
         p3 = self.project_from_3d
         if p3 is not None and len(sp.flatten(p3)) > 0:
@@ -393,10 +433,11 @@ class FoamSystemModelPrinter(GenericCppBase):
             self.symbol_maps.append(prof_map)
             try:
                 blocks.append(self._kernel(
-                    "project_from_3d", p3, shape, ["profile", "p"],
+                    "project_from_3d_at", p3, shape, ["profile", "p"],
                 ))
             finally:
                 self.symbol_maps.pop()
+            blocks.append(_PROJECT_COLUMN_WRAPPER)            # column wrapper
 
         return blocks
 
