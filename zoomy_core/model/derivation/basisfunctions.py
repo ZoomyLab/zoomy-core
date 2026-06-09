@@ -1,4 +1,4 @@
-"""Module `zoomy_core.model.models.basisfunctions`."""
+"""Module `zoomy_core.model.derivation.basisfunctions`."""
 
 from copy import deepcopy
 

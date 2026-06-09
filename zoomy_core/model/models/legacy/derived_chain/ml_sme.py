@@ -9,7 +9,7 @@ The per-layer derivation pattern is documented in
 """
 from __future__ import annotations
 
-from zoomy_core.model.models.basisfunctions import Legendre_shifted
+from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
 from .hydrostatic import Hydrostatic
 
 

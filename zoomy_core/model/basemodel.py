@@ -389,7 +389,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
 
     def _auto_tag_equations(self):
         """For every equation lacking solver tags, run
-        :func:`zoomy_core.model.models.tag_extraction.auto_solver_tag`
+        :func:`zoomy_core.model.derivation.tag_extraction.auto_solver_tag`
         on its expression so the default operator extractors can
         pull tagged sub-expressions.
 
@@ -403,7 +403,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
         produce no tags and are skipped naturally."""
         if not self._equations:
             return
-        from zoomy_core.model.models.tag_extraction import auto_solver_tag
+        from zoomy_core.model.derivation.tag_extraction import auto_solver_tag
         # State atoms = self.variables (Symbols after derive_model
         # finishes its substitution pass).
         state_atoms = [v for v in self.variables.values()
@@ -706,7 +706,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
         """
         if not self._equations or not self._variable_map:
             return None
-        from zoomy_core.model.models.tag_extraction import (
+        from zoomy_core.model.derivation.tag_extraction import (
             collect_solver_tag,
             canonical_solver_tag,
         )

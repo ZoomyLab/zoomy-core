@@ -27,7 +27,7 @@ from typing import Iterable, Optional, Sequence
 import sympy as sp
 from sympy import Add, Derivative, Mul, S
 
-from zoomy_core.model.models.tag_catalog import canonical_solver_tag
+from zoomy_core.model.derivation.tag_catalog import canonical_solver_tag
 
 
 # ---------------------------------------------------------------------------

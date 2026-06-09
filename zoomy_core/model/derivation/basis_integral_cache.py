@@ -46,7 +46,7 @@ class BasisIntegralCache:
 
     Parameters
     ----------
-    basis : :class:`~zoomy_core.model.models.basisfunctions.Basisfunction`
+    basis : :class:`~zoomy_core.model.derivation.basisfunctions.Basisfunction`
         The basis whose polynomial definitions back the opaque
         ``phi_k(arg)`` and ``Derivative(phi_k(arg), arg)`` functions
         used in the caller's expression tree.

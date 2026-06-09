@@ -198,7 +198,7 @@ def get_basis_matrices(basis, level=None, *, cache=None):
         return cached
 
     # Lazy import to avoid circulars during package init.
-    from zoomy_core.model.models.symbolic_integrator import SymbolicIntegrator
+    from zoomy_core.model.derivation.symbolic_integrator import SymbolicIntegrator
 
     integrator = SymbolicIntegrator(basis)
     disk_cache = cache if cache is not None else _default_cache()

@@ -41,7 +41,7 @@ import sympy as sp
 
 from zoomy_core.misc.misc import Zstruct, ZArray
 from zoomy_core.model.basemodel import Model
-from zoomy_core.model.models.basisfunctions import Legendre_shifted
+from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
 from zoomy_core.model.models.legacy.ins_generator import (
     AffineProjection,
     EvaluateIntegrals,
@@ -55,7 +55,7 @@ from zoomy_core.model.models.legacy.ins_generator import (
     ProductRule,
     StateSpace,
 )
-from zoomy_core.model.models.tag_extraction import (
+from zoomy_core.model.derivation.tag_extraction import (
     auto_solver_tag, collect_solver_tag,
 )
 

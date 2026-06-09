@@ -1,7 +1,7 @@
 """The opaque modal basis for the clean-redesign derivation framework.
 
 A :class:`Basis` is the *symbolic* counterpart of a concrete
-:class:`~zoomy_core.model.models.basisfunctions.Basisfunction`.  It carries
+:class:`~zoomy_core.model.derivation.basisfunctions.Basisfunction`.  It carries
 **no polynomials** — only two opaque ``sympy`` Function heads:
 
 * ``basis.phi`` — the trial/test family ``φ(k, ζ)`` (the index ``k`` is the
@@ -68,7 +68,7 @@ class Basis:
 
         ``ExtractBrackets`` / ``ResolveBasis`` read ``basis.phi_fn`` so the
         opaque :class:`Basis` and a production
-        :class:`~zoomy_core.model.models.basisfunctions.Basisfunction`
+        :class:`~zoomy_core.model.derivation.basisfunctions.Basisfunction`
         present the same attribute name."""
         return self.phi
 

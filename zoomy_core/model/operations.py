@@ -418,7 +418,7 @@ class Expression(RelationMixin, SymbolicBase):
 
             xmom = xmom.solver_tag(flux=F_x, source=g * h * dbdx)
         """
-        from zoomy_core.model.models.tag_catalog import canonical_solver_tag
+        from zoomy_core.model.derivation.tag_catalog import canonical_solver_tag
 
         merged = dict(self._solver_groups or {})
         for k, v in named_groups.items():
@@ -437,7 +437,7 @@ class Expression(RelationMixin, SymbolicBase):
 
         ``name`` can be any alias; it is normalized to canonical form.
         """
-        from zoomy_core.model.models.tag_catalog import canonical_solver_tag
+        from zoomy_core.model.derivation.tag_catalog import canonical_solver_tag
 
         if not self._solver_groups:
             return None
@@ -1263,7 +1263,7 @@ class Expression(RelationMixin, SymbolicBase):
         Expression
             With all depth integrals replaced by basis matrix products.
         """
-        from zoomy_core.model.models.basis_cache import get_basis_matrices
+        from zoomy_core.model.derivation.basis_cache import get_basis_matrices
 
         basis_obj = basis(level=level)
         matrices = get_basis_matrices(basis_obj, level)
@@ -5155,7 +5155,7 @@ class Basis:
 
     Usage::
 
-        from zoomy_core.model.models.basisfunctions import Legendre_shifted
+        from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
         basis = Basis(state, Legendre_shifted, level=2)
         model.momentum.x.apply(Multiply(basis.phi, outer=True))
         model.apply(AffineProjection(state))
@@ -5305,7 +5305,7 @@ class Basis:
         Raises ``ValueError`` if the wrapped basisfunction isn't a
         ``LayeredBasis``.
         """
-        from zoomy_core.model.models.basisfunctions import LayeredBasis
+        from zoomy_core.model.derivation.basisfunctions import LayeredBasis
         if not isinstance(self._bf, LayeredBasis):
             raise ValueError(
                 "Basis.layer_expand requires a LayeredBasis "
@@ -5376,7 +5376,7 @@ class Basis:
         Raises ``ValueError`` on a non-layered basis.
         """
         from zoomy_core.misc.misc import Zstruct
-        from zoomy_core.model.models.basisfunctions import LayeredBasis
+        from zoomy_core.model.derivation.basisfunctions import LayeredBasis
         if not isinstance(self._bf, LayeredBasis):
             raise ValueError("layer_phi requires a LayeredBasis.")
         if not (0 <= layer_idx < self._bf.n_layers):
@@ -5400,7 +5400,7 @@ class Basis:
         Raises ``ValueError`` on a non-layered basis.
         """
         from zoomy_core.misc.misc import Zstruct
-        from zoomy_core.model.models.basisfunctions import LayeredBasis
+        from zoomy_core.model.derivation.basisfunctions import LayeredBasis
         if not isinstance(self._bf, LayeredBasis):
             raise ValueError("layer_phi_of_z requires a LayeredBasis.")
         if not (0 <= layer_idx < self._bf.n_layers):
@@ -6353,7 +6353,7 @@ class ResolveDummy(Operation):
 # (NOT under legacy/), so this is legitimate.  Expose the BASE class
 # as the user-facing abstraction; concrete bases (Legendre_shifted, …)
 # are commits at the resolution step.
-from zoomy_core.model.models.basisfunctions import (
+from zoomy_core.model.derivation.basisfunctions import (
     Basisfunction,
     Legendre_shifted,
 )

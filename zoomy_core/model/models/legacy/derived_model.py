@@ -41,9 +41,9 @@ import numpy as np
 
 from zoomy_core.model.basemodel import Model
 from zoomy_core.misc.misc import ZArray, Zstruct
-from zoomy_core.model.models.basisfunctions import Legendre_shifted, Basisfunction
-from zoomy_core.model.models.symbolic_integrator import SymbolicIntegrator
-from zoomy_core.model.models.basis_cache import (
+from zoomy_core.model.derivation.basisfunctions import Legendre_shifted, Basisfunction
+from zoomy_core.model.derivation.symbolic_integrator import SymbolicIntegrator
+from zoomy_core.model.derivation.basis_cache import (
     get_basis_matrices, clear_basis_matrix_cache,
 )
 from zoomy_core.model.models.legacy.derived_system import DerivedSystem
@@ -53,14 +53,14 @@ from zoomy_core.model.models.legacy.derived_system import DerivedSystem
 # Routed to the canonical non-legacy basis_cache.  Do not use in new code.
 def get_cached_matrices(basis, level, integrator):
     """Deprecated — call ``get_basis_matrices(basis_instance, level)``
-    from ``zoomy_core.model.models.basis_cache`` instead."""
+    from ``zoomy_core.model.derivation.basis_cache`` instead."""
     basis_obj = basis(level=level) if isinstance(basis, type) else basis
     return get_basis_matrices(basis_obj, level)
 
 
 def clear_matrix_cache():
     """Deprecated — call ``clear_basis_matrix_cache()`` from
-    ``zoomy_core.model.models.basis_cache`` instead."""
+    ``zoomy_core.model.derivation.basis_cache`` instead."""
     clear_basis_matrix_cache(in_memory=True, disk=False)
 
 

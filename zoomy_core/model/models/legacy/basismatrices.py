@@ -10,9 +10,9 @@ from time import time as get_time
 
 from scipy.optimize import least_squares as lsq
 
-from zoomy_core.model.models.basisfunctions import Legendre_shifted
+from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
 from zoomy_core.misc import misc as misc
-from zoomy_core.model.models.basis_cache import BasisMatrixCache, MATRIX_NAMES
+from zoomy_core.model.derivation.basis_cache import BasisMatrixCache, MATRIX_NAMES
 
 
 class Basismatrices:
@@ -144,7 +144,7 @@ class Basismatrices:
 
     def _compute_via_integrator(self, level):
         """Use SymbolicIntegrator for bases with special integration capabilities."""
-        from zoomy_core.model.models.symbolic_integrator import SymbolicIntegrator
+        from zoomy_core.model.derivation.symbolic_integrator import SymbolicIntegrator
         integrator = SymbolicIntegrator(self.basisfunctions)
         matrices = integrator.compute_all_matrices(level)
         for name in MATRIX_NAMES:

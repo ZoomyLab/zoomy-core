@@ -6,7 +6,7 @@ This package retains only the derivation subclasses
 (``SigmaReference``, ``SME``, ``VAM``).
 
 Lazy import (PEP 562) is used so that importing
-``zoomy_core.model.models.basisfunctions`` (e.g. from
+``zoomy_core.model.derivation.basisfunctions`` (e.g. from
 ``zoomy_core.model.operations``) does not trigger eager loading of
 the derivation classes — which themselves depend on
 ``zoomy_core.model.operations`` and would create a cycle.

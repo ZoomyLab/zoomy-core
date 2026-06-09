@@ -12,7 +12,7 @@ existing manual projection paths).
 """
 from __future__ import annotations
 
-from zoomy_core.model.models.basisfunctions import Legendre_shifted
+from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
 from .simplify_stress import SimplifyStress
 
 

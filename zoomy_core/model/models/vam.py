@@ -17,7 +17,7 @@ from __future__ import annotations
 import sympy as sp
 
 from zoomy_core.model.models.sigmaref import SigmaReference
-from zoomy_core.model.models.basis_cache import get_basis_matrices
+from zoomy_core.model.derivation.basis_cache import get_basis_matrices
 from zoomy_core.model.operations import (
     Multiply,
     ResolveDummy,

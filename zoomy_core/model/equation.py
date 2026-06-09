@@ -205,7 +205,7 @@ class Equation(RelationMixin):
     def get_solver_tag(self, name):
         """Return the sp.Expr for a solver tag, or None if not set.
         ``name`` is normalised through ``canonical_solver_tag``."""
-        from zoomy_core.model.models.tag_catalog import canonical_solver_tag
+        from zoomy_core.model.derivation.tag_catalog import canonical_solver_tag
         if not self._solver_groups:
             return None
         return self._solver_groups.get(canonical_solver_tag(name))

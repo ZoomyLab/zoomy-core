@@ -29,7 +29,7 @@ from zoomy_core.model.models.legacy.ins_generator import (
     # Boundary conditions.
     KinematicBC,
 )
-from zoomy_core.model.models.basisfunctions import Legendre_shifted
+from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
 
 # Symmetrize lives on the new Model side (depends on Expression +
 # Operation but conceptually a derivation-level helper).

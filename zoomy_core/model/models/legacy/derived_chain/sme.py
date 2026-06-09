@@ -17,7 +17,7 @@ After this step the system has only polynomial expressions in
 """
 from __future__ import annotations
 
-from zoomy_core.model.models.basisfunctions import Legendre_shifted
+from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
 from zoomy_core.model.models.legacy.ins_generator import (
     Multiply,
     AffineProjection,

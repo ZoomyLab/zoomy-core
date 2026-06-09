@@ -365,7 +365,7 @@ def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
         upwinding — is the natural numerics.
     """
     from zoomy_core.model.models.system_model import SystemModel
-    from zoomy_core.model.models.tag_extraction import (
+    from zoomy_core.model.derivation.tag_extraction import (
         auto_solver_tag, collect_solver_tag,
     )
 

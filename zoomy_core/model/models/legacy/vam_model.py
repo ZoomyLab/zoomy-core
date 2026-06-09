@@ -55,8 +55,8 @@ from zoomy_core.model.models.legacy.derived_model import (
 from zoomy_core.model.models.legacy.sme_model import INSModel
 from zoomy_core.model.basemodel import Model
 from zoomy_core.misc.misc import ZArray, Zstruct
-from zoomy_core.model.models.basisfunctions import Legendre_shifted, Basisfunction
-from zoomy_core.model.models.symbolic_integrator import SymbolicIntegrator
+from zoomy_core.model.derivation.basisfunctions import Legendre_shifted, Basisfunction
+from zoomy_core.model.derivation.symbolic_integrator import SymbolicIntegrator
 
 
 class VAMModel(INSModel):

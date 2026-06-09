@@ -662,7 +662,7 @@ class ExtractBrackets(Operation):
 class ResolveBasis(Operation):
     """Resolve EVERY Galerkin bracket in the equation to a NUMBER against a
     CONCRETE basis — a thin op over
-    :meth:`~zoomy_core.model.models.basisfunctions.Basisfunction.resolve` (fast
+    :meth:`~zoomy_core.model.derivation.basisfunctions.Basisfunction.resolve` (fast
     antiderivative + per-instance cache; named ``Gram``/``Weight`` close by their
     orthogonality forms, opaque ``⟨…⟩`` and the nested ω-coupling integrals by
     polynomial evaluation, loose ``φ_i(0)``/``c(0)`` boundary terms concretised).

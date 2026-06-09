@@ -13,7 +13,7 @@ stay UNFOLDED.
 ``SystemModel.from_model(model, Q, Qaux)`` therefore extracts the operators by
 feeding each residual — rewritten from Function form into the state Symbols —
 through the SAME term classifier production uses
-(:func:`zoomy_core.model.models.tag_extraction._classify_term`).  Per additive
+(:func:`zoomy_core.model.derivation.tag_extraction._classify_term`).  Per additive
 term:
 
 * ``Derivative(*, t)``                          → ``mass_matrix`` (coeff of
@@ -224,7 +224,7 @@ def _classify_row(residual, i, state, state_funcs, t, x, gravity_param,
     """Split one row residual into ``M / F / P / B / S / A`` slots using the
     production term classifier.  ``residual`` is in state-Symbol-as-(t, x)
     Function form."""
-    from zoomy_core.model.models.tag_extraction import (
+    from zoomy_core.model.derivation.tag_extraction import (
         _split_coeff_and_derivative,
     )
 
@@ -359,7 +359,7 @@ def _route_nonconservative_product(term, i, state, state_funcs, x, B, S):
     cross-mode terms ``q_i/h · ∂_x q_j``).  Read ``(j, coeff)`` and add to
     ``B[i, j]``.  If the derivative argument is not a bare state Symbol the
     term cannot be a clean NCP coupling — route it to source as a fallback."""
-    from zoomy_core.model.models.tag_extraction import (
+    from zoomy_core.model.derivation.tag_extraction import (
         _split_coeff_and_derivative,
     )
     coeff, deriv = _split_coeff_and_derivative(term)

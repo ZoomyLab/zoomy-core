@@ -22,7 +22,7 @@ from zoomy_core.model.derivation import (
     ExpandSums, Project, PullConstants, ExtractBrackets, ResolveBasis,
     bracket_atoms, Gram,
 )
-from zoomy_core.model.models.basisfunctions import Legendre_shifted
+from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
 
 
 t, x, z, zeta = coords.t, coords.x, coords.z, coords.zeta
