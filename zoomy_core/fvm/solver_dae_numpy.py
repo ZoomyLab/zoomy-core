@@ -42,7 +42,7 @@ from zoomy_core.fvm.solver_numpy import Solver
 from zoomy_core.fvm.imex_ark import ars232, ars343, imex_ark_step
 from zoomy_core.fvm import timestepping
 from zoomy_core.mesh import ensure_lsq_mesh
-from zoomy_core.model.models.system_model import SystemModel
+from zoomy_core.systemmodel.system_model import SystemModel
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
 from zoomy_core.misc.logger_config import logger
 import zoomy_core.misc.io as io

@@ -1,7 +1,7 @@
 """Generic linear-analysis tools for shallow-water-family PDE systems.
 
 The unified analysis entry point is :class:`SystemModel` (in
-:mod:`zoomy_core.model.models.system_model`).  Every analysis routine
+:mod:`zoomy_core.systemmodel.system_model`).  Every analysis routine
 in this package consumes a SystemModel and never inspects
 model-specific attributes.
 

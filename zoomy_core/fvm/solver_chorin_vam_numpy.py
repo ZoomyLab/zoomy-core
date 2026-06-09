@@ -32,7 +32,7 @@ from zoomy_core.fvm.riemann_solvers import (
     PositiveNonconservativeRusanov,
 )
 from zoomy_core.mesh import ensure_lsq_mesh
-from zoomy_core.model.models.system_model import SystemModel, _to_zarray
+from zoomy_core.systemmodel.system_model import SystemModel, _to_zarray
 from zoomy_core.numerics import NumericalSystemModel
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
 from zoomy_core.misc.logger_config import logger

@@ -1,6 +1,6 @@
 """SystemModel-based analysis: linearise + dispersion + eigenvalues.
 
-Operates directly on :class:`zoomy_core.model.models.system_model.SystemModel`
+Operates directly on :class:`zoomy_core.systemmodel.system_model.SystemModel`
 — no ``PDESystem`` wrapper, no ``linearise``-on-equation-tree machinery.
 The model's stored sympy matrices already encode the operator surface;
 analysis is straightforward symbolic substitution + eigenvalue solve.
@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Optional
 
 import sympy as sp
 
-from zoomy_core.model.models.system_model import SystemModel
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 def linearise_system_model(

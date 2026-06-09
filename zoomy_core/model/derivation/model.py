@@ -629,7 +629,7 @@ class Model:
 
     def explicit_state(self):
         """One applied field per EVOLUTION (``∂_t``) row — the explicit state
-        vector for a :class:`~zoomy_core.model.models.system_model.SystemModel`
+        vector for a :class:`~zoomy_core.systemmodel.system_model.SystemModel`
         transition, derived from the model's OWN equations so
         ``SystemModel.from_model`` needs no hand-passed ``Q``.
 
@@ -766,7 +766,7 @@ class Model:
         ``from_model`` parses straight into the matching ``SystemModel`` slot
         (``'interpolate'`` → ``interpolate_to_3d``, ``'project'`` →
         ``project_from_3d``; the slot→attribute map is open, see
-        :func:`zoomy_core.model.models.system_model.register_function_slot`).
+        :func:`zoomy_core.systemmodel.system_model.register_function_slot`).
 
         ``relation`` may be an oriented model relation (a solved ``Equation`` /
         ``FieldHandle`` carrying ``_as_relation``) or a bare sympy expression —

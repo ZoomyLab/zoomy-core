@@ -114,7 +114,7 @@ class SMEInviscid(INSModel):
 
 
 # SMEModelTagged / VAMModelTagged (previously: tag-driven legacy adapters)
-# are superseded by ``SystemModel`` (``zoomy_core.model.models.system_model``),
+# are superseded by ``SystemModel`` (``zoomy_core.systemmodel.system_model``),
 # which walks any closed, tagged derived ``System`` and exposes
 # ``flux / nonconservative_matrix / source`` for the solver with no
 # hand-coded physics.  See also ``tutorials/sme/symbolic_swe_simulation.py``

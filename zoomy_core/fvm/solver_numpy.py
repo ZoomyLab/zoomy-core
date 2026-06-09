@@ -25,7 +25,7 @@ import zoomy_core.fvm.ode as ode
 import zoomy_core.fvm.timestepping as timestepping
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel, NumpyRuntimeSymbolic
 from zoomy_core.mesh import ensure_lsq_mesh
-from zoomy_core.model.models.system_model import SystemModel
+from zoomy_core.systemmodel.system_model import SystemModel
 from zoomy_core.numerics import NumericalSystemModel
 from zoomy_core.fvm.riemann_solvers import (
     PositiveNonconservativeRusanov,

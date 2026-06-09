@@ -25,7 +25,7 @@ from zoomy_core.analysis import (
     sample_hyperbolicity,
 )
 from zoomy_core.misc.misc import Zstruct
-from zoomy_core.model.models.system_model import SystemModel
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 def _swe(g_sym=None):

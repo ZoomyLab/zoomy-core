@@ -28,7 +28,7 @@ from typing import Sequence
 
 import sympy as sp
 
-from zoomy_core.model.models.system_model import SystemModel
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +364,7 @@ def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
         a centrally-differenced stencil — not Roe / path-integral
         upwinding — is the natural numerics.
     """
-    from zoomy_core.model.models.system_model import SystemModel
+    from zoomy_core.systemmodel.system_model import SystemModel
     from zoomy_core.model.derivation.tag_extraction import (
         auto_solver_tag, collect_solver_tag,
     )
@@ -841,7 +841,7 @@ def split_simple(sm, pressure_vars, dt, *, bottom=None):
     S_pred = _zero_pressure(_row_slice(sm.source, evo_rows))
     M_pred = _row_slice(sm.mass_matrix, evo_rows)    # mass matrix is unchanged
 
-    from zoomy_core.model.models.system_model import SystemModel as _SM
+    from zoomy_core.systemmodel.system_model import SystemModel as _SM
 
     SM_pred = _SM(
         time=sm.time,

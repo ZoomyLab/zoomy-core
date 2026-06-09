@@ -23,7 +23,7 @@ from __future__ import annotations
 import param
 
 from zoomy_core.model.models.legacy.vam_galerkin import VAMModelGalerkin
-from zoomy_core.model.models.system_model import SystemModel
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 class VAM(VAMModelGalerkin):

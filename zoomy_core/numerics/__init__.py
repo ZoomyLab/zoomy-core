@@ -2,7 +2,7 @@
 
 This subpackage holds the numerical setup that the FV / JAX solvers
 consume.  The central type is :class:`NumericalSystemModel`, a wrapper
-around a :class:`zoomy_core.model.models.system_model.SystemModel` that
+around a :class:`zoomy_core.systemmodel.system_model.SystemModel` that
 also carries the Riemann-solver class, the LSQ reconstruction spec, the
 diffusion scheme, and numerical regularization knobs.
 

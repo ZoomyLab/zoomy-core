@@ -17,7 +17,7 @@ from zoomy_core.model.basefunction import SymbolicRegistrar
 from zoomy_core.model.kernel_functions import (
     conditional, max_wavespeed,
 )
-from zoomy_core.model.models.system_model import SystemModel
+from zoomy_core.systemmodel.system_model import SystemModel
 from zoomy_core.transformation.to_numpy import (
     NumpyRuntimeModel, NumpyRuntimeSymbolic,
 )

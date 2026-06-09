@@ -39,7 +39,7 @@ def linearise(sm, base_state: Dict, *, eps=None, simplify=True):
         New SystemModel whose state is ``[δq_0, …, δq_{n-1}]`` and
         whose operator matrices are linearised around ``base_state``.
     """
-    from zoomy_core.model.models.system_model import SystemModel
+    from zoomy_core.systemmodel.system_model import SystemModel
 
     if eps is None:
         eps = sp.Symbol("epsilon", positive=True)

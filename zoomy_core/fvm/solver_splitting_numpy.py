@@ -22,7 +22,7 @@ from scipy.sparse.linalg import LinearOperator, gmres
 from zoomy_core.fvm.solver_imex_numpy import IMEXSolver, IMEXStats
 from zoomy_core.fvm.solver_numpy import _build_free_surface_numerics, _EMPTY_AUX
 from zoomy_core.mesh import ensure_lsq_mesh
-from zoomy_core.model.models.system_model import SystemModel
+from zoomy_core.systemmodel.system_model import SystemModel
 from zoomy_core.mesh.lsq_reconstruction import find_derivative_indices
 import zoomy_core.fvm.ode as ode
 import zoomy_core.misc.io as io
