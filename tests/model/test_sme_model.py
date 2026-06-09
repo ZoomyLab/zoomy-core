@@ -10,7 +10,9 @@ import sympy as sp
 from zoomy_core.model.models import SME
 from zoomy_core.systemmodel import SystemModel
 
-zeta = sp.Symbol("zeta", real=True)
+# the vertical reconstruction is evaluated at position[2] == z (the runtime's
+# 3-D eval coordinate), so interpolate_to_3d is written in `z`, not a free `ζ`.
+zeta = sp.Symbol("z", real=True)
 
 
 def _scalar(row):

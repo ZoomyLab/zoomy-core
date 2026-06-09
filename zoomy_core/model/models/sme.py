@@ -55,16 +55,18 @@ class SME(BaseModel):
         """Build the declarative SME model (stored as ``self.derivation``) and
         register the vertical reconstruction.  Called by the base ``__init__``."""
         Nu = int(self.level)
-        m = DModel(coords=(t, x, z), parameters={"g": 9.81, "rho": 1.0})
+        # nu (kinematic viscosity) and lambda_s (Navier slip) are MODEL
+        # PARAMETERS — default 0 (inviscid / free-slip), set them for friction.
+        m = DModel(coords=(t, x, z),
+                   parameters={"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0})
         g, rho = m.parameters.g, m.parameters.rho
+        nu, lam = m.parameters.nu, m.parameters.lambda_s
         u = sp.Function("u", real=True)(t, x, z)
         w = sp.Function("w", real=True)(t, x, z)
         p = sp.Function("p", real=True)(t, x, z)
         h = sp.Function("h", positive=True)(t, x)
         b = sp.Function("b", real=True)(t, x)
         txz = sp.Function("tau_xz", real=True)(t, x, z)
-        nu = sp.Symbol("nu", positive=True)
-        lam = sp.Symbol("lambda_s", positive=True)
 
         # 1 — full system in (t, x, z)
         m.Q = [h, u, w, p]

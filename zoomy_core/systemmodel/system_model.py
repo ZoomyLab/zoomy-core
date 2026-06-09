@@ -211,6 +211,10 @@ def _attach_function_groups(sm, model) -> None:
         return
     x = sm.space[0]
     zeta = sp.Symbol("zeta", real=True)
+    # the runtime evaluates the vertical reconstruction at the 3-D position's
+    # vertical component; bind the unit-interval ζ to a real ``z`` (= position[2])
+    # so interpolate_to_3d lambdifies with a genuine argument (not a free ζ).
+    y_pos, z_pos = sp.Symbol("y", real=True), sp.Symbol("z", real=True)
     new_aux: list = []
     for group, comps in groups.items():
         attr = _FUNCTION_SLOTS.get(group)
@@ -223,13 +227,13 @@ def _attach_function_groups(sm, model) -> None:
             # so the gradient aux are named cleanly (``dq0dx``, ``dhdx``).
             e, grads = _gradients_to_aux(sp.sympify(rhs).doit(), x)
             new_aux.extend(grads)
-            vec[idx] = _fields_to_state_symbols(sp.expand(e), x)
+            vec[idx] = _fields_to_state_symbols(sp.expand(e), x).subs(zeta, z_pos)
         setattr(sm, attr, _to_zarray(sp.Matrix(vec)))
     for g in sorted(set(new_aux), key=str):
         if g not in sm.aux_state:
             sm.aux_state = list(sm.aux_state) + [g]
-    if new_aux and sm.position is None:
-        sm.position = Zstruct(X0=x, X1=sp.S.Zero, X2=zeta)
+    if sm.position is None:
+        sm.position = Zstruct(X0=x, X1=y_pos, X2=z_pos)
 
 
 @dataclass
@@ -489,6 +493,34 @@ class SystemModel:
         mirrors ``Model.eigenvalue_mode`` so a solver's wavespeed build
         branches the same way."""
         return "numerical" if self.eigenvalues is None else "symbolic"
+
+    def attach_boundary_conditions(self, bcs, aux_bcs=None):
+        """Inject boundary conditions onto a declarative SystemModel using the
+        SAME ``BoundaryConditions`` objects as the production models — the hook
+        for "use our old BCs as we always did".
+
+        Builds the indexed symbolic BC kernels (``boundary_conditions`` /
+        ``boundary_gradients`` / ``aux_boundary_conditions``) the runtime +
+        codegen expect, from this SystemModel's own time / position / state /
+        aux / parameters / normal.  ``aux_bcs`` defaults to per-tag
+        Extrapolation.  Optional — a SystemModel without BCs still builds; the
+        solver only needs them at run time.  Returns ``self``.
+        """
+        from zoomy_core.model.boundary_conditions import BoundaryConditions
+        import zoomy_core.model.aux_boundary_conditions as AuxBC
+        dist = sp.Symbol("distance", real=True)
+        sig = (self.time, self.position, dist, self.variables,
+               self.aux_variables, self.parameters, self.normal)
+        self.boundary_conditions = bcs.get_boundary_condition_function(
+            *sig, function_name="boundary_conditions")
+        self.boundary_gradients = bcs.get_boundary_gradient_function(
+            *sig, function_name="boundary_gradients")
+        if aux_bcs is None:
+            tags = [bc.tag for bc in bcs.boundary_conditions_list]
+            aux_bcs = BoundaryConditions([AuxBC.Extrapolation(tag=tg) for tg in tags])
+        self.aux_boundary_conditions = aux_bcs.get_boundary_condition_function(
+            *sig, function_name="aux_boundary_conditions")
+        return self
 
     @property
     def is_square(self) -> bool:
