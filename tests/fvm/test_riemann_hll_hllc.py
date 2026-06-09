@@ -42,7 +42,7 @@ class MiniSWE(Model):
         h = self.variables[0]
         hu = Matrix(self.variables[1:])
         u = hu / h
-        g = self._parameter_symbols.g
+        g = self.parameters.g
         F = Matrix.zeros(self.n_variables, dim)
         F[0, :] = hu.T
         F[1:, :] = h * u * u.T + 0.5 * g * h**2 * Matrix.eye(dim)
@@ -53,7 +53,7 @@ class MiniSWE(Model):
         h = self.variables[0]
         hu = Matrix(self.variables[1:])
         n = Matrix(self.normal[:dim])
-        g = self._parameter_symbols.g
+        g = self.parameters.g
         un = (hu.T * n)[0] / h
         c = sqrt(g * h)
         # {un - c, un + c} plus (dim - 1) shear waves at un.
@@ -75,7 +75,7 @@ def _phys_flux_n(mrt, q, aux, p, n):
 def swe(request):
     dim = request.param
     m = MiniSWE(dimension=dim)
-    p = np.array(list(m.parameters.values()), dtype=float)
+    p = np.array(list(m.parameter_values.values()), dtype=float)
     aux = np.zeros(m.n_aux_variables)
     return {
         "dim": dim,
@@ -188,7 +188,7 @@ def test_hllc_contact_preserves_normal_momentum_flux():
     mrt = _model_runtime(m)
     hll = HLL(m).to_runtime_numpy()
     hllc = HLLC(m).to_runtime_numpy()
-    p = np.array(list(m.parameters.values()), dtype=float)
+    p = np.array(list(m.parameter_values.values()), dtype=float)
     aux = np.zeros(m.n_aux_variables)
     n = np.array([1.0, 0.0])
 

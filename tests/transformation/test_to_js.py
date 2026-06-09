@@ -49,7 +49,7 @@ class MiniSWE(Model):
         h = self.variables[0]
         hu = Matrix(self.variables[1:])
         u = hu / h
-        g = self._parameter_symbols.g
+        g = self.parameters.g
         F = Matrix.zeros(self.n_variables, dim)
         F[0, :] = hu.T
         F[1:, :] = h * u * u.T + 0.5 * g * h**2 * Matrix.eye(dim)
@@ -60,7 +60,7 @@ class MiniSWE(Model):
         h = self.variables[0]
         hu = Matrix(self.variables[1:])
         n = Matrix(self.normal[:dim])
-        g = self._parameter_symbols.g
+        g = self.parameters.g
         un = (hu.T * n)[0] / h
         c = sqrt(g * h)
         return ZArray([un - c, un + c] + [un] * (dim - 1))
@@ -152,7 +152,7 @@ def test_js_model_flux_matches_numpy(dim):
     m = MiniSWE(dimension=dim)
     js = JsModel(m).generate()
     mrt = NumpyRuntimeModel(m)
-    p = np.array(list(m.parameters.values()), dtype=float)
+    p = np.array(list(m.parameter_values.values()), dtype=float)
     aux = np.zeros(m.n_aux_variables)
     q = np.array([1.7, 0.6, -0.25][: dim + 1])
     expect = np.asarray(mrt.flux(q, aux, p), dtype=float).ravel()
@@ -173,7 +173,7 @@ def test_js_numerical_flux_matches_numpy(dim, scheme):
     js = JsNumerics(numerics).generate()
     rt = numerics.to_runtime_numpy()
 
-    p = np.array(list(m.parameters.values()), dtype=float)
+    p = np.array(list(m.parameter_values.values()), dtype=float)
     aux = np.zeros(m.n_aux_variables)
     n = np.array([1.0] + [0.0] * (dim - 1))
     qL = np.array([2.0, 0.8, 0.3][: dim + 1])
