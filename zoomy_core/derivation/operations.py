@@ -144,20 +144,43 @@ class ChangeOfVariables(Operation):
         )
 
     def apply_to_model(self, model):
-        old_head = sp.Function(self._old)
-        new_head = sp.Function(self._new)
+        # Match the old family by NAME — reconstructing ``sp.Function(self._old)``
+        # would drop the field's assumptions (``real=True``) and match nothing.
+        # The real head (with assumptions) is recovered from the equations and
+        # handed to ``redeclare_unknown`` so the Q swap matches too.
+        old_head = next(
+            (f.func for eq in model._equations.values()
+             for f in eq.expr.atoms(sp.Function)
+             if f.func.__name__ == self._old),
+            sp.Function(self._old, real=True))
+        # Mint the new head with the SAME assumptions as the old family — a real
+        # ``a`` gives a real ``q``, a plain ``a`` a plain ``q``.  Hardcoding
+        # ``real=True`` would create a ``q`` that ``expr.has`` cannot match
+        # against an assumption-free ``Function(self._new)``.
+        new_head = sp.Function(
+            self._new, **getattr(old_head, "_explicit_class_assumptions", {}))
 
         def _rewrite(expr):
+            if not hasattr(expr, "replace"):
+                return expr
             return expr.replace(
-                old_head,
-                lambda *args, _new=new_head: self._relation(_new(*args)),
-            )
+                lambda e: (isinstance(e, sp.Function)
+                           and e.func.__name__ == self._old),
+                lambda e: self._relation(new_head(*e.args)))
 
         for eq in model._equations.values():
             eq.expr = _rewrite(eq.expr)
+            # An ORIENTED relation (e.g. the w-reconstruction ``w̃ = …``) keeps a
+            # separate ``_as_relation`` — rewrite its lhs/rhs too.
+            rel = getattr(eq, "_as_relation", None)
+            if rel:
+                eq._as_relation = {_rewrite(k): _rewrite(v)
+                                   for k, v in rel.items()}
 
-        # Swap the unknown family in Q (and let the model recompute Qaux).
-        model.redeclare_unknown(old_head, new_head)
+        # Swap the unknown family in Q (and let the model recompute Qaux).  A
+        # change of variables is a genuine family RENAME, so the logical Q key
+        # follows the new family (``a → q``), not the old one.
+        model.redeclare_unknown(old_head, new_head, rename_key=True)
         model._refresh_unknowns()
         return model
 

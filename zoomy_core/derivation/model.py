@@ -286,6 +286,12 @@ class Model:
         # part of the final PDE system handed to a SystemModel.  Oriented
         # relations in ``_assumptions`` (KinematicBCs) are auxiliary too.
         self._aux_names: set = set()
+        # Field HEADS explicitly demoted to auxiliary via :meth:`move_to_aux`
+        # (e.g. the bed ``b`` — given data that appears in the primary momentum
+        # slope ``g h ∂_x b`` yet has no evolution equation).  A head listed here
+        # is kept OUT of ``Q`` even when it is present in a primary equation, and
+        # surfaces in ``Qaux`` instead.
+        self._aux_fields: set = set()
 
         # Derivation history + per-model modal-index registry.  The registry
         # hands out a distinct summation index per coefficient family and is
@@ -666,57 +672,118 @@ class Model:
 
     def _refresh_unknowns(self):
         """Drop from ``Q`` any declared unknown that has appeared in an
-        equation and then vanished from every equation.
+        equation and then left the PRIMARY system.
 
-        A declared-but-never-yet-present unknown (e.g. ``h`` declared before
-        its balance is added) is kept; it is dropped only once it has been
-        seen and is gone again.  (Q gains a symbol only via
-        :meth:`redeclare_unknown` / the setter.)
+        A field stays in ``Q`` while it appears in a primary (``group="model"``)
+        equation.  Two ways out, handled uniformly:
+
+        * fully substituted out of EVERY equation (``p`` after the hydrostatic
+          reduction) — gone from the primary scan, dropped;
+        * eliminated from the primary equations but still DEFINED by its own
+          auxiliary relation (``w̃`` after ``ω``-elimination) — also gone from
+          the primary scan, dropped from ``Q`` and surfaced by :attr:`Qaux`.
+
+        A declared-but-never-yet-present unknown (``h`` declared before its
+        balance is added) is kept; it is dropped only once it has been seen
+        (in ANY equation) and is gone from the primary system.  (Q gains a
+        symbol only via :meth:`redeclare_unknown` / the setter.)
         """
-        present_heads = {self._head(f) for f in self._collect_fields()}
-        self._ever_seen_heads |= present_heads
-        # Keep a Q entry while ANY field in its value (single or list of modes)
-        # is still present, or while none of them has ever been seen.
-        self._Q = {
-            nm: v for nm, v in self._Q.items()
-            if any(self._head(f) in present_heads
-                   for f in self._as_field_list(v))
-            or all(self._head(f) not in self._ever_seen_heads
-                   for f in self._as_field_list(v))
-        }
+        primary_heads = {self._head(f)
+                         for f in self._collect_fields(primary_only=True)}
+        self._ever_seen_heads |= {self._head(f) for f in self._collect_fields()}
 
-    def redeclare_unknown(self, old_field, new_fields):
-        """Transfer unknown-status from ``old_field`` to ``new_fields`` — a
-        change of the VALUE stored under the family's logical Q key, NOT of the
-        key itself.
+        def _kept(v):
+            heads = [self._head(f) for f in self._as_field_list(v)]
+            # Explicitly demoted (move_to_aux) → never a state, even if it still
+            # appears in a primary equation (the bed-slope ``b``).
+            if any(hd in self._aux_fields for hd in heads):
+                return False
+            # Keep while present in the PRIMARY system, or while never seen yet
+            # (declared-early case, e.g. ``h`` before its balance is added).
+            return (any(hd in primary_heads for hd in heads)
+                    or all(hd not in self._ever_seen_heads for hd in heads))
 
-        ``Q`` is ``{logical_name: value}``; ``redeclare_unknown`` rewrites the
-        value while keeping the key, so the handle survives every transform::
+        self._Q = {nm: v for nm, v in self._Q.items() if _kept(v)}
 
-            {u: u}  --σ-map-->  {u: ũ}  --basis ansatz-->  {u: [u_0, u_1, …]}
+    def move_to_aux(self, *fields):
+        """Demote one or more PRIMARY-state fields to auxiliary.
 
-        A single ``new`` becomes a single value (``m.Q.u`` → that field); a list
-        of ``new`` becomes a list value (``m.Q.u`` → ``[u_0, …]``, ``m.Q.u[1]``
-        → ``u_1``).  ``old_field`` / ``new_fields`` may be applied Functions or
-        bare heads.  Not user-facing — ops (``PDETransformation`` /
+        Removes each field's head from ``Q`` and keeps it out — even when the
+        field still appears in a primary equation — so it surfaces in
+        :attr:`Qaux` instead.  This is the convenient handle for a field that is
+        part of the primary system but is GIVEN rather than evolved: the bed
+        ``b`` appears in the momentum slope ``g h ∂_x b`` yet has no evolution
+        equation, so ``m.move_to_aux(b)`` (or ``m.move_to_aux("b")``) records
+        that intent explicitly.  Idempotent; returns ``self``.
+        """
+        for field in fields:
+            self._aux_fields.add(self._resolve_head(field))
+        self._refresh_unknowns()
+        return self
+
+    def _resolve_head(self, field):
+        """The Function head for ``field`` given as a head, an applied Function,
+        or a field NAME (matched against the fields present in the equations,
+        original or σ-decorated)."""
+        if isinstance(field, str):
+            for f in self._collect_fields():
+                if self._field_name(f) == field:
+                    return self._head(f)
+            for orig, deco in self._field_decoration.items():
+                if getattr(orig, "__name__", None) == field:
+                    return deco
+            raise KeyError(f"move_to_aux: no field named {field!r}")
+        return self._head(field)
+
+    def redeclare_unknown(self, old_field, new_fields, rename_key=False):
+        """Transfer unknown-status from ``old_field`` to ``new_fields``.
+
+        ``Q`` is ``{logical_name: value}``.  Two modes:
+
+        * ``rename_key=False`` (default — a DECORATION, e.g. the σ-map
+          ``u → ũ``): rewrite the VALUE, KEEP the logical key, so the handle
+          survives::
+
+              {u: u}  --σ-map-->  {u: ũ}
+
+        * ``rename_key=True`` (a genuine FAMILY RENAME, e.g. the basis ansatz
+          ``u → a`` or the change of variables ``a → q``): move the value to a
+          key named after the NEW family, IN PLACE so the state-vector ORDER is
+          preserved::
+
+              {u: ũ}  --basis ansatz-->  {a: [a_0, a_1, …]}  --CoV-->  {q: …}
+
+        A single ``new`` becomes a single value (``m.Q.q`` → that field); a list
+        of ``new`` becomes a list value (``m.Q.a`` → ``[a_0, …]``,
+        ``m.Q.a[1]`` → ``a_1``).  ``old_field`` / ``new_fields`` may be applied
+        Functions or bare heads.  Not user-facing — ops
+        (``PDETransformation`` / ``separation_of_variables`` /
         ``ChangeOfVariables``) call this.
         """
         old_head = self._head(old_field)
-        # The LOGICAL key(s) the old family currently occupies.
-        old_keys = [nm for nm, v in self._Q.items()
-                    if any(self._head(f) == old_head
-                           for f in self._as_field_list(v))]
-        # Drop those entries; re-add the new value under the SAME logical key.
-        self._Q = {nm: v for nm, v in self._Q.items()
-                   if not any(self._head(f) == old_head
-                              for f in self._as_field_list(v))}
         if not isinstance(new_fields, (list, tuple)):
             new_fields = [new_fields]
         value = new_fields[0] if len(new_fields) == 1 else list(new_fields)
+
+        def _is_old(v):
+            return any(self._head(f) == old_head
+                       for f in self._as_field_list(v))
+
+        # The LOGICAL key(s) the old family currently occupies.
+        old_keys = [nm for nm, v in self._Q.items() if _is_old(v)]
         if len(old_keys) == 1:
-            self._Q[old_keys[0]] = value          # keep the logical key
+            # In-place swap (preserves dict ORDER): keep the key for a
+            # decoration, or rename it to the new family for a rename.
+            new_key = (self._field_name(new_fields[0]) if rename_key
+                       else old_keys[0])
+            self._Q = {(new_key if nm == old_keys[0] else nm):
+                       (value if nm == old_keys[0] else v)
+                       for nm, v in self._Q.items()}
         else:
-            for nf in new_fields:                 # fallback: key by field name
+            # Spread across several keys (or none yet): drop the old entries and
+            # key each new field by its own family name.
+            self._Q = {nm: v for nm, v in self._Q.items() if not _is_old(v)}
+            for nf in new_fields:
                 self._Q[self._field_name(nf)] = nf
 
     # ── field introspection ──────────────────────────────────────────
@@ -754,12 +821,21 @@ class Model:
         return (sp.Function in getattr(func, "__bases__", ())
                 and func.__dict__.get("eval") is None)
 
-    def _collect_fields(self):
-        """Every applied field Function across all equations — every
-        undefined-like Function application whose head is not a parameter."""
+    def _collect_fields(self, primary_only=False):
+        """Every applied field Function across the equations — every
+        undefined-like Function application whose head is not a parameter.
+
+        ``primary_only=True`` restricts the scan to the PRIMARY (``group="model"``)
+        equations, skipping the auxiliary rows (the ``w``-reconstruction, the
+        ``ω``-definition).  This is what lets a field that has been ELIMINATED
+        from the primary system but still lives in its own auxiliary definition
+        (``w̃``) drop out of ``Q`` — the same way a fully substituted-out field
+        (``p``) does."""
         param_names = set(self.parameters.keys())
         fields = set()
-        for eq in self._equations.values():
+        for name, eq in self._equations.items():
+            if primary_only and name in self._aux_names:
+                continue
             for atom in eq.expr.atoms(sp.Function):
                 if not self._is_field_application(atom):
                     continue

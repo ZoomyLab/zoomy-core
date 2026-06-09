@@ -244,7 +244,24 @@ class Basisfunction:
         # evaluations ``φ_i(0)``, ``c(0)`` of the wall-friction term (``φ_i(0) =
         # P_i(−1) = (−1)^i``).
         expr = self._concretize_bracket(expr)
-        return sympy.expand(expr.doit())
+        # Collapse only the δ-``Sum``s produced by the closed-form Gram/Weight
+        # (the symbolic-``l`` case).  Deliberately NOT a bare ``expr.doit()``:
+        # that would evaluate the OUTER spatial derivatives too, product-ruling
+        # ``∂_x(h·a²) → a²∂_x h + 2 a h ∂_x a`` and destroying the conservative
+        # structure — resolution must only INSERT VALUES, never restructure.
+        expr = expr.replace(lambda e: isinstance(e, sympy.Sum),
+                            lambda e: e.doit())
+        expr = sympy.expand(expr)
+        # A bracket that resolves to 0 INSIDE ``∂_v(coeff·⟨…⟩)`` (a vanishing
+        # Gram/Weight or an odd φ-moment) leaves an unevaluated ``Derivative(0, v)``:
+        # ``replace`` rebuilds the derivative wrapper around the new ``0`` without
+        # collapsing it, and ``expand`` does not touch it.  These are identically
+        # zero — drop them so the resolved row carries no zombie ``2·∂_t(0)`` /
+        # ``3·∂_x(0)`` terms downstream (they would otherwise reach SystemModel).
+        expr = expr.replace(
+            lambda e: isinstance(e, sympy.Derivative) and e.expr == 0,
+            lambda e: sympy.S.Zero)
+        return expr
 
     def get(self, k):
         """Get."""

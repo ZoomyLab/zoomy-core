@@ -212,8 +212,15 @@ class EvaluateSums(Operation):
         )
 
     def _leaf_sp(self, sp_expr):
+        # ``deep=False`` is essential: a bare ``Sum.doit()`` first calls
+        # ``self.function.doit()``, which descends into the opaque Galerkin
+        # ``Integral(c φ_i φ_j φ_k …)`` and hands it to sympy's ``heurisch``
+        # symbolic integrator — that recurses without bound on the unevaluated
+        # ``φ`` heads and hangs.  We only want the SUMMATION unrolled to explicit
+        # modes; the inner ``Integral`` / ``Derivative`` stay deferred (ResolveBasis
+        # evaluates the brackets later, by antiderivative, not ``heurisch``).
         return sp_expr.replace(lambda e: isinstance(e, sp.Sum),
-                               lambda e: e.doit())
+                               lambda e: e.doit(deep=False))
 
 
 # ── Project (Multiply(test) → ∫ dζ through the Sum) ────────────────────────

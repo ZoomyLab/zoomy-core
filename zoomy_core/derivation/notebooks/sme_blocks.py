@@ -27,7 +27,7 @@ import zoomy_core.derivatives as d
 from zoomy_core.derivation import (
     Model, PDETransformation, Simplify, ResolveIntegral, SolveFor, Sort, Basis,
     Split, Consolidate, ExpandSums, EvaluateSums, PullConstants, ExtractBrackets,
-    AutoTag, SortByTag, ResolveModes, ResolveBasis,
+    AutoTag, SortByTag, ResolveModes, ResolveBasis, ChangeOfVariables,
     separation_of_variables, reset_modal_indices, modal_bound)
 from zoomy_core.model.operations import Multiply, ProductRule, KinematicBC
 from zoomy_core.model.operations import Integrate as IntegrateZ        # vertical (pressure) integral
@@ -196,7 +196,7 @@ mx.apply(ExpandSums())                         # ũ² → Σ_i Σ_j a_i a_j φ_i
 mx.apply(Sort())
 m.w.apply(ExpandSums())                        # aux: same treatment for w̃(ζ)
 m.w.apply(PullConstants())                     #   pull a_i / ∂_x out of the ∫₀^ζ
-m.w.apply(SolveFor(m.Q.w))                     #   re-orient: displayed w̃ = … is normalised
+m.w.apply(SolveFor(m.functions.w.expr))        #   re-orient (w̃ is AUX now — not in Q)
 mx.describe(show_tags=True)
 
 # %% [markdown]
@@ -248,8 +248,34 @@ m.momentum.x.apply({N_u: 2})                       # truncate: N = 2  (a_0, a_1,
 m.momentum.x.apply(EvaluateSums())                 # resolve the finite Σ_i, Σ_j
 m.momentum.x.apply(ResolveModes(index=k, modes=range(3)))   # → vector m.momentum.x[k]
 m.momentum.apply(ResolveBasis(legendre, var=zeta))          # every bracket → a number
+#   (ResolveBasis only INSERTS values — the conservative ∂_x(h aᵢaⱼ) / ∂_t(h aᵢ)
+#    structure built in §8–§10 is preserved verbatim, nothing is re-expanded.)
 
 m.momentum.describe()                              # the explicit N=2 x-momentum vector
+
+# %% [markdown]
+# ## 12 — conservative variables (CoV `a_i → q_i/h`)
+# The transition to a `SystemModel` wants the K&T (4.17) CONSERVATIVE form: the
+# unknowns are the conserved momenta `q_i = h·a_i` (and `h`), so the time term
+# reads `∂_t q_i` (a clean mass-matrix entry) and the flux `∂_x(q_i q_j / h)`.
+# First resolve the remaining rows (mass + the `w` aux-reconstruction) to the
+# same finite-mode number form, then apply the change of variables model-wide —
+# it also swaps the unknown family `a → q` in `Q`.
+
+# %%
+for eq in (m.mass, m.w):                           # resolve mass + w like momentum
+    eq.apply({N_u: 2})
+    eq.apply(EvaluateSums())
+    eq.apply(ExtractBrackets(basis, var=zeta))
+    eq.apply(ResolveBasis(legendre, var=zeta))
+m.w.apply(SolveFor(m.functions.w.expr))             # re-orient the resolved w̃ = … (aux)
+
+m.apply(ChangeOfVariables("a", "q", lambda q_i: q_i / h))   # a_i → q_i/h ; Q: a → q
+#   No fold needed: resolution only INSERTED values, so the conservative
+#   ∂_t(h a_i) / ∂_x(h a_i a_j) structure survived verbatim — sympy's own Mul
+#   cancellation turns ∂_t(h·q_i/h) → ∂_t(q_i) and ∂_x(h·(q_i/h)(q_j/h)) →
+#   ∂_x(q_i q_j / h) on the spot.
+m.describe(show="all")
 
 # %% [markdown]
 # ## Full model

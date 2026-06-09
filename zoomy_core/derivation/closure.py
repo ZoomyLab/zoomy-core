@@ -751,7 +751,11 @@ def pull_consts(expr):
     def _pull(a):
         if not a.variables:
             return a
-        const, dep = a.expr.as_independent(*a.variables)
+        # MULTIPLICATIVE split (``as_Add=False``): pull a v-independent FACTOR
+        # out.  The additive default would, for ``∂_v(Σ v-dependent terms)``
+        # (a conservative flux of a sum, e.g. the mass ``∂_x(h·Σ_i a_i⟨φ_i⟩)``),
+        # return ``const=0`` and silently ZERO the whole derivative.
+        const, dep = a.expr.as_independent(*a.variables, as_Add=False)
         return a if const == sp.S.One else const * sp.Derivative(dep, *a.variables)
     prev = None
     while expr != prev:
@@ -862,7 +866,9 @@ def fold_self_products(expr):
 
     A pure ``½ + ½`` split can't do this — the two halves are identical and
     recombine.  Detection: the differentiated ``arg`` must DIVIDE the
-    coefficient exactly (``M = coeff/arg`` has unit denominator)."""
+    coefficient exactly (``M = coeff/arg`` does not REINTRODUCE ``arg`` — a
+    constant denominator like the Legendre ``2h/3`` is fine, only ``arg`` in
+    ``M`` is not, e.g. ``a²∂a`` is not ``M·a·∂a`` for a polynomial ``M``)."""
     out = []
     for tm in sp.Add.make_args(sp.expand(expr)):
         df = _deriv_factor(tm)
@@ -870,7 +876,19 @@ def fold_self_products(expr):
             coeff, arg, v = df
             if arg != 0 and not arg.is_number:
                 M = sp.cancel(coeff / arg)
-                if (sp.denom(M) == 1 and not M.has(sp.Derivative)
+                # IDEMPOTENCE GUARD.  A genuine self-product ``M·f·∂_v f`` has the
+                # differentiated ``f`` as an explicit factor, so ``M = coeff/f``
+                # carries NO trace of ``f``: neither ``f`` itself (``not M.has(arg)``
+                # — rejects ``a²∂a`` where ``M=a``) NOR ``f``'s symbols in its
+                # DENOMINATOR.  The latter is the decisive one: a bare flux
+                # ``∂_v(F)`` has ``coeff=1 ⇒ M=1/F`` and an already-folded
+                # ``M·∂_v(F²/2)`` has ``M∝1/F`` — neither literally ``.has(F)``
+                # (``1/(g h²/2)`` is ``2/(g h²)``, a different node), but both put
+                # ``F``'s symbols in ``denom(M)``.  Without this the fold re-fires on
+                # its own output and the ``consolidate`` fixpoint never terminates.
+                if (not M.has(arg)
+                        and not (sp.denom(M).free_symbols & arg.free_symbols)
+                        and not M.has(sp.Derivative)
                         and not M.has(sp.Integral)
                         and sp.expand(M * arg - coeff) == 0):
                     inner = (M * arg**2 / 2 if not M.has(v) else arg**2 / 2)
@@ -1020,9 +1038,17 @@ def consolidate(expr, fold_self=False, fold_sums=False):
             return e.func(*[_rec(a) for a in e.args])
         return e
 
-    expr = leibniz_fold(_rec(expr))
+    # Iterate leibniz + self-product folds to a FIXPOINT: recovering a fully
+    # expanded conservative flux ``a²∂_x h + 2 a h ∂_x a → ∂_x(h a²)`` needs two
+    # passes — fold_self first exposes ``h ∂_x(a²)``, then leibniz combines it
+    # with ``a²∂_x h`` — so a single pass leaves it half-folded.
+    prev = None
+    while expr != prev:
+        prev = expr
+        expr = leibniz_fold(_rec(expr))
+        if fold_self:
+            expr = fold_self_products(expr)
     if fold_self:
-        expr = fold_self_products(expr)
         # Re-conservatise: push pure constants (``g``) back into a bare flux that
         # ``pull_consts`` had split — but only when a clean ``∂_v(F)`` results.
         expr = push_consts_into_flux(expr)

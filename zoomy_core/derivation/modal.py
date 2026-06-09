@@ -304,7 +304,8 @@ class SeparationOfVariables(Operation):
         # Swap the unknown family: the field's head leaves Q, the coeff
         # family (``a(i, *coords)``) enters.
         coeff_applied = coeff_head(idx, *coords)
-        model.redeclare_unknown(head, coeff_applied)
+        # A genuine family rename (u → a): the Q key follows the new coeff family.
+        model.redeclare_unknown(head, coeff_applied, rename_key=True)
         model._refresh_unknowns()
         return model
 
