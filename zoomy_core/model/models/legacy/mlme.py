@@ -28,7 +28,7 @@ from __future__ import annotations
 import sympy as sp
 
 from zoomy_core.model.models.model import Model, Symmetrize
-from zoomy_core.model.models.operations import (
+from zoomy_core.model.models.legacy.operations import (
     Expression,
     StateSpace,
     MassMomentum,

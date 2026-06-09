@@ -20,12 +20,12 @@ __all__ = ["SigmaReference", "SME", "VAM"]
 
 def __getattr__(name):
     if name == "SigmaReference":
-        from zoomy_core.model.models.sigmaref import SigmaReference
+        from zoomy_core.model.models.legacy.sigmaref import SigmaReference
         return SigmaReference
     if name == "SME":
         from zoomy_core.model.models.sme import SME
         return SME
     if name == "VAM":
-        from zoomy_core.model.models.vam import VAM
+        from zoomy_core.model.models.legacy.vam_sigmaref import VAM
         return VAM
     raise AttributeError(f"module 'zoomy_core.model.models' has no attribute {name!r}")

@@ -1,4 +1,4 @@
-"""Module `zoomy_core.model.models.vam`."""
+"""Module `zoomy_core.model.models.legacy.vam_sigmaref`."""
 
 import numpy as np
 import numpy.polynomial.legendre as L
