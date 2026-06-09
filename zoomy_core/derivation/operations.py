@@ -32,7 +32,8 @@ import sympy as sp
 from zoomy_core.model.operations import Operation
 
 
-__all__ = ["SolveFor", "ChangeOfVariables", "Granularity", "granularity_of"]
+__all__ = ["SolveFor", "SolveLinearSystem", "ChangeOfVariables",
+           "Granularity", "granularity_of"]
 
 
 # ── SolveFor ───────────────────────────────────────────────────────────────
@@ -64,6 +65,89 @@ class SolveFor(Operation):
 
     def __repr__(self):
         return f"SolveFor({self._var})"
+
+
+# ── SolveLinearSystem ──────────────────────────────────────────────────────
+
+
+class SolveLinearSystem:
+    """Assemble and solve a COUPLED linear system for a family of variables.
+
+    :class:`SolveFor` isolates ONE variable from ONE equation; many moment
+    closures instead need a COUPLED solve — e.g. the continuity moments
+    ``m.mass[1:N+2]`` for the vertical-velocity coefficients ``ŵ_0 … ŵ_N``.
+
+    ``SolveLinearSystem(equations, variables).solve()`` builds ``A·v = b``
+    (``A[i][j]`` = coefficient of ``variables[j]`` in ``equations[i]``, ``b`` the
+    remainder), solves it with :func:`sympy.linsolve`, and returns the solution
+    as a :class:`~zoomy_core.derivation.model.MomentFamily` whose component
+    ``i`` is the oriented row ``variables[i] = solution_i``.  Opaque Galerkin
+    brackets are hidden behind symbols for the solve and restored after, so it
+    works both post-``ResolveBasis`` (numeric coefficients — fast) and, in
+    principle, on the abstract bracket form.
+
+    The returned family is
+
+    * INDEXABLE  — ``sol[i]`` is the oriented row for ``variables[i]``;
+    * APPLICABLE — it carries a combined ``_as_relation`` so ``eq.apply(sol)``
+      substitutes every ``variables[i] -> solution_i`` at once;
+    * ADDABLE    — ``model.add_equation("w_coefs", sol)``.
+
+    Example — the SME ``w``-closure::
+
+        h_eq = m.mass[0].solve_for(d.t(h))        # k=0 → the h-equation
+        for row in m.mass[1:4]:                    # substitute ∂_t h
+            row.apply(h_eq)
+        sol = SolveLinearSystem(m.mass[1:4],
+                                [wh(j, t, x) for j in range(3)]).solve()
+        m.momentum.x.apply(sol)                    # insert ŵ_0, ŵ_1, ŵ_2 at once
+        sol[0]                                     # the oriented row  ŵ_0 = …
+    """
+
+    def __init__(self, equations, variables, name="solve_linear_system"):
+        self._eqs = list(equations)
+        self._vars = list(variables)
+        self.name = name
+
+    def solve(self):
+        from zoomy_core.derivation.model import MomentFamily
+        from zoomy_core.model.equation import Equation
+        from zoomy_core.model.operations import is_bracket
+
+        exprs = [sp.expand(sp.sympify(getattr(e, "expr", e))) for e in self._eqs]
+        vars_ = list(self._vars)
+        n = len(vars_)
+        # Hide opaque Galerkin brackets behind symbols so the solver sees clean
+        # (rational / numeric) coefficients; restore them in the solution.
+        igs = sorted({ig for ex in exprs for ig in ex.atoms(sp.Integral)
+                      if is_bracket(ig)}, key=sp.srepr)
+        hide = {ig: sp.Symbol(f"_Br{i}") for i, ig in enumerate(igs)}
+        restore = {s: ig for ig, s in hide.items()}
+        # ``variables`` are applied Functions (``ŵ_j(t,x)``), not Symbols —
+        # linsolve wants Symbols, so swap in placeholders for the solve.
+        ph = [sp.Symbol(f"_v{i}") for i in range(n)]
+        vsub = {v: ph[i] for i, v in enumerate(vars_)}
+        back = {ph[i]: vars_[i] for i in range(n)}
+        H = [ex.xreplace(hide).xreplace(vsub) for ex in exprs]
+        sols = sp.linsolve(H, ph)
+        if not sols:
+            raise ValueError(
+                "SolveLinearSystem: inconsistent system (linsolve returned ∅).")
+        tup = list(sols)[0]
+        comps, relmap = [], {}
+        for i, v in enumerate(vars_):
+            si = sp.expand(tup[i].xreplace(restore).xreplace(back))
+            comps.append(Equation(sp.Eq(v, si), name=f"{self.name}_{i}"))
+            relmap[v] = si
+        fam = MomentFamily(name=self.name, modes=list(range(n)), components=comps)
+        # Combined relation so ``eq.apply(sol)`` substitutes the whole family
+        # (the ``.apply`` dispatch duck-types on ``_as_relation``).
+        fam._as_relation = relmap
+        return fam
+
+    def __repr__(self):
+        return (f"SolveLinearSystem({len(self._eqs)} eqs, "
+                f"{len(self._vars)} vars)")
 
 
 # ── granularity ──────────────────────────────────────────────────────────

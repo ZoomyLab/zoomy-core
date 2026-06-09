@@ -24,6 +24,7 @@ from .model import (
 )
 from .operations import (
     SolveFor,
+    SolveLinearSystem,
     ChangeOfVariables,
     Granularity,
     granularity_of,
@@ -79,6 +80,7 @@ __all__ = [
     "resolve_modes",
     "ResolveModes",
     "SolveFor",
+    "SolveLinearSystem",
     "ChangeOfVariables",
     "Granularity",
     "granularity_of",

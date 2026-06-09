@@ -5955,10 +5955,18 @@ def _is_function_definition(lhs):
     (``f(t,x,b+h)``, ``f(t,x,0)``) is a boundary / point value, and a
     ``Derivative`` lhs (``∂_t b``) is a specific atom — both substitute by exact
     structural match instead.  (``sympy.Dummy`` subclasses ``Symbol``, so the
-    canonicalised ``\\hat{ζ}`` integration dummy also qualifies.)"""
+    canonicalised ``\\hat{ζ}`` integration dummy also qualifies.)
+
+    A CONCRETE-INDEX modal coefficient (``ŵ(0, t, x)``, ``a(2, t, x)``) is also a
+    SPECIFIC atom, not a generalisation — a genuine function definition
+    generalises over all its arguments and so carries none that are concrete
+    numbers.  Excluding a numeric argument keeps a per-mode solution
+    (``SolveLinearSystem`` → ``ŵ_j = …``) substituting by exact match instead of
+    head-rewriting the whole ``ŵ`` family."""
     return (isinstance(lhs, sp.Function)
             and bool(lhs.args)
-            and isinstance(lhs.args[-1], sp.Symbol))
+            and isinstance(lhs.args[-1], sp.Symbol)
+            and not any(getattr(a, "is_number", False) for a in lhs.args))
 
 
 def _apply_relation(expr, rel):

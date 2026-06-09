@@ -293,6 +293,14 @@ class Model:
         # surfaces in ``Qaux`` instead.
         self._aux_fields: set = set()
 
+        # Function groups — named slots that hold explicit DEFINITIONS of
+        # derived model operators (the vertical reconstruction → ``interpolate``,
+        # its Galerkin inverse → ``project``, derived BCs, …) rather than PDE
+        # residuals or auxiliary fields.  ``{slot_name: {component_index: rhs}}``;
+        # populated by :meth:`register_group` and parsed straight into the
+        # matching ``SystemModel`` slot by ``from_model``.
+        self._function_groups: dict = {}
+
         # Derivation history + per-model modal-index registry.  The registry
         # hands out a distinct summation index per coefficient family and is
         # read back by ``separation_of_variables`` / ``ResolveBasis``.
@@ -619,6 +627,37 @@ class Model:
         out._symbolic_name = "Qaux"
         return out
 
+    def explicit_state(self):
+        """One applied field per EVOLUTION (``∂_t``) row — the explicit state
+        vector for a :class:`~zoomy_core.model.models.system_model.SystemModel`
+        transition, derived from the model's OWN equations so
+        ``SystemModel.from_model`` needs no hand-passed ``Q``.
+
+        Each PRIMARY (``group="model"``) row contributes the field carried by
+        its time derivative, with modal families flattened to their individual
+        modes, in equation order — e.g. ``[b, h, q_0, q_1, q_2]``.  A field
+        already claimed by an earlier row is skipped, so a conservative momentum
+        row ``∂_t(q_k/(2k+1))`` (which, expanded, also touches ``∂_t h``) yields
+        ``q_k``, not ``h`` again.  Auxiliary rows (the ``w``-reconstruction, …)
+        are excluded — they become aux-update relations, not states.
+        """
+        t = self.coords[0]
+        out, seen = [], set()
+        for name, eq in self._equations.items():
+            if name in self._aux_names:
+                continue
+            cands = []
+            for der in sp.expand(eq.expr).atoms(sp.Derivative):
+                if der.variables == (t,):
+                    for f in der.args[0].atoms(sp.Function):
+                        if self._is_field_application(f) and f not in seen:
+                            cands.append(f)
+            if cands:
+                f = sorted(cands, key=sp.srepr)[0]
+                out.append(f)
+                seen.add(f)
+        return out
+
     @property
     def functions(self):
         """Registry of EVERY field by its ORIGINAL name → :class:`FieldHandle`.
@@ -720,6 +759,44 @@ class Model:
             self._aux_fields.add(self._resolve_head(field))
         self._refresh_unknowns()
         return self
+
+    def register_group(self, slot, index, relation):
+        """Register ``relation`` as component ``index`` of the function group
+        ``slot`` — an explicit DEFINITION of a derived operator that
+        ``from_model`` parses straight into the matching ``SystemModel`` slot
+        (``'interpolate'`` → ``interpolate_to_3d``, ``'project'`` →
+        ``project_from_3d``; the slot→attribute map is open, see
+        :func:`zoomy_core.model.models.system_model.register_function_slot`).
+
+        ``relation`` may be an oriented model relation (a solved ``Equation`` /
+        ``FieldHandle`` carrying ``_as_relation``) or a bare sympy expression —
+        e.g. the modal reconstruction ``Σ_j ŵ_j φ_j(ζ)`` built from the (aux)
+        coefficients ``ŵ_j``.
+
+        Purely ADDITIVE: it only records the definition.  The fields the
+        definition references — the coefficients ``ŵ_j``, the field ``w̃`` —
+        STAY in ``Q`` / ``Qaux``; membership is yours to manage (the runtime
+        computes the aux coefficients and we use them to reconstruct ``w``).
+        Any ``∂_x(state)`` a definition needs is still turned into a runtime
+        gradient aux (``dhdx``, ``dq0dx``, …) at extraction time.
+
+        Returns ``self``.
+        """
+        self._function_groups.setdefault(slot, {})[int(index)] = \
+            self._relation_rhs(relation)
+        return self
+
+    @staticmethod
+    def _relation_rhs(relation):
+        """Extract the defining right-hand side from a registration argument:
+        an oriented relation (``_as_relation`` rule), an ``Equation`` (``.rhs``),
+        a ``FieldHandle`` / bare expression (sympified)."""
+        rel = getattr(relation, "_as_relation", None)
+        if isinstance(rel, dict) and rel:
+            return sp.sympify(next(iter(rel.values())))
+        if hasattr(relation, "rhs"):
+            return sp.sympify(relation.rhs)
+        return sp.sympify(getattr(relation, "expr", relation))
 
     def _resolve_head(self, field):
         """The Function head for ``field`` given as a head, an applied Function,

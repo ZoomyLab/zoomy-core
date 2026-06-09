@@ -246,6 +246,14 @@ def _classify_row(residual, i, state, state_funcs, t, x, gravity_param,
                     j = state_funcs.index(inner)
                     M[i, j] = M[i, j] + coeff
                     continue
+                # ``∂_t(c · Q_j)`` — the conservative time term carries the Gram
+                # factor INSIDE the derivative (``∂_t(q_k/(2k+1))``).  Pull the
+                # state-free constant ``c`` out → mass-matrix entry ``coeff·c``.
+                c_in, base = inner.as_independent(*state_funcs, as_Mul=True)
+                if base in sym_of_func:
+                    j = state_funcs.index(base)
+                    M[i, j] = M[i, j] + coeff * c_in
+                    continue
             # Fallback: ∂_t of a non-state function (shouldn't happen for SME).
             raise ValueError(
                 f"row {i}: unhandled time-derivative term {term}")
@@ -370,14 +378,26 @@ def _assign_rows(model, Q, field_to_fn, state, state_fn, t):
     carries ``state[i]`` (the evolution row for that state).  Falls back to the
     declared equation order when no ``∂_t`` match is found (algebraic rows)."""
     eqs = list(model._equations.values())
+
+    def _has_dt_of(expr, sf):
+        """True iff ``expr`` carries a ``∂_t(c · sf)`` term — matching the
+        conservative time term whose Gram factor sits inside the derivative
+        (``∂_t(q_k/(2k+1))``), not only the bare ``∂_t(sf)``."""
+        for der in expr.atoms(sp.Derivative):
+            if der.variables == (t,):
+                _, base = der.args[0].as_independent(sf, as_Mul=True)
+                if base == sf:
+                    return True
+        return False
+
     rows = [None] * len(state)
     used = set()
     for i, s in enumerate(state):
-        dt_s = sp.Derivative(state_fn[s], t)
+        sf = state_fn[s]
         for k, eq in enumerate(eqs):
             if k in used:
                 continue
-            if sp.expand(eq.expr.xreplace(field_to_fn)).has(dt_s):
+            if _has_dt_of(sp.expand(eq.expr.xreplace(field_to_fn)), sf):
                 rows[i] = eq.expr
                 used.add(k)
                 break

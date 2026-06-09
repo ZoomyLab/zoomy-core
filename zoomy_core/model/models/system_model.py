@@ -138,6 +138,100 @@ def _cov_propagate_bc_function(bc_func, sub_map, new_state):
     )
 
 
+# ── function-group slot registry ──────────────────────────────────────────
+# Maps a derivation function-group name (registered via
+# ``Model.register_group``) to the ``SystemModel`` attribute it fills.  Open
+# by design — ``register_function_slot`` lets user-defined derived operators
+# ride the same rails as the built-in vertical reconstruction.
+_FUNCTION_SLOTS: Dict[str, str] = {
+    "interpolate": "interpolate_to_3d",
+    "project": "project_from_3d",
+}
+
+
+def register_function_slot(group_name: str, sm_attr: str) -> None:
+    """Route a custom derivation function-group ``group_name`` to the
+    ``SystemModel`` attribute ``sm_attr`` (e.g. a derived wall BC → a
+    boundary-condition slot)."""
+    _FUNCTION_SLOTS[group_name] = sm_attr
+
+
+def _grad_aux_name(base) -> str:
+    """Name a spatial-gradient aux symbol after the field it differentiates:
+    ``∂_x h → dhdx``, ``∂_x q_0 → dq0dx``, ``∂_x b → dbdx`` (legacy convention)."""
+    if isinstance(base, sp.Function):
+        head = base.func.__name__
+        idx = "".join(str(int(a)) for a in base.args
+                      if getattr(a, "is_Integer", False))
+        return f"d{head}{idx}dx"
+    return f"d{base}dx"
+
+
+def _gradients_to_aux(expr, x):
+    """Replace every ``∂_x(field)`` in ``expr`` with a fresh gradient-aux
+    Symbol; return ``(new_expr, [aux_symbols])`` (order-stable, de-duplicated).
+    These are the runtime aux the solver supplies from its stencil — the reason
+    a reconstructed ``w`` needs ``∂_x h``, ``∂_x q_i`` available."""
+    grads: list = []
+
+    def _is_dx(e):
+        return (isinstance(e, sp.Derivative)
+                and any(v == x for v, _ in e.variable_count))
+
+    def _to_sym(e):
+        s = sp.Symbol(_grad_aux_name(e.expr), real=True)
+        if s not in grads:
+            grads.append(s)
+        return s
+
+    return expr.replace(_is_dx, _to_sym), grads
+
+
+def _fields_to_state_symbols(expr, x):
+    """Collapse applied state/aux fields ``q(i, t, x) → q_i``, ``h(t, x) → h``
+    so the stored operator reads in the SystemModel's bare state symbols."""
+    from zoomy_core.derivation.system_extract import _state_symbol
+
+    def _is_field(e):
+        return (isinstance(e, sp.Function) and bool(e.args)
+                and any(a == x for a in e.args))
+
+    return expr.replace(_is_field, lambda e: _state_symbol(e))
+
+
+def _attach_function_groups(sm, model) -> None:
+    """Parse ``model._function_groups`` into the matching ``SystemModel`` slots.
+
+    Each group ``{component_index: rhs}`` becomes a vector operator: the rhs is
+    rewritten into bare state symbols, every ``∂_x(state)`` becomes a runtime
+    gradient aux (appended to ``aux_state``), and the unit-interval vertical
+    coordinate ``ζ`` is exposed via ``sm.position``."""
+    groups = getattr(model, "_function_groups", None)
+    if not groups:
+        return
+    x = sm.space[0]
+    zeta = sp.Symbol("zeta", real=True)
+    new_aux: list = []
+    for group, comps in groups.items():
+        attr = _FUNCTION_SLOTS.get(group)
+        if attr is None:
+            continue
+        vec = [sp.S.Zero] * (max(comps) + 1)
+        for idx, rhs in comps.items():
+            # ``.doit()`` expands derivatives of compounds (the CoV leaves
+            # ``∂_x(q_i/h)``) into the bare-field gradients ``∂_x q_i``, ``∂_x h``
+            # so the gradient aux are named cleanly (``dq0dx``, ``dhdx``).
+            e, grads = _gradients_to_aux(sp.sympify(rhs).doit(), x)
+            new_aux.extend(grads)
+            vec[idx] = _fields_to_state_symbols(sp.expand(e), x)
+        setattr(sm, attr, _to_zarray(sp.Matrix(vec)))
+    for g in sorted(set(new_aux), key=str):
+        if g not in sm.aux_state:
+            sm.aux_state = list(sm.aux_state) + [g]
+    if new_aux and sm.position is None:
+        sm.position = Zstruct(X0=x, X1=sp.S.Zero, X2=zeta)
+
+
 @dataclass
 class SystemModel:
     """Symbolic operator-form PDE system.
@@ -686,10 +780,13 @@ class SystemModel:
             extract_system_operators,
         )
         if Q is None:
-            raise TypeError(
-                "SystemModel.from_model(declarative_model, Q=...) requires Q — "
-                "the state fields, one per evolution row (e.g. "
-                "Q=[b, h, q(0,t,x), q(1,t,x), q(2,t,x)]).")
+            # Derive the state vector from the model's own ∂_t evolution rows
+            # (one field per primary row, families flattened) — no hand-passed Q.
+            Q = model.explicit_state()
+            if not Q:
+                raise TypeError(
+                    "SystemModel.from_model: could not derive Q from the model "
+                    "(no ∂_t evolution rows found); pass Q= explicitly.")
         ops = extract_system_operators(model, Q, Qaux)
         normal = Zstruct(n0=sp.Symbol("n0", real=True))
         normal._symbolic_name = "n"
@@ -717,6 +814,10 @@ class SystemModel:
         # open-SME source vanishes (the stress is an auxiliary field, computed
         # separately) exactly as production reports.
         sm.expose_aux_atoms()
+        # Parse any registered function groups (vertical reconstruction →
+        # interpolate_to_3d, its inverse → project_from_3d, …) into their
+        # SystemModel slots; runtime gradient aux (∂_x h, ∂_x q_i) land in Qaux.
+        _attach_function_groups(sm, model)
         return sm
 
     @classmethod
@@ -1982,8 +2083,15 @@ class SystemModel:
     # ── describe ──────────────────────────────────────────────────────
 
     def describe(self, full: bool = False) -> "SystemModelDescription":
-        """Return a Description rendering the operator form.  ``full=True``
-        includes symbolic flux/NCP/source/mass-matrix entries."""
+        """Return a Description rendering the operator form.
+
+        By DEFAULT the core balance-law operators are rendered — ``Q``,
+        ``Q_aux``, the mass matrix ``M``, flux ``F``, hydrostatic
+        pressure ``P``, diffusive flux ``A``, NCP ``B`` and the
+        (implicit / explicit) source ``S``.  ``full=True`` additionally
+        renders the rare / derived slots (quasilinear matrix, source
+        Jacobian, eigenvalues, state-update, reconstruction maps,
+        ``interpolate_to_3d``, …)."""
         return SystemModelDescription(self, full=full)
 
 
@@ -2033,44 +2141,128 @@ class SystemModelDescription:
         self._sm = sm
         self._full = full
 
+    # ── rendering helpers ──────────────────────────────────────────────
+    @staticmethod
+    def _as_matrix(obj):
+        """Coerce a stored operator (ZArray / list / Matrix) to a 2-D
+        ``sp.Matrix`` (a flat vector becomes a column).  ``None`` passes
+        through so callers can render it as ``= 0``."""
+        if obj is None:
+            return None
+        if isinstance(obj, sp.MatrixBase):
+            return obj
+        lst = obj.tolist() if hasattr(obj, "tolist") else list(obj)
+        return sp.Matrix(lst)
+
+    def _render(self, parts, label, mat):
+        M = self._as_matrix(mat)
+        if M is None or M.is_zero_matrix:
+            parts.append(f"**{label} $= 0$**")
+        else:
+            parts.append(f"**{label}:**")
+            parts.append(f"$$\n{sp.latex(M)}\n$$")
+
+    def _render_ndim(self, parts, label, arr, rank):
+        """Render a rank-3 NCP ``B[i, j, d]`` or rank-4 diffusion
+        ``A[i, j, d, e]`` by slicing into ``n_eq × n_state`` slabs per
+        direction (pair).  All-zero / ``None`` collapses to ``= 0``."""
+        sm = self._sm
+        if arr is None:
+            parts.append(f"**{label} $= 0$**")
+            return
+        n, ns, nd = sm.n_equations, sm.n_state, sm.n_dim
+        slabs = []
+        if rank == 3:
+            for d in range(nd):
+                slab = sp.Matrix(n, ns, lambda i, j, _d=d: arr[i, j, _d])
+                if not slab.is_zero_matrix:
+                    tag = f"$_{{{sp.latex(sm.space[d])}}}$" if nd > 1 else ""
+                    slabs.append((f"{label}{tag}", slab))
+        else:  # rank == 4
+            for d in range(nd):
+                for e in range(nd):
+                    slab = sp.Matrix(n, ns,
+                                     lambda i, j, _d=d, _e=e: arr[i, j, _d, _e])
+                    if not slab.is_zero_matrix:
+                        tag = (f"$_{{{sp.latex(sm.space[d])}{sp.latex(sm.space[e])}}}$"
+                               if nd > 1 else "")
+                        slabs.append((f"{label}{tag}", slab))
+        if not slabs:
+            parts.append(f"**{label} $= 0$**")
+            return
+        for lab, slab in slabs:
+            parts.append(f"**{lab}:**")
+            parts.append(f"$$\n{sp.latex(slab)}\n$$")
+
     def _operator_block(self) -> str:
+        """The CORE operator set — always rendered: state, aux state, and
+        every operator that is part of the canonical balance law."""
         sm = self._sm
         parts = []
 
-        # Canonical equation form.
+        # Canonical equation form (incl. the diffusive flux ∇·(A∇Q)).
         parts.append("**System form:**")
         parts.append(
             r"$$"
             r"M(Q)\,\partial_t Q "
             r"+ \nabla\cdot\!\big(F(Q) + P(Q)\big)"
             r" + \sum_{d} B_{d}(Q)\,\partial_{d} Q "
-            r"- S(Q) = 0"
+            r"- \nabla\cdot\!\big(A(Q)\,\nabla Q\big)"
+            r" - S(Q) = 0"
             r"$$"
         )
 
-        # State vector.
-        Q_vec = sp.Matrix(list(sm.state))
+        # State + auxiliary state.
         parts.append("**State $Q$:**")
-        parts.append(f"$$\n{sp.latex(Q_vec)}\n$$")
+        parts.append(f"$$\n{sp.latex(sp.Matrix(list(sm.state)))}\n$$")
+        if sm.aux_state:
+            parts.append("**Auxiliary $Q_{aux}$:**")
+            parts.append(
+                f"$$\n{sp.latex(sp.Matrix(list(sm.aux_state)))}\n$$")
+        else:
+            parts.append(r"**Auxiliary $Q_{aux} = \varnothing$**")
 
-        def _render(label, mat):
-            if mat.is_zero_matrix:
-                parts.append(f"**{label} $= 0$**")
+        self._render(parts, "Mass matrix $M$", sm.mass_matrix)
+        self._render(parts, "Flux $F$", sm.flux)
+        self._render(parts, "Hydrostatic pressure $P$",
+                     sm.hydrostatic_pressure)
+        self._render_ndim(parts, "Diffusive flux $A$",
+                          sm.diffusion_matrix, rank=4)
+        self._render_ndim(parts, "NCP $B$",
+                          sm.nonconservative_matrix, rank=3)
+        self._render(parts, "Source $S$ (implicit)", sm.source)
+        if sm.source_explicit is not None:
+            self._render(parts, "Source $S_\\mathrm{exp}$ (explicit)",
+                         sm.source_explicit)
+        return "\n\n".join(parts)
+
+    def _extra_block(self) -> str:
+        """The rare / derived operators — only with ``full=True``."""
+        sm = self._sm
+        parts = ["**Extended operators:**"]
+        any_shown = False
+        for label, val, rank in (
+            ("Explicit diffusion $A_\\mathrm{exp}$",
+             sm.diffusion_matrix_explicit, 4),
+            ("Quasilinear $A_\\mathrm{ql}$", sm.quasilinear_matrix, 3),
+            ("Source Jacobian $\\partial S/\\partial Q$",
+             sm.source_jacobian, 2),
+            ("Eigenvalues $\\Lambda$", sm.eigenvalues, 1),
+            ("State update", sm.state_update, 1),
+            ("Update variables", sm.update_variables, 1),
+            ("Reconstruction variables", sm.reconstruction_variables, 1),
+            ("State from reconstruction", sm.state_from_reconstruction, 1),
+            ("interpolate\\_to\\_3d", sm.interpolate_to_3d, 1),
+        ):
+            if val is None:
+                continue
+            any_shown = True
+            if rank >= 3:
+                self._render_ndim(parts, label, val, rank)
             else:
-                parts.append(f"**{label}:**")
-                parts.append(f"$$\n{sp.latex(mat)}\n$$")
-
-        _render("Mass matrix $M$", sm.mass_matrix)
-        _render("Flux $F$", sm.flux)
-        _render("Hydrostatic pressure $P$", sm.hydrostatic_pressure)
-        for d in range(sm.n_dim):
-            slab = sp.Matrix(sm.n_equations, sm.n_equations,
-                             lambda i, j, _d=d:
-                                 sm.nonconservative_matrix[i, j, _d])
-            label = (f"NCP $B_{{{d}}}$ "
-                     f"(direction ${sp.latex(sm.space[d])}$)")
-            _render(label, slab)
-        _render("Source $S$", sm.source)
+                self._render(parts, label, val)
+        if not any_shown:
+            parts.append("_(none set)_")
         return "\n\n".join(parts)
 
     def _repr_markdown_(self) -> str:
@@ -2080,8 +2272,6 @@ class SystemModelDescription:
             f"{'s' if sm.n_equations != 1 else ''}, "
             f"{sm.n_dim} spatial dimension{'s' if sm.n_dim != 1 else ''}"
         ]
-        state_syms = ", ".join(f"${sp.latex(s)}$" for s in sm.state)
-        parts.append(f"**State $Q$:** {state_syms}")
         if sm.parameters.length():
             parts.append(
                 "**Parameters:** "
@@ -2091,13 +2281,14 @@ class SystemModelDescription:
                     for k in sm.parameters.keys()
                 )
             )
+        parts.append(self._operator_block())     # CORE operators — always
+        if self._full:
+            parts.append(self._extra_block())     # rare slots — full=True only
         if sm.history:
             parts.append(
                 "**Operations:** "
                 + ", ".join(h["name"] for h in sm.history)
             )
-        if self._full:
-            parts.append(self._operator_block())
         return "\n\n".join(parts)
 
     def __str__(self) -> str:
