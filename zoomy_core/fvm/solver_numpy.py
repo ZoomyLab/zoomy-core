@@ -493,6 +493,15 @@ class HyperbolicSolver(Solver):
         # Build reconstruction (ghost-cell-free)
         reconstruct = self._build_reconstruction(mesh, symbolic_model)
 
+        # Runtime non-conservative matrix B(Q) for the cell-interior NCP
+        # integral (path-conservative consistency at order ≥ 2).  Built only
+        # when a higher-order reconstruction carries a slope — order 1 has none.
+        ncm = None
+        if self.nsm.reconstruction.order >= 2:
+            from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
+            ncm = NumpyRuntimeModel.from_system_model(
+                symbolic_model).nonconservative_matrix
+
         # Build diffusion operators (ghost-cell-free)
         self._diffusion_ops = self._build_diffusion_operators(mesh, symbolic_model, dim, n_vars)
 
@@ -571,6 +580,26 @@ class HyperbolicSolver(Solver):
                     bc_indices[i_bf], time, position, d_face[i_bf],
                     Q_L[:, fidx], qaux_inner, parameters, normal,
                 )
+
+            # 3b. Cell-interior non-conservative integral (path-conservative,
+            # order ≥ 2): ∫_cell B(Q)·∂_x Q dx ≈ B(Q_c)·s_c, with B evaluated
+            # at the cell-centre state and s_c the limited reconstruction slope
+            # (depth row = ∂_x η − ∂_x b for free-surface).  The face
+            # fluctuations below carry only the inter-cell jump; this is the
+            # intra-cell smooth part.  Skipped exactly at order 1 (slope = 0).
+            # REQUIRED for well-balancing at order ≥ 2 — it telescopes the
+            # reconstructed hydrostatic-pressure variation against the bed
+            # slope.  The |cell| factor cancels the per-unit-volume residual
+            # normalisation, so there is no division by cell volume.
+            grad = getattr(reconstruct, "_limited_grad", None)
+            if ncm is not None and grad is not None and grad.any():
+                for c in range(nc):
+                    qa_c = Qaux[:, c] if has_aux else _EMPTY_AUX
+                    B_c = np.asarray(ncm(Q[:, c], qa_c, parameters), dtype=float)
+                    if B_c.ndim == 2 and dim == 1:
+                        B_c = B_c[..., None]
+                    for d in range(dim):
+                        dQ[:, c] -= B_c[:, :, d] @ grad[:, d, c]
 
             # 4a. Interior face loop — both cells are valid inner cells
             for fi in range(len(interior_faces)):
@@ -833,11 +862,39 @@ def _build_free_surface_numerics(symbolic_model):
     )
 
 
+class _SurfaceReconAdapter:
+    """Adapt :class:`SurfaceReconstruction` to the explicit flux operator's
+    ``reconstruct(Q, bf) → (Q_L, Q_R)`` interface.
+
+    ``SurfaceReconstruction`` reconstructs the free-surface elevation
+    ``η = h + b`` (flat at lake-at-rest → zero limited slope) and returns
+    ``(Q_L, Q_R, b_L, b_R)`` with the per-side depth recovered as ``h = η − b``;
+    the explicit flux operator wants only ``(Q_L, Q_R)`` and reads the limited
+    slope of the *actual* state (depth row ``∂η − ∂b``) off ``_limited_grad``
+    for the cell-interior non-conservative integral.  ``b`` lives in the
+    conservative state here, so no ``Qaux`` is needed at reconstruction time.
+    """
+
+    def __init__(self, surf):
+        self.surf = surf
+        self._limited_grad = None
+
+    def __call__(self, Q, bf, phi=None):
+        Q_L, Q_R, _b_L, _b_R = self.surf(Q, None, bf, phi=phi)
+        self._limited_grad = self.surf._limited_grad
+        return Q_L, Q_R
+
+
 class FreeSurfaceFlowSolver(HyperbolicSolver):
     """Explicit FVM for free-surface flows (SWE, SME, VAM).
 
     Uses positive (hydrostatic reconstruction) Rusanov with wet/dry handling.
     Requires model variables 'b' and 'h'.
+
+    At reconstruction order ≥ 2 it reconstructs the free-surface elevation
+    ``η = h + b`` (so the limiter is well-balanced) and the base solver adds
+    the cell-interior non-conservative integral — together these give exact
+    well-balancing at lake-at-rest to machine precision.
     """
 
     def _build_numerics(self, symbolic_model):
@@ -846,8 +903,22 @@ class FreeSurfaceFlowSolver(HyperbolicSolver):
     def _build_reconstruction(self, mesh, symbolic_model):
         dim = symbolic_model.dimension
         if self.nsm.reconstruction.order >= 2:
-            from zoomy_core.fvm.reconstruction import FreeSurfaceLSQMUSCL
             h_idx = _var_index(symbolic_model, "h")
+            b_idx = _var_index(symbolic_model, "b")
+            # Well-balanced surface-elevation reconstruction needs b in the
+            # conservative state (recover h = η − b per side).  When the model
+            # has no in-state bathymetry, fall back to the wet/dry conservative
+            # MUSCL (not WB at order 2, but the only sensible option there).
+            if b_idx is not None:
+                from zoomy_core.fvm.reconstruction import (
+                    LSQMUSCLReconstruction, SurfaceReconstruction,
+                )
+                base = LSQMUSCLReconstruction(
+                    mesh, dim, limiter=self.nsm.reconstruction.limiter)
+                surf = SurfaceReconstruction(
+                    base, h_index=h_idx, b_index=b_idx, b_in_state=True)
+                return _SurfaceReconAdapter(surf)
+            from zoomy_core.fvm.reconstruction import FreeSurfaceLSQMUSCL
             eps_wet = self._get_dry_threshold(symbolic_model)
             return FreeSurfaceLSQMUSCL(
                 mesh, dim, h_index=h_idx, eps_wet=eps_wet,
@@ -859,9 +930,9 @@ def _build_roe_numerics(symbolic_model):
     """Path-conservative Roe (matrix |A| dissipation) for free-surface models;
     auto-locates ``h``/``b`` and the depth-scaled momentum rows like the
     Rusanov variant."""
-    from zoomy_core.fvm.riemann_solvers import PathConservativeRoe
+    from zoomy_core.fvm.riemann_solvers import NonconservativeRoe
     scaled_q_indices = _detect_scaled_q_indices(symbolic_model)
-    return PathConservativeRoe(symbolic_model, scaled_q_indices=scaled_q_indices)
+    return NonconservativeRoe(symbolic_model, scaled_q_indices=scaled_q_indices)
 
 
 class RoeFreeSurfaceFlowSolver(FreeSurfaceFlowSolver):

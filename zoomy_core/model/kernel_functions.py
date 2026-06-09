@@ -83,25 +83,19 @@ class max_wavespeed(sp.Function):
         return None  # always keep unevaluated
 
 
-class roe_dissipation(sp.Function):
-    """
-    roe_dissipation(i, *flat_states) — the i-th component of the Roe matrix
-    dissipation ``|A(Q*)| · (Q_R − Q_L) = R|Λ|L · ΔQ`` at a face.
+class eigensystem(sp.Function):
+    """eigensystem(idx, *A_flat) — idx-th component of the eigendecomposition of
+    the row-major n*n matrix A_flat, laid out as
+      [ eigenvalues(n), right_eigenvectors R (n*n, row-major), left L=R^{-1} (n*n) ].
+    Opaque to SymPy; numerical in the backends (np.linalg.eig / Eigen).  The Roe
+    scheme builds |A| = R|Lambda|L from this."""
 
-    ``A`` is the FULL quasilinear matrix (``∂F/∂Q + B``) at the midpoint
-    state ``Q* = ½(Q_L+Q_R)`` and ``|A|`` is formed by a runtime NUMERICAL
-    eigendecomposition (no analytical eigenvectors — generic over any model).
-    Opaque to SymPy (never simplified).  The flat argument list is
-    ``[i, *Q_L, *Q_R, *Qaux_L, *Qaux_R, *p, *n]``; the backend supplies the
-    implementation (NumPy: ``np.linalg.eig`` with a Harten-Hyman entropy fix
-    and a defective-eigenbasis fallback to scalar Rusanov dissipation).
-    """
     is_commutative = True
     is_real = True
 
     @classmethod
     def eval(cls, *args):
-        return None  # always keep unevaluated (numerical, backend-provided)
+        return None  # always keep unevaluated
 
 
 class conditional(sp.Function):

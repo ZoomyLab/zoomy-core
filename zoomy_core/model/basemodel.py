@@ -557,6 +557,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
             ("eigenvalues", self.eigenvalues, eig_sig),
             ("left_eigenvectors", self.left_eigenvectors, eig_sig),
             ("right_eigenvectors", self.right_eigenvectors, eig_sig),
+            ("eigensystem", self.eigensystem, eig_sig),
             ("source", self.source, std_sig),
             (
                 "source_jacobian_wrt_variables",
@@ -1019,6 +1020,20 @@ class Model(param.Parameterized, SymbolicRegistrar):
     def right_eigenvectors(self):
         """Right eigenvectors."""
         return ZArray.zeros(self.n_variables, self.n_variables)
+
+    def eigensystem(self):
+        """Eigendecomposition of the normal-projected quasilinear matrix A_n,
+        stacked as ``[Lambda(n), R(n*n), L(n*n)]`` (row-major), each entry an
+        opaque ``eigensystem`` kernel call — numerical in the backends.  The Roe
+        scheme builds ``|A| = R|Lambda|L`` from this."""
+        from zoomy_core.model.kernel_functions import eigensystem as _es
+        n = self.n_variables
+        qm = self.quasilinear_matrix()
+        A_flat = [
+            sum(qm[i, j, d] * self.normal[d] for d in range(self.dimension))
+            for i in range(n) for j in range(n)
+        ]
+        return ZArray([_es(sp.Integer(idx), *A_flat) for idx in range(n + 2 * n * n)])
 
     def print_model_functions(self, function_names=None):
         """Print model functions."""

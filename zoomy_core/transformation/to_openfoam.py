@@ -510,9 +510,22 @@ class FoamNumericsPrinter(GenericCppBase):
             printer.doprint(a) for a in args
         ) + ")"
 
+    # ``eigensystem(idx, *A_flat)`` is the opaque eigendecomposition leaf
+    # the Roe scheme builds ``|A| = R|Lambda|L`` from.  Like max_wavespeed
+    # it is implemented in UserFunctions.H (``numerics::eigensystem``,
+    # Eigen-backed); the generated kernels live in ``namespace Numerics``,
+    # so the call MUST be namespace-qualified to resolve (unqualified
+    # lookup would not reach ``namespace numerics``).
+    @staticmethod
+    def _emit_eigensystem(printer, *args):
+        return "numerics::eigensystem(" + ", ".join(
+            printer.doprint(a) for a in args
+        ) + ")"
+
     c_functions = {
         **GenericCppBase.c_functions,
         "max_wavespeed": _emit_max_wavespeed.__func__,
+        "eigensystem": _emit_eigensystem.__func__,
     }
 
     def __init__(self, numerics, **opts):

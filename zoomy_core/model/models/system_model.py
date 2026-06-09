@@ -566,6 +566,39 @@ class SystemModel:
         evs = sp.solve(A.charpoly(lam), lam)
         return sp.Matrix(n_eq, 1, lambda i, _j: sp.simplify(evs[i]))
 
+    @property
+    def eigensystem(self) -> ZArray:
+        """Opaque eigendecomposition of the normal-projected quasilinear
+        matrix ``A_n = Σ_d n_d · quasilinear_matrix[:, :, d]``.
+
+        Flattened layout (row-major), length ``n + 2·n²``::
+
+            [ eigenvalues λ (n),
+              right eigenvectors R (n·n),
+              left  eigenvectors L = R⁻¹ (n·n) ]
+
+        Each component is a call to the opaque
+        :class:`zoomy_core.model.kernel_functions.eigensystem` kernel —
+        realised numerically per backend (``np.linalg.eig`` / Eigen),
+        never a closed-form symbolic spectral derivation.  The Roe
+        scheme builds ``|A| = R |Λ| L`` symbolically on top.  This is a
+        *derived* operator (cheap symbolic wrapping of
+        ``quasilinear_matrix``), so it is exposed as a property — always
+        consistent with the current quasilinear matrix — and mirrors
+        ``Model.eigensystem`` so a SystemModel-driven solver reaches the
+        same operator the root model defines.
+        """
+        from zoomy_core.model.kernel_functions import eigensystem as _es
+        n = self.n_equations
+        qm = self.quasilinear_matrix
+        normal = list(self.normal.values())
+        A_flat = [
+            sum(qm[i, j, d] * normal[d] for d in range(self.n_dim))
+            for i in range(n) for j in range(n)
+        ]
+        return ZArray([_es(sp.Integer(idx), *A_flat)
+                       for idx in range(n + 2 * n * n)])
+
     def refresh_derived_operators(self, *, eigenvalues: bool = False):
         """Recompute ``quasilinear_matrix`` and ``source_jacobian`` from
         the (possibly just-mutated) primary operators, keeping the

@@ -10,6 +10,30 @@ from zoomy_core.model.basefunction import Function
 from zoomy_core.model.basemodel import Model
 
 
+_EIGENSYSTEM_CACHE = {"key": None, "out": None}
+
+
+def _eigensystem_numpy(idx, *a_flat):
+    """Backend impl of the opaque ``eigensystem`` kernel: numerical
+    eigendecomposition of the row-major matrix, returning the flat stack
+    [eigenvalues(n), R(n*n), L=R^{-1}(n*n)].  One eig is shared across the
+    n+2n^2 component calls via a 1-slot cache."""
+    key = tuple(float(x) for x in a_flat)
+    c = _EIGENSYSTEM_CACHE
+    if c["key"] != key:
+        n = int(round(len(key) ** 0.5))
+        A = np.array(key, float).reshape(n, n)
+        w, V = np.linalg.eig(A)
+        w = np.real(w); V = np.real(V)
+        try:
+            L = np.linalg.inv(V)
+        except np.linalg.LinAlgError:
+            L = np.linalg.pinv(V)
+        c["key"] = key
+        c["out"] = np.concatenate([w, V.flatten(), L.flatten()])
+    return float(c["out"][int(idx)])
+
+
 class NumpyRuntimeModel:
     """Runtime model generated from a symbolic Model.
 
@@ -28,7 +52,7 @@ class NumpyRuntimeModel:
         "clamp_positive": lambda x: np.maximum(x, 0.0),
         "clamp_momentum": lambda hu, h, u_max: np.clip(hu, -h * u_max, h * u_max),
         "max_wavespeed": None,  # must be provided by the solver before compilation
-        "roe_dissipation": None,  # provided by PathConservativeRoe.runtime_kernels
+        "eigensystem": _eigensystem_numpy,
     }
     printer = "numpy"
     

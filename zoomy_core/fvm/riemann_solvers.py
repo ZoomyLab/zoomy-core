@@ -15,7 +15,7 @@ import sympy as sp
 from zoomy_core.misc.misc import ZArray, Zstruct
 from zoomy_core.model.basefunction import SymbolicRegistrar
 from zoomy_core.model.kernel_functions import (
-    conditional, max_wavespeed, roe_dissipation,
+    conditional, max_wavespeed,
 )
 from zoomy_core.model.models.system_model import SystemModel
 from zoomy_core.transformation.to_numpy import (
@@ -948,93 +948,52 @@ class PositiveNonconservativeRusanov(PositiveRusanov, NonconservativeRusanov):
         )
 
 
-def _make_roe_dissipation_numpy(symbolic_model):
-    """Build the NumPy ``roe_dissipation`` kernel: ``|A(Q*)|·(Q_R − Q_L)``
-    via numerical eigendecomposition of the full quasilinear matrix at the
-    midpoint state.  Per face the n component calls share ONE eig (cached)."""
-    n_vars = symbolic_model.n_variables
-    n_aux = symbolic_model.n_aux_variables
-    n_params = symbolic_model.n_parameters
-    dim = symbolic_model.dimension
-    rt = NumpyRuntimeModel.from_system_model(symbolic_model)
-    ql_fn = rt.quasilinear_matrix
-    keys = list(symbolic_model.variables.keys())
-    b_idx = keys.index("b") if "b" in keys else None
-    cache = {"key": None, "vec": None}
+class NonconservativeRoe(NonconservativeRusanov):
+    """Roe scheme.
 
-    def roe_diss(i, *args):
-        """roe_dissipation(i, *[Q_L, Q_R, Qaux_L, Qaux_R, p, n])."""
-        if cache["key"] != args:
-            o = 0
-            qL = np.asarray(args[o:o + n_vars], float); o += n_vars
-            qR = np.asarray(args[o:o + n_vars], float); o += n_vars
-            auxL = np.asarray(args[o:o + n_aux], float); o += n_aux
-            auxR = np.asarray(args[o:o + n_aux], float); o += n_aux
-            p = np.asarray(args[o:o + n_params], float); o += n_params
-            nrm = np.asarray(args[o:o + dim], float)
-            qa = 0.5 * (qL + qR)
-            auxa = 0.5 * (auxL + auxR)
-            ql = np.asarray(ql_fn(qa, auxa, p), float).reshape(n_vars, n_vars, dim)
-            A_n = sum(ql[:, :, d] * nrm[d] for d in range(dim))
-            cache["key"] = args
-            cache["vec"] = _roe_abs_apply(A_n, qR - qL, b_idx)
-        return float(cache["vec"][int(i)])
+    The Gauss-Legendre path-integral NCP advection term (as
+    :class:`NonconservativeRusanov`), with the scalar Rusanov viscosity
+    ``s_max*Id*dQ`` replaced by the Roe matrix dissipation
+    ``|A(Q*)|*dQ = R|Lambda|L*dQ`` at the midpoint state
+    ``Q* = 1/2 (Q_L + Q_R)``.  Each characteristic field is upwinded by its own
+    ``|lambda|`` (vs a single max wave speed), so shocks and contacts are markedly
+    sharper than Rusanov; the stationary bed mode (lambda=0) contributes
+    ``|0| = 0`` automatically -- no special bed handling.
 
-    return roe_diss
+    The eigendecomposition is sourced from the model's ``eigensystem`` operator:
+    the SystemModel forms the normal-projected quasilinear matrix
+    ``A_n = Sum_d n_d * quasilinear_matrix[:, :, d]`` and wraps it in the opaque
+    :class:`zoomy_core.model.kernel_functions.eigensystem` kernel, which the
+    backends realise numerically (``np.linalg.eig`` / Eigen via UserFunctions).
+    The scheme then assembles ``|A| = R|Lambda|L`` symbolically on top -- no
+    closed-form symbolic spectral derivation, so it is general over ANY
+    SystemModel (SWE with an analytic spectrum, or SME/VAM without one).  The
+    printer emits the ``eigensystem(...)`` calls as opaque function applications;
+    each backend's UserFunctions supplies the implementation.
 
-
-def _roe_abs_apply(A, dq, b_idx):
-    """Return ``|A|·dq`` with ``|A| = R diag(|λ|) L`` and a Harten-Hyman
-    entropy fix; fall back to scalar Rusanov dissipation ``s_max·dq`` if A is
-    (near-)defective.  The stationary-bed row is never dissipated."""
-    try:
-        w, V = np.linalg.eig(A)
-        w = np.real(w)
-        V = np.real(V)
-        aw = np.abs(w)
-        s_max = float(aw.max()) if aw.size else 0.0
-        delta = 0.1 * s_max + 1e-12                      # Harten-Hyman floor
-        aw = np.where(aw < delta, 0.5 * (w * w / delta + delta), aw)
-        out = V @ (aw * np.linalg.solve(V, dq))          # V diag(|λ|) V^{-1} dq
-        if not np.all(np.isfinite(out)):
-            raise np.linalg.LinAlgError("non-finite Roe dissipation")
-    except np.linalg.LinAlgError:                        # defective -> Rusanov
-        s_max = float(np.max(np.abs(np.real(np.linalg.eigvals(A)))))
-        out = s_max * dq
-    out = np.real(np.asarray(out, float))
-    if b_idx is not None:
-        out[b_idx] = 0.0
-    return out
-
-
-class PathConservativeRoe(PositiveNonconservativeRusanov):
-    """Path-conservative Roe scheme.
-
-    Identical to :class:`PositiveNonconservativeRusanov` (Audusse-Bristeau-
-    Klein hydrostatic reconstruction + Gauss-Legendre path-integral NCP)
-    EXCEPT the fluctuation dissipation: the scalar Rusanov viscosity
-    ``s_max·Id·ΔQ`` is replaced by the Roe matrix dissipation
-    ``|A(Q*)|·ΔQ = R|Λ|L·ΔQ``, where ``A`` is the FULL quasilinear matrix
-    (``∂F/∂Q + B``) at the midpoint-averaged face state ``Q* = ½(Q_L+Q_R)``
-    and ``|A|`` is formed by a runtime NUMERICAL eigendecomposition — no
-    analytical eigenvectors, so the scheme is generic over any SystemModel
-    (SWE, SME, VAM).  The midpoint freeze is O(jump^3)-accurate at the
-    interface (vs O(jump^2) for an endpoint freeze); upwinding each
-    characteristic with its own ``|λ|`` instead of a single max wave speed
-    makes shocks and contacts markedly sharper than Rusanov.
-
-    The eigendecomposition (Harten-Hyman entropy fix + defective-eigenbasis
-    fallback to scalar Rusanov) runs in the backend kernel ``roe_dissipation``
-    injected via :meth:`runtime_kernels`.  OpenFOAM codegen is not yet wired
-    (the printer emits closed-form bodies, not Eigen calls) — numpy runtime
-    for now.
+    Roe is well-balanced by construction (the path-integral fluctuations carry
+    the bed coupling and the lambda=0 bed mode is exact), so it is built on the
+    plain :class:`NonconservativeRusanov` -- NO hydrostatic reconstruction.
     """
 
-    name = param.String(default="PathConservativeRoeV2")
+    name = param.String(default="NonconservativeRoe")
+
+    def _abs_quasilinear(self, q_state, aux_state, p, n):
+        """``|A_n| = R|Lambda|L`` of the normal-projected quasilinear matrix at
+        ``q_state``, assembled here (the 'real Roe' part) from the model's
+        ``eigensystem`` operator — which evaluates ``quasilinear_matrix`` and
+        applies the opaque ``eigensystem`` kernel (numerical eig in the backends:
+        np.linalg.eig / Eigen).  No symbolic diagonalization, so it is general
+        over any SystemModel (SWE, SME/VAM, HR-reconstructed)."""
+        n_vars = self.n_variables
+        es = self._model_eval("eigensystem", q_state, aux_state, p, n)
+        R = sp.Matrix(n_vars, n_vars, lambda i, j: es[n_vars + i * n_vars + j])
+        L = sp.Matrix(n_vars, n_vars,
+                      lambda i, j: es[n_vars + n_vars * n_vars + i * n_vars + j])
+        abs_lam = sp.diag(*[sp.Abs(es[k]) for k in range(n_vars)])
+        return R @ abs_lam @ L
 
     def _compute_fluctuations(self, qL, qR, auxL, auxR, p, n):
-        """Central path-integral term (as NonconservativeRusanov) with the
-        scalar dissipation replaced by the Roe matrix dissipation."""
         xi_np, wi_np = np.polynomial.legendre.leggauss(self.integration_order)
         xi_np = 0.5 * (xi_np + 1)
         wi_np = 0.5 * wi_np
@@ -1044,6 +1003,7 @@ class PathConservativeRoe(PositiveNonconservativeRusanov):
         n_vars = self.n_variables
         dim = len(n)
 
+        # NCP-consistent advection term: path-integral of A along Q_L -> Q_R.
         A_int = ZArray.zeros(n_vars, n_vars)
         for xi, wi in zip(xi_np, wi_np):
             q_path = qL + xi * dQ
@@ -1052,27 +1012,18 @@ class PathConservativeRoe(PositiveNonconservativeRusanov):
             A_n = ZArray.zeros(n_vars, n_vars)
             for i in range(n_vars):
                 for j in range(n_vars):
-                    val = 0
-                    for d in range(dim):
-                        val += A_tensor[i, j, d] * n[d]
-                    A_n[i, j] = val
+                    A_n[i, j] = sum(A_tensor[i, j, d] * n[d] for d in range(dim))
             A_int += wi * A_n
         term_advection = A_int @ dQ
 
-        # Roe matrix dissipation |A|·ΔQ — opaque numerical kernel, per row.
-        flat = (list(qL) + list(qR) + list(auxL) + list(auxR)
-                + list(p) + list(n))
-        term_dissipation = ZArray(
-            [roe_dissipation(sp.Integer(i), *flat) for i in range(n_vars)])
+        # Roe matrix dissipation |A(Q*)|*dQ at the midpoint state (closed form).
+        absA = self._abs_quasilinear(qL + 0.5 * dQ, auxL + 0.5 * dAux, p, n)
+        diss = absA @ sp.Matrix([dQ[i] for i in range(n_vars)])
+        term_dissipation = ZArray([diss[i] for i in range(n_vars)])
 
         Dp_matrix = 0.5 * (term_advection + term_dissipation)
         Dm_matrix = 0.5 * (term_advection - term_dissipation)
         return ZArray([Dp_matrix, Dm_matrix])
-
-    def runtime_kernels(self, symbolic_model):
-        """Backend kernels this numerics needs at runtime — merged into the
-        NumpyRuntime module by the solver before lambdification."""
-        return {"roe_dissipation": _make_roe_dissipation_numpy(symbolic_model)}
 
 
 class PositiveNonconservativeHLL(PositiveHLL, NonconservativeRusanov):
