@@ -26,6 +26,6 @@ def __getattr__(name):
         from zoomy_core.model.models.sme import SME
         return SME
     if name == "VAM":
-        from zoomy_core.model.models.legacy.vam_sigmaref import VAM
+        from zoomy_core.model.models.vam import VAM
         return VAM
     raise AttributeError(f"module 'zoomy_core.model.models' has no attribute {name!r}")
