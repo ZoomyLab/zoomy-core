@@ -39,7 +39,24 @@ def test_sme_builds_a_systemmodel():
 def test_sme_mass_matrix_is_legendre_gram():
     sm = _sm()
     M = sp.Matrix(sm.mass_matrix.tolist())
-    assert M == sp.diag(0, 1, 1, sp.Rational(1, 3), sp.Rational(1, 5))
+    # row 0 is the (trivial) bed evolution ∂_t b = 0 — M[0,0] = 1, not a
+    # mass-less algebraic row; rows 1… carry the shifted-Legendre Gram.
+    assert M == sp.diag(1, 1, 1, sp.Rational(1, 3), sp.Rational(1, 5))
+
+
+def test_mass_row_is_conservative_and_bed_row_is_inert():
+    """Coupling contract (chat_model_coupling.md): interface mass exchange
+    goes through the generated flux kernels, so the mass divergence must be
+    a FLUX (``flux[1] = q_0``), never a ``B·∂_x Q`` coupling; and the bed
+    row must be exactly ``∂_t b = 0`` (no source decay) for M-unaware
+    consumers of the kernels."""
+    sm = _sm()
+    assert sp.simplify(_scalar(sm.flux[1]) - sm.state[2]) == 0
+    assert all(_scalar(e) == 0 for e in sm.nonconservative_matrix[1])
+    assert _scalar(sm.source[0]) == 0
+    assert _scalar(sm.flux[0]) == 0
+    assert all(_scalar(e) == 0 for e in sm.nonconservative_matrix[0])
+    assert 0 in sm.stationary_indices
 
 
 def test_sme_flux_and_hydrostatic_pressure():

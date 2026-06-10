@@ -275,15 +275,29 @@ def _classify_row(residual, i, state, state_funcs, t, x, gravity_param,
             continue
 
         inner = deriv.args[0]
+        coeff_has_state = any(coeff.has(f) for f in state_set)
 
-        # 4. coeff·∂_x(state) → nonconservative coupling B[i, j].
+        # 4. coeff·∂_x(state).  A state-free, (t,x)-free coeff is an EXACT
+        # divergence ``∂_x(coeff·Q_j)`` — a conservative FLUX, never a
+        # ``B·∂_x Q`` coupling (the mass row ``∂_x q_0`` must reach the
+        # generated flux kernels: interface/open-boundary mass exchange uses
+        # flux + fluctuations, and mass-in-NCP transmits only the jump).
+        # Genuinely non-conservative couplings (state-dependent coeff: the
+        # bed slope ``g h ∂_x b``, the SME cross-mode ``q_i/h·∂_x q_j``)
+        # stay in B.
         if inner in sym_of_func:
+            if not coeff_has_state and not coeff.has(x) and not coeff.has(t):
+                flux_i = coeff * inner
+                if gravity_param is not None and flux_i.has(gravity_param):
+                    P[i, 0] = P[i, 0] + flux_i
+                else:
+                    F[i, 0] = F[i, 0] + flux_i
+                continue
             j = state_funcs.index(inner)
             B[i, j, 0] = B[i, j, 0] + coeff
             continue
 
         inner_has_state = any(inner.has(f) for f in state_set)
-        coeff_has_state = any(coeff.has(f) for f in state_set)
 
         # 5. ∂_x(F(state)) with state-free coeff → flux / pressure.
         if inner_has_state and not coeff_has_state:

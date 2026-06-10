@@ -414,9 +414,14 @@ class Model:
                 and all(isinstance(k, int) for k in shape_or_expr)):
             # scalar: add_equation(name, expr).  Accept an existing Equation /
             # Expression and COPY its residual — e.g. duplicate continuity for
-            # the w-reconstruction: ``m.add_equation("w", m.mass)``.
+            # the w-reconstruction: ``m.add_equation("w", m.mass)``.  The
+            # ``.expr`` unwrap must NOT fire on sympy objects: ``Derivative``
+            # also carries ``.expr`` (its differentiated argument), and
+            # unwrapping it silently turns ``∂_t b`` into ``b``.
             scalar_expr = (shape_or_expr.expr
-                           if hasattr(shape_or_expr, "expr") else shape_or_expr)
+                           if hasattr(shape_or_expr, "expr")
+                           and not isinstance(shape_or_expr, sp.Basic)
+                           else shape_or_expr)
             eq = Equation(scalar_expr, name=name, model=self)
             self._equations[name] = eq
             self._equation_shapes[name] = (1,)

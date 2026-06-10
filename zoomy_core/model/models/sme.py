@@ -188,7 +188,12 @@ class SME(BaseModel):
         ``SystemModel.attach_boundary_conditions`` remains available as the
         hook for attaching/replacing BCs on an existing SystemModel."""
         m = self.derivation
-        sm = SystemModel.from_model(m, Q=[self._bed, *m.explicit_state()])
+        qs = list(m.explicit_state())
+        # b evolves via the (trivial) bottom equation ∂_t b = 0, so it is
+        # already an explicit unknown; prepend only if absent.
+        if self._bed not in qs:
+            qs = [self._bed, *qs]
+        sm = SystemModel.from_model(m, Q=qs)
         if self.boundary_conditions is not None:
             sm.attach_boundary_conditions(
                 self.boundary_conditions, aux_bcs=self.aux_boundary_conditions)
