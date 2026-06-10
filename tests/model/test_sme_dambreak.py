@@ -26,8 +26,11 @@ from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
 
 
 def _run_dambreak(level, *, hL=2.0, hR=1.0, n_cells=100, t_end=0.3):
-    """Build the new SME at `level`, inject BCs, run a 1-D dam break, return h."""
-    sm = SME(level=level).system_model
+    """Build the new SME at `level` with BCs as always, run a 1-D dam break."""
+    # the NORMAL interface — BoundaryConditions in the model constructor,
+    # exactly as the production models always took them (transmissive here)
+    sm = SME(level=level, boundary_conditions=BoundaryConditions(
+        [Extrapolation(tag="left"), Extrapolation(tag="right")])).system_model
     n_state = len(sm.state)
     # state = [b, h, q_0, …]; bed b=0, dam: h=hL left of x=5, hR right, momenta 0
     high = np.zeros(n_state); high[1] = hL
@@ -35,9 +38,6 @@ def _run_dambreak(level, *, hL=2.0, hR=1.0, n_cells=100, t_end=0.3):
     sm.initial_conditions = RP(high=lambda n, hi=high: hi,
                                low=lambda n, lo=low: lo, jump_position_x=5.0)
     sm.aux_initial_conditions = Constant(constants=lambda n: np.zeros(n))
-    # the HOOK — use our old BoundaryConditions exactly as always (transmissive)
-    sm.attach_boundary_conditions(BoundaryConditions(
-        [Extrapolation(tag="left"), Extrapolation(tag="right")]))
 
     assert sm.eigenvalue_mode == "numerical"          # numerical by default
 

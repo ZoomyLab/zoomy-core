@@ -173,6 +173,16 @@ class SME(BaseModel):
 
     @property
     def system_model(self) -> SystemModel:
-        """The runtime operator-form system (conservative q-state, `b` prepended)."""
+        """The runtime operator-form system (conservative q-state, `b` prepended).
+
+        Boundary conditions passed to the constructor
+        (``SME(level, boundary_conditions=BoundaryConditions(...))``) are
+        forwarded — the normal interface, exactly as the production models.
+        ``SystemModel.attach_boundary_conditions`` remains available as the
+        hook for attaching/replacing BCs on an existing SystemModel."""
         m = self.derivation
-        return SystemModel.from_model(m, Q=[self._bed, *m.explicit_state()])
+        sm = SystemModel.from_model(m, Q=[self._bed, *m.explicit_state()])
+        if self.boundary_conditions is not None:
+            sm.attach_boundary_conditions(
+                self.boundary_conditions, aux_bcs=self.aux_boundary_conditions)
+        return sm
