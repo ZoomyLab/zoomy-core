@@ -174,6 +174,28 @@ class SME(BaseModel):
         for i in range(Nu + 1):
             m.register_group("boundary:wall", q(i, t, x), -q(i, t, x))
 
+        # 12 — WB reconstruction: the model OWNS its primitive map.  Limit the
+        # free surface η = b + h and the modal velocities u_i = q_i/h instead
+        # of the conservative state (bounds limited values by physical scales;
+        # removes momentum overshoot at wet/dry fronts).  b reconstructs as
+        # itself (identity default).
+        m.register_group("reconstruction", h, b + h)
+        for i in range(Nu + 1):
+            m.register_group("reconstruction", q(i, t, x), q(i, t, x) / h)
+
+        # 13 — project (inverse of interpolate): canonical-profile fields
+        # ``P3_<f>`` → state.  The current column contract hands the model a
+        # DEPTH-AVERAGED profile, which carries exactly the 0-th moment:
+        # q_0 = h·⟨u⟩ is exact, the higher moments are NOT representable and
+        # stay 0 until the ζ-resolved column contract lands (then this block
+        # registers the exact Galerkin reduction (2i+1)·h·⟨u φ_i⟩).
+        P3 = {f: sp.Symbol(f"P3_{f}", real=True) for f in ("b", "h", "u")}
+        m.register_group("project", b, P3["b"])
+        m.register_group("project", h, P3["h"])
+        m.register_group("project", q(0, t, x), P3["h"] * P3["u"])
+        for i in range(1, Nu + 1):
+            m.register_group("project", q(i, t, x), sp.S.Zero)
+
         self.derivation = m
         self._bed = b
         return None

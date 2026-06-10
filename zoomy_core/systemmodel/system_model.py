@@ -146,6 +146,7 @@ def _cov_propagate_bc_function(bc_func, sub_map, new_state):
 _FUNCTION_SLOTS: Dict[str, str] = {
     "interpolate": "interpolate_to_3d",
     "project": "project_from_3d",
+    "reconstruction": "reconstruction_variables",
 }
 
 
@@ -264,10 +265,32 @@ def _attach_function_groups(sm, model) -> None:
         attr = _FUNCTION_SLOTS.get(group)
         if attr is None:
             continue
-        vec = [sp.S.Zero] * (max(comps) + 1)
+        # Keys may be ints (slot positions — for ``interpolate`` these are
+        # CANONICAL-PROFILE slots, not state slots) or state FIELDS, resolved
+        # to their state slot — so registrations never hard-code the layout.
+        comps = {_state_slot(k): rhs for k, rhs in comps.items()}
+        if attr == "reconstruction_variables":
+            # state-shaped map; unregistered slots default to the IDENTITY
+            # (reconstruct the conservative entry itself), never to zero.
+            vec = list(sm.state)
+        else:
+            vec = [sp.S.Zero] * (max(comps) + 1)
         for idx, rhs in comps.items():
             vec[idx] = _parse(rhs, group, idx)
-        setattr(sm, attr, _to_zarray(sp.Matrix(vec)))
+        # reconstruction_variables is consumed entry-wise (invert, runtime
+        # limiting) — rank-1; the 3-D maps stay column matrices.
+        arr = (sp.Array(vec) if attr == "reconstruction_variables"
+               else sp.Matrix(vec))
+        setattr(sm, attr, _to_zarray(arr))
+    # A model-registered WB reconstruction implies its inverse (the runtime
+    # feeds reconstructed primitives back through ``WB_<name>`` symbols).
+    if (getattr(sm, "reconstruction_variables", None) is not None
+            and getattr(sm, "state_from_reconstruction", None) is None):
+        from zoomy_core.model.reconstruction_inverse import (
+            invert_reconstruction,
+        )
+        sm.state_from_reconstruction = invert_reconstruction(
+            sm.reconstruction_variables, list(sm.state))
     for g in sorted(set(new_aux), key=str):
         if g not in sm.aux_state:
             sm.aux_state = list(sm.aux_state) + [g]
@@ -563,6 +586,11 @@ class SystemModel:
             aux_bcs = BoundaryConditions([AuxBC.Extrapolation(tag=tg) for tg in tags])
         self.aux_boundary_conditions = aux_bcs.get_boundary_condition_function(
             *sig, function_name="aux_boundary_conditions")
+        # Retain the source objects, mirroring the production ``from_model``
+        # path — runtime consumers (face_value dispatch, codegen emitters)
+        # read them from here instead of poking private attrs.
+        self._bc_source = bcs
+        self._aux_bc_source = aux_bcs
         return self
 
     @property
