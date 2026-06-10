@@ -19,7 +19,8 @@ import pytest
 from zoomy_core.model.models import SME
 from zoomy_core.mesh import BaseMesh
 from zoomy_core.model.initial_conditions import RP, Constant
-from zoomy_core.model.boundary_conditions import BoundaryConditions, Extrapolation
+from zoomy_core.model.boundary_conditions import (
+    BoundaryConditions, Extrapolation, FromModel)
 import zoomy_core.fvm.timestepping as timestepping
 from zoomy_core.fvm.solver_numpy import HyperbolicSolver
 from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
@@ -48,6 +49,49 @@ def _run_dambreak(level, *, hL=2.0, hR=1.0, n_cells=100, t_end=0.3):
                               compute_dt=timestepping.adaptive(CFL=0.9))
     Q, _ = solver.solve(mesh, nsm, write_output=False)
     return np.asarray(Q[1, :n_cells], dtype=float)
+
+
+def test_wall_bc_comes_from_the_model():
+    """The wall is DEFINED in the derivation (register_group('boundary:wall'))
+    and accessed at runtime via FromModel — same signature as every other BC."""
+    sm = SME(level=2).system_model
+    bc = FromModel(tag="left", definition="wall").resolve(sm)
+    ghost = bc.compute_boundary_condition(
+        sm.time, sm.position, None, sm.variables,
+        sm.aux_variables, sm.parameters, sm.normal)
+    b, h, q0, q1, q2 = sm.state
+    # mirror state u(ζ) → −u(ζ): every moment flips, b and h extrapolate
+    assert list(ghost) == [b, h, -q0, -q1, -q2]
+
+
+def test_sme_dambreak_between_walls_conserves_mass():
+    """Dam break in a closed box: both walls are the MODEL-derived wall BC.
+    The mirrored ghost gives an exactly zero mass flux at each wall, so total
+    mass is conserved to machine precision while the wave keeps reflecting."""
+    n_cells, hL, hR = 50, 2.0, 1.0
+    sm = SME(level=2, boundary_conditions=BoundaryConditions(
+        [FromModel(tag="left", definition="wall"),
+         FromModel(tag="right", definition="wall")])).system_model
+    n_state = len(sm.state)
+    high = np.zeros(n_state); high[1] = hL
+    low = np.zeros(n_state);  low[1] = hR
+    sm.initial_conditions = RP(high=lambda n, hi=high: hi,
+                               low=lambda n, lo=low: lo, jump_position_x=1.0)
+    sm.aux_initial_conditions = Constant(constants=lambda n: np.zeros(n))
+    mesh = BaseMesh.create_1d(domain=(0.0, 2.0), n_inner_cells=n_cells)
+    nsm = NumericalSystemModel.from_system_model(
+        sm, reconstruction=ReconstructionSpec(order=1))
+    solver = HyperbolicSolver(time_end=1.0,
+                              compute_dt=timestepping.adaptive(CFL=0.9))
+    Q, _ = solver.solve(mesh, nsm, write_output=False)
+    h = np.asarray(Q[1, :n_cells], dtype=float)
+    assert np.all(np.isfinite(h)) and h.min() > 0.0
+    mass0 = (hL + hR) / 2 * 2.0                 # ∫h dx at t=0
+    mass1 = h.sum() * (2.0 / n_cells)
+    assert abs(mass1 - mass0) < 1e-10 * mass0, "wall leaks mass"
+    # the box is closed and t_end ≫ first wall hit: the state must NOT be the
+    # plain dam-break similarity solution anymore (reflections happened)
+    assert h.max() < hL - 0.05 and h.min() > hR + 0.05
 
 
 @pytest.mark.parametrize("level", [0, 2])      # SWE (level 0) and SME (level 2)

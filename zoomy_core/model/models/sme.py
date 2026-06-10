@@ -167,6 +167,13 @@ class SME(BaseModel):
         m.register_group("interpolate", 4, w_interp)
         m.register_group("interpolate", 5, rho * g * h * (1 - zeta))
 
+        # 11 — model-derived lateral wall BC: the mirror state u(ζ) → −u(ζ)
+        # flips EVERY moment (odd reflection, ⟨−u φ_i⟩ = −q_i/h); h and b
+        # extrapolate.  Keyed by the FIELD (no hard-coded state slots) —
+        # runtime access: FromModel(tag=…, definition="wall").
+        for i in range(Nu + 1):
+            m.register_group("boundary:wall", q(i, t, x), -q(i, t, x))
+
         self.derivation = m
         self._bed = b
         return None

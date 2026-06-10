@@ -291,6 +291,61 @@ class Lambda(BoundaryCondition):
         return Qout
 
 
+class FromModel(BoundaryCondition):
+    """Boundary values DERIVED IN THE MODEL.
+
+    References a boundary definition the declarative derivation registered as
+    a function group, e.g.::
+
+        m.register_group("boundary:wall", state_index, boundary_value_expr)
+
+    ``SystemModel.from_model`` parses these into ``sm.boundary_specs[<name>]``
+    (state-symbol expressions per state slot);
+    ``SystemModel.attach_boundary_conditions`` then calls :meth:`resolve` on
+    every ``FromModel`` entry — after which this BC has the SAME signature
+    and kernel path as every other :class:`BoundaryCondition`.  Slots the
+    model definition does not prescribe extrapolate (ghost = inner).
+
+    Usage::
+
+        BoundaryConditions([FromModel(tag="left", definition="wall"),
+                            Extrapolation(tag="right")])
+    """
+
+    definition = param.String(default="", doc="name registered in the model "
+                              "via register_group('boundary:<name>', …)")
+    prescribe_fields = param.Dict(default={}, doc="state_index → sympy expr "
+                                  "in the SystemModel's state symbols; "
+                                  "filled by resolve()")
+
+    def resolve(self, sm):
+        """Pull the named definition off ``sm.boundary_specs`` (the wrapper
+        model-definition → boundary function)."""
+        specs = getattr(sm, "boundary_specs", None) or {}
+        if self.definition not in specs:
+            raise KeyError(
+                f"FromModel: no boundary definition {self.definition!r} on "
+                f"this SystemModel; available: {sorted(specs)}. Register it "
+                "in the derivation via "
+                f"register_group('boundary:{self.definition}', index, expr).")
+        self.prescribe_fields = dict(specs[self.definition])
+        self._state_syms = list(sm.state)
+        return self
+
+    def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
+        """Compute boundary condition."""
+        if not self.prescribe_fields:
+            raise RuntimeError(
+                f"FromModel(tag={self.tag!r}, definition={self.definition!r}) "
+                "is unresolved — attach it via "
+                "SystemModel.attach_boundary_conditions (or call .resolve(sm)).")
+        Qout = ZArray(Q)
+        smap = {s: Qout[i] for i, s in enumerate(self._state_syms)}
+        for k, expr in self.prescribe_fields.items():
+            Qout[k] = sympy.sympify(expr).subs(smap)
+        return Qout
+
+
 class FromData(BoundaryCondition):
     """FromData. (class)."""
     prescribe_fields = param.Dict(default={})

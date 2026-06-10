@@ -205,7 +205,13 @@ def _attach_function_groups(sm, model) -> None:
     Each group ``{component_index: rhs}`` becomes a vector operator: the rhs is
     rewritten into bare state symbols, every ``∂_x(state)`` becomes a runtime
     gradient aux (appended to ``aux_state``), and the unit-interval vertical
-    coordinate ``ζ`` is exposed via ``sm.position``."""
+    coordinate ``ζ`` is exposed via ``sm.position``.
+
+    Groups named ``boundary:<name>`` are model-DERIVED boundary definitions
+    (``{state_index: boundary value}``); they land in ``sm.boundary_specs``
+    where :class:`~zoomy_core.model.boundary_conditions.FromModel` picks them
+    up by ``<name>`` at :meth:`SystemModel.attach_boundary_conditions` time.
+    """
     groups = getattr(model, "_function_groups", None)
     if not groups:
         return
@@ -214,20 +220,53 @@ def _attach_function_groups(sm, model) -> None:
     # the runtime evaluates the vertical reconstruction at the 3-D position's
     # vertical component; bind the unit-interval ζ to a real ``z`` (= position[2])
     # so interpolate_to_3d lambdifies with a genuine argument (not a free ζ).
+    # A truly z-dependent (un-σ-mapped) definition already reads in ``z`` and
+    # passes through untouched; mixing BOTH coordinates in one expression is
+    # ambiguous and refused.
     y_pos, z_pos = sp.Symbol("y", real=True), sp.Symbol("z", real=True)
     new_aux: list = []
+
+    def _parse(rhs, group, idx):
+        # ``.doit()`` expands derivatives of compounds (the CoV leaves
+        # ``∂_x(q_i/h)``) into the bare-field gradients ``∂_x q_i``, ``∂_x h``
+        # so the gradient aux are named cleanly (``dq0dx``, ``dhdx``).
+        e, grads = _gradients_to_aux(sp.sympify(rhs).doit(), x)
+        new_aux.extend(grads)
+        e = _fields_to_state_symbols(sp.expand(e), x)
+        if e.has(zeta) and e.has(z_pos):
+            raise ValueError(
+                f"function group {group!r}[{idx}] mixes the σ-reference "
+                "coordinate ζ ('zeta') and the physical vertical 'z' — "
+                "ambiguous; σ-map the definition fully or write it in z.")
+        return e.subs(zeta, z_pos)
+
+    def _state_slot(key):
+        """A boundary-group key may be the state FIELD itself — resolve it to
+        its slot in ``sm.state`` so registrations never hard-code the layout."""
+        if isinstance(key, int):
+            return key
+        sym = _fields_to_state_symbols(sp.sympify(key), x)
+        state = list(sm.state)
+        if sym not in state:
+            raise KeyError(
+                f"boundary group key {key} → {sym} is not a state entry "
+                f"of {[str(s) for s in state]}")
+        return state.index(sym)
+
     for group, comps in groups.items():
+        if group.startswith("boundary:"):
+            spec = {_state_slot(k): _parse(rhs, group, k)
+                    for k, rhs in comps.items()}
+            specs = getattr(sm, "boundary_specs", None) or {}
+            specs[group[len("boundary:"):]] = spec
+            sm.boundary_specs = specs
+            continue
         attr = _FUNCTION_SLOTS.get(group)
         if attr is None:
             continue
         vec = [sp.S.Zero] * (max(comps) + 1)
         for idx, rhs in comps.items():
-            # ``.doit()`` expands derivatives of compounds (the CoV leaves
-            # ``∂_x(q_i/h)``) into the bare-field gradients ``∂_x q_i``, ``∂_x h``
-            # so the gradient aux are named cleanly (``dq0dx``, ``dhdx``).
-            e, grads = _gradients_to_aux(sp.sympify(rhs).doit(), x)
-            new_aux.extend(grads)
-            vec[idx] = _fields_to_state_symbols(sp.expand(e), x).subs(zeta, z_pos)
+            vec[idx] = _parse(rhs, group, idx)
         setattr(sm, attr, _to_zarray(sp.Matrix(vec)))
     for g in sorted(set(new_aux), key=str):
         if g not in sm.aux_state:
@@ -506,8 +545,12 @@ class SystemModel:
         Extrapolation.  Optional — a SystemModel without BCs still builds; the
         solver only needs them at run time.  Returns ``self``.
         """
-        from zoomy_core.model.boundary_conditions import BoundaryConditions
+        from zoomy_core.model.boundary_conditions import (
+            BoundaryConditions, FromModel)
         import zoomy_core.model.aux_boundary_conditions as AuxBC
+        for bc in bcs.boundary_conditions_list:
+            if isinstance(bc, FromModel):
+                bc.resolve(self)
         dist = sp.Symbol("distance", real=True)
         sig = (self.time, self.position, dist, self.variables,
                self.aux_variables, self.parameters, self.normal)

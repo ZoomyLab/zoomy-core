@@ -780,9 +780,17 @@ class Model:
         Any ``∂_x(state)`` a definition needs is still turned into a runtime
         gradient aux (``dhdx``, ``dq0dx``, …) at extraction time.
 
+        ``index`` is an integer slot — except for ``boundary:<name>`` groups,
+        where it may also be the state FIELD the value belongs to (e.g.
+        ``q(i, t, x)``); the field is resolved to its state slot at
+        extraction time, so the registration never hard-codes the final
+        state layout.
+
         Returns ``self``.
         """
-        self._function_groups.setdefault(slot, {})[int(index)] = \
+        key = (int(index) if isinstance(index, int)
+               or getattr(index, "is_Integer", False) else index)
+        self._function_groups.setdefault(slot, {})[key] = \
             self._relation_rhs(relation)
         return self
 
