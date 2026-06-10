@@ -574,6 +574,12 @@ class SystemModel:
         for bc in bcs.boundary_conditions_list:
             if isinstance(bc, FromModel):
                 bc.resolve(self)
+        if self.position is None:
+            # the BC kernel signature needs a 3-component position; models
+            # without registered function groups never set one.
+            self.position = Zstruct(X0=self.space[0],
+                                    X1=sp.Symbol("y", real=True),
+                                    X2=sp.Symbol("z", real=True))
         dist = sp.Symbol("distance", real=True)
         sig = (self.time, self.position, dist, self.variables,
                self.aux_variables, self.parameters, self.normal)

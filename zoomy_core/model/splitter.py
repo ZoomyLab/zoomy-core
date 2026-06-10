@@ -720,6 +720,163 @@ def split_for_pressure(sm, pressure_vars, dt, *, bottom=None):
     )
 
 
+def split_for_pressure_structural(sm, pressure_vars, dt):
+    """Structural predictor / pressure / corrector splitter — no
+    equation-name conventions.
+
+    The chain-DAE :func:`split_for_pressure` dispatches rows by the legacy
+    naming scheme (``xmom_j*``, ``cont_j*``, ``U_k``/``q_Uk``).  SystemModels
+    extracted from a DECLARATIVE derivation carry no such names, but the row
+    roles are fully visible in the operators:
+
+    * **constraint rows** — identically-zero mass-matrix row (no ``∂_t``):
+      these are the divergence/incompressibility projections → the elliptic
+      block determining the pressure modes;
+    * **evolution rows** — everything else; rows whose residual carries a
+      pressure variable get the corrector update
+      ``Q[s] ← Q[s] − dt·(pressure part)/M[row, s]``;
+    * ``equation_to_state_index`` supplies the row→slot map (identity for a
+      square ``from_model`` extraction).
+
+    Semantics match :func:`split_for_pressure` exactly: the predictor keeps
+    the FULL residual (pressure forces enter at ``P^n`` since the predictor
+    substep never writes the pressure slots); the elliptic rows are the
+    constraint residuals with every corrected velocity substituted; the
+    corrector applies the closed-form update via ``state_update``.
+
+    Parameters
+    ----------
+    sm : SystemModel
+        Square (or rectangular) extraction with ``equation_to_state_index``.
+    pressure_vars : Sequence
+        Pressure-mode state Symbols (must be entries of ``sm.state``).
+    dt : sp.Symbol
+        Symbolic time-step.
+    """
+    n_eq = sm.n_equations
+    state = list(sm.state)
+    state_names = [str(s) for s in state]
+    t = sm.time
+    coords = list(sm.space)
+    e2s = list(sm.equation_to_state_index)
+    residuals = sm.reconstruct_residuals()
+
+    def _to_fn(sym):
+        return sp.Function(str(sym), real=True)(t, *coords)
+
+    state_funcs = [_to_fn(s) for s in state]
+    sym_to_fn = dict(zip(state, state_funcs))
+    pressure_indices = [state.index(p) for p in pressure_vars]
+    pressure_funcs = [state_funcs[i] for i in pressure_indices]
+
+    def _row_is_constraint(i):
+        return all(sp.sympify(sm.mass_matrix[i, j]) == 0
+                   for j in range(sm.n_state))
+
+    constraint_rows = [i for i in range(n_eq) if _row_is_constraint(i)]
+    evolution_rows = [i for i in range(n_eq) if not _row_is_constraint(i)]
+    if len(constraint_rows) != len(pressure_vars):
+        raise ValueError(
+            f"split_for_pressure_structural: {len(constraint_rows)} "
+            f"constraint rows (zero mass-matrix rows) vs "
+            f"{len(pressure_vars)} pressure variables — the elliptic "
+            "block must be square.  Constraint rows found: "
+            f"{[state_names[e2s[i]] for i in constraint_rows]}.")
+
+    def _pressure_part(e):
+        e = sp.expand(sp.sympify(e).doit())
+        no_p = sp.expand(
+            e.subs({p: sp.S.Zero for p in pressure_funcs}).doit())
+        return sp.expand(e - no_p)
+
+    # ── corrector updates (and the substitution for the elliptic rows) ──
+    corr_e2s, update_exprs, update_names = [], [], []
+    repl = {}
+    for i in evolution_rows:
+        p_part = _pressure_part(residuals[i])
+        if p_part == 0:
+            continue
+        s = e2s[i]
+        M_ss = sp.sympify(sm.mass_matrix[i, s]).xreplace(sym_to_fn)
+        if M_ss == 0:
+            raise ValueError(
+                f"evolution row {i} (state {state_names[s]}) carries "
+                "pressure terms but a zero mass-matrix diagonal — cannot "
+                "build the corrector update.")
+        corrected = sp.expand(state_funcs[s] - dt * p_part / M_ss)
+        repl[state_funcs[s]] = corrected
+        corr_e2s.append(s)
+        update_exprs.append(corrected)
+        update_names.append(f"corr_{state_names[s]}")
+
+    # ── elliptic rows: corrected velocities into the constraints ──
+    press_names = [f"elliptic_{state_names[pressure_indices[k]]}"
+                   for k in range(len(constraint_rows))]
+    press_res = [sp.expand(sp.sympify(residuals[i]).subs(repl).doit())
+                 for i in constraint_rows]
+
+    # ── predictor: the evolution rows, full residuals ──
+    pred_names = [f"pred_{state_names[e2s[i]]}" for i in evolution_rows]
+    pred_res = [sp.expand(residuals[i]) for i in evolution_rows]
+    pred_e2s = [e2s[i] for i in evolution_rows]
+
+    SM_pred = _build_subsystem(
+        eq_names=pred_names, eq_residuals=pred_res, sm_parent=sm,
+        state=state, equation_to_state_index=pred_e2s,
+        history_entry={
+            "name": "split_for_pressure_structural[pred]",
+            "description": f"predictor: {len(pred_names)} evolution rows "
+                           f"updating {[state_names[i] for i in pred_e2s]}",
+        })
+    SM_press = _build_subsystem(
+        eq_names=press_names, eq_residuals=press_res, sm_parent=sm,
+        state=state, equation_to_state_index=list(pressure_indices),
+        source_only=True,
+        history_entry={
+            "name": "split_for_pressure_structural[press]",
+            "description": f"pressure: {len(press_names)} elliptic rows "
+                           f"determining {[str(p) for p in pressure_vars]}",
+        })
+
+    func_to_sym = dict(zip(state_funcs, state))
+    update_exprs_sym = [e.xreplace(func_to_sym) for e in update_exprs]
+    n_corr = len(corr_e2s)
+    SM_corr = SystemModel(
+        time=sm.time,
+        space=list(sm.space),
+        state=list(state),
+        aux_state=[],
+        parameters=sm.parameters,
+        parameter_values=sm.parameter_values,
+        flux=sp.zeros(n_corr, sm.n_dim),
+        hydrostatic_pressure=sp.zeros(n_corr, sm.n_dim),
+        nonconservative_matrix=sp.MutableDenseNDimArray.zeros(
+            n_corr, sm.n_state, sm.n_dim),
+        source=sp.zeros(n_corr, 1),
+        mass_matrix=sp.zeros(n_corr, sm.n_state),
+        equation_to_state_index=list(corr_e2s),
+        state_update=sp.Array(update_exprs_sym),
+        boundary_conditions=sm.boundary_conditions,
+        aux_boundary_conditions=sm.aux_boundary_conditions,
+        boundary_gradients=sm.boundary_gradients,
+        initial_conditions=sm.initial_conditions,
+        aux_initial_conditions=sm.aux_initial_conditions,
+        update_variables=sm.update_variables,
+        reconstruction_variables=sm.reconstruction_variables,
+        state_from_reconstruction=sm.state_from_reconstruction,
+    )
+    SM_corr.equation_names = list(update_names)
+    SM_corr.expose_aux_atoms()
+    SM_corr.history.append({
+        "name": "split_for_pressure_structural[corr]",
+        "description": f"corrector: explicit update on "
+                       f"{[state_names[i] for i in corr_e2s]}",
+    })
+
+    return SplitForPressureResult(
+        SM_pred=SM_pred, SM_press=SM_press, SM_corr=SM_corr)
+
+
 def split_simple(sm, pressure_vars, dt, *, bottom=None):
     """Minimal manual splitter — copies the SystemModel, then deletes
     rows and terms.
