@@ -56,9 +56,16 @@ class SME(BaseModel):
         register the vertical reconstruction.  Called by the base ``__init__``."""
         Nu = int(self.level)
         # nu (kinematic viscosity) and lambda_s (Navier slip) are MODEL
-        # PARAMETERS — default 0 (inviscid / free-slip), set them for friction.
-        m = DModel(coords=(t, x, z),
-                   parameters={"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0})
+        # PARAMETERS — default 0 (inviscid / free-slip); override values via
+        # ``SME(level, parameters={"lambda_s": 0.5, ...})``.
+        values = {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0}
+        # the base __init__ has already split the user's parameters= dict
+        # into the Zstruct ``self.parameter_values`` — merge those numeric
+        # overrides over the defaults.
+        user_vals = getattr(self, "parameter_values", None)
+        if user_vals is not None and hasattr(user_vals, "items"):
+            values.update({k: float(v) for k, v in user_vals.items()})
+        m = DModel(coords=(t, x, z), parameters=values)
         g, rho = m.parameters.g, m.parameters.rho
         nu, lam = m.parameters.nu, m.parameters.lambda_s
         u = sp.Function("u", real=True)(t, x, z)
@@ -111,7 +118,12 @@ class SME(BaseModel):
         mx.apply(ResolveIntegral())
         mx.apply(m.kbc_bot); mx.apply(m.kbc_top); mx.apply({sp.Derivative(b, t): 0})
         tau, uu = m.functions.tau_xz, m.functions.u
-        mx.apply({tau.at(1): 0, tau.at(0): -lam * uu.at(0)})              # stress BCs
+        # stress BCs: free surface τ(1)=0; Navier slip τ(0)=+λ·u_b — stress
+        # and slip velocity carry the SAME sign (τ = ρν/h·∂_ζu > 0 for u_b>0),
+        # so the projected source DAMPS: s[q_0] = −λ·u_b/ρ.  (A minus here
+        # flips the friction into anti-damping — coupling caught it as
+        # exponential growth of uniform flow.)
+        mx.apply({tau.at(1): 0, tau.at(0): lam * uu.at(0)})
         mx.apply({tau.expr: rho * nu / h * sp.Derivative(uu.expr, zeta)})  # bulk Newtonian
         mx.apply(Simplify())
 

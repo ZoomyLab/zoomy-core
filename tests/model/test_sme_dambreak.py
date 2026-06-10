@@ -94,6 +94,56 @@ def test_sme_dambreak_between_walls_conserves_mass():
     assert h.max() < hL - 0.05 and h.min() > hR + 0.05
 
 
+def test_friction_decays_uniform_flow():
+    """Coupling acceptance (chat_model_coupling.md 21:50): slip friction must
+    DAMP.  Uniform flow h=0.2, q_0=0.1, λ_s=0.5 ⇒ ḣ=0 and
+    q̇_0 = −λ q_0/(ρh), so q_0(t=1) = 0.1·e^{−2.5} ≈ 0.00821.  The wrong
+    (pre-fix) sign grows this to ≈1.12 — far outside any tolerance."""
+    sm = SME(level=0, parameters={"lambda_s": 0.5},
+             boundary_conditions=BoundaryConditions(
+                 [Extrapolation(tag="left"), Extrapolation(tag="right")])
+             ).system_model
+    ic = np.array([0.0, 0.2, 0.1])
+    sm.initial_conditions = Constant(constants=lambda n, v=ic: v)
+    sm.aux_initial_conditions = Constant(constants=lambda n: np.zeros(n))
+    mesh = BaseMesh.create_1d(domain=(0.0, 1.0), n_inner_cells=20)
+    nsm = NumericalSystemModel.from_system_model(
+        sm, reconstruction=ReconstructionSpec(order=1))
+    solver = HyperbolicSolver(time_end=1.0,
+                              compute_dt=timestepping.adaptive(CFL=0.9))
+    Q, _ = solver.solve(mesh, nsm, write_output=False)
+    q0 = np.asarray(Q[2, :20], dtype=float)
+    assert q0.std() < 1e-12, "uniform flow stopped being uniform"
+    assert abs(q0.mean() - 0.1 * np.exp(-2.5)) < 1e-3
+
+
+def test_friction_excites_q1_boundedly():
+    """Level-1 dam break with bottom friction must EXCITE shear (q_1 ≠ 0 —
+    the physics the inter-level coupling wants to see) and stay bounded."""
+    n_cells = 100
+    sm = SME(level=1, parameters={"lambda_s": 0.5, "nu": 1e-3},
+             boundary_conditions=BoundaryConditions(
+                 [Extrapolation(tag="left"), Extrapolation(tag="right")])
+             ).system_model
+    n_state = len(sm.state)
+    high = np.zeros(n_state); high[1] = 2.0
+    low = np.zeros(n_state);  low[1] = 1.0
+    sm.initial_conditions = RP(high=lambda n, hi=high: hi,
+                               low=lambda n, lo=low: lo, jump_position_x=5.0)
+    sm.aux_initial_conditions = Constant(constants=lambda n: np.zeros(n))
+    mesh = BaseMesh.create_1d(domain=(0.0, 10.0), n_inner_cells=n_cells)
+    nsm = NumericalSystemModel.from_system_model(
+        sm, reconstruction=ReconstructionSpec(order=1))
+    solver = HyperbolicSolver(time_end=0.3,
+                              compute_dt=timestepping.adaptive(CFL=0.9))
+    Q, _ = solver.solve(mesh, nsm, write_output=False)
+    h = np.asarray(Q[1, :n_cells], dtype=float)
+    q1 = np.asarray(Q[3, :n_cells], dtype=float)
+    assert np.all(np.isfinite(h)) and h.min() > 0.0
+    assert np.abs(q1).max() > 1e-6, "friction failed to excite shear (q_1)"
+    assert np.abs(q1).max() < 1.0, "q_1 unbounded — friction sign regressed?"
+
+
 @pytest.mark.parametrize("level", [0, 2])      # SWE (level 0) and SME (level 2)
 def test_sme_dambreak_1d(level):
     hL, hR = 2.0, 1.0
