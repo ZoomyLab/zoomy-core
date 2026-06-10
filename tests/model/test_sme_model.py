@@ -74,11 +74,19 @@ def test_model_owns_wb_reconstruction_and_projection():
     assert all(sp.simplify(R[2 + i] - qi/h) == 0
                for i, qi in enumerate((q0, q1, q2)))
     assert sm.state_from_reconstruction is not None
-    P3b, P3h, P3u = sp.symbols("P3_b P3_h P3_u", real=True)
-    P = [_scalar(e) for e in sm.project_from_3d]
+    # project rows are the EXACT Galerkin reduction over the sampled column:
+    # q_i = (2i+1)·P3_h·∫₀¹ P3_u(ζ) φ_i(ζ) dζ.  Evaluate against a sheared
+    # test profile u(ζ) = U0 + U1·(2ζ−1): the moments come back exactly.
+    P3b, P3h = sp.symbols("P3_b P3_h", real=True)
+    P = [sp.sympify(_scalar(e)) for e in sm.project_from_3d]
     assert P[0] == P3b and P[1] == P3h
-    assert sp.simplify(P[2] - P3h*P3u) == 0
-    assert P[3] == 0 and P[4] == 0
+    zz = sp.Symbol("zeta", real=True)
+    U0, U1 = sp.symbols("U0 U1", real=True)
+    shear = {sp.Function("P3_u", real=True)(zz): U0 + U1 * (2 * zz - 1)}
+    proj = [sp.simplify(e.subs(shear).doit()) for e in P[2:]]
+    assert sp.simplify(proj[0] - P3h * U0) == 0      # q_0 = h·U0
+    assert sp.simplify(proj[1] - P3h * U1) == 0      # q_1 = h·U1 (exact)
+    assert sp.simplify(proj[2]) == 0                 # no spurious q_2
 
 
 def test_sme_flux_and_hydrostatic_pressure():

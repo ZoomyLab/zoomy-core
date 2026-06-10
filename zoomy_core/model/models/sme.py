@@ -195,18 +195,26 @@ class SME(BaseModel):
         for i in range(Nu + 1):
             m.register_group("reconstruction", q(i, t, x), q(i, t, x) / h)
 
-        # 13 — project (inverse of interpolate): canonical-profile fields
-        # ``P3_<f>`` → state.  The current column contract hands the model a
-        # DEPTH-AVERAGED profile, which carries exactly the 0-th moment:
-        # q_0 = h·⟨u⟩ is exact, the higher moments are NOT representable and
-        # stay 0 until the ζ-resolved column contract lands (then this block
-        # registers the exact Galerkin reduction (2i+1)·h·⟨u φ_i⟩).
-        P3 = {f: sp.Symbol(f"P3_{f}", real=True) for f in ("b", "h", "u")}
+        # 13 — project (inverse of interpolate): the EXACT Galerkin reduction
+        # over the ζ-resolved column contract (z[] = water-relative ζ∈[0,1]
+        # in both directions; adapters own the absolute→ζ map):
+        #   q_i = (2i+1) · h · ∫₀¹ u(ζ) φ_i(ζ) dζ ,
+        # registered as a sympy Integral over the sampled-profile head
+        # ``P3_u(ζ)`` — the printer lowers ∫₀¹ to the normalized-trapezoid
+        # column sum.  Scalar profile slots (b, h) reduce as depth averages.
+        # A constant u (level-0 / flat profile) recovers q_0 = h·⟨u⟩ and
+        # zero higher moments — backward compatible with the averaged
+        # contract.
+        P3 = {f: sp.Symbol(f"P3_{f}", real=True) for f in ("b", "h")}
+        P3u = sp.Function("P3_u", real=True)(zeta)
         m.register_group("project", b, P3["b"])
         m.register_group("project", h, P3["h"])
-        m.register_group("project", q(0, t, x), P3["h"] * P3["u"])
-        for i in range(1, Nu + 1):
-            m.register_group("project", q(i, t, x), sp.S.Zero)
+        for i in range(Nu + 1):
+            m.register_group(
+                "project", q(i, t, x),
+                (2 * i + 1) * P3["h"]
+                * sp.Integral(P3u * sp.legendre(i, 2 * zeta - 1),
+                              (zeta, 0, 1)))
 
         self.derivation = m
         self._bed = b

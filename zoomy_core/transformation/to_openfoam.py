@@ -91,6 +91,7 @@ _FOAM_ARG = {
     "bc_idx": "const int bc_idx",
     "z": "const Foam::scalar& z",
     "profile": "const Foam::List<Foam::scalar>& profile",
+    "I": "const Foam::List<Foam::scalar>& I",
 }
 
 _AXIS = ("x", "y", "z")
@@ -422,9 +423,30 @@ class FoamSystemModelPrinter(GenericCppBase):
 
         p3 = self.project_from_3d
         if p3 is not None and len(sp.flatten(p3)) > 0:
-            shape = (len(sp.flatten(p3)),)
+            rows = [sp.sympify(e) for e in sp.flatten(p3)]
+            shape = (len(rows),)
+
+            # ζ-quadrature lowering (the column contract, both directions in
+            # water-relative ζ ∈ [0,1]): every ``Integral(g(ζ), (ζ, 0, 1))``
+            # in a project row becomes a normalized-trapezoid column sum
+            # ``I[j] = Σ_k (w_k/W)·g(ζ_k)`` with ``ζ_k = z[k]`` and the
+            # sampled-profile heads ``P3_<f>(ζ) → field[k][<slot>]``.  The
+            # integrand is printed AS REGISTERED — basis, weights, everything
+            # stays the model's symbolic definition; the printer only supplies
+            # the quadrature.  Rows without Integrals lower exactly as before
+            # (depth-averaged ``profile[]``), so flat-profile models are
+            # untouched.
+            integral_atoms: list = []
+            for e in rows:
+                for a in e.atoms(sp.Integral):
+                    if a not in integral_atoms:
+                        integral_atoms.append(a)
+            int_syms = {a: sp.Symbol(f"_ZINT{j}", real=True)
+                        for j, a in enumerate(integral_atoms)}
+            rows = [e.xreplace(int_syms) for e in rows]
+
             free = set()
-            for expr in sp.flatten(p3):
+            for expr in rows:
                 if hasattr(expr, "free_symbols"):
                     free |= expr.free_symbols
             by_name = {str(s): s for s in free}
@@ -433,16 +455,93 @@ class FoamSystemModelPrinter(GenericCppBase):
                 sym = by_name.get(f"P3_{field}")
                 if sym is not None:
                     prof_map[sym] = f"profile[{i}]"
+            for a, s in int_syms.items():
+                prof_map[s] = f"I[{int(str(s)[len('_ZINT'):])}]"
+            at_args = (["profile", "p", "I"] if integral_atoms
+                       else ["profile", "p"])
             self.symbol_maps.append(prof_map)
             try:
                 blocks.append(self._kernel(
-                    "project_from_3d_at", p3, shape, ["profile", "p"],
+                    "project_from_3d_at", sp.Matrix(rows), shape, at_args,
                 ))
             finally:
                 self.symbol_maps.pop()
-            blocks.append(_PROJECT_COLUMN_WRAPPER)            # column wrapper
+            if integral_atoms:
+                blocks.append(self._project_column_wrapper_quadrature(
+                    integral_atoms))
+            else:
+                blocks.append(_PROJECT_COLUMN_WRAPPER)        # legacy wrapper
 
         return blocks
+
+    def _project_column_wrapper_quadrature(self, integral_atoms):
+        """The combined ``project_from_3d(field, z, p)`` column wrapper with
+        ζ-quadrature accumulators for the model's registered Integral rows."""
+        zeta_loop = sp.Symbol("_zeta_loop", real=True)
+        lines = []
+        smap = {zeta_loop: "zeta"}
+        integrands = []
+        for j, a in enumerate(integral_atoms):
+            g = a.function
+            var = a.limits[0][0]
+            # sampled-profile heads P3_<f>(ζ) → field[k][slot]
+            for fa in list(g.atoms(sp.Function)):
+                name = fa.func.__name__
+                if name.startswith("P3_"):
+                    fld = name[len("P3_"):]
+                    if fld not in _PROFILE_3D_FIELDS:
+                        raise ValueError(
+                            f"project Integral references {name}(ζ) but "
+                            f"{fld!r} is not a canonical profile field "
+                            f"{_PROFILE_3D_FIELDS}.")
+                    slot = _PROFILE_3D_FIELDS.index(fld)
+                    s = sp.Symbol(f"_P3S_{fld}", real=True)
+                    g = g.xreplace({fa: s})
+                    smap[s] = f"field[k][{slot}]"
+            integrands.append((j, g.xreplace({var: zeta_loop})))
+        self.symbol_maps.append(smap)
+        try:
+            for j, g in integrands:
+                lines.append(f"        I[{j}] += wn * ({self._print(g)});")
+        finally:
+            self.symbol_maps.pop()
+        int_lines = "\n".join(lines)
+        n_int = len(integral_atoms)
+        return f"""inline Foam::List<Foam::scalar> project_from_3d(
+    const Foam::List<Foam::List<Foam::scalar>>& field,
+    const Foam::List<Foam::scalar>& z,     // water-relative zeta in [0,1]
+    const Foam::List<Foam::scalar>& p)
+{{
+    const Foam::label N = field.size();
+    Foam::List<Foam::scalar> profile(6, Foam::scalar(0));   // canonical [b,h,u,v,w,p]
+    Foam::List<Foam::scalar> I({n_int}, Foam::scalar(0));   // zeta-quadrature accumulators
+    Foam::scalar W = 0;
+    forAll(field, k)
+    {{
+        const Foam::scalar w =
+            (N == 1)     ? Foam::scalar(1)
+          : (k == 0)     ? Foam::mag(z[1]     - z[0])
+          : (k == N - 1) ? Foam::mag(z[N - 1] - z[N - 2])
+          :                Foam::scalar(0.5)*Foam::mag(z[k + 1] - z[k - 1]);
+        W += w;
+        forAll(profile, c) profile[c] += w*field[k][c];
+    }}
+    forAll(profile, c) profile[c] /= W;
+    // normalized trapezoid: integral_0^1 g dzeta ~= sum_k (w_k/W) g(zeta_k)
+    forAll(field, k)
+    {{
+        const Foam::scalar zeta = z[k];
+        (void)zeta;
+        const Foam::scalar w =
+            (N == 1)     ? Foam::scalar(1)
+          : (k == 0)     ? Foam::mag(z[1]     - z[0])
+          : (k == N - 1) ? Foam::mag(z[N - 1] - z[N - 2])
+          :                Foam::scalar(0.5)*Foam::mag(z[k + 1] - z[k - 1]);
+        const Foam::scalar wn = w / W;
+{int_lines}
+    }}
+    return project_from_3d_at(profile, p, I);
+}}"""
 
     def _emit_boundary_conditions(self):
         """Emit ``Model::boundary_conditions(bc_idx, time, X, dX, Q,
