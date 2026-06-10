@@ -160,9 +160,10 @@ class FoamSystemModelPrinter(GenericCppBase):
     real_type = "Foam::scalar"
     math_namespace = "Foam::"
     analytical_eigenvalues = False
-    # Phase 7 coupling: the inverse 3D→2D map.  Not a SystemModel field
-    # (system_model.py is owned elsewhere), so the case's run.py passes
-    # ``model.project_from_3d()`` here.  Default None ⇒ not emitted.
+    # Phase 7 coupling: the inverse 3D→2D map.  Read from the model-owned
+    # ``sm.project_from_3d`` slot (filled by ``register_group("project", …)``)
+    # — the ``project_from_3d=`` kwarg remains as an explicit override.
+    # None (no registration, no kwarg) ⇒ not emitted.
     project_from_3d = None
 
     def __init__(self, sm, **opts):
@@ -174,6 +175,8 @@ class FoamSystemModelPrinter(GenericCppBase):
         self.register_map("p", list(sm.parameters.values()))
         for k, v in opts.items():
             setattr(self, k, v)
+        if self.project_from_3d is None:
+            self.project_from_3d = getattr(sm, "project_from_3d", None)
 
     # ── Foam syntax hooks ────────────────────────────────────────────────
 
