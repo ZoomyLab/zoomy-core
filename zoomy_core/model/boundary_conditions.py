@@ -346,6 +346,118 @@ class FromModel(BoundaryCondition):
         return Qout
 
 
+class Characteristic(BoundaryCondition):
+    """Incoming-characteristic ghost — the data-level analogue of Roe
+    upwinding.
+
+    With ``A·n = R Λ L`` the eigendecomposition of the normal-projected
+    quasilinear matrix at the interior state, the ghost is
+
+        ``Q_ghost = Q + P⁻·(Q_target − Q)``,   ``P⁻ = R · 1_{λ<0} · L``,
+
+    i.e. only the INCOMING characteristic fields (λ < 0 w.r.t. the outward
+    normal) carry the target's information; the outgoing content is the
+    interior's, so the face Riemann problem reflects nothing — even when the
+    target data is inconsistent (mid-coupling-iteration peer data, far-field
+    guesses).  Built symbolically over the SystemModel's OPAQUE
+    ``eigensystem`` kernel (numerical eigendecomposition per backend), so it
+    works for systems without a closed-form spectrum (SME N≥2, K&T).
+
+    The target defaults to extrapolation (= interior ⇒ pure outflow);
+    override slots via ``prescribe_fields`` (slot → callable, Lambda-style)
+    or override :meth:`target_state` in subclasses (far-field, wall,
+    coupled).  Resolved against the SystemModel by
+    ``attach_boundary_conditions`` (needs the eigensystem + state layout).
+    """
+
+    prescribe_fields = param.Dict(default={}, doc="state_index → callable("
+                                  "time, X, dX, Q, Qaux, p, n) for the "
+                                  "TARGET state in that slot")
+
+    def resolve(self, sm):
+        self._state_syms = list(sm.state)
+        self._normal_syms = list(sm.normal.values())
+        self._es = [sympy.sympify(e) for e in sm.eigensystem]
+        return self
+
+    def target_state(self, time, X, dX, Q, Qaux, parameters, normal):
+        """The state whose incoming-characteristic content is imposed.
+        Default: extrapolation base overridden by ``prescribe_fields``."""
+        target = ZArray(Q)
+        for k, func in self.prescribe_fields.items():
+            target[k] = func(time, X, dX, Q, Qaux, parameters, normal)
+        return target
+
+    def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
+        """Compute boundary condition."""
+        if getattr(self, "_es", None) is None:
+            raise RuntimeError(
+                f"Characteristic(tag={self.tag!r}) is unresolved — attach "
+                "via SystemModel.attach_boundary_conditions (or call "
+                ".resolve(sm)).")
+        n_st = len(self._state_syms)
+        Qv = ZArray(Q)
+        smap = {s: Qv[i] for i, s in enumerate(self._state_syms)}
+        for i, ns in enumerate(self._normal_syms):
+            smap[ns] = normal[i]
+        ES = [e.xreplace(smap) for e in self._es]
+        lam = ES[:n_st]
+        R = Matrix(n_st, n_st,
+                   lambda i, j: ES[n_st + i * n_st + j])
+        L = Matrix(n_st, n_st,
+                   lambda i, j: ES[n_st + n_st * n_st + i * n_st + j])
+        target = self.target_state(time, X, dX, Q, Qaux, parameters, normal)
+        dQ = Matrix(n_st, 1, lambda i, _j: target[i] - Qv[i])
+        sel = sympy.diag(*[sympy.Piecewise((1, lam[k] < 0), (0, True))
+                           for k in range(n_st)])
+        corr = R * sel * (L * dQ)
+        out = ZArray(Q)
+        for i in range(n_st):
+            out[i] = Qv[i] + corr[i, 0]
+        return out
+
+
+class CharacteristicFarField(Characteristic):
+    """Far-field / open boundary: the incoming characteristics carry a
+    prescribed far-field state, the outgoing ones leave undisturbed
+    (Thompson-style non-reflecting in-/outflow)."""
+
+    far_field = param.Parameter(default=None, doc="callable(n_state) → "
+                                "far-field state vector, or a sequence")
+
+    def target_state(self, time, X, dX, Q, Qaux, parameters, normal):
+        if self.far_field is None:
+            return ZArray(Q)
+        vals = (self.far_field(len(self._state_syms))
+                if callable(self.far_field) else self.far_field)
+        target = ZArray(Q)
+        for i, v in enumerate(vals):
+            target[i] = v
+        return target
+
+
+class CharacteristicWall(Characteristic):
+    """Wall built from the characteristic tool: the target is the MIRROR
+    state (normal momentum reflected); only its incoming content is imposed,
+    which enforces u·n → 0 at the face without over-specifying the outgoing
+    fields."""
+
+    momentum_field_indices = param.List(default=[[1, 2]])
+
+    def target_state(self, time, X, dX, Q, Qaux, parameters, normal):
+        q = ZArray(Q)
+        out = ZArray(Q)
+        for indices in self.momentum_field_indices:
+            dim = len(indices)
+            n_vec = Matrix(normal[:dim])
+            momentum = Matrix([q[k] for k in indices])
+            normal_momentum = momentum.dot(n_vec)
+            mirrored = momentum - 2 * normal_momentum * n_vec
+            for i, idx in enumerate(indices):
+                out[idx] = mirrored[i]
+        return out
+
+
 class FromData(BoundaryCondition):
     """FromData. (class)."""
     prescribe_fields = param.Dict(default={})

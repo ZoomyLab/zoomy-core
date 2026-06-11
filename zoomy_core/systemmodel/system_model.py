@@ -568,11 +568,12 @@ class SystemModel:
         Extrapolation.  Optional — a SystemModel without BCs still builds; the
         solver only needs them at run time.  Returns ``self``.
         """
-        from zoomy_core.model.boundary_conditions import (
-            BoundaryConditions, FromModel)
+        from zoomy_core.model.boundary_conditions import BoundaryConditions
         import zoomy_core.model.aux_boundary_conditions as AuxBC
+        # BCs that need the SystemModel (FromModel: boundary_specs;
+        # Characteristic: eigensystem + state layout) expose .resolve(sm).
         for bc in bcs.boundary_conditions_list:
-            if isinstance(bc, FromModel):
+            if hasattr(bc, "resolve"):
                 bc.resolve(self)
         if self.position is None:
             # the BC kernel signature needs a 3-component position; models
