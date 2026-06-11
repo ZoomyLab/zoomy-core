@@ -19,8 +19,8 @@ def test_mlsme_structure():
     assert [str(s) for s in sm.state] == [
         "b", "h", "q_1_0", "q_1_1", "q_2_0", "q_2_1"]
     M = sp.Matrix(sm.mass_matrix.tolist())
-    # bed + global continuity + per-layer Legendre Gram (1, 1/3)
-    assert M == sp.diag(1, 1, 1, sp.Rational(1, 3), 1, sp.Rational(1, 3))
+    # Gram-normalized at extraction (runtime integrates ∂_t Q = RHS)
+    assert M == sp.eye(6)
     # same fraction-multiplier G as the level-0 MLSWE (k=0 continuities)
     G = sp.sympify(list(mod._G_closed.values())[0])
     rho, l1 = sp.Symbol("rho", positive=True), sp.Symbol("l_1", positive=True)

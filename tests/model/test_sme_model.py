@@ -37,12 +37,13 @@ def test_sme_builds_a_systemmodel():
     assert [str(s) for s in sm.state] == ["b", "h", "q_0", "q_1", "q_2"]
 
 
-def test_sme_mass_matrix_is_legendre_gram():
+def test_sme_mass_matrix_is_normalized_identity():
+    """The extraction normalizes every row by its (constant, diagonal)
+    Legendre-Gram mass entry — the runtime integrates ∂_t Q = RHS, so a
+    non-identity M would make the higher moments evolve 1/M_ii too fast."""
     sm = _sm()
     M = sp.Matrix(sm.mass_matrix.tolist())
-    # row 0 is the (trivial) bed evolution ∂_t b = 0 — M[0,0] = 1, not a
-    # mass-less algebraic row; rows 1… carry the shifted-Legendre Gram.
-    assert M == sp.diag(1, 1, 1, sp.Rational(1, 3), sp.Rational(1, 5))
+    assert M == sp.eye(5)
 
 
 @pytest.mark.parametrize("level", [0, 1, 2])

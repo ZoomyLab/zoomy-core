@@ -204,6 +204,45 @@ def extract_system_operators(model, Q, Qaux=None):
                 for ee in range(n_dim)] for dd in range(n_dim)]
               for c in range(n_state)] for r in range(n_eq)])
 
+    # ── mass-matrix normalization ──────────────────────────────────────
+    # The runtime solvers integrate ``∂_t Q = RHS`` — they do NOT consume a
+    # mass matrix.  Rows with a CONSTANT diagonal mass entry (the Galerkin
+    # Gram, e.g. shifted-Legendre 1/(2k+1)) are normalized here:
+    # ``M_ii·∂_t q_i + ∂_x F_i + B_i·∂_x Q − S_i = 0  →  ÷ M_ii``.
+    # Without this every higher-moment row evolves 1/M_ii times too fast
+    # (the legacy chains applied InvertMassMatrix for the same reason).
+    # Constraint rows (M_i· ≡ 0) and rows with non-constant or off-diagonal
+    # mass entries are left untouched (the latter raise — no silent wrong
+    # dynamics).
+    for i in range(n_eq):
+        offdiag = [sp.simplify(M[i, j]) for j in range(n_state)
+                   if j != i and sp.simplify(M[i, j]) != 0]
+        m_ii = (sp.cancel(sp.sympify(M[i, i])) if i < n_state
+                else sp.S.Zero)
+        if not offdiag and m_ii != 0 and m_ii != 1:
+            if not m_ii.is_number:
+                raise ValueError(
+                    f"row {i}: non-constant mass-matrix diagonal {m_ii} — "
+                    "cannot normalize; apply an explicit mass-matrix "
+                    "inversion in the derivation.")
+            F[i, 0] = sp.expand(F[i, 0] / m_ii)
+            P[i, 0] = sp.expand(P[i, 0] / m_ii)
+            S[i, 0] = sp.expand(S[i, 0] / m_ii)
+            for j in range(n_state):
+                B[i, j, 0] = sp.expand(sp.sympify(B[i, j, 0]) / m_ii)
+            if A_out is not None:
+                for j in range(n_state):
+                    for dd in range(n_dim):
+                        for ee in range(n_dim):
+                            A_out[i, j, dd, ee] = sp.expand(
+                                sp.sympify(A_out[i, j, dd, ee]) / m_ii)
+            M[i, i] = sp.S.One
+        elif offdiag:
+            raise ValueError(
+                f"row {i}: off-diagonal mass-matrix entries {offdiag} — "
+                "the runtime cannot integrate this; apply an explicit "
+                "mass-matrix inversion in the derivation.")
+
     parameters = Zstruct(**{k: model.parameters[k]
                             for k in model.parameters.keys()})
     parameters._symbolic_name = "p"

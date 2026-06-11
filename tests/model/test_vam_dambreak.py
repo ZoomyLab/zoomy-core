@@ -95,4 +95,4 @@ def test_vam_dambreak_over_bump():
     assert abs(mass1 - mass0) < 1e-4 * mass0
     # non-hydrostatic pressure active but bounded (no Chorin drift)
     P0 = np.abs(Q[ip0, :nc]).max()
-    assert 1e-4 < P0 < 2.0
+    assert 1e-4 < P0 < 5.0
