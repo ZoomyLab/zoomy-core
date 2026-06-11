@@ -117,15 +117,17 @@ class VAM(BaseModel):
         mz.apply({pp.at(1): 0})              # dynamic surface BC p(ζ=1)=0
         mz.apply(Simplify())
 
-        # 4 — modal ansatz for u, w AND p (shared basis)
+        # 4 — modal ansatz: u ∈ P_Nu;  w, p ∈ P_{Nu+1} (Escalante spaces —
+        # a UNIFORM truncation leaves the pressure space inconsistent with
+        # the surface/bottom closures and drifts secularly at runtime)
         uh = sp.Function(r"\hat{u}", real=True)
         wh = sp.Function(r"\hat{w}", real=True)
         ph = sp.Function(r"\hat{p}", real=True)
         reset_modal_indices(m)
         N_u = modal_bound("N_u")
         m.apply(separation_of_variables(u, uh(t, x), basis, N_u))
-        m.apply(separation_of_variables(w, wh(t, x), basis, N_u))
-        m.apply(separation_of_variables(p, ph(t, x), basis, N_u))
+        m.apply(separation_of_variables(w, wh(t, x), basis, N_u + 1))
+        m.apply(separation_of_variables(p, ph(t, x), basis, N_u + 1))
 
         # 5 — resolve: mass k=0…Nu+1 (h-eq + Nu+1 divergence constraints,
         # one per pressure mode); momenta k=0…Nu.  NB: re-fetch the family
@@ -143,6 +145,18 @@ class VAM(BaseModel):
             getattr(m, nm).apply(ResolveModes(index=k, modes=modes))
             getattr(m, nm).apply(ResolveBasis(legendre, var=zeta))
 
+        # 5b — MODAL closures for the top w/p modes (Escalante eq 6):
+        # surface dynamic p(1)=0   → p̂_{Nu+1} = −Σ_{j≤Nu} p̂_j   (φ_j(1)=1)
+        # bottom kinematic w(0)=u(0)·∂_x b
+        #                  → ŵ_{Nu+1} = (−1)^{Nu+1}(u(0)∂_x b − Σ_{j≤Nu}(−1)^j ŵ_j)
+        top = Nu + 1
+        u_at0 = sum((-1) ** j * uh(j, t, x) for j in range(Nu + 1))
+        w_top = (-1) ** top * (u_at0 * sp.Derivative(b, x)
+                               - sum((-1) ** j * wh(j, t, x) for j in range(top)))
+        p_top = -sum(ph(j, t, x) for j in range(top))
+        m.apply({wh(top, t, x): w_top})
+        m.apply({ph(top, t, x): p_top})
+
         # 6 — conservative CoV (û→q/h, ŵ→r/h, p̂→P) + h-eq substitution
         m.apply(ChangeOfVariables(r"\hat{u}", "q", lambda qi: qi / h))
         m.apply(ChangeOfVariables(r"\hat{w}", "r", lambda ri: ri / h))
@@ -157,6 +171,47 @@ class VAM(BaseModel):
             m.mass[kk].apply(Consolidate())
         # AFTER the stray dt-h substitutions (op docstring): unit dt coeffs
         m.apply(InvertMassMatrix())
+
+        # 6b — resolve the advective σ-mass flux ω̃ (Escalante eq(3)→(4)):
+        # the Galerkin rows keep ω̃ in DEFINITION form; the paper substitutes
+        # the σ-mass-integrated CLOSED form ω̃ = −Σ_j ∂_x(hû_j)∫₀^ζφ_j (h-eq
+        # applied) BEFORE projecting.  The two differ by {h-eq, divergence-
+        # constraint} combinations — equivalent ON the constraint manifold,
+        # but the predictor runs OFF it and the published hyperbolicity
+        # analysis holds for the closed form.  Exact correction
+        #   Δ_k = −∫₀¹ (ω̃_closed − ω̃_def)·field·φ_k′ dζ / μ_k
+        # per momentum row (field = ũ for x, w̃ for z); k=0 rows: Δ=0.
+        phis = [sp.legendre(j, 2 * zeta - 1) for j in range(Nu + 2)]
+        mus = [sp.Rational(1, 2 * j + 1) for j in range(Nu + 2)]
+        s_ = sp.Symbol("_s_omega")
+        qf = [m.functions.q.head(j, t, x) for j in range(Nu + 1)]
+        rf = [m.functions.r.head(j, t, x) for j in range(Nu + 1)]
+        ut_m = sum(qf[j] / h * phis[j] for j in range(Nu + 1))
+        w_top_cons = ((-1) ** (Nu + 1)) * (
+            sum((-1) ** j * qf[j] / h for j in range(Nu + 1)) * sp.Derivative(b, x)
+            - sum((-1) ** j * rf[j] / h for j in range(Nu + 1)))
+        wt_m = (sum(rf[j] / h * phis[j] for j in range(Nu + 1))
+                + w_top_cons * phis[Nu + 1])
+        omega_def = (wt_m - zeta * (-sp.Derivative(qf[0], x))
+                     - ut_m * (zeta * sp.Derivative(h, x) + sp.Derivative(b, x)))
+        omega_closed = -sum(sp.Derivative(qf[j], x)
+                            * sp.integrate(phis[j].subs(zeta, s_), (s_, 0, zeta))
+                            for j in range(1, Nu + 1))
+        R_om = sp.expand(omega_closed - omega_def)
+        # ω̃_closed − ω̃_def must vanish at the bottom (= the ŵ-closure/KBC)
+        assert sp.simplify(R_om.subs(zeta, 0)) == 0
+
+        def _zint01(e):
+            poly = sp.Poly(sp.expand(e.doit()), zeta)
+            return sum(cc / (nn[0] + 1)
+                       for nn, cc in zip(poly.monoms(), poly.coeffs()))
+
+        for kk in range(1, Nu + 1):
+            dphi = sp.diff(phis[kk], zeta)
+            m.momentum_x[kk].expr = sp.expand(
+                m.momentum_x[kk].expr - _zint01(R_om * ut_m * dphi) / mus[kk])
+            m.momentum_z[kk].expr = sp.expand(
+                m.momentum_z[kk].expr - _zint01(R_om * wt_m * dphi) / mus[kk])
 
         self.derivation = m
         self._bed = b
