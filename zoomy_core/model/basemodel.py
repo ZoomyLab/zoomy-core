@@ -882,11 +882,25 @@ class Model(param.Parameterized, SymbolicRegistrar):
         return ZArray(self.variables)
 
     def interpolate_to_3d(self):
-        """Project 2d to 3d."""
+        """Vertical reconstruction (canonical operator).
+
+        Declarative models build the rows in ``derive_model`` and stash them
+        as ``self._interpolate_rows`` ({profile_slot: expr}); the extraction
+        picks the dict up through this method and parses it with the same
+        machinery as ``register_group`` — one definition, one parser.
+        Production overrides returning a ZArray keep their old meaning."""
+        rows = getattr(self, "_interpolate_rows", None)
+        if rows is not None:
+            return rows
         return ZArray.zeros(6)
 
     def project_from_3d(self):
-        """Project 3d to 2d."""
+        """Profile → state projection (canonical operator); see
+        :meth:`interpolate_to_3d` for the stash/dict contract
+        ({state_field_or_slot: expr})."""
+        rows = getattr(self, "_project_rows", None)
+        if rows is not None:
+            return rows
         return ZArray.zeros(self.n_variables)
 
     def initial_condition(self):
@@ -925,7 +939,14 @@ class Model(param.Parameterized, SymbolicRegistrar):
 
         See ``thesis/chapters/30_numerics.md`` "Primitive-variable
         MUSCL reconstruction".
+
+        Declarative models stash ``self._reconstruction_rows``
+        ({state_field_or_slot: expr}) in ``derive_model``; unregistered
+        slots default to the identity at extraction time.
         """
+        rows = getattr(self, "_reconstruction_rows", None)
+        if rows is not None:
+            return rows
         return ZArray(self.variables)
 
     def state_from_reconstruction(self):

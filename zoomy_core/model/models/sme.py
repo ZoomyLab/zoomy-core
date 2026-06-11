@@ -173,11 +173,10 @@ class SME(BaseModel):
                        for i in range(Nu + 1))
         w_interp = sum(sp.expand(w_closure[j].rhs.subs(cov)) * sp.legendre(j, 2 * zeta - 1)
                        for j in range(Nu + 2))
-        m.register_group("interpolate", 0, b)
-        m.register_group("interpolate", 1, h)
-        m.register_group("interpolate", 2, u_interp)
-        m.register_group("interpolate", 4, w_interp)
-        m.register_group("interpolate", 5, rho * g * h * (1 - zeta))
+        # canonical operator: built here, returned by interpolate_to_3d()
+        # (basemodel), parsed by the extraction — never copied by hand.
+        self._interpolate_rows = {0: b, 1: h, 2: u_interp, 4: w_interp,
+                                  5: rho * g * h * (1 - zeta)}
 
         # 11 — model-derived lateral wall BC: the mirror state u(ζ) → −u(ζ)
         # flips EVERY moment (odd reflection, ⟨−u φ_i⟩ = −q_i/h); h and b
@@ -191,9 +190,9 @@ class SME(BaseModel):
         # of the conservative state (bounds limited values by physical scales;
         # removes momentum overshoot at wet/dry fronts).  b reconstructs as
         # itself (identity default).
-        m.register_group("reconstruction", h, b + h)
-        for i in range(Nu + 1):
-            m.register_group("reconstruction", q(i, t, x), q(i, t, x) / h)
+        self._reconstruction_rows = {h: b + h}
+        self._reconstruction_rows.update(
+            {q(i, t, x): q(i, t, x) / h for i in range(Nu + 1)})
 
         # 13 — project (inverse of interpolate): the EXACT Galerkin reduction
         # over the ζ-resolved column contract (z[] = water-relative ζ∈[0,1]
@@ -207,14 +206,11 @@ class SME(BaseModel):
         # contract.
         P3 = {f: sp.Symbol(f"P3_{f}", real=True) for f in ("b", "h")}
         P3u = sp.Function("P3_u", real=True)(zeta)
-        m.register_group("project", b, P3["b"])
-        m.register_group("project", h, P3["h"])
-        for i in range(Nu + 1):
-            m.register_group(
-                "project", q(i, t, x),
-                (2 * i + 1) * P3["h"]
-                * sp.Integral(P3u * sp.legendre(i, 2 * zeta - 1),
-                              (zeta, 0, 1)))
+        self._project_rows = {b: P3["b"], h: P3["h"]}
+        self._project_rows.update({
+            q(i, t, x): (2 * i + 1) * P3["h"]
+            * sp.Integral(P3u * sp.legendre(i, 2 * zeta - 1), (zeta, 0, 1))
+            for i in range(Nu + 1)})
 
         self.derivation = m
         self._bed = b
@@ -235,7 +231,7 @@ class SME(BaseModel):
         # already an explicit unknown; prepend only if absent.
         if self._bed not in qs:
             qs = [self._bed, *qs]
-        sm = SystemModel.from_model(m, Q=qs)
+        sm = SystemModel.from_model(m, Q=qs, canonical_source=self)
         if self.boundary_conditions is not None:
             sm.attach_boundary_conditions(
                 self.boundary_conditions, aux_bcs=self.aux_boundary_conditions)

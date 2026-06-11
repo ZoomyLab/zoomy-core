@@ -130,3 +130,17 @@ def test_interpolate_u_is_modal_reconstruction():
     expected = sum((qi/h) * sp.legendre(i, 2*zeta - 1)
                    for i, qi in enumerate((q0, q1, q2)))
     assert sp.simplify(u - expected) == 0
+
+
+def test_canonical_method_and_register_group_conflict_raises():
+    """Exactly one definition per canonical operator: stash/method AND
+    register_group together must raise at extraction."""
+    from zoomy_core.systemmodel import SystemModel
+    model = SME(level=0)
+    m = model.derivation
+    b = model._bed
+    m.register_group("interpolate", 0, b)        # collides with the stash
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="exactly one definition"):
+        SystemModel.from_model(
+            m, Q=list(m.explicit_state()), canonical_source=model)

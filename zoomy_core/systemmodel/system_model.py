@@ -200,7 +200,19 @@ def _fields_to_state_symbols(expr, x):
     return expr.replace(_is_field, lambda e: _state_symbol(e))
 
 
-def _attach_function_groups(sm, model) -> None:
+# canonical operator slots: METHOD on the model class → group name.  The
+# method returns the RAW definition rows ({slot_or_field: expr}, built and
+# stashed by derive_model); the SAME parser below converts them — one source
+# of truth, no hand-copied symbolic definitions.  register_group() remains
+# for user-defined extras (boundary:<name>, custom slots).
+_CANONICAL_METHODS = {
+    "interpolate": "interpolate_to_3d",
+    "project": "project_from_3d",
+    "reconstruction": "reconstruction_variables",
+}
+
+
+def _attach_function_groups(sm, model, canonical_source=None) -> None:
     """Parse ``model._function_groups`` into the matching ``SystemModel`` slots.
 
     Each group ``{component_index: rhs}`` becomes a vector operator: the rhs is
@@ -213,7 +225,19 @@ def _attach_function_groups(sm, model) -> None:
     where :class:`~zoomy_core.model.boundary_conditions.FromModel` picks them
     up by ``<name>`` at :meth:`SystemModel.attach_boundary_conditions` time.
     """
-    groups = getattr(model, "_function_groups", None)
+    groups = dict(getattr(model, "_function_groups", None) or {})
+    if canonical_source is not None:
+        for slot, meth in _CANONICAL_METHODS.items():
+            fn = getattr(canonical_source, meth, None)
+            rows = fn() if callable(fn) else None
+            if not isinstance(rows, dict) or not rows:
+                continue            # legacy/default return — not a definition
+            if slot in groups:
+                raise ValueError(
+                    f"operator {slot!r} is defined BOTH via "
+                    f"register_group({slot!r}, …) and the canonical method "
+                    f"{meth}() — exactly one definition is allowed.")
+            groups[slot] = rows
     if not groups:
         return
     x = sm.space[0]
@@ -879,7 +903,8 @@ class SystemModel:
     # ── from_model factory ────────────────────────────────────────────
 
     @classmethod
-    def _from_derivation_model(cls, model, Q=None, Qaux=None) -> "SystemModel":
+    def _from_derivation_model(cls, model, Q=None, Qaux=None,
+                               canonical_source=None) -> "SystemModel":
         """Build a SystemModel from a declarative
         :class:`zoomy_core.model.derivation.model.Model` by structurally extracting
         the operators from its untagged residuals (see
@@ -927,11 +952,13 @@ class SystemModel:
         # Parse any registered function groups (vertical reconstruction →
         # interpolate_to_3d, its inverse → project_from_3d, …) into their
         # SystemModel slots; runtime gradient aux (∂_x h, ∂_x q_i) land in Qaux.
-        _attach_function_groups(sm, model)
+        _attach_function_groups(sm, model,
+                                canonical_source=canonical_source)
         return sm
 
     @classmethod
-    def from_model(cls, model, Q=None, Qaux=None) -> "SystemModel":
+    def from_model(cls, model, Q=None, Qaux=None,
+                   canonical_source=None) -> "SystemModel":
         """Build a SystemModel from a Model.
 
         Two input kinds are dispatched on the *Model class*:
@@ -951,7 +978,8 @@ class SystemModel:
         """
         from zoomy_core.model.derivation.model import Model as _DerivationModel
         if isinstance(model, _DerivationModel):
-            return cls._from_derivation_model(model, Q=Q, Qaux=Qaux)
+            return cls._from_derivation_model(
+                model, Q=Q, Qaux=Qaux, canonical_source=canonical_source)
 
         if hasattr(model, "_finalize_for_systemmodel") \
                 and not getattr(model, "_finalized", True):
