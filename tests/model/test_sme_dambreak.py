@@ -40,7 +40,9 @@ def _run_dambreak(level, *, hL=2.0, hR=1.0, n_cells=100, t_end=0.3):
                                low=lambda n, lo=low: lo, jump_position_x=5.0)
     sm.aux_initial_conditions = Constant(constants=lambda n: np.zeros(n))
 
-    assert sm.eigenvalue_mode == "numerical"          # numerical by default
+    # symbolic since the beta-HSWME spectrum registration (closed-form
+    # wavespeeds, no per-face LAPACK eigensolves)
+    assert sm.eigenvalue_mode == "symbolic"
 
     mesh = BaseMesh.create_1d(domain=(0.0, 10.0), n_inner_cells=n_cells)
     nsm = NumericalSystemModel.from_system_model(

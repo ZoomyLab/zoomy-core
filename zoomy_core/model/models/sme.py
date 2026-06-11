@@ -253,7 +253,39 @@ class SME(BaseModel):
         if self._bed not in qs:
             qs = [self._bed, *qs]
         sm = SystemModel.from_model(m, Q=qs, canonical_source=self)
+        self._register_hswme_spectrum(sm)
         if self.boundary_conditions is not None:
             sm.attach_boundary_conditions(
                 self.boundary_conditions, aux_bcs=self.aux_boundary_conditions)
         return sm
+
+    def _register_hswme_spectrum(self, sm):
+        """Register the closed-form β-HSWME spectrum (Koellermeier &
+        Rominger 2020, Thm 3.5) as the SystemModel's symbolic eigenvalues:
+
+            λ_{1,2} = n·(u_m ∓ √(g h + α₁²)),
+            λ_{i+2} = n·(u_m + c_{i,N}·α₁),   c_{i,N} = roots of P_N,
+
+        with u_m = q_0/h and α₁ = −q_1/h in our shifted-Legendre basis
+        (their φ₁ = 1−2ζ = −ours; the spectrum is invariant under
+        α₁ → −α₁ since the Legendre roots come in ± pairs).  All
+        eigenvalues lie inside [u_m−√(gh+α₁²), u_m+√(gh+α₁²)], so this
+        gives a SHARP Rusanov wavespeed / CFL bound for the full SME
+        without per-face numerical eigensolves (the JAX/CUDA blocker and
+        ~90% of the numpy step cost).  The bed row carries λ = 0."""
+        import numpy as _np
+        Nu = int(self.level)
+        by = {str(s_): s_ for s_ in sm.state}
+        h_s = by["h"]
+        u_m = by["q_0"] / h_s
+        g_s = sm.parameters.g
+        n_x = sm.normal[0]
+        a1 = (-by["q_1"] / h_s) if Nu >= 1 else sp.S.Zero
+        c_wave = sp.sqrt(g_s * h_s + a1 ** 2)
+        lams = [sp.S.Zero,                       # inert bed row
+                n_x * (u_m - c_wave), n_x * (u_m + c_wave)]
+        if Nu >= 1:
+            roots = _np.polynomial.legendre.leggauss(Nu)[0]   # roots of P_N
+            lams += [n_x * (u_m + sp.Float(float(c_)) * a1) for c_ in roots]
+        assert len(lams) == sm.n_equations
+        sm.eigenvalues = sp.Matrix(sm.n_equations, 1, lams)

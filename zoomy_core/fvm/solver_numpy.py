@@ -421,6 +421,41 @@ class HyperbolicSolver(Solver):
         iInner_bnd = iA[boundary_faces]
 
         eig_mode = getattr(symbolic_model, "eigenvalue_mode", "symbolic")
+        if (eig_mode != "numerical"
+                and getattr(symbolic_model, "eigenvalues", None) is not None):
+            # BATCHED symbolic wave speeds: one vectorized evaluation of the
+            # registered closed-form spectrum (e.g. the SME β-HSWME
+            # eigenvalues) per face side — no per-face Python loop and no
+            # LAPACK at all.
+            rt = NumpyRuntimeModel.from_system_model(symbolic_model)
+            eig_fn = rt.eigenvalues
+            n_int = normals[:, interior_faces]
+            n_bnd = normals[:, boundary_faces]
+            n_vars_s = symbolic_model.n_variables
+
+            def _side_max(Q, Qaux, parameters, cells, ns):
+                q_s = Q[:, cells]
+                a_s = Qaux[:, cells] if Qaux.shape[0] > 0 else _EMPTY_AUX2
+                evs = np.asarray(eig_fn(q_s, a_s, parameters, ns), float)
+                evs = evs.reshape(n_vars_s, -1)
+                return np.abs(evs).max(axis=0)
+
+            def compute_max_eigenvalue(Q, Qaux, parameters):
+                max_ev = np.zeros(mesh.n_faces)
+                m_A = _side_max(Q, Qaux, parameters, iA_int, n_int)
+                m_B = _side_max(Q, Qaux, parameters, iB_int, n_int)
+                max_ev[interior_faces] = np.maximum(m_A, m_B)
+                max_ev[boundary_faces] = _side_max(
+                    Q, Qaux, parameters, iInner_bnd, n_bnd)
+                if fi_h is not None:                          # dry-cell skip
+                    both_dry = ((Q[fi_h, iA_int] < dry_thr)
+                                & (Q[fi_h, iB_int] < dry_thr))
+                    max_ev[interior_faces[both_dry]] = 0.0
+                    max_ev[boundary_faces[
+                        Q[fi_h, iInner_bnd] < dry_thr]] = 0.0
+                return max_ev
+            return compute_max_eigenvalue
+
         if eig_mode == "numerical":
             # BATCHED numerical wave speeds: one vectorized quasilinear
             # evaluation over all cells + one stacked np.linalg.eigvals over
