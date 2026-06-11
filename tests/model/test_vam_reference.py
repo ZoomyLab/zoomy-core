@@ -149,3 +149,47 @@ def test_vam1_chorin_split_matches_escalante_projection(vam1, reference):
         exp_upd = sp.expand(corr_map[Fn(sname)].doit())
         diff = sp.simplify(upd - exp_upd)
         assert diff == 0, f"corrector {sname} != U − dt·T(P): {diff}"
+
+
+# ── predictor: Escalante eq (12a) — the pressure-FREE hydrostatic rows ─────
+
+def test_vam1_predictor_is_pressure_zeroed_full_rows(vam1, reference):
+    """SM_pred row-by-row ≡ the full system's rows with P_0 = P_1 = 0.
+    Pins the splitter's RE-extraction (term content AND source sign —
+    a double sign flip here once anti-damped the predictor friction and
+    inverted the dam-break shear profile)."""
+    model, sm = vam1
+    split = model.chorin_split()
+    rv = sm.reconstruct_residuals()
+    names = [str(s) for s in sm.state]
+    Fn = reference["Fn"]
+    zero_P = {Fn("P_0"): 0, Fn("P_1"): 0}
+
+    pred_rv = split.SM_pred.reconstruct_residuals()
+    for k, nm in enumerate(split.SM_pred.equation_names):
+        sname = nm[len("pred_"):]
+        expected = sp.expand(
+            sp.sympify(rv[names.index(sname)]).subs(zero_P).doit())
+        got = sp.expand(sp.sympify(pred_rv[k]).doit())
+        diff = sp.simplify(got - expected)
+        assert diff == 0, f"SM_pred row {sname} != full row at P=0: {diff}"
+
+
+def test_vam1_advective_divergences_routed_as_flux(vam1):
+    """The conservative parts of the k=1 rows must sit in the FLUX slot
+    (compound ∂_x atoms), not be smeared into NCP — flux vs NCP routing
+    is O(1) at shocks (path-dependence of nonconservative products)."""
+    _, sm = vam1
+    names = [str(s) for s in sm.state]
+    i_q1 = names.index("q_1")
+    i_r1 = names.index("r_1")
+    Fq1 = sp.sympify(sm.flux[i_q1, 0])
+    Fr1 = sp.sympify(sm.flux[i_r1, 0])
+    by_name = {str(s): s for s in sm.state}
+    q0, q1, r0, r1, P1, h = (by_name[n] for n in
+                             ("q_0", "q_1", "r_0", "r_1", "P_1", "h"))
+    rho = sm.parameters.rho
+    assert sp.simplify(Fq1 - (2*q0*q1/h + h*P1/rho)) == 0, f"q_1 flux: {Fq1}"
+    assert sp.simplify(
+        Fr1 - (q0*r1/h + q1*r0/h - sp.Rational(2, 5)*q1*(r0 - r1)/h)) == 0, \
+        f"r_1 flux: {Fr1}"

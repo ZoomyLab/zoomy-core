@@ -213,6 +213,38 @@ class VAM(BaseModel):
             m.momentum_z[kk].expr = sp.expand(
                 m.momentum_z[kk].expr - _zint01(R_om * wt_m * dphi) / mus[kk])
 
+        # 6c — conservative regroup.  The closure/ω̃ substitutions left the
+        # k≥1 rows fully EXPANDED, so the extraction routes their advective
+        # divergences into NCP (path-dependent at shocks) instead of flux.
+        # Regroup the conservative part F_k (the reference-pinned Escalante
+        # flux, mapped to our variables) as a compound ∂_x atom:
+        #   expr − expand(∂_x F.doit()) + Derivative(F, x)   (exact zero-change)
+        # NB: keep ∂_x b-bearing flux parts in their OWN compound atom — the
+        # extraction's diffusion branch fires on any b_x inside a compound
+        # and silently skips bx-free pieces, so a MIXED atom would drop them.
+        Pf = [m.functions.P.head(j, t, x) for j in range(Nu + 1)]
+        if Nu == 1:
+            F_groups = {
+                ("momentum_x", 1): [2 * qf[0] * qf[1] / h + h * Pf[1] / rho],
+                ("momentum_z", 1): [
+                    (qf[0] * rf[1] / h + qf[1] * rf[0] / h
+                     - sp.Rational(2, 5) * qf[1] * (rf[0] - rf[1]) / h),
+                    (sp.Rational(2, 5) * qf[1] * (qf[0] - qf[1]) / h
+                     * sp.Derivative(b, x)),
+                ],
+            }
+            for (fam, kk), Fs in F_groups.items():
+                row = getattr(m, fam)[kk]
+                # normalize to fully-expanded atoms FIRST — the closure
+                # substitutions left compound Derivative atoms behind, and
+                # subtracting an expanded ∂_x F against unexpanded compounds
+                # double-counts the content at extraction
+                e = sp.expand(sp.sympify(row.expr).doit())
+                for F in Fs:
+                    dF = sp.Derivative(F, x)
+                    e = sp.expand(e - sp.expand(dF.doit())) + dF
+                row.expr = e
+
         self.derivation = m
         self._bed = b
         self._P_head = m.functions.P.head

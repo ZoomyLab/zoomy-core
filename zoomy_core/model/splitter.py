@@ -445,9 +445,12 @@ def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
             holder, "source", variable_map=variable_map,
             n_variables=n_eq, policy="strict",
         )
-        # SystemModel residual form is ``... − S(Q) = 0``; auto-tagger
-        # stores source terms with their original LHS sign — negate.
-        S_mat = sp.Matrix(n_eq, 1, lambda i, _j: -S_list[i])
+        # ``collect_solver_tag`` ALREADY flips source terms to the RHS
+        # convention (sign = −1 for implicit/explicit_source) — store
+        # verbatim.  The previous extra negation here double-flipped the
+        # sign, so every split predictor ran with ANTI-DAMPED friction
+        # (the inverted VAM dam-break shear profile).
+        S_mat = sp.Matrix(n_eq, 1, lambda i, _j: S_list[i])
 
         B = sp.MutableDenseNDimArray.zeros(n_eq, n_state, n_dim)
         for i in range(n_eq):

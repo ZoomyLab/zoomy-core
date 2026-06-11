@@ -361,6 +361,23 @@ def _route_diffusion(term, i, deriv, coeff, state_funcs, x, A):
     The residual carries ``+∂_x(Fᵈ)`` with ``Fᵈ[i] = Σ_j A[i, j, 0, 0]·∂_x Q_j``;
     we read the inner ``D·∂_x Q_j`` and place ``coeff · D`` at ``A[i, j, 0, 0]``.
     """
+    # Bare second derivative ``coeff · ∂_xx Q_j``: identical to
+    # ``∂_x(coeff · ∂_x Q_j)`` ONLY for a (t, x, state)-free coeff — route
+    # that; anything else has no conservative reading here → raise (silent
+    # drops in this branch hid the VAM b″ bathymetry terms for weeks).
+    if deriv.variables == (x, x):
+        q = deriv.args[0]
+        if (q in state_funcs and not coeff.has(x)
+                and not any(coeff.has(f) for f in state_funcs)):
+            j = state_funcs.index(q)
+            A[i, j, 0, 0] = A[i, j, 0, 0] + coeff
+            return
+        raise ValueError(
+            f"row {i}: cannot route bare second-derivative term {term} — "
+            "rewrite it as a conservative compound ∂_x(D·∂_x Q) in the "
+            "derivation (own atom, not mixed with derivative-free flux "
+            "parts).")
+
     inner = deriv.args[0]            # D · ∂_x Q_j  (the diffusive flux)
     # ``.doit()`` resolves an inner ``∂_x(q_j/h)`` (the CoV-introduced
     # conserved-variable derivative) into ``∂_x q_j/h − q_j·∂_x h/h²`` so the
@@ -369,12 +386,15 @@ def _route_diffusion(term, i, deriv, coeff, state_funcs, x, A):
     # and the dominant diagonal diffusion would be silently dropped.
     for sub in sp.Add.make_args(sp.expand(inner.doit())):
         c2, d2 = _split_inner_x_derivative(sub, x)
-        if d2 is None:
-            continue
-        q = d2.args[0]
-        if q in state_funcs:
-            j = state_funcs.index(q)
+        if d2 is not None and d2.args[0] in state_funcs:
+            j = state_funcs.index(d2.args[0])
             A[i, j, 0, 0] = A[i, j, 0, 0] + coeff * c2
+            continue
+        raise ValueError(
+            f"row {i}: diffusion-compound piece {sub} of ∂_x({inner}) has "
+            "no ``D·∂_x Q`` reading — derivative-free flux content mixed "
+            "into a ∂_x b-bearing compound is silently lost otherwise; "
+            "keep bx-bearing flux parts in their OWN compound atom.")
 
 
 def _split_inner_x_derivative(term, x):
