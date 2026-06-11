@@ -30,7 +30,7 @@ from zoomy_core.model.basemodel import Model as BaseModel
 from zoomy_core.model.derivation import (
     Model as DModel, PDETransformation, Simplify, ResolveIntegral, Basis,
     Consolidate, ExpandSums, EvaluateSums, PullConstants, ExtractBrackets,
-    ResolveModes, ResolveBasis, ChangeOfVariables,
+    ResolveModes, ResolveBasis, InvertMassMatrix, ChangeOfVariables,
     separation_of_variables, reset_modal_indices, modal_bound, test_index,
 )
 from zoomy_core.model.derivation.projection import Integrate
@@ -159,6 +159,8 @@ class MLVAM(BaseModel):
             for k in range(1, Nu + 2):
                 ml.mass[k].apply(h_eq)
                 ml.mass[k].apply(Consolidate())
+            # AFTER the stray dt-h substitutions (op docstring)
+            ml.apply(InvertMassMatrix())
             cont = sp.expand(ml.mass[0].expr)
             constraints = [sp.expand(ml.mass[k].expr)
                            for k in range(1, Nu + 2)]
@@ -231,6 +233,10 @@ class MLVAM(BaseModel):
                 m.add_equation(f"constraint_{ell}_{j}",
                                sp.expand(cst.subs(par).doit()))
 
+        # final pass on the ASSEMBLED rows (cross-layer ∂_t h traces are
+        # only eliminated at assembly via dth_glob, so the per-layer pass
+        # can miss a row; idempotent for already-normalized ones).
+        m.apply(InvertMassMatrix())
         self.derivation = m
         self._bed = b
         self._ht = ht

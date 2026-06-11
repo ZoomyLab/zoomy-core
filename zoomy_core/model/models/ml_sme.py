@@ -29,7 +29,7 @@ from zoomy_core.model.basemodel import Model as BaseModel
 from zoomy_core.model.derivation import (
     Model as DModel, PDETransformation, Simplify, ResolveIntegral, Basis,
     Consolidate, ExpandSums, EvaluateSums, PullConstants, ExtractBrackets,
-    ResolveModes, ResolveBasis, SolveLinearSystem, ChangeOfVariables,
+    ResolveModes, ResolveBasis, InvertMassMatrix, SolveLinearSystem, ChangeOfVariables,
     separation_of_variables, reset_modal_indices, modal_bound, test_index,
 )
 from zoomy_core.model.derivation.projection import Integrate
@@ -148,6 +148,7 @@ class MLSME(BaseModel):
                 ml.momentum_x[k].apply(Consolidate())
             ml.apply(ChangeOfVariables(
                 rf"\hat{{u}}_{ell}", f"q_{ell}", lambda qi: qi / h_l))
+            ml.apply(InvertMassMatrix())
             h_eq_q = ml.mass[0].solve_for(d.t(h_l))
             cont = sp.expand(h_eq_q.lhs - h_eq_q.rhs)
             mom = [sp.expand(ml.momentum_x[k].expr) for k in range(Nu + 1)]

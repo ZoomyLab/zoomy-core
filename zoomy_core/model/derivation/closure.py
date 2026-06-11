@@ -140,25 +140,43 @@ class InvertMassMatrix(Operation):
     def _leaf_sp(self, sp_expr):
         t = self._t
         expr = sp.expand(sp_expr)
-        mass = None
+        # The mass coefficient of a ∂_t atom may be SPLIT across several
+        # expanded terms (fraction-substituted multilayer rows expand
+        # ``(1−l)²h/(h(1−l))·∂_t r`` into three pieces) and may sit INSIDE
+        # the conservative time term (``∂_t(q_k/(2k+1))``).  Collect the
+        # TOTAL coefficient per ∂_t atom, then pick the (unique) one that is
+        # t-free and non-trivial — stray surface/interface traces keep a
+        # t-bearing coefficient and are ignored.
+        coeffs: dict = {}
         for term in sp.Add.make_args(expr):
             dts = [D for D in term.atoms(sp.Derivative)
                    if D.variables == (t,)]
             if len(dts) == 1:
-                cand = sp.simplify(term / dts[0])
-                # The mass-matrix diagonal is the PURELY NUMERIC Legendre factor
-                # ``1/(2k+1)`` multiplying the conserved ``∂_t Q_k``.  Apply this
-                # op AFTER the change of variables ``a→q/h``: the conservative
-                # ``(1/(2k+1))∂_t(h a_k)`` then reads ``(1/(2k+1))∂_t q_k`` with a
-                # t-FREE coefficient, while any leftover surface-trace ``∂_t h``
-                # keeps a t-bearing coefficient ``(Σq_k)/h`` — so the t-free guard
-                # selects exactly the mass-matrix term and ignores the traces.
-                if cand != 0 and not cand.has(t):
-                    mass = cand
-                    break
+                D = dts[0]
+                inner_c, _base = D.expr.as_independent(
+                    *D.expr.atoms(sp.Function), as_Mul=True)
+                coeffs[D] = coeffs.get(D, sp.S.Zero) \
+                    + sp.simplify(term / D) * inner_c
+        mass = None
+        for _D, cand in coeffs.items():
+            cand = sp.cancel(sp.simplify(cand))
+            if cand not in (sp.S.Zero, sp.S.One) and not cand.has(t):
+                mass = cand
+                break
         if mass in (None, sp.S.Zero, sp.S.One):
             return sp_expr
-        return sp.expand(expr / mass)
+        out = sp.expand(expr / mass)
+
+        # normalize the form: pull field-free factors out of Derivatives
+        # (linearity) so ``∂_t(q/(2k+1))/(1/(2k+1))`` reads ``∂_t q``.
+        def _pull(a):
+            co, rest = a.expr.as_independent(
+                *a.expr.atoms(sp.Function), as_Mul=True)
+            return (co * sp.Derivative(rest, *a.args[1:])
+                    if co != 1 and rest != 1 else a)
+
+        return sp.expand(out.replace(
+            lambda a: isinstance(a, sp.Derivative), _pull))
 
 
 # ── conservative fold (flux/pressure bundling, NCP-preserving) ─────────────

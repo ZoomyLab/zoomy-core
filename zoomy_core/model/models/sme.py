@@ -28,7 +28,7 @@ from zoomy_core.model.basemodel import Model as BaseModel
 from zoomy_core.model.derivation import (
     Model as DModel, PDETransformation, Simplify, ResolveIntegral, Basis,
     Consolidate, ExpandSums, EvaluateSums, PullConstants, ExtractBrackets,
-    ResolveModes, ResolveBasis, SolveLinearSystem, ChangeOfVariables,
+    ResolveModes, ResolveBasis, InvertMassMatrix, SolveLinearSystem, ChangeOfVariables,
     separation_of_variables, reset_modal_indices, modal_bound,
 )
 from zoomy_core.model.derivation.projection import Integrate          # abstract ζ-integral
@@ -165,6 +165,8 @@ class SME(BaseModel):
             m.momentum.x[kk].apply(h_eq)
             m.momentum.x[kk].apply(Consolidate())
         m.apply(ChangeOfVariables(r"\hat{u}", "q", lambda q_i: q_i / h))
+        # unit ∂_t coefficients — the runtime integrates ∂_t Q = RHS
+        m.apply(InvertMassMatrix())
 
         # 10 — vertical reconstruction → interpolate (ŵ_j inlined as their closure)
         q = m.functions.q.head

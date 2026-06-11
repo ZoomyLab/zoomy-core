@@ -27,7 +27,7 @@ from zoomy_core.model.basemodel import Model as BaseModel
 from zoomy_core.model.derivation import (
     Model as DModel, PDETransformation, Simplify, ResolveIntegral, Basis,
     Consolidate, ExpandSums, EvaluateSums, PullConstants, ExtractBrackets,
-    ResolveModes, ResolveBasis, ChangeOfVariables,
+    ResolveModes, ResolveBasis, InvertMassMatrix, ChangeOfVariables,
     separation_of_variables, reset_modal_indices, modal_bound, test_index,
 )
 from zoomy_core.model.derivation.projection import Integrate
@@ -155,6 +155,8 @@ class VAM(BaseModel):
         for kk in range(1, Nu + 2):
             m.mass[kk].apply(h_eq)
             m.mass[kk].apply(Consolidate())
+        # AFTER the stray dt-h substitutions (op docstring): unit dt coeffs
+        m.apply(InvertMassMatrix())
 
         self.derivation = m
         self._bed = b
