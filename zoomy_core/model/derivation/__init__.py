@@ -58,6 +58,7 @@ from .projection import (
 from .closure import (
     Resolve,
     ResolveIntegral,
+    GaussQuadrature,
     InvertMassMatrix,
     FoldConservative,
     Split,
@@ -108,6 +109,7 @@ __all__ = [
     "ResolveBasis",
     "Resolve",
     "ResolveIntegral",
+    "GaussQuadrature",
     "InvertMassMatrix",
     "FoldConservative",
     "Split",

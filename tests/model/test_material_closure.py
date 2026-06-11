@@ -84,3 +84,37 @@ def test_newtonian_variants_equal_explicit_injection():
             d_ = sp.simplify(sp.sympify(sm_a.flux[i, 0])
                              - sp.sympify(sm_b.flux[i, 0]))
             assert d_ == 0, f"{mk.__name__} row {i} flux differs"
+
+
+def test_bingham_requires_explicit_quadrature():
+    """A non-polynomial closure (Bingham) leaves Galerkin integrals the
+    bracket machinery cannot resolve — extraction must REFUSE loudly and
+    point at the numerical-integration escape hatch."""
+    from zoomy_core.model.models.material import bingham_navier_slip
+    par = {"nu": 0.1, "lambda_s": 50.0, "tau_y": 0.3, "eps_reg": 1e-2}
+    with pytest.raises(ValueError, match="quadrature"):
+        SME(level=2, material=bingham_navier_slip(),
+            parameters=par).system_model
+
+
+def test_bingham_with_gauss_quadrature_builds_and_lambdifies():
+    """With quadrature_order set, the surviving integrals become
+    Gauss–Legendre sums: no Integral atoms reach the operators, the yield
+    stress lands in the source, and the runtime lambdification works."""
+    import numpy as np
+    from zoomy_core.model.models.material import bingham_navier_slip
+    from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
+    par = {"nu": 0.1, "lambda_s": 50.0, "tau_y": 0.3, "eps_reg": 1e-2}
+    sm = SME(level=2, material=bingham_navier_slip(), quadrature_order=8,
+             parameters=par).system_model
+    for i in range(sm.n_equations):
+        assert not sp.sympify(sm.source[i, 0]).atoms(sp.Integral)
+    names = [str(s) for s in sm.state]
+    assert sp.sympify(sm.source[names.index("q_1"), 0]).has(
+        sm.parameters.tau_y)
+    rt = NumpyRuntimeModel.from_system_model(sm)
+    Q = np.array([0.0, 1.0, 0.3, -0.1, 0.02]).reshape(-1, 1)
+    Qaux = np.zeros((len(sm.aux_state), 1))
+    p = np.array(list(sm.parameter_values.values()), float)
+    s_val = np.asarray(rt.source(Q, Qaux, p), float)
+    assert np.all(np.isfinite(s_val))

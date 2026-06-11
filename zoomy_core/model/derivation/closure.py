@@ -1089,6 +1089,68 @@ class Consolidate(Operation):
         return consolidate(sp_expr, fold_self=True, fold_sums=True)
 
 
+class GaussQuadrature(Operation):
+    """Replace surviving ``Integral`` atoms by an n-point GAUSS-LEGENDRE
+    quadrature sum — the numerical-integration escape hatch for Galerkin
+    terms whose integrand is NOT analytically integrable.
+
+    Non-polynomial material closures (Bingham, power-law, ...) produce
+    projection integrals like ``∫ τ(∂_ζ ũ)·φ_k′ dζ`` that the bracket
+    machinery (`ExtractBrackets`/`ResolveIntegral`) rightly refuses: there
+    is no closed form.  Applying this op AFTER the basis is resolved
+    rewrites every remaining ``Integral(f(ζ), (ζ, a, b))`` as
+
+        Σ_g  w_g · f(ζ_g),        (ζ_g, w_g) = Gauss–Legendre nodes/weights
+                                   mapped to (a, b),
+
+    a plain nonlinear expression in the modal unknowns that flows through
+    extraction (source slot) and lambdifies into every solver backend.
+    ``order`` is the user's accuracy knob (exact for polynomials of degree
+    ≤ 2·order − 1)."""
+
+    whole_leaf_op = True
+    log_level = 1
+
+    def __init__(self, var=None, order=8, name=None):
+        self._var = var if var is not None else sp.Symbol("zeta", real=True)
+        self._order = int(order)
+        if self._order < 1:
+            raise ValueError("GaussQuadrature: order must be >= 1")
+        super().__init__(
+            name=name or f"gauss_quadrature[{self._order}]",
+            description=(f"∫ dζ → {self._order}-point Gauss–Legendre "
+                         "quadrature (numerical integration of "
+                         "analytically unintegrable closure terms)"))
+
+    def _leaf_sp(self, sp_expr):
+        import numpy as _np
+        integrals = list(sp.sympify(sp_expr).atoms(sp.Integral))
+        if not integrals:
+            return sp_expr
+        x_ref, w_ref = _np.polynomial.legendre.leggauss(self._order)
+        repl = {}
+        for I in integrals:
+            if len(I.limits) != 1 or len(I.limits[0]) != 3:
+                continue                      # not a definite 1-D integral
+            vv, a, b = I.limits[0]
+            try:
+                a_f, b_f = float(a), float(b)
+            except TypeError:
+                continue                      # symbolic bounds — not ours
+            half = (b_f - a_f) / 2.0
+            mid = (b_f + a_f) / 2.0
+            # evaluate the ζ-derivatives EXPLICITLY first — substituting a
+            # numeric node into an unevaluated Derivative leaves Subs junk
+            # that no code printer accepts
+            fn = sp.expand(sp.sympify(I.function).doit())
+            acc = sp.S.Zero
+            for xg, wg in zip(x_ref, w_ref):
+                acc += sp.Float(wg * half) * fn.subs(
+                    vv, sp.Float(mid + half * xg))
+            repl[I] = acc
+        return sp_expr.xreplace(repl) if repl else sp_expr
+
+
 class Simplify(Operation):
     """Canonicalisation that keeps fluxes as fluxes while exposing cancellations.
 

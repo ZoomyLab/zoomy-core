@@ -28,7 +28,7 @@ from zoomy_core.model.basemodel import Model as BaseModel
 from zoomy_core.model.derivation import (
     Model as DModel, PDETransformation, Simplify, ResolveIntegral, Basis,
     Consolidate, ExpandSums, EvaluateSums, PullConstants, ExtractBrackets,
-    ResolveModes, ResolveBasis, InvertMassMatrix, SolveLinearSystem, ChangeOfVariables,
+    ResolveModes, ResolveBasis, GaussQuadrature, InvertMassMatrix, SolveLinearSystem, ChangeOfVariables,
     separation_of_variables, reset_modal_indices, modal_bound,
 )
 from zoomy_core.model.derivation.projection import Integrate          # abstract ζ-integral
@@ -50,6 +50,12 @@ class SME(BaseModel):
 
     _finalize_lazy = True               # declarative path — skip the production tag pipeline
     level = param.Integer(default=2, bounds=(0, None))
+    quadrature_order = param.Integer(default=0, bounds=(0, None), doc=(
+        "Gauss-Legendre order for NUMERICAL integration of Galerkin "
+        "integrals that survive the analytic bracket machinery "
+        "(non-polynomial material closures, e.g. bingham_navier_slip). "
+        "0 (default) = off: an unresolvable integral then raises at "
+        "extraction."))
     material = param.Parameter(default=None, doc=(
         "Stress closure (MaterialModel) injected at the CORE level; "
         "None (default) leaves tau_xz UNCLOSED — its modal moments stay "
@@ -178,6 +184,12 @@ class SME(BaseModel):
         mx.apply(w_closure)
         mx.apply(ResolveModes(index=k, modes=range(Nu + 1)))
         m.momentum.x.apply(ResolveBasis(legendre, var=zeta))
+        if int(self.quadrature_order) > 0:
+            # numerical integration of the analytically unintegrable
+            # closure terms (the user-chosen escape hatch — see the
+            # quadrature_order doc)
+            m.momentum.x.apply(GaussQuadrature(
+                var=zeta, order=int(self.quadrature_order)))
 
         # 9 — kill loose ∂_t h, consolidate the pressure, conservative CoV û→q/h
         for kk in range(Nu + 1):

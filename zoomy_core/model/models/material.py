@@ -30,6 +30,8 @@ starting point for deriving a new material model in a notebook.
 """
 from __future__ import annotations
 
+import sympy as sp
+
 
 class MaterialModel:
     """Stress closure record: ``bulk``, ``bottom``, ``surface`` callables
@@ -59,6 +61,35 @@ def newtonian_navier_slip():
         bottom=lambda u_b, par: par.lambda_s * u_b,
         surface=lambda u_s, par: 0,
         name="newtonian+navier-slip",
+    )
+
+
+def bingham_navier_slip():
+    """Regularized BINGHAM closure: τ = (ρν + τ_y/√((∂_z u)² + ε²))·∂_z u
+    (smooth square-root regularization — rigid below the yield stress
+    in the ε→0 limit; the ε² floor keeps the root argument POSITIVE
+    in floating point even when sympy expands the square — the
+    |γ̇|+ε form NaN-ed at plug formation), Navier slip at the bed,
+    stress-free
+    surface.  Requires the parameters ``tau_y`` (yield stress) and
+    ``eps_reg`` (regularization rate scale) on the model, e.g.::
+
+        SME(level=3, material=bingham_navier_slip(), quadrature_order=8,
+            parameters={"nu": 0.1, "lambda_s": 50.0,
+                        "tau_y": 0.3, "eps_reg": 1e-3})
+
+    The Galerkin projection of this stress is NOT analytically
+    integrable — the model must be built with ``quadrature_order > 0``
+    so the surviving integrals are replaced by Gauss–Legendre
+    quadrature (:class:`~zoomy_core.model.derivation.GaussQuadrature`)."""
+    return MaterialModel(
+        bulk=lambda u, dz, par: (par.rho * par.nu
+                                 + par.tau_y
+                                 / sp.sqrt(dz(u) ** 2 + par.eps_reg ** 2))
+                                * dz(u),
+        bottom=lambda u_b, par: par.lambda_s * u_b,
+        surface=lambda u_s, par: 0,
+        name="bingham+navier-slip",
     )
 
 

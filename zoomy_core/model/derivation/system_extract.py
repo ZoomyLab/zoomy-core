@@ -261,6 +261,18 @@ def _classify_row(residual, i, state, state_funcs, t, x, gravity_param,
         if term == 0:
             continue
 
+        # 0. Unresolved Galerkin integrals must NOT reach the runtime —
+        # they appear when a material closure is not analytically
+        # integrable (e.g. Bingham): the user must opt into numerical
+        # integration explicitly.
+        if term.atoms(sp.Integral):
+            raise ValueError(
+                f"row {i}: analytically unresolved integral in {term} — "
+                "the Galerkin projection of this term has no closed form "
+                "(non-polynomial material closure?). Build the model with "
+                "quadrature_order=N (Gauss-Legendre numerical integration "
+                "via the GaussQuadrature operation) to resolve it.")
+
         # 1. Time derivative → mass matrix (no sign flip — LHS).
         if any(isinstance(d, sp.Derivative) and t in d.variables
                for d in term.atoms(sp.Derivative)):
