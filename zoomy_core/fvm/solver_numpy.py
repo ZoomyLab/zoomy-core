@@ -393,6 +393,52 @@ class HyperbolicSolver(Solver):
         # face_cells[0] is guaranteed to be the inner cell at boundary faces
         iInner_bnd = iA[boundary_faces]
 
+        eig_mode = getattr(symbolic_model, "eigenvalue_mode", "symbolic")
+        if eig_mode == "numerical":
+            # BATCHED numerical wave speeds: one vectorized quasilinear
+            # evaluation over all cells + one stacked np.linalg.eigvals over
+            # all face-side matrices.  The per-face Python loop below costs
+            # ~25 ms/step at 200 cells (it dominated the whole time loop);
+            # the batched path is two orders of magnitude cheaper.
+            rt = NumpyRuntimeModel.from_system_model(symbolic_model)
+            ql_fn = rt.quasilinear_matrix
+            n_vars = symbolic_model.n_variables
+            eps_reg = self.nsm.regularization.eigenvalue_eps
+            keys = list(symbolic_model.variables.keys())
+            reg = eps_reg * np.eye(n_vars)
+            if fi_h is not None and "b" in keys:
+                reg[keys.index("b"), keys.index("b")] = 0.0
+            n_int = normals[:, interior_faces]          # (dim, n_if)
+            n_bnd = normals[:, boundary_faces]
+
+            def compute_max_eigenvalue(Q, Qaux, parameters):
+                ql = np.asarray(ql_fn(Q, Qaux, parameters), dtype=float)
+                nc_ = Q.shape[1]
+                if ql.shape == (n_vars, n_vars, nc_, dim):
+                    # vectorize wrapper appends the cell axis before dim
+                    ql = np.transpose(ql, (0, 1, 3, 2))
+                elif ql.shape != (n_vars, n_vars, dim, nc_):
+                    raise ValueError(
+                        f"unexpected quasilinear shape {ql.shape}")
+                # (n, n, dim, nc); A·n per face side → (n_faces_side, n, n)
+                A_A = np.einsum("ijdk,dk->kij", ql[:, :, :, iA_int], n_int)
+                A_B = np.einsum("ijdk,dk->kij", ql[:, :, :, iB_int], n_int)
+                A_I = np.einsum("ijdk,dk->kij", ql[:, :, :, iInner_bnd], n_bnd)
+                A_all = np.concatenate([A_A, A_B, A_I], axis=0) + reg[None]
+                evs = np.real(np.linalg.eigvals(A_all))       # batched LAPACK
+                m = np.abs(evs).max(axis=1)
+                n_if = len(interior_faces)
+                max_ev = np.zeros(mesh.n_faces)
+                max_ev[interior_faces] = np.maximum(m[:n_if], m[n_if:2 * n_if])
+                max_ev[boundary_faces] = m[2 * n_if:]
+                if fi_h is not None:                          # dry-cell skip
+                    both_dry = ((Q[fi_h, iA_int] < dry_thr)
+                                & (Q[fi_h, iB_int] < dry_thr))
+                    max_ev[interior_faces[both_dry]] = 0.0
+                    max_ev[boundary_faces[Q[fi_h, iInner_bnd] < dry_thr]] = 0.0
+                return max_ev
+            return compute_max_eigenvalue
+
         def compute_max_eigenvalue(Q, Qaux, parameters):
             max_ev = np.zeros(mesh.n_faces)
 
