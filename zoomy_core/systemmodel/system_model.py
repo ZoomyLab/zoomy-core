@@ -1237,6 +1237,19 @@ class SystemModel:
                     b_ijd = _restore(self.nonconservative_matrix[i, j, d])
                     if b_ijd != 0:
                         res = res + b_ijd * sp.Derivative(state_funcs[j], coords[d])
+            # + ∂_x(A · ∂_x Q)  (diffusion tensors, implicit AND explicit —
+            # bathymetry-curvature fluxes like ∂_x(D(Q)·∂_x b) land here, so
+            # omitting A makes reference comparisons silently lossy)
+            for A in (self.diffusion_matrix, self.diffusion_matrix_explicit):
+                if A is None:
+                    continue
+                for j in range(n_st):
+                    for d in range(n_dim):
+                        a_ijd = _restore(A[i, j, d, d])
+                        if a_ijd != 0:
+                            res = res + sp.Derivative(
+                                a_ijd * sp.Derivative(state_funcs[j], coords[d]),
+                                coords[d])
             # − S[i]
             s_i = _restore(self.source[i, 0])
             res = res - s_i
