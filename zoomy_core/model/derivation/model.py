@@ -363,7 +363,8 @@ class Model:
         })
 
     # ── equation registration ────────────────────────────────────────
-    def add_equation(self, name, shape_or_expr=None, expr=None, *, group="model"):
+    def add_equation(self, name, shape_or_expr=None, expr=None, *, group="model",
+                 _refresh=True):
         """Register a scalar or vector equation.
 
         Scalar::
@@ -425,7 +426,8 @@ class Model:
             eq = Equation(scalar_expr, name=name, model=self)
             self._equations[name] = eq
             self._equation_shapes[name] = (1,)
-            self._refresh_unknowns()
+            if _refresh:
+                self._refresh_unknowns()
             return eq
 
         if expr is None:
@@ -434,7 +436,8 @@ class Model:
                           name=name, model=self)
             self._equations[name] = eq
             self._equation_shapes[name] = (1,)
-            self._refresh_unknowns()
+            if _refresh:
+                self._refresh_unknowns()
             return eq
 
         # vector: add_equation(name, shape, [exprs])
@@ -1158,11 +1161,19 @@ def resolve_modes(equation, *, index, modes, test_weight=None,
     comps = []
     for k in modes:
         row_name = f"{base}_{k}"
-        model.add_equation(row_name, src_expr)
+        # Specialise the abstract test index ``l`` → concrete mode ``k``
+        # BEFORE creating the row: one exact ``xreplace`` + one
+        # canonicalization per mode.  Routing the substitution through
+        # ``row.apply({index: k})`` instead costs a per-TERM pass plus a
+        # full-expression simplify over the giant unspecialised sum for
+        # EVERY mode — the dominant cost of high-level builds (SME(4)
+        # spent ~70% of its 26 s build here; the integrals are cheap).
+        # ``_refresh=False``: the unknowns registry is refreshed ONCE after
+        # the loop — the per-add refresh re-walks every equation in the
+        # model (the other half of the build cost).
+        model.add_equation(row_name, src_expr.xreplace({index: k}),
+                           _refresh=False)
         row = model._equations[row_name]
-        # Specialise the abstract test index ``l`` → concrete mode ``k`` — a
-        # plain exact substitution (no Substitution class needed).
-        row.apply({index: k}, _no_history=True)
         if do_close:
             tw = test_weight.xreplace({index: k})
             if resolver is not None:
