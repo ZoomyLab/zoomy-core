@@ -15,7 +15,7 @@ Users get the eager-looking surface (``from zoomy_core.model.models
 import SME``) without the cycle.
 """
 
-__all__ = ["SigmaReference", "SME", "VAM", "MLSWE"]
+__all__ = ["SigmaReference", "SME", "VAM", "MLSWE", "MLSME"]
 
 
 def __getattr__(name):
@@ -31,4 +31,7 @@ def __getattr__(name):
     if name == "MLSWE":
         from zoomy_core.model.models.ml_swe import MLSWE
         return MLSWE
+    if name == "MLSME":
+        from zoomy_core.model.models.ml_sme import MLSME
+        return MLSME
     raise AttributeError(f"module 'zoomy_core.model.models' has no attribute {name!r}")
