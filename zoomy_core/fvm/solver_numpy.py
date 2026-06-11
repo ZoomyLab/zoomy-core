@@ -34,6 +34,7 @@ from zoomy_core.fvm.riemann_solvers import (
 
 
 _EMPTY_AUX = np.array([])
+_EMPTY_AUX2 = np.empty((0, 0))
 
 
 # -- Field detection helpers ---------------------------------------------------
@@ -355,17 +356,43 @@ class HyperbolicSolver(Solver):
             reg_diag[keys.index("b"), keys.index("b")] = 0.0
 
         def max_ws_numerical(*args):
-            Q = np.array(args[:n_vars])
-            Qaux = np.array(args[n_vars:n_vars + n_aux])
-            p = np.array(args[n_vars + n_aux:n_vars + n_aux + n_params])
-            n_vec = np.array(args[n_vars + n_aux + n_params:])
-            if fi_h is not None and Q[fi_h] < dry_thr:
-                return 0.0
-            ql = np.asarray(ql_fn(Q, Qaux, p), dtype=float).reshape(n_vars, n_vars, dim)
-            A_n = sum(ql[:, :, d] * float(n_vec[d]) for d in range(dim))
-            A_n += reg_diag
+            # BATCH-AWARE: scalar args → single 4×4 eigvals (legacy);
+            # face-array args (the vectorized Riemann kernels broadcast the
+            # whole flux expression over faces) → ONE stacked eigvals call.
+            a0 = np.asarray(args[0])
+            if a0.ndim == 0:
+                Q = np.array(args[:n_vars])
+                Qaux = np.array(args[n_vars:n_vars + n_aux])
+                p = np.array(args[n_vars + n_aux:n_vars + n_aux + n_params])
+                n_vec = np.array(args[n_vars + n_aux + n_params:])
+                if fi_h is not None and Q[fi_h] < dry_thr:
+                    return 0.0
+                ql = np.asarray(ql_fn(Q, Qaux, p), dtype=float).reshape(
+                    n_vars, n_vars, dim)
+                A_n = sum(ql[:, :, d] * float(n_vec[d]) for d in range(dim))
+                A_n += reg_diag
+                evs = np.real(np.linalg.eigvals(A_n))
+                return float(np.max(np.abs(evs)))
+
+            nf = a0.shape[-1]
+            Q = np.stack([np.broadcast_to(np.asarray(a, dtype=float), (nf,))
+                          for a in args[:n_vars]])
+            Qaux = (np.stack([np.broadcast_to(np.asarray(a, dtype=float), (nf,))
+                              for a in args[n_vars:n_vars + n_aux]])
+                    if n_aux else np.zeros((0, nf)))
+            p = np.array([float(np.asarray(a).ravel()[0]) for a in
+                          args[n_vars + n_aux:n_vars + n_aux + n_params]])
+            n_vec = np.stack([np.broadcast_to(np.asarray(a, dtype=float), (nf,))
+                              for a in args[n_vars + n_aux + n_params:]])
+            ql = np.asarray(ql_fn(Q, Qaux, p), dtype=float)
+            if ql.shape == (n_vars, n_vars, nf, dim):
+                ql = np.transpose(ql, (0, 1, 3, 2))
+            A_n = np.einsum("ijdk,dk->kij", ql, n_vec) + reg_diag[None]
             evs = np.real(np.linalg.eigvals(A_n))
-            return float(np.max(np.abs(evs)))
+            out = np.abs(evs).max(axis=1)
+            if fi_h is not None:
+                out[Q[fi_h] < dry_thr] = 0.0
+            return out
 
         return max_ws_numerical
 
@@ -526,6 +553,7 @@ class HyperbolicSolver(Solver):
         runtime_numerics.local_max_abs_eigenvalue = (
             lambda Q, Qaux, p, n: max_wavespeed_fn(*Q, *Qaux, *p, *n)
         )
+        use_batched = bool(getattr(numerics, "supports_batched_faces", False))
 
         nc = mesh.n_inner_cells
         iA = mesh.face_cells[0]
@@ -647,52 +675,92 @@ class HyperbolicSolver(Solver):
                     for d in range(dim):
                         dQ[:, c] -= B_c[:, :, d] @ grad[:, d, c]
 
-            # 4a. Interior face loop — both cells are valid inner cells
-            for fi in range(len(interior_faces)):
-                f = interior_faces[fi]
-                qA = Q_L[:, f]
-                qB = Q_R[:, f]
-                qauxA = Qaux[:, iA_int[fi]] if has_aux else _EMPTY_AUX
-                qauxB = Qaux[:, iB_int[fi]] if has_aux else _EMPTY_AUX
-                n = normals_arr[:, f]
+            # 4. BATCHED face Riemann solves: the lambdified kernels (and the
+            # batch-aware max_wavespeed backend) broadcast over a trailing
+            # face axis — one call per kernel instead of one per face.
+            # Scatter with np.add.at (unbuffered) so repeated cell indices
+            # accumulate correctly on unstructured meshes.  Numerics classes
+            # opt IN via ``supports_batched_faces`` (verified bit-identical
+            # for the plain NCP-Rusanov; the HR variants keep the loop until
+            # their kernels are batch-validated).
 
-                fluct = np.asarray(
-                    runtime_numerics.numerical_fluctuations(
-                        qA, qB, qauxA, qauxB, parameters, n
-                    ), dtype=float,
-                ).reshape(-1)
-                num_flux = np.asarray(
-                    runtime_numerics.numerical_flux(
-                        qA, qB, qauxA, qauxB, parameters, n
-                    ), dtype=float,
-                ).reshape(-1)
+            # 4a. Interior faces — both cells valid
+            if use_batched and len(interior_faces):
+                qA = Q_L[:, interior_faces]
+                qB = Q_R[:, interior_faces]
+                qauxA = Qaux[:, iA_int] if has_aux else _EMPTY_AUX2
+                qauxB = Qaux[:, iB_int] if has_aux else _EMPTY_AUX2
+                n_f = normals_arr[:, interior_faces]
+                fluct = np.asarray(runtime_numerics.numerical_fluctuations(
+                    qA, qB, qauxA, qauxB, parameters, n_f), dtype=float
+                ).reshape(2 * n_vars, -1)
+                num_flux = np.asarray(runtime_numerics.numerical_flux(
+                    qA, qB, qauxA, qauxB, parameters, n_f), dtype=float
+                ).reshape(n_vars, -1)
                 Dp = fluct[:n_vars]
                 Dm = fluct[n_vars:]
-                dQ[:, iA_int[fi]] -= (num_flux + Dm) * fv_int[fi] / cvA_int[fi]
-                dQ[:, iB_int[fi]] -= (-num_flux + Dp) * fv_int[fi] / cvB_int[fi]
+                np.add.at(dQ.T, iA_int,
+                          (-(num_flux + Dm) * fv_int / cvA_int).T)
+                np.add.at(dQ.T, iB_int,
+                          (-(-num_flux + Dp) * fv_int / cvB_int).T)
 
-            # 4b. Boundary face loop — one inner cell only
-            for bi in range(len(boundary_faces)):
-                f = boundary_faces[bi]
-                qA = Q_L[:, f]
-                qB = Q_R[:, f]
-                qauxA = Qaux[:, iInner_bnd[bi]] if has_aux else _EMPTY_AUX
-                qauxB = qauxA  # boundary: use inner cell aux
-                n = normals_arr[:, f]
-
-                fluct = np.asarray(
-                    runtime_numerics.numerical_fluctuations(
-                        qA, qB, qauxA, qauxB, parameters, n
-                    ), dtype=float,
-                ).reshape(-1)
-                num_flux = np.asarray(
-                    runtime_numerics.numerical_flux(
-                        qA, qB, qauxA, qauxB, parameters, n
-                    ), dtype=float,
-                ).reshape(-1)
+            # 4b. Boundary faces — one inner cell only
+            if use_batched and len(boundary_faces):
+                qA = Q_L[:, boundary_faces]
+                qB = Q_R[:, boundary_faces]
+                qauxI = Qaux[:, iInner_bnd] if has_aux else _EMPTY_AUX2
+                n_f = normals_arr[:, boundary_faces]
+                fluct = np.asarray(runtime_numerics.numerical_fluctuations(
+                    qA, qB, qauxI, qauxI, parameters, n_f), dtype=float
+                ).reshape(2 * n_vars, -1)
+                num_flux = np.asarray(runtime_numerics.numerical_flux(
+                    qA, qB, qauxI, qauxI, parameters, n_f), dtype=float
+                ).reshape(n_vars, -1)
                 Dm = fluct[n_vars:]
-                # Inner cell is always face_cells[0] (A-side)
-                dQ[:, iInner_bnd[bi]] -= (num_flux + Dm) * fv_bnd[bi] / cvInner_bnd[bi]
+                np.add.at(dQ.T, iInner_bnd,
+                          (-(num_flux + Dm) * fv_bnd / cvInner_bnd).T)
+
+            # 4-loop. Per-face fallback for numerics without batch support.
+            if not use_batched:
+                for fi in range(len(interior_faces)):
+                    f = interior_faces[fi]
+                    qA = Q_L[:, f]
+                    qB = Q_R[:, f]
+                    qauxA = Qaux[:, iA_int[fi]] if has_aux else _EMPTY_AUX
+                    qauxB = Qaux[:, iB_int[fi]] if has_aux else _EMPTY_AUX
+                    n = normals_arr[:, f]
+                    fluct = np.asarray(
+                        runtime_numerics.numerical_fluctuations(
+                            qA, qB, qauxA, qauxB, parameters, n
+                        ), dtype=float,
+                    ).reshape(-1)
+                    num_flux = np.asarray(
+                        runtime_numerics.numerical_flux(
+                            qA, qB, qauxA, qauxB, parameters, n
+                        ), dtype=float,
+                    ).reshape(-1)
+                    Dp = fluct[:n_vars]
+                    Dm = fluct[n_vars:]
+                    dQ[:, iA_int[fi]] -= (num_flux + Dm) * fv_int[fi] / cvA_int[fi]
+                    dQ[:, iB_int[fi]] -= (-num_flux + Dp) * fv_int[fi] / cvB_int[fi]
+                for bi in range(len(boundary_faces)):
+                    f = boundary_faces[bi]
+                    qA = Q_L[:, f]
+                    qB = Q_R[:, f]
+                    qauxA = Qaux[:, iInner_bnd[bi]] if has_aux else _EMPTY_AUX
+                    n = normals_arr[:, f]
+                    fluct = np.asarray(
+                        runtime_numerics.numerical_fluctuations(
+                            qA, qB, qauxA, qauxA, parameters, n
+                        ), dtype=float,
+                    ).reshape(-1)
+                    num_flux = np.asarray(
+                        runtime_numerics.numerical_flux(
+                            qA, qB, qauxA, qauxA, parameters, n
+                        ), dtype=float,
+                    ).reshape(-1)
+                    Dm = fluct[n_vars:]
+                    dQ[:, iInner_bnd[bi]] -= (num_flux + Dm) * fv_bnd[bi] / cvInner_bnd[bi]
 
             # 5. Explicit diffusion with boundary contributions
             if self._diffusion_ops is not None and self._diffusion_in_flux:

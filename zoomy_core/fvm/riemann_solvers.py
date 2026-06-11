@@ -687,6 +687,10 @@ class NonconservativeRusanov(Rusanov):
     """NonconservativeRusanov. (class)."""
     name = param.String(default="NonconservativeRusanovV2")
     integration_order = param.Integer(default=3)
+    # Kernels verified bit-identical between per-face and face-batched
+    # evaluation — the numpy solver may evaluate them with a trailing
+    # face axis (see solver_numpy.flux_operator).
+    supports_batched_faces = True
 
     def get_path_integral_states(self):
         """Get path integral states."""
@@ -937,6 +941,8 @@ class PositiveHLL(HLL):
 class PositiveNonconservativeRusanov(PositiveRusanov, NonconservativeRusanov):
     """PositiveNonconservativeRusanov. (class)."""
     name = param.String(default="PositiveNonconservativeRusanovV2")
+    # HR kernels not yet batch-validated — keep the per-face loop.
+    supports_batched_faces = False
 
     def get_path_integral_states(self):
         """Get path integral states."""

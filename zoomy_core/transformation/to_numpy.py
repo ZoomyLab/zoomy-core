@@ -187,16 +187,30 @@ class NumpyRuntimeModel:
     def _collect_vector_symbols(self, signature):
         """Internal helper `_collect_vector_symbols`."""
         vector_symbols = []
-        vector_keys = {"variables", "aux_variables", "normal", "position"}
+        # Prefix match: the Riemann kernels carry two-sided state groups
+        # (``variables_minus`` / ``variables_plus`` / ``aux_variables_*`` /
+        # ``normal``); they broadcast over faces exactly like the std groups
+        # broadcast over cells, so their constants need the same
+        # ones_like/zeros_like wrapping.  ``parameters`` stays scalar.
+        vector_bases = ("variables", "aux_variables", "normal", "position",
+                        "q", "aux")    # q_minus/q_plus etc. (Riemann kernels)
+
+        def _is_vector_key(key):
+            return key is not None and any(
+                key == b or key.startswith(b + "_") for b in vector_bases)
 
         def _collect(node, key=None, in_vector_context=False):
             """Internal helper `_collect`."""
-            context = in_vector_context or (key in vector_keys)
+            context = in_vector_context or _is_vector_key(key)
             if hasattr(node, "values") and callable(node.values):
                 keys = list(node.keys()) if hasattr(node, "keys") else [None] * len(node.values())
                 for child_key, child_value in zip(keys, node.values()):
                     _collect(child_value, key=child_key, in_vector_context=context)
-            elif isinstance(node, (list, tuple)):
+            elif isinstance(node, (list, tuple)) or (
+                    not isinstance(node, sp.Basic)
+                    and hasattr(node, "__iter__")):
+                # ZArray groups (the Riemann kernels' q_minus/q_plus/...)
+                # iterate their member symbols without exposing .values()
                 for child_value in node:
                     _collect(child_value, key=None, in_vector_context=context)
             else:
