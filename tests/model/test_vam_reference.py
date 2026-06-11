@@ -27,14 +27,14 @@ wrong (secular P-drift at runtime).  This file pins every term.
 import pytest
 import sympy as sp
 
-from zoomy_core.model.models import VAM
+from zoomy_core.model.models import VAM, newtonian_navier_slip
 
 
 # ── shared fixtures ────────────────────────────────────────────────────────
 
 @pytest.fixture(scope="module")
 def vam1():
-    model = VAM(level=1)
+    model = VAM(material=newtonian_navier_slip(), level=1)
     sm = model.system_model
     return model, sm
 

@@ -8,7 +8,7 @@ pressure, NCP, source) and the registered vertical reconstruction
 import pytest
 import sympy as sp
 
-from zoomy_core.model.models import SME
+from zoomy_core.model.models import SME, newtonian_navier_slip
 from zoomy_core.systemmodel import SystemModel
 
 # the vertical reconstruction is evaluated at position[2] == z (the runtime's
@@ -21,7 +21,7 @@ def _scalar(row):
 
 
 def _sm():
-    return SME(level=2).system_model
+    return SME(material=newtonian_navier_slip(), level=2).system_model
 
 
 def _syms(sm):
@@ -53,7 +53,7 @@ def test_mass_row_is_conservative_and_bed_row_is_inert(level):
     a FLUX (``flux[1] = q_0``), never a ``B·∂_x Q`` coupling; and the bed
     row must be exactly ``∂_t b = 0`` (no source decay) for M-unaware
     consumers of the kernels.  Levels 0/1 are what the OF coupling runs."""
-    sm = SME(level=level).system_model
+    sm = SME(material=newtonian_navier_slip(), level=level).system_model
     assert sp.simplify(_scalar(sm.flux[1]) - sm.state[2]) == 0
     assert all(_scalar(e) == 0 for e in sm.nonconservative_matrix[1])
     assert _scalar(sm.source[0]) == 0
@@ -137,7 +137,7 @@ def test_canonical_method_and_register_group_conflict_raises():
     """Exactly one definition per canonical operator: stash/method AND
     register_group together must raise at extraction."""
     from zoomy_core.systemmodel import SystemModel
-    model = SME(level=0)
+    model = SME(material=newtonian_navier_slip(), level=0)
     m = model.derivation
     b = model._bed
     m.register_group("interpolate", 0, b)        # collides with the stash

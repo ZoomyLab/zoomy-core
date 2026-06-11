@@ -50,6 +50,11 @@ class SME(BaseModel):
 
     _finalize_lazy = True               # declarative path — skip the production tag pipeline
     level = param.Integer(default=2, bounds=(0, None))
+    material = param.Parameter(default=None, doc=(
+        "Stress closure (MaterialModel) injected at the CORE level; "
+        "None (default) leaves tau_xz UNCLOSED — its modal moments stay "
+        "free functions in the derived system. Use "
+        "material=newtonian_navier_slip() for the standard closure."))
 
     def derive_model(self):
         """Build the declarative SME model (stored as ``self.derivation``) and
@@ -123,8 +128,17 @@ class SME(BaseModel):
         # so the projected source DAMPS: s[q_0] = −λ·u_b/ρ.  (A minus here
         # flips the friction into anti-damping — coupling caught it as
         # exponential growth of uniform flow.)
-        mx.apply({tau.at(1): 0, tau.at(0): lam * uu.at(0)})
-        mx.apply({tau.expr: rho * nu / h * sp.Derivative(uu.expr, zeta)})  # bulk Newtonian
+        mat = self.material
+        if mat is not None:
+            if mat.surface is not None:
+                mx.apply({tau.at(1): mat.surface(uu.at(1), m.parameters)})
+            if mat.bottom is not None:
+                mx.apply({tau.at(0): mat.bottom(uu.at(0), m.parameters)})
+            if mat.bulk is not None:
+                # core-level dz, realized through the sigma map: dz = (1/h) dzeta
+                mx.apply({tau.expr: mat.bulk(
+                    uu.expr, lambda e: sp.Derivative(e, zeta) / h,
+                    m.parameters)})
         mx.apply(Simplify())
 
         # 6 — separation of variables: u → û_i (N_u), w → ŵ_j (N_u + 1)
@@ -133,6 +147,11 @@ class SME(BaseModel):
         N_u = modal_bound("N_u")
         m.apply(separation_of_variables(u, uh(t, x), basis, N_u))
         m.apply(separation_of_variables(w, wh(t, x), basis, N_u + 1))
+        if mat is None:
+            # UNCLOSED stress: expand tau in the modal basis too — its
+            # moments remain free functions (K&T pre-closure form)
+            sh_ = sp.Function(r"\hat{\sigma}", real=True)
+            m.apply(separation_of_variables(txz, sh_(t, x), basis, N_u + 1))
 
         # 7 — basis → h-equation (k=0) and the ŵ closure (k=1…N_u+2)
         m.mass.apply(ExpandSums())

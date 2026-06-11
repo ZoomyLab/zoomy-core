@@ -45,6 +45,11 @@ class VAM(BaseModel):
 
     _finalize_lazy = True               # declarative path
     level = param.Integer(default=1, bounds=(0, None))
+    material = param.Parameter(default=None, doc=(
+        "Stress closure (MaterialModel) injected at the CORE level; "
+        "None (default) leaves tau_xz UNCLOSED - its modal moments stay "
+        "free functions in the derived system. Use "
+        "material=newtonian_navier_slip() for the standard closure."))
 
     def derive_model(self):
         Nu = int(self.level)
@@ -103,8 +108,17 @@ class VAM(BaseModel):
         mx.apply({pp.at(1): 0})              # dynamic surface BC p(ζ=1)=0
         tau, uu = m.functions.tau_xz, m.functions.u
         # Navier slip: τ(0) = +λ·u_b (same sign as the slip velocity)
-        mx.apply({tau.at(1): 0, tau.at(0): lam * uu.at(0)})
-        mx.apply({tau.expr: rho * nu / h * sp.Derivative(uu.expr, zeta)})
+        mat = self.material
+        if mat is not None:
+            if mat.surface is not None:
+                mx.apply({tau.at(1): mat.surface(uu.at(1), m.parameters)})
+            if mat.bottom is not None:
+                mx.apply({tau.at(0): mat.bottom(uu.at(0), m.parameters)})
+            if mat.bulk is not None:
+                # core-level dz, realized through the sigma map: (1/h) dzeta
+                mx.apply({tau.expr: mat.bulk(
+                    uu.expr, lambda e: sp.Derivative(e, zeta) / h,
+                    m.parameters)})
         mx.apply(Simplify())
 
         mz = m.momentum_z
@@ -128,6 +142,10 @@ class VAM(BaseModel):
         m.apply(separation_of_variables(u, uh(t, x), basis, N_u))
         m.apply(separation_of_variables(w, wh(t, x), basis, N_u + 1))
         m.apply(separation_of_variables(p, ph(t, x), basis, N_u + 1))
+        if mat is None:
+            # UNCLOSED stress: expand tau in the modal basis too
+            sh_ = sp.Function(r"\hat{\sigma}", real=True)
+            m.apply(separation_of_variables(txz, sh_(t, x), basis, N_u + 1))
 
         # 5 — resolve: mass k=0…Nu+1 (h-eq + Nu+1 divergence constraints,
         # one per pressure mode); momenta k=0…Nu.  NB: re-fetch the family

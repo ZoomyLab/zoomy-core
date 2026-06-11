@@ -20,7 +20,7 @@ the symbolic term-by-term reference tests.
 import numpy as np
 import pytest
 
-from zoomy_core.model.models import SME, VAM
+from zoomy_core.model.models import SME, VAM, newtonian_navier_slip
 from zoomy_core.model.boundary_conditions import BoundaryConditions, Extrapolation
 from zoomy_core.fvm.solver_numpy import HyperbolicSolver
 from zoomy_core.fvm.solver_chorin_vam_numpy import ChorinSplitVAMSolver
@@ -52,7 +52,7 @@ def _ic(n):
 def test_vam1_matches_sme1_in_long_wave_limit():
     mesh = BaseMesh.create_1d(domain=(0.0, XMAX), n_inner_cells=NC)
 
-    sme = SME(level=1, parameters=dict(PAR), boundary_conditions=_bcs())
+    sme = SME(material=newtonian_navier_slip(), level=1, parameters=dict(PAR), boundary_conditions=_bcs())
     sm_s = sme.system_model
     sm_s.initial_conditions = IC.UserFunction(function=_ic(len(sm_s.state)))
     sm_s.aux_initial_conditions = IC.Constant(constants=lambda n: np.zeros(n))
@@ -64,7 +64,7 @@ def test_vam1_matches_sme1_in_long_wave_limit():
     Qs = np.asarray(Qs[:, :NC], float)
     ns = [str(s) for s in sm_s.state]
 
-    vam = VAM(level=1, parameters=dict(PAR), boundary_conditions=_bcs())
+    vam = VAM(material=newtonian_navier_slip(), level=1, parameters=dict(PAR), boundary_conditions=_bcs())
     sm_v = vam.system_model
     sm_v.initial_conditions = IC.UserFunction(function=_ic(len(sm_v.state)))
     sm_v.aux_initial_conditions = IC.Constant(constants=lambda n: np.zeros(n))

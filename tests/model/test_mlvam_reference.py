@@ -28,7 +28,7 @@ constant factor).
 import pytest
 import sympy as sp
 
-from zoomy_core.model.models import MLVAM
+from zoomy_core.model.models import MLVAM, newtonian_navier_slip
 
 NU = 1
 TOP = NU + 1
@@ -37,7 +37,7 @@ NL = 2
 
 @pytest.fixture(scope="module")
 def mlvam21():
-    model = MLVAM(n_layers=NL, level=NU)
+    model = MLVAM(material=newtonian_navier_slip(), n_layers=NL, level=NU)
     return model, model.system_model
 
 

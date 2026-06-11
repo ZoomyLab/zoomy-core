@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 import sympy as sp
 
-from zoomy_core.model.models import MLVAM
+from zoomy_core.model.models import MLVAM, newtonian_navier_slip
 from zoomy_core.mesh import BaseMesh
 import zoomy_core.model.initial_conditions as IC
 from zoomy_core.model.boundary_conditions import BoundaryConditions, Extrapolation
@@ -19,7 +19,7 @@ from zoomy_core.fvm.solver_chorin_vam_numpy import ChorinSplitVAMSolver
 
 @pytest.fixture(scope="module")
 def mlvam():
-    return MLVAM(n_layers=2, level=1)
+    return MLVAM(material=newtonian_navier_slip(), n_layers=2, level=1)
 
 
 def test_mlvam_is_a_square_dae(mlvam):

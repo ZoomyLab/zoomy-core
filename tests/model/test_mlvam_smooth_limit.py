@@ -10,7 +10,7 @@ an analytic expectation.
 import numpy as np
 import pytest
 
-from zoomy_core.model.models import MLSME, MLVAM
+from zoomy_core.model.models import MLSME, MLVAM, newtonian_navier_slip
 from zoomy_core.model.boundary_conditions import BoundaryConditions, Extrapolation
 from zoomy_core.fvm.solver_numpy import HyperbolicSolver
 from zoomy_core.fvm.solver_chorin_vam_numpy import ChorinSplitVAMSolver
@@ -42,7 +42,7 @@ def _ic(n):
 def test_mlvam21_matches_mlsme21_in_long_wave_limit():
     mesh = BaseMesh.create_1d(domain=(0.0, XMAX), n_inner_cells=NC)
 
-    sme = MLSME(n_layers=2, level=1, interface_velocity="mean",
+    sme = MLSME(material=newtonian_navier_slip(), n_layers=2, level=1, interface_velocity="mean",
                 parameters=dict(PAR), boundary_conditions=_bcs())
     sm_s = sme.system_model
     sm_s.initial_conditions = IC.UserFunction(function=_ic(len(sm_s.state)))
@@ -55,7 +55,7 @@ def test_mlvam21_matches_mlsme21_in_long_wave_limit():
     Qs = np.asarray(Qs[:, :NC], float)
     ns = [str(s) for s in sm_s.state]
 
-    vam = MLVAM(n_layers=2, level=1, parameters=dict(PAR),
+    vam = MLVAM(material=newtonian_navier_slip(), n_layers=2, level=1, parameters=dict(PAR),
                 boundary_conditions=_bcs())
     sm_v = vam.system_model
     sm_v.initial_conditions = IC.UserFunction(function=_ic(len(sm_v.state)))

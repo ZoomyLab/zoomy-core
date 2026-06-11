@@ -16,7 +16,7 @@ A passing run = the new SME/SWE model solves a real test case.
 import numpy as np
 import pytest
 
-from zoomy_core.model.models import SME
+from zoomy_core.model.models import SME, newtonian_navier_slip
 from zoomy_core.mesh import BaseMesh
 from zoomy_core.model.initial_conditions import RP, Constant
 from zoomy_core.model.boundary_conditions import (
@@ -30,7 +30,7 @@ def _run_dambreak(level, *, hL=2.0, hR=1.0, n_cells=100, t_end=0.3):
     """Build the new SME at `level` with BCs as always, run a 1-D dam break."""
     # the NORMAL interface — BoundaryConditions in the model constructor,
     # exactly as the production models always took them (transmissive here)
-    sm = SME(level=level, boundary_conditions=BoundaryConditions(
+    sm = SME(material=newtonian_navier_slip(), level=level, boundary_conditions=BoundaryConditions(
         [Extrapolation(tag="left"), Extrapolation(tag="right")])).system_model
     n_state = len(sm.state)
     # state = [b, h, q_0, …]; bed b=0, dam: h=hL left of x=5, hR right, momenta 0
@@ -54,7 +54,7 @@ def _run_dambreak(level, *, hL=2.0, hR=1.0, n_cells=100, t_end=0.3):
 def test_wall_bc_comes_from_the_model():
     """The wall is DEFINED in the derivation (register_group('boundary:wall'))
     and accessed at runtime via FromModel — same signature as every other BC."""
-    sm = SME(level=2).system_model
+    sm = SME(material=newtonian_navier_slip(), level=2).system_model
     bc = FromModel(tag="left", definition="wall").resolve(sm)
     ghost = bc.compute_boundary_condition(
         sm.time, sm.position, None, sm.variables,
@@ -69,7 +69,7 @@ def test_sme_dambreak_between_walls_conserves_mass():
     The mirrored ghost gives an exactly zero mass flux at each wall, so total
     mass is conserved to machine precision while the wave keeps reflecting."""
     n_cells, hL, hR = 50, 2.0, 1.0
-    sm = SME(level=2, boundary_conditions=BoundaryConditions(
+    sm = SME(material=newtonian_navier_slip(), level=2, boundary_conditions=BoundaryConditions(
         [FromModel(tag="left", definition="wall"),
          FromModel(tag="right", definition="wall")])).system_model
     n_state = len(sm.state)
@@ -99,7 +99,7 @@ def test_friction_decays_uniform_flow():
     DAMP.  Uniform flow h=0.2, q_0=0.1, λ_s=0.5 ⇒ ḣ=0 and
     q̇_0 = −λ q_0/(ρh), so q_0(t=1) = 0.1·e^{−2.5} ≈ 0.00821.  The wrong
     (pre-fix) sign grows this to ≈1.12 — far outside any tolerance."""
-    sm = SME(level=0, parameters={"lambda_s": 0.5},
+    sm = SME(material=newtonian_navier_slip(), level=0, parameters={"lambda_s": 0.5},
              boundary_conditions=BoundaryConditions(
                  [Extrapolation(tag="left"), Extrapolation(tag="right")])
              ).system_model
@@ -121,7 +121,7 @@ def test_friction_excites_q1_boundedly():
     """Level-1 dam break with bottom friction must EXCITE shear (q_1 ≠ 0 —
     the physics the inter-level coupling wants to see) and stay bounded."""
     n_cells = 100
-    sm = SME(level=1, parameters={"lambda_s": 0.5, "nu": 1e-3},
+    sm = SME(material=newtonian_navier_slip(), level=1, parameters={"lambda_s": 0.5, "nu": 1e-3},
              boundary_conditions=BoundaryConditions(
                  [Extrapolation(tag="left"), Extrapolation(tag="right")])
              ).system_model

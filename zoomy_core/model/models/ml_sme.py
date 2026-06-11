@@ -48,6 +48,11 @@ class MLSME(BaseModel):
     _finalize_lazy = True
     n_layers = param.Integer(default=2, bounds=(2, None))
     level = param.Integer(default=1, bounds=(0, None))
+    material = param.Parameter(default=None, doc=(
+        "Stress closure (MaterialModel) injected at the CORE level; "
+        "None (default) leaves tau_xz UNCLOSED - its modal moments stay "
+        "free functions in the derived system. Use "
+        "material=newtonian_navier_slip() for the standard closure."))
     interface_velocity = param.Selector(
         default="upwind", objects=["upwind", "mean"],
         doc="shared transfer velocity u* at internal interfaces")
@@ -109,10 +114,19 @@ class MLSME(BaseModel):
                 getattr(ml, nm).apply({sp.Derivative(b, t): 0})
             tau = getattr(ml.functions, f"tau_{ell}")
             uu = getattr(ml.functions, f"u_{ell}")
-            bot_stress = lam_s * uu.at(0) if ell == 1 else 0
-            ml.momentum_x.apply({tau.at(1): 0, tau.at(0): bot_stress})
-            ml.momentum_x.apply(
-                {tau.expr: rl * nu_s / h_l * sp.Derivative(uu.expr, zeta)})
+            mat = self.material
+            if mat is not None:
+                from types import SimpleNamespace
+                par_ns = SimpleNamespace(rho=rl, nu=nu_s, lambda_s=lam_s)
+                top_tr = (mat.surface(uu.at(1), par_ns)
+                          if (ell == N and mat.surface is not None) else 0)
+                bot_tr = (mat.bottom(uu.at(0), par_ns)
+                          if (ell == 1 and mat.bottom is not None) else 0)
+                ml.momentum_x.apply({tau.at(1): top_tr, tau.at(0): bot_tr})
+                if mat.bulk is not None:
+                    ml.momentum_x.apply({tau.expr: mat.bulk(
+                        uu.expr, lambda e: sp.Derivative(e, zeta) / h_l,
+                        par_ns)})
             ml.momentum_x.apply(Simplify())
             uh = sp.Function(rf"\hat{{u}}_{ell}", real=True)
             wh = sp.Function(rf"\hat{{w}}_{ell}", real=True)
@@ -120,6 +134,9 @@ class MLSME(BaseModel):
             Nb = modal_bound("N_u")
             ml.apply(separation_of_variables(u, uh(t, x), basis, Nb))
             ml.apply(separation_of_variables(w, wh(t, x), basis, Nb + 1))
+            if mat is None:
+                sh_ = sp.Function(rf"\hat{{\sigma}}_{ell}", real=True)
+                ml.apply(separation_of_variables(txz, sh_(t, x), basis, Nb + 1))
             # mass: k=0 h-eq + ŵ closure rows
             ml.mass.apply(ExpandSums()); ml.mass.apply(PullConstants())
             ml.mass.apply(ExtractBrackets(basis, var=zeta))

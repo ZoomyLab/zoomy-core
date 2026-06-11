@@ -65,6 +65,11 @@ class MLVAM(BaseModel):
     _finalize_lazy = True
     n_layers = param.Integer(default=2, bounds=(2, None))
     level = param.Integer(default=1, bounds=(0, None))
+    material = param.Parameter(default=None, doc=(
+        "Stress closure (MaterialModel) injected at the CORE level; "
+        "None (default) leaves tau_xz UNCLOSED - its modal moments stay "
+        "free functions in the derived system. Use "
+        "material=newtonian_navier_slip() for the standard closure."))
 
     def derive_model(self):
         N = int(self.n_layers)
@@ -145,10 +150,19 @@ class MLVAM(BaseModel):
                 getattr(ml, nm).apply({pp.at(1): p_top_trace_full})
             tau = getattr(ml.functions, f"tau_{ell}")
             uu = getattr(ml.functions, f"u_{ell}")
-            bot_stress = lam_s * uu.at(0) if ell == 1 else 0
-            ml.momentum_x.apply({tau.at(1): 0, tau.at(0): bot_stress})
-            ml.momentum_x.apply(
-                {tau.expr: rl * nu_s / h_l * sp.Derivative(uu.expr, zeta)})
+            mat = self.material
+            if mat is not None:
+                from types import SimpleNamespace
+                par_ns = SimpleNamespace(rho=rl, nu=nu_s, lambda_s=lam_s)
+                top_tr = (mat.surface(uu.at(1), par_ns)
+                          if (ell == N and mat.surface is not None) else 0)
+                bot_tr = (mat.bottom(uu.at(0), par_ns)
+                          if (ell == 1 and mat.bottom is not None) else 0)
+                ml.momentum_x.apply({tau.at(1): top_tr, tau.at(0): bot_tr})
+                if mat.bulk is not None:
+                    ml.momentum_x.apply({tau.expr: mat.bulk(
+                        uu.expr, lambda e: sp.Derivative(e, zeta) / h_l,
+                        par_ns)})
             ml.momentum_x.apply(Simplify())
 
             # modal ansatz: u ∈ P_Nu;  w, p ∈ P_{Nu+1} (Escalante spaces)
@@ -158,6 +172,9 @@ class MLVAM(BaseModel):
             Nb = modal_bound("N_u")
             ml.apply(separation_of_variables(u, uh(t, x), basis, Nb))
             ml.apply(separation_of_variables(w, wh(t, x), basis, Nb + 1))
+            if mat is None:
+                sh_ = sp.Function(rf"\hat{{\sigma}}_{ell}", real=True)
+                ml.apply(separation_of_variables(txz, sh_(t, x), basis, Nb + 1))
             ml.apply(separation_of_variables(
                 p, P_heads[ell - 1](t, x), basis, Nb + 1))
 
