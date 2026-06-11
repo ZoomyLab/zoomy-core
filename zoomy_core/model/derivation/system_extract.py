@@ -408,6 +408,26 @@ def _route_nonconservative_product(term, i, state, state_funcs, x, B, S):
             j = state_funcs.index(inner)
             B[i, j, 0] = B[i, j, 0] + coeff
             return
+        # Compound argument (``∂_x(P_1·h²)`` etc.): expand by the product
+        # rule and route every bare-state derivative into B.  Leaving the
+        # compound in SOURCE would surface it as an opaque LSQ aux symbol
+        # (``P_1*h**2_x``) — the CFL path, the Riemann dissipation AND the
+        # Chorin splitter are then blind to it (a pressure force frozen at
+        # P^n that the corrector never sees).
+        expanded = sp.expand(deriv.doit())
+        pieces = []
+        routed_all = True
+        for sub in sp.Add.make_args(expanded):
+            c2, d2 = _split_inner_x_derivative(sub, x)
+            if d2 is not None and d2.args[0] in state_funcs:
+                pieces.append((state_funcs.index(d2.args[0]), coeff * c2))
+            else:
+                routed_all = False
+                break
+        if routed_all and pieces:
+            for j, c in pieces:
+                B[i, j, 0] = B[i, j, 0] + c
+            return
     # Not a clean coupling — keep as source (sign-flipped).
     S[i, 0] = S[i, 0] - term
 
