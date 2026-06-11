@@ -4,8 +4,9 @@ Consumes the three sub-system models produced by
 :func:`zoomy_core.model.splitter.split_for_pressure`:
 
 * ``SM_pred``  — explicit predictor.  Evolution rows (mass + xmom_jk +
-  zmom_jk) with the pressure modes implicitly frozen at the current
-  step (read straight from ``Q[pressure_idx]``).  Solved with
+  zmom_jk) of the PRESSURE-FREE hydrostatic system (Escalante eq 12a;
+  the splitter zeroes every pressure mode in the predictor residuals —
+  the full pressure impulse belongs to the corrector).  Solved with
   :class:`HyperbolicSolver`'s Rusanov + non-conservative path-integral
   + indexed-BC flux machinery — same path the SWE/SME solvers use.
   Mass-conservative by construction.

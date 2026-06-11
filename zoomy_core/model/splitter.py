@@ -738,11 +738,16 @@ def split_for_pressure_structural(sm, pressure_vars, dt):
     * ``equation_to_state_index`` supplies the row→slot map (identity for a
       square ``from_model`` extraction).
 
-    Semantics match :func:`split_for_pressure` exactly: the predictor keeps
-    the FULL residual (pressure forces enter at ``P^n`` since the predictor
-    substep never writes the pressure slots); the elliptic rows are the
-    constraint residuals with every corrected velocity substituted; the
-    corrector applies the closed-form update via ``state_update``.
+    The predictor is the PRESSURE-FREE hydrostatic system (the evolution
+    residuals with every pressure mode set to zero) — Escalante et al. 2024
+    eq (12a): the hyperbolic step carries no non-hydrostatic terms; the FULL
+    pressure impulse ``−dt·T(P^{n+1})`` is applied by the corrector.
+    (Keeping the pressure force at ``P^n`` in the predictor double-applies
+    it and turns the pressure into an undamped alternating iteration
+    ``P^{n+1} + P^n ≈ P_phys`` that diverges at shocks — the historic VAM
+    dam-break NaN.)  The elliptic rows are the constraint residuals with
+    every corrected velocity substituted; the corrector applies the
+    closed-form update via ``state_update``.
 
     Parameters
     ----------
@@ -815,9 +820,12 @@ def split_for_pressure_structural(sm, pressure_vars, dt):
     press_res = [sp.expand(sp.sympify(residuals[i]).subs(repl).doit())
                  for i in constraint_rows]
 
-    # ── predictor: the evolution rows, full residuals ──
+    # ── predictor: the evolution rows, PRESSURE-FREE (hydrostatic part) ──
     pred_names = [f"pred_{state_names[e2s[i]]}" for i in evolution_rows]
-    pred_res = [sp.expand(residuals[i]) for i in evolution_rows]
+    pred_res = [sp.expand(sp.sympify(residuals[i])
+                          .subs({p: sp.S.Zero for p in pressure_funcs})
+                          .doit())
+                for i in evolution_rows]
     pred_e2s = [e2s[i] for i in evolution_rows]
 
     SM_pred = _build_subsystem(
