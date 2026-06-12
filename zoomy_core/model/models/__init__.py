@@ -16,10 +16,13 @@ import SME``) without the cycle.
 """
 
 __all__ = ["SigmaReference", "SWE", "SME", "VAM", "MLSWE", "MLSME", "MLVAM",
-           "MaterialModel", "ClosureState", "newtonian_navier_slip",
-           "bingham_navier_slip", "rough_wall", "kepsilon_eddy_viscosity",
-           "NewtonianSME", "NewtonianMLSWE", "NewtonianMLSME",
-           "NewtonianVAM", "NewtonianMLVAM"]
+           "MaterialModel", "ClosureState",
+           # composable stress / interface closures (closures.py)
+           "Closure", "Newtonian", "NavierSlip", "StressFree", "RoughWall",
+           "KEpsilonViscosity", "InterfaceFlux", "MeanInterface",
+           "UpwindInterface",
+           # legacy MaterialModel factories (deprecated)
+           "newtonian_navier_slip", "bingham_navier_slip"]
 
 
 def __getattr__(name):
@@ -47,12 +50,12 @@ def __getattr__(name):
     if name == "MaterialModel":
         from zoomy_core.model.models.material import MaterialModel
         return MaterialModel
-    if name in ("ClosureState", "newtonian_navier_slip", "bingham_navier_slip",
-                "rough_wall", "kepsilon_eddy_viscosity"):
+    if name in ("ClosureState", "newtonian_navier_slip", "bingham_navier_slip"):
         from zoomy_core.model.models import material as _mat
         return getattr(_mat, name)
-    if name in ("NewtonianSME", "NewtonianMLSWE", "NewtonianMLSME",
-                "NewtonianVAM", "NewtonianMLVAM"):
-        from zoomy_core.model.models import material as _mat
-        return getattr(_mat, name)
+    if name in ("Closure", "Newtonian", "NavierSlip", "StressFree", "RoughWall",
+                "KEpsilonViscosity", "InterfaceFlux", "MeanInterface",
+                "UpwindInterface"):
+        from zoomy_core.model.models import closures as _cl
+        return getattr(_cl, name)
     raise AttributeError(f"module 'zoomy_core.model.models' has no attribute {name!r}")

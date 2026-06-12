@@ -49,15 +49,17 @@ class MLSWE(BaseModel):
 
     _finalize_lazy = True
     n_layers = param.Integer(default=2, bounds=(2, None))
+    closures = param.List(default=[], doc=(
+        "Composable Closure pieces (closures.py): stress AND the interface "
+        "transfer scheme (MeanInterface/UpwindInterface). Precedence over "
+        "`material` / `interface_velocity`."))
     material = param.Parameter(default=None, doc=(
-        "Stress closure (MaterialModel) injected at the CORE level; "
-        "None (default) leaves tau_xz UNCLOSED - its modal moments stay "
-        "free functions in the derived system. Use "
-        "material=newtonian_navier_slip() for the standard closure."))
+        "DEPRECATED - use `closures=[...]`.  Legacy MaterialModel stress "
+        "closure; None leaves tau_xz UNCLOSED (modal moments stay free)."))
     interface_velocity = param.Selector(
         default="upwind", objects=["upwind", "mean"],
-        doc="transfer velocity u* at internal interfaces: sign-of-G upwind "
-            "(Hörnschemeyer Eq. 9) or arithmetic mean")
+        doc="DEPRECATED - use closures=[UpwindInterface()/MeanInterface()].  "
+            "Transfer velocity u* at internal interfaces.")
 
     def derive_model(self):
         N = int(self.n_layers)
@@ -116,27 +118,22 @@ class MLSWE(BaseModel):
             tau = getattr(ml.functions, f"tau_{ell}")
             uu = getattr(ml.functions, f"u_{ell}")
             # Navier slip at the BED only; interior interfaces inviscid here
-            mat = self.material
-            if mat is not None:
-                from types import SimpleNamespace
-                par_ns = SimpleNamespace(rho=rl, nu=nu_s, lambda_s=lam_s)
-                from zoomy_core.model.models.material import ClosureState
-                def _state(at):
-                    return ClosureState({"u": uu}, params=par_ns,
-                                        h=h_l, x=C.x, zeta=zeta, at=at)
-                top_tr = (mat.surface(_state(1))
-                          if (ell == N and mat.surface is not None) else 0)
-                bot_tr = (mat.bottom(_state(0))
-                          if (ell == 1 and mat.bottom is not None) else 0)
-                ml.momentum_x.apply({tau.at(1): top_tr, tau.at(0): bot_tr})
-                if mat.bulk is not None:
-                    ml.momentum_x.apply({tau.expr: mat.bulk(_state(None))})
+            from types import SimpleNamespace
+            from zoomy_core.model.models.material import ClosureState
+            from zoomy_core.model.models.closures import apply_layer_stress_closures
+            par_ns = SimpleNamespace(rho=rl, nu=nu_s, lambda_s=lam_s)
+            def _state(at):
+                return ClosureState({"u": uu}, params=par_ns,
+                                    h=h_l, x=C.x, zeta=zeta, at=at)
+            has_bulk = apply_layer_stress_closures(
+                self.closures, self.material, ml, ml.momentum_x, tau, _state,
+                is_top=(ell == N), is_bottom=(ell == 1))
             ml.momentum_x.apply(Simplify())
             uh = sp.Function(rf"\hat{{u}}_{ell}", real=True)
             reset_modal_indices(ml)
             Nb = modal_bound("N_u")
             ml.apply(separation_of_variables(ul, uh(t, x), basis, Nb))
-            if mat is None:
+            if not has_bulk:
                 sh_ = sp.Function(rf"\hat{{\sigma}}_{ell}", real=True)
                 ml.apply(separation_of_variables(tl, sh_(t, x), basis, Nb + 1))
             for nm in ("mass", "momentum_x"):
@@ -192,12 +189,18 @@ class MLSWE(BaseModel):
             part = sp.expand(part.subs(sp.Derivative(ht, t), dth_glob))
             G_sol[Gf[a]] = sp.solve(part, Gf[a])[0]
 
+        from zoomy_core.model.models.closures import interface_closure
+        iface = interface_closure(self.closures)
+
         def _ustar(a):
-            """Shared transfer velocity at internal interface α."""
+            """Shared transfer velocity at internal interface α: the
+            InterfaceFlux closure if given, else the legacy selector."""
+            below, above = u_lc[a - 1], u_lc[a]
+            if iface is not None:
+                return iface.expression(below, above, G_sol[Gf[a]])
             if self.interface_velocity == "mean":
-                return (u_lc[a - 1] + u_lc[a]) / 2
-            return sp.Piecewise((u_lc[a - 1], G_sol[Gf[a]] >= 0),
-                                (u_lc[a], True))
+                return (below + above) / 2
+            return sp.Piecewise((below, G_sol[Gf[a]] >= 0), (above, True))
 
         m = DModel(coords=(t, x), parameters=values)
         par = {lam_s: m.parameters.lambda_s, nu_s: m.parameters.nu}

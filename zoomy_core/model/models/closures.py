@@ -34,6 +34,38 @@ from zoomy_core.model.operations import Operation
 from zoomy_core.model.models.material import ClosureState   # the full-access state
 
 
+def apply_stress_closures(closures, material, m, mx, tau, state):
+    """Inject stress closures at the projected x-momentum (shared by SME / VAM /
+    the multilayer models).
+
+    ``closures`` is the composable list (closures.py); ``material`` is the legacy
+    MaterialModel fallback used only when ``closures`` is empty.  ``state`` is a
+    callable ``at -> ClosureState``.  Boundary traces (surface/bottom) are
+    substituted BEFORE the bulk field so the trace substitutions are not
+    pre-empted by the bulk rewrite.  Returns True iff a BULK closure was applied
+    (else the caller leaves the bulk stress free / modally expanded)."""
+    pieces = []                                       # (closes_tag, expression_fn)
+    if closures:
+        for c in closures:
+            c.register(m)
+        for c in closures:
+            c.check(m)
+            pieces.append((c.closes, c.expression))
+    elif material is not None:
+        if material.surface is not None: pieces.append(("surface", material.surface))
+        if material.bottom is not None:  pieces.append(("bottom", material.bottom))
+        if material.bulk is not None:    pieces.append(("bulk", material.bulk))
+    order = {"surface": 0, "bottom": 1, "bulk": 2}
+    pieces.sort(key=lambda p: order[p[0]])
+    target = {"surface": tau.at(1), "bottom": tau.at(0), "bulk": tau.expr}
+    loc = {"surface": 1, "bottom": 0, "bulk": None}
+    has_bulk = False
+    for closes, fn in pieces:
+        mx.apply({target[closes]: fn(state(loc[closes]))})
+        has_bulk = has_bulk or closes == "bulk"
+    return has_bulk
+
+
 class Closure(Operation):
     """Base for a one-component stress closure (see module docstring).
 
@@ -135,5 +167,80 @@ class StressFree(Closure):
         return sp.S.Zero
 
 
-__all__ = ["Closure", "ClosureState", "Newtonian", "KEpsilonViscosity",
-           "NavierSlip", "RoughWall", "StressFree"]
+# ── interface-transfer closures (multilayer) ───────────────────────────────
+# The shared transfer velocity u* at an INTERNAL layer interface — the
+# numerical scheme for the advection trace exchanged across the interface.
+# A distinct closure family: ``expression(below, above, G)`` (the two one-sided
+# modal interface traces + the interface mass flux G), not the stress ``(s)``.
+
+
+class InterfaceFlux(Closure):
+    """Base for the multilayer interface transfer-velocity scheme."""
+    closes = "interface"; requires = ()
+
+    def expression(self, below, above, G):    # noqa: D401 - distinct signature
+        raise NotImplementedError
+
+
+class MeanInterface(InterfaceFlux):
+    """Central interface velocity  u* = (u_below + u_above) / 2."""
+
+    def expression(self, below, above, G):
+        return (below + above) / 2
+
+
+class UpwindInterface(InterfaceFlux):
+    """Donor interface velocity by the sign of the interface flux G
+    (Hörnschemeyer Eq. 9): u* = u_below if G ≥ 0 else u_above."""
+
+    def expression(self, below, above, G):
+        return sp.Piecewise((below, G >= 0), (above, True))
+
+
+def apply_layer_stress_closures(closures, material, m, mx, tau, state,
+                                *, is_top, is_bottom):
+    """Per-layer stress-closure injection for the multilayer models.
+
+    Same as :func:`apply_stress_closures`, but the *surface* closure is applied
+    only on the TOP layer and the *bottom* closure only on the BED layer (the
+    internal interfaces carry no dynamic stress BC).  Returns True iff a bulk
+    closure was applied."""
+    pieces = []
+    if closures:
+        stress = [c for c in closures if c.closes in ("bulk", "bottom", "surface")]
+        for c in stress:
+            c.register(m)
+        for c in stress:
+            if c.closes == "surface" and not is_top:    continue
+            if c.closes == "bottom" and not is_bottom:  continue
+            # NB: no c.check(m) here — the multilayer state maps the generic
+            # field name ("u") to the per-layer field (u_ℓ) explicitly, so the
+            # model-namespace check (which only sees u_1/u_2/…) does not apply.
+            pieces.append((c.closes, c.expression))
+    elif material is not None:
+        if is_top and material.surface is not None:
+            pieces.append(("surface", material.surface))
+        if is_bottom and material.bottom is not None:
+            pieces.append(("bottom", material.bottom))
+        if material.bulk is not None:
+            pieces.append(("bulk", material.bulk))
+    order = {"surface": 0, "bottom": 1, "bulk": 2}
+    pieces.sort(key=lambda p: order[p[0]])
+    target = {"surface": tau.at(1), "bottom": tau.at(0), "bulk": tau.expr}
+    loc = {"surface": 1, "bottom": 0, "bulk": None}
+    has_bulk = False
+    for closes, fn in pieces:
+        mx.apply({target[closes]: fn(state(loc[closes]))})
+        has_bulk = has_bulk or closes == "bulk"
+    return has_bulk
+
+
+def interface_closure(closures):
+    """Return the InterfaceFlux closure in ``closures`` (or None)."""
+    return next((c for c in (closures or []) if c.closes == "interface"), None)
+
+
+__all__ = ["Closure", "ClosureState", "apply_stress_closures",
+           "apply_layer_stress_closures", "interface_closure",
+           "Newtonian", "KEpsilonViscosity", "NavierSlip", "RoughWall",
+           "StressFree", "InterfaceFlux", "MeanInterface", "UpwindInterface"]

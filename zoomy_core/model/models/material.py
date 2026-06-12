@@ -209,37 +209,6 @@ def kepsilon_eddy_viscosity(C_mu=0.09):
     )
 
 
-# ── pre-closed convenience variants ────────────────────────────────────────
-# Thin factories that pre-bind the standard closure — for downstream users
-# (coupling chains, solvers, cases) who want the classical Newtonian +
-# Navier-slip models without defining a closure.  Same signature as the
-# bare classes minus ``material``:  NewtonianSME(level=2, parameters=...).
-
-def NewtonianSME(**kwargs):
-    """SME with the standard Newtonian + Navier-slip closure pre-bound."""
-    from zoomy_core.model.models.sme import SME
-    return SME(material=newtonian_navier_slip(), **kwargs)
-
-
-def NewtonianMLSWE(**kwargs):
-    """MLSWE with the standard Newtonian + Navier-slip closure pre-bound."""
-    from zoomy_core.model.models.ml_swe import MLSWE
-    return MLSWE(material=newtonian_navier_slip(), **kwargs)
-
-
-def NewtonianMLSME(**kwargs):
-    """MLSME with the standard Newtonian + Navier-slip closure pre-bound."""
-    from zoomy_core.model.models.ml_sme import MLSME
-    return MLSME(material=newtonian_navier_slip(), **kwargs)
-
-
-def NewtonianVAM(**kwargs):
-    """VAM with the standard Newtonian + Navier-slip closure pre-bound."""
-    from zoomy_core.model.models.vam import VAM
-    return VAM(material=newtonian_navier_slip(), **kwargs)
-
-
-def NewtonianMLVAM(**kwargs):
-    """MLVAM with the standard Newtonian + Navier-slip closure pre-bound."""
-    from zoomy_core.model.models.ml_vam import MLVAM
-    return MLVAM(material=newtonian_navier_slip(), **kwargs)
+# The pre-closed convenience factories (NewtonianSME, NewtonianVAM, …) were
+# removed — they are superseded by the composable closure list, e.g.
+#   SME(level=2, closures=[Newtonian(), NavierSlip(), StressFree()]).

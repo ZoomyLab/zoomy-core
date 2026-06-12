@@ -46,6 +46,39 @@ def test_closures_list_equals_material_term_by_term():
             assert sp.simplify(a - b) == 0, f"{name}[{k}] differs: {sp.simplify(a - b)}"
 
 
+def _termwise_equal(A, B):
+    if [str(s) for s in A.state] != [str(s) for s in B.state]:
+        return False
+    for name in _OPERATORS:
+        a, b = getattr(A, name, None), getattr(B, name, None)
+        if a is None or b is None:
+            continue
+        fa, fb = _flat(a), _flat(b)
+        if any(sp.simplify((p or 0) - (q or 0)) != 0 for p, q in zip(fa, fb)):
+            return False
+    return True
+
+
+def test_ml_stress_closures_equal_material():
+    from zoomy_core.model.models import MLSME
+    pars = {"nu": 0.1, "lambda_s": 0.5}
+    a = MLSME(n_layers=2, level=1, material=newtonian_navier_slip(), parameters=pars).system_model
+    b = MLSME(n_layers=2, level=1, parameters=pars,
+              closures=[Newtonian(), NavierSlip(), StressFree()]).system_model
+    assert _termwise_equal(a, b)
+
+
+def test_ml_interface_closures_equal_selector():
+    from zoomy_core.model.models import MLSME
+    from zoomy_core.model.models.closures import UpwindInterface, MeanInterface
+    up_sel = MLSME(n_layers=2, level=1, interface_velocity="upwind").system_model
+    up_cl = MLSME(n_layers=2, level=1, closures=[UpwindInterface()]).system_model
+    assert _termwise_equal(up_sel, up_cl)
+    mn_sel = MLSME(n_layers=2, level=1, interface_velocity="mean").system_model
+    mn_cl = MLSME(n_layers=2, level=1, closures=[MeanInterface()]).system_model
+    assert _termwise_equal(mn_sel, mn_cl)
+
+
 def test_empty_closures_leave_stress_unclosed():
     sm = SME(level=2).system_model
     assert any("sigma" in str(s) for s in sm.aux_state)

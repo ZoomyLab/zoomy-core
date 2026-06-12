@@ -45,11 +45,12 @@ class VAM(BaseModel):
 
     _finalize_lazy = True               # declarative path
     level = param.Integer(default=1, bounds=(0, None))
+    closures = param.List(default=[], doc=(
+        "Composable stress Closure pieces (closures.py); takes precedence over "
+        "`material`.  Empty + material=None leaves tau_xz UNCLOSED."))
     material = param.Parameter(default=None, doc=(
-        "Stress closure (MaterialModel) injected at the CORE level; "
-        "None (default) leaves tau_xz UNCLOSED - its modal moments stay "
-        "free functions in the derived system. Use "
-        "material=newtonian_navier_slip() for the standard closure."))
+        "DEPRECATED - use `closures=[...]`.  Legacy MaterialModel stress "
+        "closure; None leaves tau_xz UNCLOSED (modal moments stay free)."))
 
     def derive_model(self):
         Nu = int(self.level)
@@ -108,18 +109,12 @@ class VAM(BaseModel):
         mx.apply({pp.at(1): 0})              # dynamic surface BC p(ζ=1)=0
         tau, uu = m.functions.tau_xz, m.functions.u
         # Navier slip: τ(0) = +λ·u_b (same sign as the slip velocity)
-        mat = self.material
-        if mat is not None:
-            from zoomy_core.model.models.material import ClosureState
-            def _state(at):
-                return ClosureState(m.functions, params=m.parameters,
-                                    h=h, x=x, zeta=zeta, at=at)
-            if mat.surface is not None:
-                mx.apply({tau.at(1): mat.surface(_state(1))})
-            if mat.bottom is not None:
-                mx.apply({tau.at(0): mat.bottom(_state(0))})
-            if mat.bulk is not None:
-                mx.apply({tau.expr: mat.bulk(_state(None))})
+        from zoomy_core.model.models.material import ClosureState
+        from zoomy_core.model.models.closures import apply_stress_closures
+        def _state(at):
+            return ClosureState(m.functions, params=m.parameters,
+                                h=h, x=x, zeta=zeta, at=at)
+        has_bulk = apply_stress_closures(self.closures, self.material, m, mx, tau, _state)
         mx.apply(Simplify())
 
         mz = m.momentum_z
@@ -143,9 +138,9 @@ class VAM(BaseModel):
         m.apply(separation_of_variables(u, uh(t, x), basis, N_u))
         m.apply(separation_of_variables(w, wh(t, x), basis, N_u + 1))
         m.apply(separation_of_variables(p, ph(t, x), basis, N_u + 1))
-        if mat is None or mat.bulk is None:
+        if not has_bulk:
             # UNCLOSED bulk stress: expand tau modally (also covers a
-            # boundary-only closure like rough_wall — bulk left free)
+            # boundary-only closure like RoughWall — bulk left free)
             sh_ = sp.Function(r"\hat{\sigma}", real=True)
             m.apply(separation_of_variables(txz, sh_(t, x), basis, N_u + 1))
 

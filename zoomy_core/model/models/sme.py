@@ -67,36 +67,6 @@ class SME(BaseModel):
         "closure; None (default) leaves tau_xz UNCLOSED (modal moments stay "
         "free functions)."))
 
-    def _apply_closures(self, m, mx, tau, state):
-        """Inject the stress closures at the projected x-momentum.
-
-        Uses the composable ``closures=[...]`` list (closures.py) when given,
-        else the legacy ``material=`` MaterialModel.  Boundary traces
-        (surface/bottom) are substituted BEFORE the bulk field so the trace
-        substitutions are not pre-empted by the bulk rewrite.  Returns True iff
-        a BULK closure was applied (else §6 leaves the bulk stress free)."""
-        pieces = []                                   # (closes_tag, expression_fn)
-        if self.closures:
-            for c in self.closures:
-                c.register(m)
-            for c in self.closures:
-                c.check(m)
-                pieces.append((c.closes, c.expression))
-        elif self.material is not None:
-            mat = self.material
-            if mat.surface is not None: pieces.append(("surface", mat.surface))
-            if mat.bottom is not None:  pieces.append(("bottom", mat.bottom))
-            if mat.bulk is not None:    pieces.append(("bulk", mat.bulk))
-        order = {"surface": 0, "bottom": 1, "bulk": 2}
-        pieces.sort(key=lambda p: order[p[0]])
-        target = {"surface": tau.at(1), "bottom": tau.at(0), "bulk": tau.expr}
-        loc = {"surface": 1, "bottom": 0, "bulk": None}
-        has_bulk = False
-        for closes, fn in pieces:
-            mx.apply({target[closes]: fn(state(loc[closes]))})
-            has_bulk = has_bulk or closes == "bulk"
-        return has_bulk
-
     def derive_model(self):
         """Build the declarative SME model (stored as ``self.derivation``) and
         register the vertical reconstruction.  Called by the base ``__init__``."""
@@ -175,12 +145,13 @@ class SME(BaseModel):
         # flips the friction into anti-damping — coupling caught it as
         # exponential growth of uniform flow.)
         from zoomy_core.model.models.material import ClosureState
+        from zoomy_core.model.models.closures import apply_stress_closures
         # full-access state handed to a closure: fields (s.u, …), σ-aware
         # derivatives (s.dz/s.dx) and parameters (s.par).
         def _state(at):
             return ClosureState(m.functions, params=m.parameters,
                                 h=h, x=x, zeta=zeta, at=at)
-        has_bulk = self._apply_closures(m, mx, tau, _state)
+        has_bulk = apply_stress_closures(self.closures, self.material, m, mx, tau, _state)
         mx.apply(Simplify())
 
         # 6 — separation of variables: u → û_i (N_u), w → ŵ_j (N_u + 1)

@@ -65,11 +65,13 @@ class MLVAM(BaseModel):
     _finalize_lazy = True
     n_layers = param.Integer(default=2, bounds=(2, None))
     level = param.Integer(default=1, bounds=(0, None))
+    closures = param.List(default=[], doc=(
+        "Composable Closure pieces (closures.py): stress AND the interface "
+        "transfer scheme (MeanInterface/UpwindInterface). Precedence over "
+        "`material`.  Default interface scheme is the mean."))
     material = param.Parameter(default=None, doc=(
-        "Stress closure (MaterialModel) injected at the CORE level; "
-        "None (default) leaves tau_xz UNCLOSED - its modal moments stay "
-        "free functions in the derived system. Use "
-        "material=newtonian_navier_slip() for the standard closure."))
+        "DEPRECATED - use `closures=[...]`.  Legacy MaterialModel stress "
+        "closure; None leaves tau_xz UNCLOSED (modal moments stay free)."))
 
     def derive_model(self):
         N = int(self.n_layers)
@@ -150,21 +152,16 @@ class MLVAM(BaseModel):
                 getattr(ml, nm).apply({pp.at(1): p_top_trace_full})
             tau = getattr(ml.functions, f"tau_{ell}")
             uu = getattr(ml.functions, f"u_{ell}")
-            mat = self.material
-            if mat is not None:
-                from types import SimpleNamespace
-                par_ns = SimpleNamespace(rho=rl, nu=nu_s, lambda_s=lam_s)
-                from zoomy_core.model.models.material import ClosureState
-                def _state(at):
-                    return ClosureState({"u": uu}, params=par_ns,
-                                        h=h_l, x=C.x, zeta=zeta, at=at)
-                top_tr = (mat.surface(_state(1))
-                          if (ell == N and mat.surface is not None) else 0)
-                bot_tr = (mat.bottom(_state(0))
-                          if (ell == 1 and mat.bottom is not None) else 0)
-                ml.momentum_x.apply({tau.at(1): top_tr, tau.at(0): bot_tr})
-                if mat.bulk is not None:
-                    ml.momentum_x.apply({tau.expr: mat.bulk(_state(None))})
+            from types import SimpleNamespace
+            from zoomy_core.model.models.material import ClosureState
+            from zoomy_core.model.models.closures import apply_layer_stress_closures
+            par_ns = SimpleNamespace(rho=rl, nu=nu_s, lambda_s=lam_s)
+            def _state(at):
+                return ClosureState({"u": uu}, params=par_ns,
+                                    h=h_l, x=C.x, zeta=zeta, at=at)
+            has_bulk = apply_layer_stress_closures(
+                self.closures, self.material, ml, ml.momentum_x, tau, _state,
+                is_top=(ell == N), is_bottom=(ell == 1))
             ml.momentum_x.apply(Simplify())
 
             # modal ansatz: u ∈ P_Nu;  w, p ∈ P_{Nu+1} (Escalante spaces)
@@ -174,7 +171,7 @@ class MLVAM(BaseModel):
             Nb = modal_bound("N_u")
             ml.apply(separation_of_variables(u, uh(t, x), basis, Nb))
             ml.apply(separation_of_variables(w, wh(t, x), basis, Nb + 1))
-            if mat is None:
+            if not has_bulk:
                 sh_ = sp.Function(rf"\hat{{\sigma}}_{ell}", real=True)
                 ml.apply(separation_of_variables(txz, sh_(t, x), basis, Nb + 1))
             ml.apply(separation_of_variables(
@@ -322,8 +319,16 @@ class MLVAM(BaseModel):
             return (sum(sgn(i) * mod[ell - 1][i] for i in range(Nu + 1))
                     / (l_all[ell - 1] * ht))
 
+        from zoomy_core.model.models.closures import interface_closure
+        iface = interface_closure(self.closures)
+
         def _ustar(a):
-            return (_trace(q_mod, a, 1) + _trace(q_mod, a + 1, 0)) / 2
+            below, above = _trace(q_mod, a, 1), _trace(q_mod, a + 1, 0)
+            if iface is not None:
+                # G is not solved at this point in MLVAM; the mean scheme ignores
+                # it, the upwind scheme would need the interface flux symbol.
+                return iface.expression(below, above, sp.S.Zero)
+            return (below + above) / 2
 
         m = DModel(coords=(t, x), parameters=values)
         par = {lam_s: m.parameters.lambda_s, nu_s: m.parameters.nu}

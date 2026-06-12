@@ -67,25 +67,6 @@ def test_custom_chezy_material_lands_in_source():
     assert sp.simplify(fric - expected) == 0, f"chezy friction: {fric}"
 
 
-def test_newtonian_variants_equal_explicit_injection():
-    """The pre-closed convenience factories (NewtonianSME, …) must build
-    the SAME system as the bare class with the standard closure injected."""
-    from zoomy_core.model.models import NewtonianSME, NewtonianVAM
-
-    for mk, cls, kw in ((NewtonianSME, SME, dict(level=1)),
-                        (NewtonianVAM, VAM, dict(level=1))):
-        sm_a = mk(**kw).system_model
-        sm_b = cls(material=newtonian_navier_slip(), **kw).system_model
-        assert [str(s) for s in sm_a.state] == [str(s) for s in sm_b.state]
-        for i in range(sm_a.n_equations):
-            d_ = sp.simplify(sp.sympify(sm_a.source[i, 0])
-                             - sp.sympify(sm_b.source[i, 0]))
-            assert d_ == 0, f"{mk.__name__} row {i} source differs"
-            d_ = sp.simplify(sp.sympify(sm_a.flux[i, 0])
-                             - sp.sympify(sm_b.flux[i, 0]))
-            assert d_ == 0, f"{mk.__name__} row {i} flux differs"
-
-
 def test_bingham_requires_explicit_quadrature():
     """A non-polynomial closure (Bingham) leaves Galerkin integrals the
     bracket machinery cannot resolve — extraction must REFUSE loudly and
