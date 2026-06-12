@@ -54,6 +54,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import meshio  # noqa: E402
 import numpy as np  # noqa: E402
 
+from zoomy_core.postprocessing import style  # noqa: E402
 from zoomy_core.postprocessing.plotting import (  # noqa: E402
     list_series_frames,
     plot_2d_mesh,
@@ -210,7 +211,8 @@ def main(argv=None):
     p.add_argument("--gif", action="store_true",
                    help="Also write a .gif next to the mp4.")
     p.add_argument("--fps", type=int, default=10)
-    p.add_argument("--cmap", default="viridis")
+    p.add_argument("--cmap", default=None,
+                   help="Colormap (default: the style scheme's continuous map).")
     p.add_argument("--vmin", type=float, default=None)
     p.add_argument("--vmax", type=float, default=None)
     p.add_argument("--with-edges", action="store_true",
@@ -229,6 +231,11 @@ def main(argv=None):
 
     if shutil.which("ffmpeg") is None:
         raise SystemExit("ffmpeg not found on PATH")
+
+    # Animations target the screen profile (scaled-up fonts on big canvases).
+    style.use("screen")
+    if args.cmap is None:
+        args.cmap = style.CMAP_CONTINUOUS
 
     paired = args.right is not None
     figsize = tuple(args.figsize) if args.figsize is not None else (

@@ -29,6 +29,8 @@ import matplotlib.pyplot as plt
 import meshio
 from matplotlib.collections import PolyCollection
 
+from . import style
+
 
 def _read_field(vtu_path, field_name):
     """Return ``(points2d, triangle_conn, cell_data, h_field)`` for a .vtu."""
@@ -48,8 +50,10 @@ def _read_field(vtu_path, field_name):
 
 
 def plot_map(vtu_path, field_name, out_path, clip=99.0,
-             cmap="RdBu_r", title=None):
+             cmap=None, title=None):
     """Single .vtu → one colored 2D map PNG."""
+    style.use()
+    cmap = cmap or style.CMAP_DIVERGING
     pts, conn, data, _ = _read_field(vtu_path, field_name)
 
     # Robust symmetric colorbar via percentile.
@@ -63,7 +67,7 @@ def plot_map(vtu_path, field_name, out_path, clip=99.0,
     vmin = -vmax
 
     polys = [pts[c] for c in conn]
-    fig, ax = plt.subplots(figsize=(9, 4.5), dpi=120)
+    fig, ax = plt.subplots(figsize=(9, 4.5))
     coll = PolyCollection(
         polys, array=data, cmap=cmap,
         norm=plt.Normalize(vmin=vmin, vmax=vmax),
@@ -92,13 +96,15 @@ def plot_map(vtu_path, field_name, out_path, clip=99.0,
 
 
 def plot_panels(inputs, field_name, out_path, clip=99.0,
-                cmap="RdBu_r", suptitle=None):
+                cmap=None, suptitle=None):
     """Several .vtu side-by-side with one shared symmetric colorbar.
 
     Each panel is titled by its parent dirname (e.g. ``smt_lvl0_...``).
     The colorbar limit is the max of the per-panel P{clip} percentiles
     so all maps are directly comparable.
     """
+    style.use()
+    cmap = cmap or style.CMAP_DIVERGING
     panels = []
     for path in inputs:
         if not os.path.exists(path):
@@ -123,7 +129,7 @@ def plot_panels(inputs, field_name, out_path, clip=99.0,
     vmin = -vmax
 
     fig, axes = plt.subplots(
-        1, len(panels), figsize=(5.0 * len(panels), 4.2), dpi=120,
+        1, len(panels), figsize=(5.0 * len(panels), 4.2),
         squeeze=False,
     )
     coll = None
@@ -150,7 +156,7 @@ def plot_panels(inputs, field_name, out_path, clip=99.0,
     )
     cbar.set_label(f"{field_name}   (clipped P{clip:.0f})")
     if suptitle:
-        fig.suptitle(suptitle, fontsize=12)
+        fig.suptitle(suptitle)
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     fig.savefig(out_path)
     plt.close(fig)
