@@ -141,15 +141,18 @@ class SME(BaseModel):
         # exponential growth of uniform flow.)
         mat = self.material
         if mat is not None:
+            from zoomy_core.model.models.material import ClosureState
+            # core-level dz, realized through the sigma map: dz = (1/h) dzeta
+            dz = lambda e: sp.Derivative(e, zeta) / h
             if mat.surface is not None:
-                mx.apply({tau.at(1): mat.surface(uu.at(1), m.parameters)})
+                mx.apply({tau.at(1): mat.surface(
+                    ClosureState(m.functions, at=1), dz, m.parameters)})
             if mat.bottom is not None:
-                mx.apply({tau.at(0): mat.bottom(uu.at(0), m.parameters)})
+                mx.apply({tau.at(0): mat.bottom(
+                    ClosureState(m.functions, at=0), dz, m.parameters)})
             if mat.bulk is not None:
-                # core-level dz, realized through the sigma map: dz = (1/h) dzeta
                 mx.apply({tau.expr: mat.bulk(
-                    uu.expr, lambda e: sp.Derivative(e, zeta) / h,
-                    m.parameters)})
+                    ClosureState(m.functions, at=None), dz, m.parameters)})
         mx.apply(Simplify())
 
         # 6 — separation of variables: u → û_i (N_u), w → ŵ_j (N_u + 1)
@@ -158,9 +161,12 @@ class SME(BaseModel):
         N_u = modal_bound("N_u")
         m.apply(separation_of_variables(u, uh(t, x), basis, N_u))
         m.apply(separation_of_variables(w, wh(t, x), basis, N_u + 1))
-        if mat is None:
-            # UNCLOSED stress: expand tau in the modal basis too — its
-            # moments remain free functions (K&T pre-closure form)
+        if mat is None or mat.bulk is None:
+            # UNCLOSED bulk stress: expand tau in the modal basis too — its
+            # moments remain free functions (K&T pre-closure form).  This also
+            # covers a BOUNDARY-ONLY closure (e.g. rough_wall: bottom/surface
+            # set, bulk left free) — the dynamic BC traces are already baked in
+            # §5, the bulk stays a free modal field.
             sh_ = sp.Function(r"\hat{\sigma}", real=True)
             m.apply(separation_of_variables(txz, sh_(t, x), basis, N_u + 1))
 

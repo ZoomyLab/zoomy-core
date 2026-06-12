@@ -50,9 +50,9 @@ def test_standard_closure_produces_friction(cls, kw):
 
 def test_custom_chezy_material_lands_in_source():
     chezy = MaterialModel(
-        bulk=lambda u, dz, par: par.rho * par.nu * dz(u),
-        bottom=lambda u_b, par: par.lambda_s * u_b * u_b,
-        surface=lambda u_s, par: 0,
+        bulk=lambda s, dz, par: par.rho * par.nu * dz(s.u),
+        bottom=lambda s, dz, par: par.lambda_s * s.u * s.u,
+        surface=lambda s, dz, par: 0,
         name="newtonian+chezy",
     )
     sm = SME(level=1, material=chezy).system_model

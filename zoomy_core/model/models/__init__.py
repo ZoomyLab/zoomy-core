@@ -16,7 +16,8 @@ import SME``) without the cycle.
 """
 
 __all__ = ["SigmaReference", "SWE", "SME", "VAM", "MLSWE", "MLSME", "MLVAM",
-           "MaterialModel", "newtonian_navier_slip",
+           "MaterialModel", "ClosureState", "newtonian_navier_slip",
+           "bingham_navier_slip", "rough_wall", "kepsilon_eddy_viscosity",
            "NewtonianSME", "NewtonianMLSWE", "NewtonianMLSME",
            "NewtonianVAM", "NewtonianMLVAM"]
 
@@ -46,9 +47,10 @@ def __getattr__(name):
     if name == "MaterialModel":
         from zoomy_core.model.models.material import MaterialModel
         return MaterialModel
-    if name == "newtonian_navier_slip":
-        from zoomy_core.model.models.material import newtonian_navier_slip
-        return newtonian_navier_slip
+    if name in ("ClosureState", "newtonian_navier_slip", "bingham_navier_slip",
+                "rough_wall", "kepsilon_eddy_viscosity"):
+        from zoomy_core.model.models import material as _mat
+        return getattr(_mat, name)
     if name in ("NewtonianSME", "NewtonianMLSWE", "NewtonianMLSME",
                 "NewtonianVAM", "NewtonianMLVAM"):
         from zoomy_core.model.models import material as _mat

@@ -110,15 +110,18 @@ class VAM(BaseModel):
         # Navier slip: τ(0) = +λ·u_b (same sign as the slip velocity)
         mat = self.material
         if mat is not None:
+            from zoomy_core.model.models.material import ClosureState
+            # core-level dz, realized through the sigma map: (1/h) dzeta
+            dz = lambda e: sp.Derivative(e, zeta) / h
             if mat.surface is not None:
-                mx.apply({tau.at(1): mat.surface(uu.at(1), m.parameters)})
+                mx.apply({tau.at(1): mat.surface(
+                    ClosureState(m.functions, at=1), dz, m.parameters)})
             if mat.bottom is not None:
-                mx.apply({tau.at(0): mat.bottom(uu.at(0), m.parameters)})
+                mx.apply({tau.at(0): mat.bottom(
+                    ClosureState(m.functions, at=0), dz, m.parameters)})
             if mat.bulk is not None:
-                # core-level dz, realized through the sigma map: (1/h) dzeta
                 mx.apply({tau.expr: mat.bulk(
-                    uu.expr, lambda e: sp.Derivative(e, zeta) / h,
-                    m.parameters)})
+                    ClosureState(m.functions, at=None), dz, m.parameters)})
         mx.apply(Simplify())
 
         mz = m.momentum_z
@@ -142,8 +145,9 @@ class VAM(BaseModel):
         m.apply(separation_of_variables(u, uh(t, x), basis, N_u))
         m.apply(separation_of_variables(w, wh(t, x), basis, N_u + 1))
         m.apply(separation_of_variables(p, ph(t, x), basis, N_u + 1))
-        if mat is None:
-            # UNCLOSED stress: expand tau in the modal basis too
+        if mat is None or mat.bulk is None:
+            # UNCLOSED bulk stress: expand tau modally (also covers a
+            # boundary-only closure like rough_wall — bulk left free)
             sh_ = sp.Function(r"\hat{\sigma}", real=True)
             m.apply(separation_of_variables(txz, sh_(t, x), basis, N_u + 1))
 
