@@ -923,7 +923,11 @@ class SystemModel:
                     "SystemModel.from_model: could not derive Q from the model "
                     "(no ∂_t evolution rows found); pass Q= explicitly.")
         ops = extract_system_operators(model, Q, Qaux)
-        normal = Zstruct(n0=sp.Symbol("n0", real=True))
+        # One normal component per horizontal direction — ``space`` length is
+        # ``n_dim`` (1 for the usual SME, 2 for the dimension-agnostic
+        # ``dimension=3`` map-view model).
+        normal = Zstruct(**{f"n{d}": sp.Symbol(f"n{d}", real=True)
+                            for d in range(len(ops["space"]))})
         normal._symbolic_name = "n"
         sm = cls(
             aux_state=ops["aux_state"],

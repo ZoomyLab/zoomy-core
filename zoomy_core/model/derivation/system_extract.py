@@ -105,9 +105,14 @@ def extract_system_operators(model, Q, Qaux=None):
         ``SystemModel(...)``.
     """
     t = model.coords[0]
-    x = model.horizontal[0] if model.horizontal else model.coords[1]
-    space = [sp.Symbol("x", real=True)]
-    x_sym = space[0]
+    # One spatial Symbol per horizontal direction (``n_dim`` ≥ 1).  The coords
+    # are real Symbols (``zoomy_core.coords``), so reusing them directly
+    # guarantees the residual's ``∂_{x_d}`` derivative variables match these
+    # spatial symbols.  A single horizontal recovers the 1-D path verbatim.
+    horizontals = (list(model.horizontal) if model.horizontal
+                   else [model.coords[1]])
+    space = list(horizontals)
+    n_dim = len(space)
 
     param_names = set(model.parameters.keys())
     gravity_param = (model.parameters.g
@@ -146,13 +151,13 @@ def extract_system_operators(model, Q, Qaux=None):
     aux_state = [_state_symbol(f) for f in Qaux]
     n_eq = len(state)
     n_state = len(state)
-    n_dim = 1
 
-    # Map every field application → its state/aux Symbol-as-(t, x)-function so
-    # structural ``∂_t`` / ``∂_x`` collection is well-defined.  ``x_sym`` is the
-    # SystemModel spatial Symbol; the field's own ``x`` is rewritten onto it.
-    state_fn = {s: sp.Function(str(s), real=True)(t, x_sym) for s in state}
-    aux_fn = {s: sp.Function(str(s), real=True)(t, x_sym) for s in aux_state}
+    # Map every field application → its state/aux Symbol-as-(t, *space)-function
+    # so structural ``∂_t`` / ``∂_{x_d}`` collection is well-defined in every
+    # horizontal direction.  ``space`` are the SystemModel spatial Symbols; the
+    # field's own horizontal coords are rewritten onto them.
+    state_fn = {s: sp.Function(str(s), real=True)(t, *space) for s in state}
+    aux_fn = {s: sp.Function(str(s), real=True)(t, *space) for s in aux_state}
     field_to_fn = {}
     for f in Q:
         field_to_fn[f] = state_fn[_state_symbol(f)]
@@ -175,7 +180,7 @@ def extract_system_operators(model, Q, Qaux=None):
     for i in range(n_eq):
         residual = sp.expand(rows[i].xreplace(field_to_fn))
         _classify_row(
-            residual, i, state, state_funcs, t, x_sym, gravity_param,
+            residual, i, state, state_funcs, t, space, gravity_param,
             F, P, B, S, M, A,
         )
         for d in range(n_dim):
@@ -195,8 +200,8 @@ def extract_system_operators(model, Q, Qaux=None):
     S = _to_sym(S)
     M = _to_sym(M)
     B = sp.MutableDenseNDimArray(
-        [[[_to_sym(sp.sympify(B[r, c, 0]))] for c in range(n_state)]
-         for r in range(n_eq)])
+        [[[_to_sym(sp.sympify(B[r, c, d])) for d in range(n_dim)]
+          for c in range(n_state)] for r in range(n_eq)])
     A_out = None
     if A_nonzero:
         A_out = sp.MutableDenseNDimArray(
@@ -244,13 +249,17 @@ def extract_system_operators(model, Q, Qaux=None):
     )
 
 
-def _classify_row(residual, i, state, state_funcs, t, x, gravity_param,
+def _classify_row(residual, i, state, state_funcs, t, space, gravity_param,
                   F, P, B, S, M, A):
     """Split one row residual into ``M / F / P / B / S / A`` slots using the
-    production term classifier.  ``residual`` is in state-Symbol-as-(t, x)
-    Function form."""
+    production term classifier.  ``residual`` is in state-Symbol-as-(t, *space)
+    Function form; ``space`` is the list of horizontal spatial symbols (one per
+    flux column).  Each spatial term routes to the column ``d`` of the
+    direction its derivative is taken in, so the multi-horizontal case folds
+    out of the SAME per-direction branch logic as the 1-D case (single
+    horizontal ⇒ ``d`` ≡ 0, byte-identical to the legacy path)."""
     from zoomy_core.model.derivation.tag_extraction import (
-        _split_coeff_and_derivative,
+        _split_coeff_and_derivative, _first_order_direction,
     )
 
     n_state = len(state)
@@ -297,92 +306,101 @@ def _classify_row(residual, i, state, state_funcs, t, x, gravity_param,
 
         coeff, deriv = _split_coeff_and_derivative(term)
 
-        # 2. Second-order diffusion ``∂_x(coeff · ∂_x Q_j)`` → diffusion_matrix.
-        # Checked BEFORE the flux / NCP branches: the outer ``∂_x`` is
-        # first-order in x but its argument carries an inner ``∂_x`` (the
-        # diffusive flux ``Fᵈ = A ∇Q``), so it must NOT be mistyped as an
-        # advective flux.
-        if deriv is not None and _is_second_order_x(deriv, x):
-            _route_diffusion(term, i, deriv, coeff, state_funcs, x, A)
+        # 2. Second-order diffusion ``∂_{x_d}(coeff · ∂_{x_e} Q_j)`` →
+        # diffusion_matrix.  Checked BEFORE the flux / NCP branches: the outer
+        # ``∂_{x_d}`` is first-order but its argument carries an inner spatial
+        # derivative (the diffusive flux ``Fᵈ = A ∇Q``), so it must NOT be
+        # mistyped as an advective flux.
+        if deriv is not None and _second_order_dirs(deriv, space) is not None:
+            _route_diffusion(term, i, deriv, coeff, state_funcs, space, A)
             continue
 
-        # 3. No spatial derivative → source (sign-flipped: S = −LHS).
-        if deriv is None or deriv.variables != (x,):
+        # 3. No first-order spatial derivative → source (sign-flipped: S = −LHS).
+        d = (_first_order_direction(deriv, space)
+             if deriv is not None else None)
+        if d is None:
             S[i, 0] = S[i, 0] - term
             continue
+        x = space[d]
 
         inner = deriv.args[0]
         coeff_has_state = any(coeff.has(f) for f in state_set)
 
-        # 4. coeff·∂_x(state).  A state-free, (t,x)-free coeff is an EXACT
-        # divergence ``∂_x(coeff·Q_j)`` — a conservative FLUX, never a
-        # ``B·∂_x Q`` coupling (the mass row ``∂_x q_0`` must reach the
-        # generated flux kernels: interface/open-boundary mass exchange uses
-        # flux + fluctuations, and mass-in-NCP transmits only the jump).
-        # Genuinely non-conservative couplings (state-dependent coeff: the
-        # bed slope ``g h ∂_x b``, the SME cross-mode ``q_i/h·∂_x q_j``)
-        # stay in B.
+        # 4. coeff·∂_{x_d}(state).  A state-free, (t, x_d)-free coeff is an EXACT
+        # divergence ``∂_{x_d}(coeff·Q_j)`` — a conservative FLUX in column d,
+        # never a ``B·∂_{x_d} Q`` coupling (the mass row ``∂_{x_d} q_0`` must
+        # reach the generated flux kernels: interface/open-boundary mass
+        # exchange uses flux + fluctuations, mass-in-NCP transmits only the
+        # jump).  Genuinely non-conservative couplings (state-dependent coeff:
+        # the bed slope ``g h ∂_{x_d} b``, the SME cross-mode
+        # ``q_i/h·∂_{x_d} q_j``) stay in B.
         if inner in sym_of_func:
             if not coeff_has_state and not coeff.has(x) and not coeff.has(t):
                 flux_i = coeff * inner
                 if gravity_param is not None and flux_i.has(gravity_param):
-                    P[i, 0] = P[i, 0] + flux_i
+                    P[i, d] = P[i, d] + flux_i
                 else:
-                    F[i, 0] = F[i, 0] + flux_i
+                    F[i, d] = F[i, d] + flux_i
                 continue
             j = state_funcs.index(inner)
-            B[i, j, 0] = B[i, j, 0] + coeff
+            B[i, j, d] = B[i, j, d] + coeff
             continue
 
         inner_has_state = any(inner.has(f) for f in state_set)
 
-        # 5. ∂_x(F(state)) with state-free coeff → flux / pressure.
+        # 5. ∂_{x_d}(F(state)) with state-free coeff → flux / pressure (col d).
         if inner_has_state and not coeff_has_state:
             flux_i = coeff * inner
             if gravity_param is not None and inner.has(gravity_param):
-                P[i, 0] = P[i, 0] + flux_i
+                P[i, d] = P[i, d] + flux_i
             else:
-                F[i, 0] = F[i, 0] + flux_i
+                F[i, d] = F[i, d] + flux_i
             continue
 
-        # 6. state-dependent coeff on a ∂_x argument — the non-conservative
+        # 6. state-dependent coeff on a ∂_{x_d} argument — the non-conservative
         # product that production keeps unfolded (the SME cross-mode couplings
-        # ``q_i/h · ∂_x q_j``).  Route to ``B`` (or source if not a clean
-        # coupling).
+        # ``q_i/h · ∂_{x_d} q_j``).  Route to ``B`` column d (or source).
         _route_nonconservative_product(
-            term, i, state, state_funcs, x, B, S)
+            term, i, state, state_funcs, space, d, B, S)
 
 
-def _is_second_order_x(deriv, x):
-    """True if ``deriv`` is a pure second-order ``∂_x ∂_x`` (or contains a
-    nested ``∂_x`` of a ``∂_x``)."""
-    if deriv.variables == (x, x):
-        return True
-    # ∂_x(coeff·∂_x Q): the outer is first-order in x but its argument carries
-    # an inner ∂_x.
-    if deriv.variables == (x,):
+def _second_order_dirs(deriv, space):
+    """If ``deriv`` is a second-order spatial derivative, return the
+    ``(outer_dir, inner_dir)`` index pair — the diffusion column / gradient
+    directions ``A[:, :, d, e]``; else ``None``.  Generalizes the 1-D
+    ``∂_x∂_x`` / ``∂_x(·∂_x·)`` test to every horizontal direction."""
+    v = deriv.variables
+    # Pure second derivative ``∂_{x_d} ∂_{x_e}`` (covers ``∂_{x_d}²``).
+    if len(v) == 2 and v[0] in space and v[1] in space:
+        return space.index(v[0]), space.index(v[1])
+    # Outer ``∂_{x_d}`` whose argument carries an inner spatial ``∂_{x_e}``.
+    if len(v) == 1 and v[0] in space:
+        d = space.index(v[0])
         inner = deriv.args[0]
-        return any(d.variables == (x,) for d in inner.atoms(sp.Derivative))
-    return False
+        for dd in inner.atoms(sp.Derivative):
+            if len(dd.variables) == 1 and dd.variables[0] in space:
+                return d, space.index(dd.variables[0])
+    return None
 
 
-def _route_diffusion(term, i, deriv, coeff, state_funcs, x, A):
-    """Route a second-order ``coeff · ∂_x(D · ∂_x Q_j)`` term into the rank-4
-    diffusion tensor ``A[i, j, 0, 0]`` (the diffusive flux ``Fᵈ = A ∇Q``).
-
-    The residual carries ``+∂_x(Fᵈ)`` with ``Fᵈ[i] = Σ_j A[i, j, 0, 0]·∂_x Q_j``;
-    we read the inner ``D·∂_x Q_j`` and place ``coeff · D`` at ``A[i, j, 0, 0]``.
-    """
-    # Bare second derivative ``coeff · ∂_xx Q_j``: identical to
-    # ``∂_x(coeff · ∂_x Q_j)`` ONLY for a (t, x, state)-free coeff — route
-    # that; anything else has no conservative reading here → raise (silent
-    # drops in this branch hid the VAM b″ bathymetry terms for weeks).
-    if deriv.variables == (x, x):
+def _route_diffusion(term, i, deriv, coeff, state_funcs, space, A):
+    """Route a second-order ``coeff · ∂_{x_d}(D · ∂_{x_e} Q_j)`` term into the
+    rank-4 diffusion tensor ``A[i, j, d, e]`` (the diffusive flux
+    ``Fᵈ = A ∇Q``): the outer derivative sets the flux column ``d``, the inner
+    derivative the gradient direction ``e``.  Single-horizontal models give
+    ``d = e = 0``, byte-identical to the legacy path."""
+    v = deriv.variables
+    # Bare second derivative ``coeff · ∂_{x_d}∂_{x_e} Q_j``: identical to
+    # ``∂_{x_d}(coeff · ∂_{x_e} Q_j)`` ONLY for a (t, spatial, state)-free coeff
+    # — route that; anything else has no conservative reading here → raise
+    # (silent drops in this branch hid the VAM b″ bathymetry terms for weeks).
+    if len(v) == 2 and v[0] in space and v[1] in space:
+        d, e = space.index(v[0]), space.index(v[1])
         q = deriv.args[0]
-        if (q in state_funcs and not coeff.has(x)
+        if (q in state_funcs and not any(coeff.has(s) for s in space)
                 and not any(coeff.has(f) for f in state_funcs)):
             j = state_funcs.index(q)
-            A[i, j, 0, 0] = A[i, j, 0, 0] + coeff
+            A[i, j, d, e] = A[i, j, d, e] + coeff
             return
         raise ValueError(
             f"row {i}: cannot route bare second-derivative term {term} — "
@@ -390,17 +408,18 @@ def _route_diffusion(term, i, deriv, coeff, state_funcs, x, A):
             "derivation (own atom, not mixed with derivative-free flux "
             "parts).")
 
-    inner = deriv.args[0]            # D · ∂_x Q_j  (the diffusive flux)
-    # ``.doit()`` resolves an inner ``∂_x(q_j/h)`` (the CoV-introduced
-    # conserved-variable derivative) into ``∂_x q_j/h − q_j·∂_x h/h²`` so the
-    # BARE state derivatives ``∂_x q_j`` / ``∂_x h`` surface and are routed; a
-    # raw ``∂_x(q_j/h)`` would otherwise carry a non-state ``q_j/h`` argument
-    # and the dominant diagonal diffusion would be silently dropped.
+    d = space.index(v[0])           # outer-derivative flux column
+    inner = deriv.args[0]           # D · ∂_{x_e} Q_j  (the diffusive flux)
+    # ``.doit()`` resolves an inner ``∂_{x_e}(q_j/h)`` (the CoV-introduced
+    # conserved-variable derivative) into ``∂_{x_e} q_j/h − q_j·∂_{x_e} h/h²`` so
+    # the BARE state derivatives surface and are routed; a raw ``∂_{x_e}(q_j/h)``
+    # would otherwise carry a non-state ``q_j/h`` argument and the dominant
+    # diagonal diffusion would be silently dropped.
     for sub in sp.Add.make_args(sp.expand(inner.doit())):
-        c2, d2 = _split_inner_x_derivative(sub, x)
+        c2, d2, e = _split_inner_x_derivative(sub, space)
         if d2 is not None and d2.args[0] in state_funcs:
             j = state_funcs.index(d2.args[0])
-            A[i, j, 0, 0] = A[i, j, 0, 0] + coeff * c2
+            A[i, j, d, e] = A[i, j, d, e] + coeff * c2
             continue
         raise ValueError(
             f"row {i}: diffusion-compound piece {sub} of ∂_x({inner}) has "
@@ -409,38 +428,40 @@ def _route_diffusion(term, i, deriv, coeff, state_funcs, x, A):
             "keep bx-bearing flux parts in their OWN compound atom.")
 
 
-def _split_inner_x_derivative(term, x):
-    """Return ``(coeff, ∂_x Q)`` for a ``coeff · ∂_x Q`` term, else
-    ``(None, None)``."""
+def _split_inner_x_derivative(term, space):
+    """Return ``(coeff, ∂_{x_e} Q, e)`` for a ``coeff · ∂_{x_e} Q`` term (``e``
+    = the horizontal direction index), else ``(None, None, None)``."""
     factors = term.args if isinstance(term, sp.Mul) else [term]
     deriv = None
     for f in factors:
-        if isinstance(f, sp.Derivative) and f.variables == (x,):
+        if (isinstance(f, sp.Derivative) and len(f.variables) == 1
+                and f.variables[0] in space):
             deriv = f
             break
     if deriv is None:
-        return None, None
+        return None, None, None
+    e = space.index(deriv.variables[0])
     coeff = sp.Mul(*[f for f in factors if f is not deriv])
-    return coeff, deriv
+    return coeff, deriv, e
 
 
-def _route_nonconservative_product(term, i, state, state_funcs, x, B, S):
-    """A ``coeff(state) · ∂_x(F(state))`` term that production keeps unfolded —
-    it is already a ``coeff · ∂_x Q_j`` non-conservative coupling (the SME
-    cross-mode terms ``q_i/h · ∂_x q_j``).  Read ``(j, coeff)`` and add to
-    ``B[i, j]``.  If the derivative argument is not a bare state Symbol the
-    term cannot be a clean NCP coupling — route it to source as a fallback."""
+def _route_nonconservative_product(term, i, state, state_funcs, space, d, B, S):
+    """A ``coeff(state) · ∂_{x_d}(F(state))`` term that production keeps
+    unfolded — it is already a ``coeff · ∂_{x_d} Q_j`` non-conservative coupling
+    (the SME cross-mode terms ``q_i/h · ∂_{x_d} q_j``).  Read ``(j, coeff)`` and
+    add to ``B[i, j, d]``.  If the derivative argument is not a bare state
+    Symbol the term cannot be a clean NCP coupling — route it to source."""
     from zoomy_core.model.derivation.tag_extraction import (
-        _split_coeff_and_derivative,
+        _split_coeff_and_derivative, _first_order_direction,
     )
     coeff, deriv = _split_coeff_and_derivative(term)
-    if deriv is not None and deriv.variables == (x,):
+    if deriv is not None and _first_order_direction(deriv, space) == d:
         inner = deriv.args[0]
         if inner in state_funcs:
             j = state_funcs.index(inner)
-            B[i, j, 0] = B[i, j, 0] + coeff
+            B[i, j, d] = B[i, j, d] + coeff
             return
-        # Compound argument (``∂_x(P_1·h²)`` etc.): expand by the product
+        # Compound argument (``∂_{x_d}(P_1·h²)`` etc.): expand by the product
         # rule and route every bare-state derivative into B.  Leaving the
         # compound in SOURCE would surface it as an opaque LSQ aux symbol
         # (``P_1*h**2_x``) — the CFL path, the Riemann dissipation AND the
@@ -450,15 +471,15 @@ def _route_nonconservative_product(term, i, state, state_funcs, x, B, S):
         pieces = []
         routed_all = True
         for sub in sp.Add.make_args(expanded):
-            c2, d2 = _split_inner_x_derivative(sub, x)
+            c2, d2, e = _split_inner_x_derivative(sub, space)
             if d2 is not None and d2.args[0] in state_funcs:
-                pieces.append((state_funcs.index(d2.args[0]), coeff * c2))
+                pieces.append((state_funcs.index(d2.args[0]), e, coeff * c2))
             else:
                 routed_all = False
                 break
         if routed_all and pieces:
-            for j, c in pieces:
-                B[i, j, 0] = B[i, j, 0] + c
+            for j, e, c in pieces:
+                B[i, j, e] = B[i, j, e] + c
             return
     # Not a clean coupling — keep as source (sign-flipped).
     S[i, 0] = S[i, 0] - term
