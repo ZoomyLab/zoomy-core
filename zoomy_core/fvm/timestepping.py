@@ -24,7 +24,7 @@ def constant(dt=0.1):
     return compute_dt
 
 
-def adaptive(CFL=0.9, nu=0.0, dimension=2, degree=0):
+def adaptive(CFL=0.9, nu=0.0, dimension=2, degree=0, dt_max=None):
     """Adaptive CFL-based timestep.
 
     Uses the classical hyperbolic / parabolic limits with the spatial
@@ -48,6 +48,12 @@ def adaptive(CFL=0.9, nu=0.0, dimension=2, degree=0):
     ----------
     CFL : float in (0, 1]
         Safety factor on top of the theoretical limit (default 0.9).
+    dt_max : float, optional
+        Hard upper cap on dt — for explicit SOURCE stiffness (e.g. the
+        regularized-Bingham plug viscosity or a bed-slip penalty) that
+        the hyperbolic CFL cannot see.  Backend-neutral (JIT-safe):
+        prefer this over wrapping ``compute_dt`` in a Python
+        ``min(float(...))`` lambda, which fails under ``jax.jit``.
     nu : float
         Scalar viscosity for the parabolic CFL (default 0 → skip).
     dimension : int
@@ -61,9 +67,10 @@ def adaptive(CFL=0.9, nu=0.0, dimension=2, degree=0):
     def compute_dt(Q, Qaux, parameters, min_inradius, compute_max_abs_eigenvalue):
         ev_abs_max = compute_max_abs_eigenvalue(Q, Qaux, parameters)
         h = 2.0 * min_inradius                                # conservative cell size
-        dt_conv = (CFL * h / (dim_fac * deg_fac * ev_abs_max)).min()
+        dt = (CFL * h / (dim_fac * deg_fac * ev_abs_max)).min()
         if nu > 0:
-            dt_diff = CFL * h ** 2 / (2.0 * dim_fac * nu)
-            return _safe_minimum(dt_conv, dt_diff)
-        return dt_conv
+            dt = _safe_minimum(dt, CFL * h ** 2 / (2.0 * dim_fac * nu))
+        if dt_max is not None:
+            dt = _safe_minimum(dt, dt_max)
+        return dt
     return compute_dt
