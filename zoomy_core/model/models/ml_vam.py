@@ -155,15 +155,16 @@ class MLVAM(BaseModel):
                 from types import SimpleNamespace
                 par_ns = SimpleNamespace(rho=rl, nu=nu_s, lambda_s=lam_s)
                 from zoomy_core.model.models.material import ClosureState
-                dz = lambda e: sp.Derivative(e, zeta) / h_l
-                top_tr = (mat.surface(ClosureState({"u": uu}, at=1), dz, par_ns)
+                def _state(at):
+                    return ClosureState({"u": uu}, params=par_ns,
+                                        h=h_l, x=C.x, zeta=zeta, at=at)
+                top_tr = (mat.surface(_state(1))
                           if (ell == N and mat.surface is not None) else 0)
-                bot_tr = (mat.bottom(ClosureState({"u": uu}, at=0), dz, par_ns)
+                bot_tr = (mat.bottom(_state(0))
                           if (ell == 1 and mat.bottom is not None) else 0)
                 ml.momentum_x.apply({tau.at(1): top_tr, tau.at(0): bot_tr})
                 if mat.bulk is not None:
-                    ml.momentum_x.apply({tau.expr: mat.bulk(
-                        ClosureState({"u": uu}, at=None), dz, par_ns)})
+                    ml.momentum_x.apply({tau.expr: mat.bulk(_state(None))})
             ml.momentum_x.apply(Simplify())
 
             # modal ansatz: u ∈ P_Nu;  w, p ∈ P_{Nu+1} (Escalante spaces)

@@ -331,6 +331,20 @@ class Model:
         self._ever_seen_heads: set = set()
 
     # ── parameters helpers ───────────────────────────────────────────
+    def parameter(self, name, default=0.0):
+        """Register-or-query a model parameter.  Returns the existing positive
+        Symbol if ``name`` is already declared, otherwise creates it (with the
+        given numeric ``default``) and returns it.  This lets a closure declare
+        the parameters it needs at apply-time without the model author having to
+        pre-list them; a value the user passed via ``parameters={...}`` always
+        wins (it is already present, so the default here is ignored)."""
+        if name in self.parameters.keys():
+            return getattr(self.parameters, name)
+        sym = sp.Symbol(name, positive=True)
+        setattr(self.parameters, name, sym)
+        setattr(self.parameter_values, name, default)
+        return sym
+
     @property
     def coords(self):
         return self._coords

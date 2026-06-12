@@ -56,11 +56,46 @@ class SME(BaseModel):
         "(non-polynomial material closures, e.g. bingham_navier_slip). "
         "0 (default) = off: an unresolvable integral then raises at "
         "extraction."))
+    closures = param.List(default=[], doc=(
+        "List of composable stress Closure pieces (closures.py), e.g. "
+        "closures=[Newtonian(), NavierSlip(), StressFree()] or "
+        "closures=[KEpsilonViscosity(), RoughWall()].  Each closes one stress "
+        "component (bulk / bottom / surface).  Takes precedence over `material`; "
+        "an empty list with material=None leaves tau_xz UNCLOSED."))
     material = param.Parameter(default=None, doc=(
-        "Stress closure (MaterialModel) injected at the CORE level; "
-        "None (default) leaves tau_xz UNCLOSED — its modal moments stay "
-        "free functions in the derived system. Use "
-        "material=newtonian_navier_slip() for the standard closure."))
+        "DEPRECATED — use `closures=[...]`.  Legacy MaterialModel stress "
+        "closure; None (default) leaves tau_xz UNCLOSED (modal moments stay "
+        "free functions)."))
+
+    def _apply_closures(self, m, mx, tau, state):
+        """Inject the stress closures at the projected x-momentum.
+
+        Uses the composable ``closures=[...]`` list (closures.py) when given,
+        else the legacy ``material=`` MaterialModel.  Boundary traces
+        (surface/bottom) are substituted BEFORE the bulk field so the trace
+        substitutions are not pre-empted by the bulk rewrite.  Returns True iff
+        a BULK closure was applied (else §6 leaves the bulk stress free)."""
+        pieces = []                                   # (closes_tag, expression_fn)
+        if self.closures:
+            for c in self.closures:
+                c.register(m)
+            for c in self.closures:
+                c.check(m)
+                pieces.append((c.closes, c.expression))
+        elif self.material is not None:
+            mat = self.material
+            if mat.surface is not None: pieces.append(("surface", mat.surface))
+            if mat.bottom is not None:  pieces.append(("bottom", mat.bottom))
+            if mat.bulk is not None:    pieces.append(("bulk", mat.bulk))
+        order = {"surface": 0, "bottom": 1, "bulk": 2}
+        pieces.sort(key=lambda p: order[p[0]])
+        target = {"surface": tau.at(1), "bottom": tau.at(0), "bulk": tau.expr}
+        loc = {"surface": 1, "bottom": 0, "bulk": None}
+        has_bulk = False
+        for closes, fn in pieces:
+            mx.apply({target[closes]: fn(state(loc[closes]))})
+            has_bulk = has_bulk or closes == "bulk"
+        return has_bulk
 
     def derive_model(self):
         """Build the declarative SME model (stored as ``self.derivation``) and
@@ -139,20 +174,13 @@ class SME(BaseModel):
         # so the projected source DAMPS: s[q_0] = −λ·u_b/ρ.  (A minus here
         # flips the friction into anti-damping — coupling caught it as
         # exponential growth of uniform flow.)
-        mat = self.material
-        if mat is not None:
-            from zoomy_core.model.models.material import ClosureState
-            # core-level dz, realized through the sigma map: dz = (1/h) dzeta
-            dz = lambda e: sp.Derivative(e, zeta) / h
-            if mat.surface is not None:
-                mx.apply({tau.at(1): mat.surface(
-                    ClosureState(m.functions, at=1), dz, m.parameters)})
-            if mat.bottom is not None:
-                mx.apply({tau.at(0): mat.bottom(
-                    ClosureState(m.functions, at=0), dz, m.parameters)})
-            if mat.bulk is not None:
-                mx.apply({tau.expr: mat.bulk(
-                    ClosureState(m.functions, at=None), dz, m.parameters)})
+        from zoomy_core.model.models.material import ClosureState
+        # full-access state handed to a closure: fields (s.u, …), σ-aware
+        # derivatives (s.dz/s.dx) and parameters (s.par).
+        def _state(at):
+            return ClosureState(m.functions, params=m.parameters,
+                                h=h, x=x, zeta=zeta, at=at)
+        has_bulk = self._apply_closures(m, mx, tau, _state)
         mx.apply(Simplify())
 
         # 6 — separation of variables: u → û_i (N_u), w → ŵ_j (N_u + 1)
@@ -161,12 +189,12 @@ class SME(BaseModel):
         N_u = modal_bound("N_u")
         m.apply(separation_of_variables(u, uh(t, x), basis, N_u))
         m.apply(separation_of_variables(w, wh(t, x), basis, N_u + 1))
-        if mat is None or mat.bulk is None:
+        if not has_bulk:
             # UNCLOSED bulk stress: expand tau in the modal basis too — its
             # moments remain free functions (K&T pre-closure form).  This also
-            # covers a BOUNDARY-ONLY closure (e.g. rough_wall: bottom/surface
-            # set, bulk left free) — the dynamic BC traces are already baked in
-            # §5, the bulk stays a free modal field.
+            # covers a BOUNDARY-ONLY closure (e.g. RoughWall: bottom set, bulk
+            # left free) — the dynamic BC traces are already baked in §5, the
+            # bulk stays a free modal field.
             sh_ = sp.Function(r"\hat{\sigma}", real=True)
             m.apply(separation_of_variables(txz, sh_(t, x), basis, N_u + 1))
 

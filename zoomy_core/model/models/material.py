@@ -4,26 +4,25 @@ A :class:`MaterialModel` is a plain record of three callables (NO
 inheritance, no pipeline knowledge), written in CORE variables — the
 closure is *defined* on the (t, x, z) equations before any σ-mapping.
 
-**All three callables share ONE signature** ``f(state, dz, par)``:
+**All three callables share ONE signature** ``f(s)`` — a single
+:class:`ClosureState` ``s`` giving the closure FULL access to the model state:
 
-* ``state`` — a :class:`ClosureState` accessor over the FULL field set.
-  ``state.u`` is the horizontal velocity, ``state.k`` / ``state.varepsilon``
-  the turbulence fields, ``state.h`` the depth, … — every field the model
-  carries, by name.  For a ``bulk`` closure ``state`` exposes the *bulk*
-  field; for the ``bottom`` / ``surface`` dynamic boundary closures it
-  exposes the *trace* at that interface (ζ = 0 / 1).  This is what lets an
-  eddy viscosity depend on the full state, e.g. ``ν_t = C_μ k²/ε``.
-* ``dz`` — the CORE vertical-derivative operator.  The bulk stress is a
-  constitutive law ``τ = ρν ∂_z u``; it needs ∂_z of the velocity, but the
-  closure must not know whether the system has been σ-mapped.  The model
-  hands in the realized operator (``∂_z = (1/h) ∂_ζ`` post-σ-map) so one
-  closure ``dz(state.u)`` works pre- and post-map.  Boundary closures that
-  do not need a gradient simply ignore it.
-* ``par`` — the parameter namespace.
+* **fields** (Q and Qaux) by name — ``s.u`` (velocity), ``s.k`` /
+  ``s.varepsilon`` (turbulence), ``s.h`` (depth), … — every field the model
+  carries.  For a ``bulk`` closure ``s`` exposes the *bulk* field; for the
+  ``bottom`` / ``surface`` dynamic boundary closures it exposes the *trace* at
+  that interface (ζ = 0 / 1).  This is what lets an eddy viscosity depend on the
+  full state, e.g. ``ν_t = C_μ k²/ε``.
+* **derivatives** — ``s.dz(e)`` and ``s.dx(e)`` of ANY expression.  These are
+  σ-aware: post-σ-map the field is ``u(t,x,ζ)`` and physical ``∂_z = (1/h) ∂_ζ``,
+  so ``s.dz`` applies that for you (the closure never needs to know whether the
+  system has been σ-mapped).  A constitutive law ``τ = ρν ∂_z u`` is just
+  ``s.par.rho*s.par.nu*s.dz(s.u)``.
+* **parameters** — ``s.par`` (``s.par.rho``, ``s.par.nu``, …).
 
-``bulk``  — shear stress ``τ_xz`` in the bulk (e.g. ``par.rho*par.nu*dz(s.u)``).
+``bulk``  — shear stress ``τ_xz`` in the bulk (e.g. ``s.par.rho*s.par.nu*s.dz(s.u)``).
 ``bottom``— dynamic BED boundary condition: the bed trace of ``τ_xz``
-  (Navier slip ``par.lambda_s * s.u``; rough-wall drag ``ρ C_f s.u|s.u|``).
+  (Navier slip ``s.par.lambda_s * s.u``; rough-wall drag ``ρ C_f s.u|s.u|``).
 ``surface``— dynamic FREE-SURFACE boundary condition (usually ``0``).
 
 Inject exactly like ``level`` / ``n_layers``::
@@ -44,24 +43,50 @@ import sympy as sp
 
 
 class ClosureState:
-    """Field accessor handed to a closure as its first argument.
+    """Single full-access state object handed to a closure ``f(s)``.
 
-    ``state.<field>`` resolves the model field named ``<field>`` and returns
-    its **bulk expression** (``at=None``) or its **trace** at an interface
-    (``at=0`` bottom, ``at=1`` surface).  Construct from either the model's
-    attribute namespace ``m.functions`` (single-layer: any field by name) or
-    an explicit ``{name: FunctionFamily}`` map (multi-layer: the per-layer
-    field bound to the generic name, e.g. ``{"u": u_ell}``).
+    Gives the closure everything it can legitimately need:
 
-    A :class:`~zoomy_core.model.derivation.model.FunctionFamily` exposes
-    ``.expr`` (the applied bulk field) and ``.at(value)`` (the trace); this
-    accessor just picks the right one for the closure's location.
+    * **fields** — ``s.<name>`` resolves the model field ``<name>`` and returns
+      its **bulk expression** (``at=None``) or its **trace** at an interface
+      (``at=0`` bottom, ``at=1`` surface).  Any field the model carries (Q or
+      Qaux) is reachable: ``s.u``, ``s.k``, ``s.varepsilon``, ``s.h``, ….
+    * **derivatives** — ``s.dz(e)`` / ``s.dx(e)`` of any expression, σ-aware
+      (``∂_z = (1/h) ∂_ζ`` post-map; ``∂_x`` in the σ-frame).
+    * **parameters** — ``s.par``.
+
+    Construct from either the model's attribute namespace ``m.functions``
+    (single-layer: any field by name) or an explicit ``{name: FunctionFamily}``
+    map (multi-layer: the per-layer field bound to the generic name, e.g.
+    ``{"u": u_ell}``).  A
+    :class:`~zoomy_core.model.derivation.model.FunctionFamily` exposes ``.expr``
+    (the applied bulk field) and ``.at(value)`` (the trace); this accessor picks
+    the right one for the closure's location.
     """
 
-    def __init__(self, fields, at=None):
+    def __init__(self, fields, *, params=None, h=None, x=None, zeta=None,
+                 at=None):
         # ``object.__setattr__`` so __getattr__ does not recurse on these.
         object.__setattr__(self, "_fields", fields)
+        object.__setattr__(self, "_params", params)
+        object.__setattr__(self, "_h", h)
+        object.__setattr__(self, "_x", x)
+        object.__setattr__(self, "_zeta", zeta)
         object.__setattr__(self, "_at", at)
+
+    @property
+    def par(self):
+        """The model parameter namespace (``s.par.rho`` …)."""
+        return self._params
+
+    def dz(self, e):
+        """Physical vertical derivative ``∂_z`` of ``e`` — σ-aware
+        (``∂_z = (1/h) ∂_ζ`` once the model has been σ-mapped)."""
+        return sp.Derivative(e, self._zeta) / self._h
+
+    def dx(self, e):
+        """Horizontal derivative ``∂_x`` of ``e`` (σ-frame, at fixed ζ)."""
+        return sp.Derivative(e, self._x)
 
     def _family(self, name):
         f = self._fields
@@ -82,8 +107,8 @@ class ClosureState:
 
 class MaterialModel:
     """Stress closure record: ``bulk``, ``bottom``, ``surface`` callables,
-    each ``f(state, dz, par)`` (see module docstring).  Entries left ``None``
-    keep that part of the stress unclosed."""
+    each ``f(s)`` over a full-access :class:`ClosureState` (see module
+    docstring).  Entries left ``None`` keep that part of the stress unclosed."""
 
     def __init__(self, *, bulk=None, bottom=None, surface=None,
                  name="material"):
@@ -104,9 +129,9 @@ def newtonian_navier_slip():
     Reproduces the historically hard-coded model closures exactly (the
     term-by-term reference tests pin this against K&T / Escalante)."""
     return MaterialModel(
-        bulk=lambda s, dz, par: par.rho * par.nu * dz(s.u),
-        bottom=lambda s, dz, par: par.lambda_s * s.u,
-        surface=lambda s, dz, par: 0,
+        bulk=lambda s: s.par.rho * s.par.nu * s.dz(s.u),
+        bottom=lambda s: s.par.lambda_s * s.u,
+        surface=lambda s: 0,
         name="newtonian+navier-slip",
     )
 
@@ -130,12 +155,12 @@ def bingham_navier_slip():
     so the surviving integrals are replaced by Gauss–Legendre
     quadrature (:class:`~zoomy_core.model.derivation.GaussQuadrature`)."""
     return MaterialModel(
-        bulk=lambda s, dz, par: (par.rho * par.nu
-                                 + par.tau_y
-                                 / sp.sqrt(dz(s.u) ** 2 + par.eps_reg ** 2))
-                                * dz(s.u),
-        bottom=lambda s, dz, par: par.lambda_s * s.u,
-        surface=lambda s, dz, par: 0,
+        bulk=lambda s: (s.par.rho * s.par.nu
+                        + s.par.tau_y
+                        / sp.sqrt(s.dz(s.u) ** 2 + s.par.eps_reg ** 2))
+                       * s.dz(s.u),
+        bottom=lambda s: s.par.lambda_s * s.u,
+        surface=lambda s: 0,
         name="bingham+navier-slip",
     )
 
@@ -160,8 +185,8 @@ def rough_wall(kappa=0.41, k_s=0.001, z_p=0.1):
     z0 = k_s / 30
     Cf = (kappa / sp.log(z_p / z0)) ** 2
     return MaterialModel(
-        bottom=lambda s, dz, par: par.rho * Cf * s.u * sp.Abs(s.u),
-        surface=lambda s, dz, par: 0,
+        bottom=lambda s: s.par.rho * Cf * s.u * sp.Abs(s.u),
+        surface=lambda s: 0,
         name="rough-wall",
     )
 
@@ -177,9 +202,9 @@ def kepsilon_eddy_viscosity(C_mu=0.09):
     analytically — build with ``quadrature_order > 0`` (Gauss–Legendre).
     Pair with :func:`rough_wall` for the bed."""
     return MaterialModel(
-        bulk=lambda s, dz, par: par.rho * C_mu * s.k ** 2 / s.varepsilon * dz(s.u),
-        bottom=lambda s, dz, par: 0,
-        surface=lambda s, dz, par: 0,
+        bulk=lambda s: s.par.rho * C_mu * s.k ** 2 / s.varepsilon * s.dz(s.u),
+        bottom=lambda s: 0,
+        surface=lambda s: 0,
         name="k-epsilon eddy viscosity",
     )
 

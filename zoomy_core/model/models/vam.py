@@ -111,17 +111,15 @@ class VAM(BaseModel):
         mat = self.material
         if mat is not None:
             from zoomy_core.model.models.material import ClosureState
-            # core-level dz, realized through the sigma map: (1/h) dzeta
-            dz = lambda e: sp.Derivative(e, zeta) / h
+            def _state(at):
+                return ClosureState(m.functions, params=m.parameters,
+                                    h=h, x=x, zeta=zeta, at=at)
             if mat.surface is not None:
-                mx.apply({tau.at(1): mat.surface(
-                    ClosureState(m.functions, at=1), dz, m.parameters)})
+                mx.apply({tau.at(1): mat.surface(_state(1))})
             if mat.bottom is not None:
-                mx.apply({tau.at(0): mat.bottom(
-                    ClosureState(m.functions, at=0), dz, m.parameters)})
+                mx.apply({tau.at(0): mat.bottom(_state(0))})
             if mat.bulk is not None:
-                mx.apply({tau.expr: mat.bulk(
-                    ClosureState(m.functions, at=None), dz, m.parameters)})
+                mx.apply({tau.expr: mat.bulk(_state(None))})
         mx.apply(Simplify())
 
         mz = m.momentum_z
