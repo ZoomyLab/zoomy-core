@@ -12,7 +12,7 @@ from zoomy_core.model.models import SME
 from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
 from zoomy_core.mesh import BaseMesh
 import zoomy_core.model.initial_conditions as IC
-from zoomy_core.model.boundary_conditions import BoundaryConditions, Extrapolation
+from zoomy_core.model.boundary_conditions import Extrapolation
 import zoomy_core.fvm.timestepping as timestepping
 from zoomy_core.fvm.solver_numpy import HyperbolicSolver
 from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
@@ -20,13 +20,13 @@ from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
 
 def _build_sme(level=2):
     """SME built entirely through the NEW structure: Mass()/Momentum()
-    blueprints (Phase 2) closed by the composable closure list (Phase 1)."""
+    blueprints (Phase 2) closed by the composable closure list (Phase 1), with
+    the NEW flat per-field boundary-condition list."""
     return SME(
         level=level,
         parameters={"nu": 1e-3, "lambda_s": 0.0},
         closures=[Newtonian(), NavierSlip(), StressFree()],
-        boundary_conditions=BoundaryConditions(
-            [Extrapolation(tag="left"), Extrapolation(tag="right")]),
+        boundary_conditions=[Extrapolation("left"), Extrapolation("right")],
     ).system_model
 
 

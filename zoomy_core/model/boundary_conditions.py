@@ -33,9 +33,29 @@ class BoundaryCondition(param.Parameterized):
     """
     Default implementation. The required data for the 'ghost cell' is the data
     from the interior cell. Can be overwritten e.g. to implement periodic boundary conditions.
+
+    Flat-list interface: a BC carries a positional ``tag`` (the boundary patch)
+    and an ``on`` selector naming the FIELD(S) it applies to — a state field name
+    (``"h"``, ``"q_0"``), a family base (``"q"``, ``"k"``, ``"T"`` → every
+    ``<base>_i`` slot), a model-registered alias (``"momentum"``), or ``"all"``
+    (default).  ``on`` is resolved generically against the model's own declared
+    state by :func:`resolve_per_field`, so ANY future field is addressable by
+    name with no hard-coding.  Pass a flat list of these to a model and different
+    fields get different BCs at the same tag (momentum reflects, depth
+    extrapolates, …).
     """
 
     tag = param.String(default="bc")
+    on = param.String(default="all", doc=(
+        "Field/family/group this BC applies to ('h', 'q', 'q_0', 'momentum', "
+        "'all'); resolved against the model's declared state."))
+
+    def __init__(self, tag=None, on=None, **params):
+        if tag is not None:
+            params["tag"] = tag
+        if on is not None:
+            params["on"] = on
+        super().__init__(**params)
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
         """Symbolic builder for the boundary *value* — used by
@@ -1056,3 +1076,113 @@ class BoundaryConditions(param.Parameterized):
             ),
             definition=grad_expr,
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-field boundary conditions — the flat-list interface.
+#
+#   bcs = [Wall("left", on="momentum"),     # momentum slots reflect
+#          Extrapolation("left", on="h"),   # depth extrapolates
+#          Extrapolation("right")]          # on="all" → every slot
+#   SME(level=2, closures=[...], boundary_conditions=bcs)
+#
+# Different fields get different BCs at the SAME tag.  `on` is resolved
+# GENERICALLY against the model's declared state (any future field — tracer,
+# energy, temperature — is addressable by its name), unclaimed slots default to
+# Extrapolation, and two BCs claiming the same (tag, field) is an error.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _resolve_on(on, state_names, aliases):
+    """Resolve an ``on`` selector to a list of state-slot indices, generically.
+
+    ``"all"`` → every slot; an exact field name → that slot; a family base
+    (``"q"`` → ``q_0, q_1, …``); an alias (``"momentum"`` → ``"q"``)."""
+    on = aliases.get(on, on)
+    if on in ("all", "", None):
+        return list(range(len(state_names)))
+    if on in state_names:
+        return [state_names.index(on)]
+    fam = [i for i, nm in enumerate(state_names)
+           if nm == on or nm.startswith(on + "_")]
+    if fam:
+        return fam
+    raise ValueError(
+        f"boundary condition on={on!r}: not a state field, family base, or "
+        f"alias. Known fields: {state_names}; aliases: {sorted(aliases)}")
+
+
+class PerFieldBoundary(BoundaryCondition):
+    """Composite BC for one tag: each state slot delegates to the BC assigned to
+    its field.  Built by :func:`resolve_per_field`; unclaimed slots fall back to
+    :class:`Extrapolation`.  Reuses the existing BC engines unchanged — it just
+    picks, per slot, the ghost value/gradient produced by that slot's BC."""
+
+    def __init__(self, tag=None, slot_bc=None, n_state=0, **params):
+        super().__init__(tag=tag, **params)
+        self._slot_bc = slot_bc or {}        # {slot_index: BoundaryCondition}
+        self._n = n_state
+
+    def _per_slot(self, method, base, *args):
+        cache = {}
+        for slot, bc in self._slot_bc.items():
+            key = id(bc)
+            if key not in cache:
+                cache[key] = getattr(bc, method)(*args)
+            base[slot] = cache[key][slot]
+        return base
+
+    # symbolic kernels (codegen path)
+    def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
+        return self._per_slot("compute_boundary_condition", ZArray(Q),
+                              time, X, dX, Q, Qaux, parameters, normal)
+
+    def compute_boundary_gradient(self, time, X, dX, Q, Qaux, parameters, normal):
+        n = len(Q.get_list()) if hasattr(Q, "get_list") else len(Q)
+        return self._per_slot("compute_boundary_gradient", ZArray.zeros(n),
+                              time, X, dX, Q, Qaux, parameters, normal)
+
+    # numeric kernels (numpy path)
+    def face_value(self, Q_inner, Qaux_inner, normal, d_face, time, parameters):
+        return self._per_slot("face_value",
+                              np.asarray(Q_inner, dtype=float).copy(),
+                              Q_inner, Qaux_inner, normal, d_face, time, parameters)
+
+    def face_gradient(self, Q_inner, Q_face, Qaux_inner, normal, d_face, time, parameters):
+        return self._per_slot("face_gradient",
+                              np.zeros_like(np.asarray(Q_inner, dtype=float)),
+                              Q_inner, Q_face, Qaux_inner, normal, d_face, time, parameters)
+
+
+def resolve_per_field(bc_list, state_names, aliases=None):
+    """Build a :class:`BoundaryConditions` from a FLAT LIST of per-field BCs.
+
+    For each tag, group the ``(tag, on)`` BCs into a :class:`PerFieldBoundary`:
+    every state slot is served by the BC whose ``on`` covers it (a :class:`Wall`
+    gets its ``momentum_field_indices`` set to the slots it owns so it reflects
+    exactly those); unclaimed slots default to :class:`Extrapolation`; two BCs on
+    the same ``(tag, field)`` raise."""
+    aliases = aliases or {}
+    n = len(state_names)
+    by_tag = {}
+    for bc in bc_list:
+        by_tag.setdefault(bc.tag, []).append(bc)
+    out = []
+    for tag, bcs in by_tag.items():
+        slot_bc = {}
+        for bc in bcs:
+            slots = _resolve_on(bc.on, state_names, aliases)
+            if isinstance(bc, Wall):
+                bc.momentum_field_indices = [[s] for s in slots]
+            for s in slots:
+                if s in slot_bc and slot_bc[s] is not bc:
+                    raise ValueError(
+                        f"conflicting boundary conditions on tag {tag!r} field "
+                        f"{state_names[s]!r}: {type(slot_bc[s]).__name__} and "
+                        f"{type(bc).__name__}")
+                slot_bc[s] = bc
+        default = Extrapolation(tag=tag)
+        for s in range(n):
+            slot_bc.setdefault(s, default)
+        out.append(PerFieldBoundary(tag=tag, slot_bc=slot_bc, n_state=n))
+    return BoundaryConditions(out)

@@ -277,9 +277,17 @@ class SME(BaseModel):
             qs = [self._bed, *qs]
         sm = SystemModel.from_model(m, Q=qs, canonical_source=self)
         self._register_hswme_spectrum(sm)
-        if self.boundary_conditions is not None:
+        bcs = self.boundary_conditions
+        if isinstance(bcs, list):
+            # NEW flat per-field interface: boundary_conditions=[Wall("left",
+            # on="momentum"), Extrapolation("left", on="h"), …].  Resolve `on`
+            # against the model's own state; "momentum" aliases the q-family.
+            from zoomy_core.model.boundary_conditions import resolve_per_field
+            bcs = resolve_per_field(bcs, [str(s) for s in sm.state],
+                                    aliases={"momentum": "q"})
+        if bcs is not None:
             sm.attach_boundary_conditions(
-                self.boundary_conditions, aux_bcs=self.aux_boundary_conditions)
+                bcs, aux_bcs=self.aux_boundary_conditions)
         return sm
 
     def _register_hswme_spectrum(self, sm):

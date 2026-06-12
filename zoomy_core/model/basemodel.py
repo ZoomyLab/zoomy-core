@@ -103,7 +103,11 @@ class Model(param.Parameterized, SymbolicRegistrar):
     aux_variables = param.Parameter(default=0)
     parameters = param.Parameter(default={})
 
-    boundary_conditions = param.ClassSelector(class_=BoundaryConditions, default=None)
+    # Accept EITHER the legacy BoundaryConditions container OR the new flat
+    # per-field list (boundary_conditions=[Wall("left", on="momentum"), …]),
+    # resolved against the model's state in `system_model`.
+    boundary_conditions = param.ClassSelector(
+        class_=(BoundaryConditions, list), default=None)
     aux_boundary_conditions = param.ClassSelector(
         class_=BoundaryConditions, default=None
     )
