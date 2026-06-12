@@ -650,6 +650,14 @@ class HyperbolicSolver(Solver):
             for i in range(n_bf)
         ]) if n_bf > 0 else np.array([])
 
+        # Faces remapped by ``resolve_periodic_bcs`` carry the OPPOSITE-side
+        # cell in ``boundary_face_cells`` (≠ face_cells[0], the this-side
+        # cell).  The Periodic kernel is a pass-through, so the face value
+        # is that opposite cell's state; feeding it Q_L in step 3 below
+        # would silently turn the wrap back into extrapolation.
+        periodic_bf = (np.asarray(bf_cells) != np.asarray(iA[bf_fidx])
+                       if n_bf > 0 else np.zeros(0, dtype=bool))
+
         # Store BC metadata for IMEX access — both kernels live on the
         # runtime; diffusion path uses the gradient one.
         self._bc_indices = bc_indices
@@ -679,9 +687,14 @@ class HyperbolicSolver(Solver):
             # 2. Reconstruct (uses bf_values for limiter bounds + Q_R placeholder)
             Q_L, Q_R = reconstruct(Q, bf_values)
 
-            # 3. Override Q_R at boundary faces with BC(Q_L).
+            # 3. Override Q_R at boundary faces with BC(Q_L) — except
+            # periodic faces, whose face value is the opposite-side cell
+            # state (already in bf_values via the remapped bf_cells).
             for i_bf in range(n_bf):
                 fidx = bf_fidx[i_bf]
+                if periodic_bf[i_bf]:
+                    Q_R[:, fidx] = Q[:, bf_cells[i_bf]]
+                    continue
                 qaux_inner = Qaux[:, bf_cells[i_bf]] if has_aux else _EMPTY_AUX
                 normal = normals_arr[:, fidx]
                 position = face_centers[fidx, :]
@@ -856,10 +869,18 @@ class HyperbolicSolver(Solver):
         # Periodic-BC topology resolution needs the ``BoundaryConditions``
         # object (it iterates ``.boundary_conditions_list`` for tagged
         # periodic pairs).  Done here, *before* normalising to a
-        # SystemModel — the SystemModel only carries the indexed BC
-        # function, not the object.
-        if hasattr(mesh, "resolve_periodic_bcs") and source_model is not None:
-            mesh.resolve_periodic_bcs(source_model.boundary_conditions)
+        # SystemModel.  Production Models carry the object directly;
+        # declarative SystemModels retain it as ``_bc_source`` (set by
+        # ``attach_boundary_conditions``) — without this fallback a
+        # Periodic BC on the declarative path was SILENTLY ignored and
+        # the boundary acted as extrapolation (waves leave, mass leaks).
+        bcs_obj = None
+        if source_model is not None:
+            bcs_obj = source_model.boundary_conditions
+        else:
+            bcs_obj = getattr(nsm.sm, "_bc_source", None)
+        if hasattr(mesh, "resolve_periodic_bcs") and bcs_obj is not None:
+            mesh.resolve_periodic_bcs(bcs_obj)
         model = nsm.sm
         self.sm = model
         Q, Qaux = self.initialize(mesh, model)

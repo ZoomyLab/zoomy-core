@@ -69,7 +69,11 @@ class SME(BaseModel):
         # nu (kinematic viscosity) and lambda_s (Navier slip) are MODEL
         # PARAMETERS — default 0 (inviscid / free-slip); override values via
         # ``SME(level, parameters={"lambda_s": 0.5, ...})``.
-        values = {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0}
+        # e_x: downslope gravity component (K&T eq 4.7 "hg(e_x - ...)") -
+        # the INCLINE body force; with e_x = sin(theta) and a FLAT bed the
+        # model is an exact infinite incline (periodic-domain friendly)
+        values = {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0,
+                  "e_x": 0.0}
         # the base __init__ has already split the user's parameters= dict
         # into the Zstruct ``self.parameter_values`` — merge those numeric
         # overrides over the defaults.
@@ -91,7 +95,8 @@ class SME(BaseModel):
         m.add_equation("bottom", d.t(b))
         m.add_equation("mass", d.x(u) + d.z(w))
         m.add_equation("momentum", (2,), [
-            d.t(u) + d.x(u * u) + d.z(u * w) + d.x(p) / rho - d.z(txz) / rho,
+            d.t(u) + d.x(u * u) + d.z(u * w) + d.x(p) / rho - d.z(txz) / rho
+            - g * m.parameters.e_x,
             d.t(w) + d.x(u * w) + d.z(w * w) + d.z(p) / rho + g])
         m.add_equation("kbc_top", KinematicBC(w=w, u=u, interface=b + h))
         m.add_equation("kbc_bot", KinematicBC(w=w, u=u, interface=b))
