@@ -63,20 +63,33 @@ def test_bump_wraps_and_conserves_mass():
     nsm = NumericalSystemModel.from_system_model(
         sm, reconstruction=ReconstructionSpec(order=1))
 
-    solver = HyperbolicSolver(
-        time_end=1.5,
-        compute_dt=timestepping.adaptive(CFL=0.9, dimension=1))
-    Q, _ = solver.solve(mesh, nsm, write_output=False)
-    Q = np.asarray(Q[:, :NC], float)
     xc = np.linspace(XMAX / NC / 2, XMAX - XMAX / NC / 2, NC)
     dx = XMAX / NC
-
-    # boundary_face_cells remapped to the opposite side
-    assert solver._bf_cells[0] == NC - 1 and solver._bf_cells[1] == 0
-
-    # mass exactly conserved (periodic: no boundary flux imbalance)
     m_ic = sum(ic([x])[1] for x in xc) * dx
-    np.testing.assert_allclose(Q[1].sum() * dx, m_ic, rtol=1e-12)
+
+    # THREE consecutive solves on the same script-level mesh: each
+    # setup_simulation takes a fresh internal mesh copy that SHARES the
+    # boundary_face_cells array — a remap derived from the current array
+    # state (instead of from face_cells[0]) alternates periodic/open
+    # across restarts (wrap, leak, wrap, ...).
+    Qprev = None
+    for _ in range(3):
+        if Qprev is not None:
+            Qp = Qprev.copy()
+            sm.initial_conditions = IC.UserFunction(
+                function=lambda xv, Qp=Qp: Qp[
+                    :, min(int(float(xv[0]) / dx), NC - 1)])
+        solver = HyperbolicSolver(
+            time_end=0.5,
+            compute_dt=timestepping.adaptive(CFL=0.9, dimension=1))
+        Q, _ = solver.solve(mesh, nsm, write_output=False)
+        Qprev = np.asarray(Q[:, :NC], float).copy()
+
+        # internal mesh remapped to the opposite side, every restart
+        assert solver._bf_cells[0] == NC - 1 and solver._bf_cells[1] == 0
+        # mass exactly conserved (periodic: no boundary flux imbalance)
+        np.testing.assert_allclose(Qprev[1].sum() * dx, m_ic, rtol=1e-12)
+    Q = Qprev
 
     # the bump crossed the right boundary and re-entered on the left:
     # at u+c ≈ 4.1 the peak (from x=9, t=1.5) must sit mid-domain,

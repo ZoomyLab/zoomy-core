@@ -1500,13 +1500,17 @@ class BaseMesh(param.Parameterized):
     def resolve_periodic_bcs(self, bcs):
         """Patch boundary_face_cells for periodic boundary conditions.
 
-        Idempotent: repeated calls (e.g. one ``setup_simulation`` per
-        output frame on the same mesh) must not re-derive the mapping
-        from an already-patched array — that SWAPS the remap back to
-        the physical cells on every second call, silently alternating
-        the boundary between periodic and open (mass pumps in/out).
-        The pristine mapping is stashed on first call and always used
-        as the source.
+        Idempotent and stateless: the remap source is derived from
+        ``face_cells[0]`` at the boundary faces — the PHYSICAL this-side
+        cells, which this method never modifies — rather than from
+        ``boundary_face_cells`` itself.  Deriving from the current
+        (possibly already-patched) array swaps the remap back to the
+        physical cells on every second call, silently alternating the
+        boundary between periodic and open (mass pumps in/out).  A
+        stashed-on-first-call pristine copy is NOT enough either: per-
+        solve mesh copies (ensure_lsq_mesh) share the underlying numpy
+        array with the original mesh while each copy starts without the
+        stash, re-introducing the alternation across solver restarts.
         """
         from zoomy_core.model.boundary_conditions import Periodic
 
@@ -1517,9 +1521,9 @@ class BaseMesh(param.Parameterized):
             i: v for i, v in enumerate(self.boundary_conditions_sorted_physical_tags)
         }
 
-        if not hasattr(self, "_boundary_face_cells_pristine"):
-            self._boundary_face_cells_pristine = deepcopy(self.boundary_face_cells)
-        boundary_face_cells_copy = deepcopy(self._boundary_face_cells_pristine)
+        pristine_bf_cells = np.asarray(
+            self.face_cells[0, self.boundary_face_face_indices])
+        boundary_face_cells_copy = deepcopy(pristine_bf_cells)
 
         for bc in bcs.boundary_conditions_list:
             if type(bc) == Periodic:
@@ -1533,7 +1537,7 @@ class BaseMesh(param.Parameterized):
                 mask_face_from = self.boundary_face_physical_tags == from_physical_tag
                 mask_face_to = self.boundary_face_physical_tags == to_physical_tag
 
-                from_cells = self._boundary_face_cells_pristine[mask_face_from]
+                from_cells = pristine_bf_cells[mask_face_from]
                 to_cells = self.boundary_face_ghosts[mask_face_to]
 
                 centers = self.cell_centers_computed()
