@@ -79,6 +79,17 @@ class ClosureState:
         """The model parameter namespace (``s.par.rho`` …)."""
         return self._params
 
+    @property
+    def zeta(self):
+        """The σ-coordinate ζ ∈ [0, 1] — for POSITION-dependent closures
+        (e.g. Elder's parabolic ν_t(ζ) = κ u_⋆ h ζ(1−ζ))."""
+        return self._zeta
+
+    @property
+    def depth(self):
+        """The layer depth h (the σ-map scale)."""
+        return self._h
+
     def dz(self, e):
         """Physical vertical derivative ``∂_z`` of ``e`` — σ-aware
         (``∂_z = (1/h) ∂_ζ`` once the model has been σ-mapped)."""

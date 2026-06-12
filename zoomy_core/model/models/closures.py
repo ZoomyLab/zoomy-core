@@ -123,6 +123,41 @@ class KEpsilonViscosity(Closure):
         return s.par.rho * s.par.C_mu * s.k ** 2 / s.varepsilon * s.dz(s.u)
 
 
+class Bingham(Closure):
+    """Regularized BINGHAM (viscoplastic) bulk stress
+    ``τ = (ρν + τ_y/√((∂_z u)² + ε²))·∂_z u`` — rigid below the yield stress
+    ``τ_y`` in the ``ε→0`` limit; the ``ε²`` floor keeps the root argument
+    positive in floating point (the ``|γ̇|+ε`` form NaN-ed at plug formation).
+    Needs ``tau_y`` (yield stress) and ``eps_reg`` (regularization scale).  The
+    Galerkin projection is not analytically integrable → build the model with
+    ``quadrature_order > 0`` (Gauss–Legendre)."""
+    closes = "bulk"; requires = ("u",)
+
+    def register(self, m):
+        m.parameter("nu", 0.0); m.parameter("tau_y", 0.0); m.parameter("eps_reg", 1e-3)
+
+    def expression(self, s):
+        return (s.par.rho * s.par.nu
+                + s.par.tau_y / sp.sqrt(s.dz(s.u) ** 2 + s.par.eps_reg ** 2)) * s.dz(s.u)
+
+
+class ElderViscosity(Closure):
+    """Elder / parabolic eddy viscosity  ν_t = κ u_⋆ h ζ(1−ζ)  (Elder 1959) —
+    the classical ALGEBRAIC turbulence closure for free-surface flow:
+    ``τ = ρ ν_t ∂_z u``.  Unlike k–ε it is a POLYNOMIAL in ζ, so the Galerkin
+    projection closes analytically (no quadrature).  ``u_star`` is the friction
+    velocity (a parameter here; set it from the bed law / RoughWall in practice)."""
+    closes = "bulk"; requires = ("u",)
+
+    def register(self, m):
+        m.parameter("kappa", 0.41)
+        m.parameter("u_star", 0.0)
+
+    def expression(self, s):
+        nu_t = s.par.kappa * s.par.u_star * s.depth * s.zeta * (1 - s.zeta)
+        return s.par.rho * nu_t * s.dz(s.u)
+
+
 # ── bottom (bed) closures ──────────────────────────────────────────────────
 
 
@@ -154,6 +189,60 @@ class RoughWall(Closure):
     def expression(self, s):
         Cf = (s.par.kappa / sp.log(s.par.z_p / (s.par.k_s / 30))) ** 2
         return s.par.rho * Cf * s.u * sp.Abs(s.u)
+
+
+# ── depth-averaged SWE closures (bed friction + horizontal mixing) ──────────
+# These close the DEPTH-AVERAGED shallow-water momentum, not the vertical
+# moment hierarchy: a depth-averaged model has no resolved vertical profile,
+# so its dissipation is (i) a bed-stress trace and (ii) a HORIZONTAL turbulent
+# mixing τ_xx/τ_xy.  They are consumed by the SWE model's own closure hook
+# (``apply_swe_closures``), which supplies the operator STRUCTURE (2-D vector
+# source / rank-4 diffusion tensor) while the closure supplies the
+# CONSTITUTIVE COEFFICIENT — same "compose the physics from named pieces"
+# philosophy as the moment-hierarchy closures above.
+
+
+class ManningFriction(Closure):
+    """Manning bed friction as a BOTTOM (bed-trace) closure.
+
+    Returns the friction RATE (per unit velocity)
+    ``-g n² |u| / max(h, h_floor)^{1/3}`` so the depth-averaged momentum sink
+    on each component is ``rate · u_i`` (the conservative
+    ``-g n² u_i |u| / h^{1/3}``).  ``|u|`` is the full horizontal speed
+    (``s.speed``) so x/y momenta couple correctly; ``h_floor`` keeps friction
+    finite at the wet/dry interface.  No ``Piecewise``/``sign`` — the source
+    Jacobian is auto-derived by sp.diff.
+    """
+    closes = "bottom"; requires = ("u", "h")
+
+    def __init__(self, name=None, h_floor=0.0):
+        super().__init__(name=name)
+        self.h_floor = float(h_floor)
+
+    def register(self, m):
+        m.parameter("g", 9.81); m.parameter("n", 0.0)
+
+    def expression(self, s):
+        h_eff = sp.Max(s.h, sp.Float(self.h_floor)) if self.h_floor > 0 else s.h
+        return -s.par.g * s.par.n ** 2 * s.speed / h_eff ** sp.Rational(1, 3)
+
+
+class EddyViscosity(Closure):
+    """Horizontal eddy viscosity as a HORIZONTAL-stress closure.
+
+    The depth-averaged turbulent mixing ``∇·(ν h ∇u)`` (the τ_xx/τ_xy stress
+    divergence — a horizontal diffusion, NOT the vertical τ_xz shear).
+    Returns the isotropic kinematic eddy viscosity ``ν``; the SWE model builds
+    the velocity-diffusion tensor (diagonal on momentum, chain-rule cross term
+    on h) from it.  Vanishes at lake-at-rest (u=0) so well-balancing holds.
+    """
+    closes = "horizontal"; requires = ("u",)
+
+    def register(self, m):
+        m.parameter("nu", 0.0)
+
+    def expression(self, s):
+        return s.par.nu
 
 
 # ── surface closures ───────────────────────────────────────────────────────
@@ -240,7 +329,42 @@ def interface_closure(closures):
     return next((c for c in (closures or []) if c.closes == "interface"), None)
 
 
+# ── depth-averaged SWE closure consumption ──────────────────────────────────
+# SWE states its operators directly (no moment derivation that calls
+# apply_stress_closures), so it consumes closures through this hook instead:
+# the closure supplies the constitutive COEFFICIENT, the model the operator
+# STRUCTURE (2-D vector source / rank-4 velocity-diffusion tensor).
+
+
+class _SWEField:
+    """Minimal FunctionFamily stand-in for a depth-averaged SWE field: a single
+    bulk expression with no vertical-trace distinction (depth-averaged)."""
+
+    def __init__(self, expr):
+        self.expr = expr
+
+    def at(self, loc):              # bottom/surface trace == the depth average
+        return self.expr
+
+
+def swe_closure_state(model):
+    """Build a :class:`ClosureState` over a depth-averaged SWE model so its
+    closures can read ``s.u``/``s.w``/``s.h``/``s.speed`` and ``s.par.*``.
+    Velocity is desingularised through the model's ``hinv`` aux (``u=hu·hinv``);
+    ``speed`` is the floored horizontal magnitude (couples x/y friction)."""
+    v = model.variables
+    a = model.aux_variables
+    hinv = a.hinv
+    u = v.hu * hinv
+    w = v.hv * hinv if hasattr(v, "hv") else sp.S.Zero
+    speed = sp.sqrt(u * u + w * w + 1e-12)
+    fields = {"u": _SWEField(u), "w": _SWEField(w),
+              "h": _SWEField(v.h), "speed": _SWEField(speed)}
+    return ClosureState(fields, params=model.parameters)
+
+
 __all__ = ["Closure", "ClosureState", "apply_stress_closures",
            "apply_layer_stress_closures", "interface_closure",
            "Newtonian", "KEpsilonViscosity", "NavierSlip", "RoughWall",
-           "StressFree", "InterfaceFlux", "MeanInterface", "UpwindInterface"]
+           "StressFree", "InterfaceFlux", "MeanInterface", "UpwindInterface",
+           "ManningFriction", "EddyViscosity", "swe_closure_state"]

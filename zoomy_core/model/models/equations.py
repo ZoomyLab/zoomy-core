@@ -159,4 +159,37 @@ class MomentumNonHydrostatic(Equation):
         return model
 
 
-__all__ = ["Equation", "Mass", "Momentum", "MomentumNonHydrostatic"]
+class Transport(Equation):
+    """Conservative transport of a scalar field ``name``:
+
+        ∂_t c + Σ_d ∂_d(u_d c) + ∂_z(w c) = source
+
+    Registers ``c`` as a state field (a new transported quantity: TKE ``k``,
+    dissipation ``ε``, a passive tracer, temperature, …).  ``source`` is an
+    optional free source field (its modal moments become Qaux unless a closure
+    substitutes it) — pass a sympy expression / field, or leave ``None`` for a
+    passive scalar.  The velocity ``u``/``w`` are reused from the Mass blueprint.
+    """
+
+    def __init__(self, model=None, name="c", source=None):
+        super().__init__(model)
+        self.name = name
+        self.source = source
+
+    def add_to(self, model):
+        coords = model.coords
+        horiz = coords[1:-1]
+        c = sp.Function(self.name, real=True)(*coords)
+        uvel = [sp.Function(_HNAME[xd], real=True)(*coords) for xd in horiz]
+        w = sp.Function("w", real=True)(*coords)
+        model.declare_state(c)
+        expr = (d.t(c) + sum(_DERIV[xd](uvel[i] * c) for i, xd in enumerate(horiz))
+                + d.z(w * c))
+        if self.source is not None:
+            expr = expr - self.source
+        model.add_equation(self.name, expr)
+        self.c = c
+        return model._equations[self.name]
+
+
+__all__ = ["Equation", "Mass", "Momentum", "MomentumNonHydrostatic", "Transport"]
