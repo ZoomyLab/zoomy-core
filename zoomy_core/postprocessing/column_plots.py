@@ -39,9 +39,11 @@ import numpy as np
 
 __all__ = [
     "ColumnField", "read_columns", "read_zoomyfoam", "read_vof_raw",
-    "read_ledger", "mass_of_columns", "mass_of_vof", "plot_water_columns", "plot_water_vof", "plot_profiles",
+    "read_ledger", "read_of_frames", "read_of_field", "read_of_states",
+    "concat_columns", "mass_of_columns", "mass_of_vof",
+    "plot_water_columns", "plot_water_vof", "plot_profiles",
     "plot_xt", "plot_series", "mark_stations", "frame_color",
-    "fig_coupling", "fig_mass_deviation", "animate",
+    "fig_coupling", "fig_reduced_coupling", "fig_mass_deviation", "animate",
 ]
 
 CANONICAL = ("b", "h", "u", "v", "w", "p")
@@ -84,6 +86,47 @@ def _read_internal(path, n):
         u = re.search(r"internalField\s+uniform\s+([-\d.eE+]+)", txt)
         return np.full(n, float(u.group(1)))
     return np.fromstring(m.group(1).replace("\n", " "), sep=" ")[:n]
+
+
+def read_of_frames(case, field="Q1"):
+    """Sorted ``[(t, dir)]`` of OpenFOAM write-time directories holding
+    ``field`` — the universal frame index for raw-state access."""
+    return _frame_dirs(case, field)
+
+
+def read_of_field(path, n):
+    """One OpenFOAM scalar ``internalField`` (uniform or nonuniform) ->
+    array of length ``n``."""
+    return _read_internal(path, n)
+
+
+def read_of_states(case, nq, n, prefix="Q"):
+    """Raw zoomyFoam state over all write times -> ``(T, Q[t, q, x])``."""
+    frames = _frame_dirs(case, f"{prefix}1")
+    T = np.array([t for t, _ in frames])
+    Q = np.array([[_read_internal(d / f"{prefix}{q}", n) for q in range(nq)]
+                  for _, d in frames])
+    return T, Q
+
+
+def concat_columns(cfs, label="", atol=1e-9):
+    """Join coupled-participant ColumnFields along x (e.g. part1 + part2 of
+    a split domain) at their shared write times (nearest match within
+    ``atol``; participants on the aligned time grid share names exactly)."""
+    base = cfs[0]
+    keep = [[] for _ in cfs]
+    ts = []
+    for t in base.t:
+        js = [int(np.argmin(np.abs(cf.t - t))) for cf in cfs]
+        if all(abs(cf.t[j] - t) <= atol for cf, j in zip(cfs, js)):
+            ts.append(t)
+            for k, j in enumerate(js):
+                keep[k].append(j)
+    fields = {nm: np.concatenate(
+        [cf.fields[nm][keep[k]] for k, cf in enumerate(cfs)], axis=1)
+        for nm in CANONICAL}
+    return ColumnField(np.array(ts), np.concatenate([cf.x for cf in cfs]),
+                       base.zeta, fields, label)
 
 
 def _read_internal_vec_x(path, n):
@@ -392,6 +435,66 @@ def fig_coupling(fig, tq, reduced_cf, vof_raw, panels, interface_x=0.0,
         ("water", _st.line("water", lw=5)),
     ])
     return fig
+
+
+def fig_reduced_coupling(fig, tq, coupled, reference=(), panels=(),
+                         interface_x=None, ylim=None, ulim=None, title=None):
+    """Reduced<->reduced coupling figure (the SME|SME analogue of
+    :func:`fig_coupling`): top = free surface b+h(x) of every source
+    (coupled solid + markers, reference dashed gray); bottom = one u(zeta)
+    panel per station, frames colored like their marker lines.
+
+    coupled / reference: list of (ColumnField, label)
+    panels: list of (title, station_x, [ColumnField, ...], color)
+
+    Returns ``{"water": ax, "profiles": [ax, ...]}`` so callers can overlay
+    extra curves (e.g. an analytic solution) before saving.
+    """
+    from . import style as _st
+    gs = fig.add_gridspec(2 if panels else 1, max(len(panels), 1),
+                          height_ratios=[1.2, 1.0] if panels else [1.0],
+                          hspace=0.45, wspace=0.4)
+    ax = fig.add_subplot(gs[0, :])
+    color_of = {}
+    grays = ["0.55", "0.25", "0.7"]
+    for k, (cf, lab) in enumerate(reference):
+        i = cf.at(tq)
+        color_of[id(cf)] = grays[k % len(grays)]
+        ax.plot(cf.x, cf.fields["b"][i, :, 0] + cf.fields["h"][i, :, 0],
+                color=color_of[id(cf)], ls="--", marker="",
+                label=lab or cf.label)
+    for k, (cf, lab) in enumerate(coupled):
+        i = cf.at(tq)
+        color_of[id(cf)] = _st.CYCLE[k % len(_st.CYCLE)]
+        ax.plot(cf.x, cf.fields["b"][i, :, 0] + cf.fields["h"][i, :, 0],
+                color=color_of[id(cf)], marker=_st.MARKERS[k % len(_st.MARKERS)],
+                markevery=_st.MARKEVERY, label=lab or cf.label)
+    if interface_x is not None:
+        ax.axvline(interface_x, color=_st.COLORS["interface"], lw=1.6)
+    if panels:
+        mark_stations(ax, [s for _, s, _, _ in panels],
+                      [c for _, _, _, c in panels],
+                      labels=[n for n, _, _, _ in panels])
+    if ylim:
+        ax.set_ylim(*ylim)
+    ax.set_xlabel("x")
+    ax.set_ylabel("b + h")
+    ax.set_title(title or f"t = {tq:5.2f} s")
+    profs = []
+    for k, (name, xq, sources, color) in enumerate(panels):
+        a = fig.add_subplot(gs[1, k])
+        plot_profiles(a, sources, xq, tq,
+                      colors=[color_of.get(id(s), f"C{j}")
+                              for j, s in enumerate(sources)])
+        a.set_title(name)
+        if ulim:
+            a.set_xlim(*ulim)
+        frame_color(a, color)
+        profs.append(a)
+    extra = ([("interface", _st.line("interface"))]
+             if interface_x is not None else [])
+    _st.figure_legend(fig, extra=extra)
+    return {"water": ax, "profiles": profs}
 
 
 def fig_mass_deviation(ax, sources, total_label="total"):
