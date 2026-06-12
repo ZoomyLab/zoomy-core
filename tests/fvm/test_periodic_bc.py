@@ -24,6 +24,22 @@ from zoomy_core.mesh import BaseMesh
 import zoomy_core.model.initial_conditions as IC
 
 
+def test_resolve_periodic_bcs_is_idempotent():
+    """One setup_simulation per output frame re-resolves on the SAME
+    mesh; a non-idempotent resolve swaps the remap back every second
+    call (boundary alternates periodic/open, mass pumps in and out)."""
+    NC = 50
+    bcs = BoundaryConditions([
+        Periodic(tag="left", periodic_to_physical_tag="right"),
+        Periodic(tag="right", periodic_to_physical_tag="left"),
+    ])
+    mesh = BaseMesh.create_1d(domain=(0.0, 1.0), n_inner_cells=NC)
+    for _ in range(3):
+        mesh.resolve_periodic_bcs(bcs)
+        assert (mesh.boundary_face_cells[0] == NC - 1
+                and mesh.boundary_face_cells[1] == 0)
+
+
 def test_bump_wraps_and_conserves_mass():
     NC, XMAX = 100, 10.0
     bcs = BoundaryConditions([
