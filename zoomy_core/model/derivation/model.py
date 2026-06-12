@@ -376,10 +376,39 @@ class Model:
             "description": description,
         })
 
+    # ── declarative variable registration (equation-blueprint API) ──────
+    def declare_state(self, *fields):
+        """Append field(s) to ``Q`` — the PRIMARY (state) unknowns.  Used by the
+        equation-blueprint templates (equations.py) so a balance declares the
+        state it introduces; eliminated fields still migrate to ``Qaux`` via the
+        derivation as before (declaration is intent + seed, not the classifier)."""
+        for f in fields:
+            self._Q[self._field_name(f)] = f
+        self._refresh_unknowns()
+        return fields[0] if len(fields) == 1 else fields
+
+    def declare_closure(self, *fields):
+        """Mark field(s) as CLOSURE variables — present in the equations but
+        routed to ``Qaux`` if not substituted by a closure during the
+        derivation.  Recorded for clarity / validation; the actual Q/Qaux split
+        is still derived (see the term-by-term-system-verification contract)."""
+        if not hasattr(self, "_closure_vars"):
+            self._closure_vars = set()
+        for f in fields:
+            self._closure_vars.add(self._field_name(f))
+        return fields[0] if len(fields) == 1 else fields
+
     # ── equation registration ────────────────────────────────────────
     def add_equation(self, name, shape_or_expr=None, expr=None, *, group="model",
                  _refresh=True):
         """Register a scalar or vector equation.
+
+        An equation BLUEPRINT (an ``equations.Equation`` instance carrying
+        ``_is_blueprint``) may be passed as the sole argument — it declares its
+        state / closure variables and adds its residual itself::
+
+            model.add_equation(Mass(model))
+            model.add_equation(Momentum(model))
 
         Scalar::
 
@@ -409,6 +438,8 @@ class Model:
         SystemModel.  ``describe(show="aux")`` lists them.  Oriented relations
         (KinematicBCs) are auxiliary regardless.
         """
+        if getattr(name, "_is_blueprint", False):
+            return name.add_to(self)
         if group not in ("model", "aux"):
             raise ValueError(
                 f"add_equation(group=...): 'model' | 'aux', got {group!r}.")

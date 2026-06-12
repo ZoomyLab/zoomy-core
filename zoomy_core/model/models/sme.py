@@ -95,14 +95,15 @@ class SME(BaseModel):
         b = sp.Function("b", real=True)(t, x)
         txz = sp.Function("tau_xz", real=True)(t, x, z)
 
-        # 1 — full system in (t, x, z)
-        m.Q = [h, u, w, p]
+        # 1 — full system in (t, x, z), assembled from balance blueprints
+        # (equations.py).  Mass registers u, w (state); Momentum registers p
+        # (state) and tau_xz (closure) and builds the (x, z) momentum with the
+        # incline body force −g·e_x; h is the geometry state, b the bed.
+        from zoomy_core.model.models.equations import Mass, Momentum
+        m.declare_state(h)
         m.add_equation("bottom", d.t(b))
-        m.add_equation("mass", d.x(u) + d.z(w))
-        m.add_equation("momentum", (2,), [
-            d.t(u) + d.x(u * u) + d.z(u * w) + d.x(p) / rho - d.z(txz) / rho
-            - g * m.parameters.e_x,
-            d.t(w) + d.x(u * w) + d.z(w * w) + d.z(p) / rho + g])
+        m.add_equation(Mass(m))
+        m.add_equation(Momentum(m))
         m.add_equation("kbc_top", KinematicBC(w=w, u=u, interface=b + h))
         m.add_equation("kbc_bot", KinematicBC(w=w, u=u, interface=b))
 
