@@ -119,13 +119,13 @@ class MLVAM(BaseModel):
             w = sp.Function(f"w_{ell}", real=True)(t, x, z)
             p = sp.Function(f"p_{ell}", real=True)(t, x, z)
             txz = sp.Function(f"tau_{ell}", real=True)(t, x, z)
-            ml.Q = [u, w, p]
-            ml.add_equation("mass", d.x(u) + d.z(w))
-            ml.add_equation("momentum_x",
-                            d.t(u) + d.x(u * u) + d.z(u * w)
-                            + gl * d.x(b + H) + d.x(p) / rl - d.z(txz) / rl)
-            ml.add_equation("momentum_z",
-                            d.t(w) + d.x(u * w) + d.z(w * w) + d.z(p) / rl)
+            # per-layer VAM column assembled from balance blueprints
+            # (equations.py): layer-scoped field names (suffix), the per-layer
+            # stress tau_<ell>, and the TOTAL free surface b+H.
+            from zoomy_core.model.models.equations import Mass, MomentumNonHydrostatic
+            ml.add_equation(Mass(ml, suffix=f"_{ell}"))
+            ml.add_equation(MomentumNonHydrostatic(
+                ml, suffix=f"_{ell}", tau_name=f"tau_{ell}", free_surface=b + H))
             ml.add_equation("kbc_bot", KinematicBC(
                 w=w, u=u, interface=z_bot, rho=rl,
                 mass_flux=(G_bot if G_bot != 0 else None)))

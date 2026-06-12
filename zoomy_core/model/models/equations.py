@@ -23,9 +23,11 @@ import sympy as sp
 from zoomy_core import coords as C
 import zoomy_core.derivatives as d
 
-# horizontal coord symbol → its directional derivative operator and field name
+# horizontal coord symbol → its directional derivative operator, velocity-field
+# name, and coordinate name string
 _DERIV = {C.x: d.x, C.y: d.y}
 _HNAME = {C.x: "u", C.y: "v"}
+_CNAME = {C.x: "x", C.y: "y"}
 
 
 class Equation:
@@ -46,13 +48,19 @@ class Mass(Equation):
 
     Registers the horizontal velocity(ies) and the vertical velocity ``w`` as
     state.  For the canonical SME shape ``coords=(t, x, z)`` this is
-    ``∂_x u + ∂_z w``."""
+    ``∂_x u + ∂_z w``.  ``suffix`` scopes the field names for a multilayer
+    column (e.g. ``"_1"`` → ``u_1, w_1``)."""
+
+    def __init__(self, model=None, suffix=""):
+        super().__init__(model)
+        self.suffix = suffix
 
     def add_to(self, model):
         coords = model.coords
         horiz = coords[1:-1]                       # (x,) or (x, y)
-        uvel = [sp.Function(_HNAME[xd], real=True)(*coords) for xd in horiz]
-        w = sp.Function("w", real=True)(*coords)
+        s = self.suffix
+        uvel = [sp.Function(_HNAME[xd] + s, real=True)(*coords) for xd in horiz]
+        w = sp.Function("w" + s, real=True)(*coords)
         model.declare_state(*uvel, w)
         expr = sum(_DERIV[xd](uvel[i]) for i, xd in enumerate(horiz)) + d.z(w)
         model.add_equation("mass", expr)
@@ -97,4 +105,58 @@ class Momentum(Equation):
         return model.momentum
 
 
-__all__ = ["Equation", "Mass", "Momentum"]
+class MomentumNonHydrostatic(Equation):
+    """Non-hydrostatic momentum (VAM): the hydrostatic pressure is PRE-ABSORBED,
+    so the horizontal balance carries ``g·∂_x(b+h)`` and ``p`` is only the
+    NON-hydrostatic part; the vertical balance keeps ``∂_z p`` with NO ``+g``.
+    Registered as separate scalar rows ``momentum_x`` / ``momentum_z`` (the VAM
+    convention), since the vertical balance is not eliminated::
+
+        ∂_t u + ∂_x(u u) + ∂_z(u w) + g ∂_x(η) + ∂_x p/ρ − ∂_z τ/ρ   (momentum_x)
+        ∂_t w + ∂_x(u w) + ∂_z(w w) + ∂_z p/ρ                        (momentum_z)
+
+    ``suffix`` scopes the field names (multilayer column), ``tau_name`` overrides
+    the stress field name (default ``tau_xz``; multilayer uses ``tau_<ell>``),
+    and ``free_surface`` overrides η (default ``b + h``; a multilayer column uses
+    the TOTAL free surface ``b + H``).
+    """
+
+    def __init__(self, model=None, suffix="", tau_name="tau_xz", free_surface=None):
+        super().__init__(model)
+        self.suffix = suffix
+        self.tau_name = tau_name
+        self.free_surface = free_surface
+
+    def add_to(self, model):
+        coords = model.coords
+        t = coords[0]
+        horiz = coords[1:-1]
+        s = self.suffix
+        g, rho = model.parameters.g, model.parameters.rho
+        uvel = [sp.Function(_HNAME[xd] + s, real=True)(*coords) for xd in horiz]
+        w = sp.Function("w" + s, real=True)(*coords)
+        p = sp.Function("p" + s, real=True)(*coords)
+        txz = sp.Function(self.tau_name, real=True)(*coords)
+        if self.free_surface is not None:
+            eta = self.free_surface
+        else:
+            h = sp.Function("h", positive=True)(t, *horiz)
+            b = sp.Function("b", real=True)(t, *horiz)
+            eta = b + h
+        model.declare_state(p)
+        model.declare_closure(txz)
+        for i, xd in enumerate(horiz):
+            adv = sum(_DERIV[xe](uvel[i] * uvel[j]) for j, xe in enumerate(horiz))
+            model.add_equation(
+                f"momentum_{_CNAME[xd]}",
+                d.t(uvel[i]) + adv + d.z(uvel[i] * w) + g * _DERIV[xd](eta)
+                + _DERIV[xd](p) / rho - d.z(txz) / rho)
+        model.add_equation(
+            "momentum_z",
+            d.t(w) + sum(_DERIV[xd](uvel[i] * w) for i, xd in enumerate(horiz))
+            + d.z(w * w) + d.z(p) / rho)
+        self.uvel, self.w, self.p, self.txz = uvel, w, p, txz
+        return model
+
+
+__all__ = ["Equation", "Mass", "Momentum", "MomentumNonHydrostatic"]

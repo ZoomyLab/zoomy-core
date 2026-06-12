@@ -68,16 +68,15 @@ class VAM(BaseModel):
         b = sp.Function("b", real=True)(t, x)
         txz = sp.Function("tau_xz", real=True)(t, x, z)
 
-        # 1 — full system, hydrostatic pressure already absorbed:
-        # x-momentum carries g·∂_x(b+h); z-momentum keeps only ∂_z p.
-        m.Q = [h, u, w, p]
+        # 1 — full system, hydrostatic pressure already absorbed, assembled from
+        # balance blueprints (equations.py): Mass registers u, w; the
+        # non-hydrostatic Momentum registers p (state) + tau_xz (closure) and
+        # carries g·∂_x(b+h) in x, only ∂_z p in z.
+        from zoomy_core.model.models.equations import Mass, MomentumNonHydrostatic
+        m.declare_state(h)
         m.add_equation("bottom", d.t(b))
-        m.add_equation("mass", d.x(u) + d.z(w))
-        m.add_equation("momentum_x",
-                       d.t(u) + d.x(u * u) + d.z(u * w) + g * d.x(b + h)
-                       + d.x(p) / rho - d.z(txz) / rho)
-        m.add_equation("momentum_z",
-                       d.t(w) + d.x(u * w) + d.z(w * w) + d.z(p) / rho)
+        m.add_equation(Mass(m))
+        m.add_equation(MomentumNonHydrostatic(m))
         m.add_equation("kbc_top", KinematicBC(w=w, u=u, interface=b + h))
         m.add_equation("kbc_bot", KinematicBC(w=w, u=u, interface=b))
 
