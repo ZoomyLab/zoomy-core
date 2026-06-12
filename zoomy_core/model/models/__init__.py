@@ -15,7 +15,7 @@ Users get the eager-looking surface (``from zoomy_core.model.models
 import SME``) without the cycle.
 """
 
-__all__ = ["SigmaReference", "SME", "VAM", "MLSWE", "MLSME", "MLVAM",
+__all__ = ["SigmaReference", "SWE", "SME", "VAM", "MLSWE", "MLSME", "MLVAM",
            "MaterialModel", "newtonian_navier_slip",
            "NewtonianSME", "NewtonianMLSWE", "NewtonianMLSME",
            "NewtonianVAM", "NewtonianMLVAM"]
@@ -25,6 +25,9 @@ def __getattr__(name):
     if name == "SigmaReference":
         from zoomy_core.model.models.legacy.sigmaref import SigmaReference
         return SigmaReference
+    if name == "SWE":
+        from zoomy_core.model.models.swe import SWE
+        return SWE
     if name == "SME":
         from zoomy_core.model.models.sme import SME
         return SME
