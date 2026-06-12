@@ -1186,3 +1186,17 @@ def resolve_per_field(bc_list, state_names, aliases=None):
             slot_bc.setdefault(s, default)
         out.append(PerFieldBoundary(tag=tag, slot_bc=slot_bc, n_state=n))
     return BoundaryConditions(out)
+
+
+def resolve_and_attach(sm, boundary_conditions, aux_bcs=None, aliases=None):
+    """Attach boundary conditions to a built SystemModel, accepting EITHER the
+    legacy :class:`BoundaryConditions` container OR the NEW flat per-field list
+    (``[Wall("left", on="momentum"), …]``), which is resolved against ``sm``'s
+    declared state via :func:`resolve_per_field`.  Shared by every model's
+    ``system_model``."""
+    if isinstance(boundary_conditions, list):
+        boundary_conditions = resolve_per_field(
+            boundary_conditions, [str(s) for s in sm.state],
+            aliases if aliases is not None else {"momentum": "q"})
+    if boundary_conditions is not None:
+        sm.attach_boundary_conditions(boundary_conditions, aux_bcs=aux_bcs)

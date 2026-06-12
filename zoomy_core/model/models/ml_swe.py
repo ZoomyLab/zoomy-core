@@ -231,7 +231,7 @@ class MLSWE(BaseModel):
         m = self.derivation
         sm = SystemModel.from_model(
             m, Q=[self._bed, self._ht, *self._q_l])
-        if self.boundary_conditions is not None:
-            sm.attach_boundary_conditions(
-                self.boundary_conditions, aux_bcs=self.aux_boundary_conditions)
+        from zoomy_core.model.boundary_conditions import resolve_and_attach
+        resolve_and_attach(sm, self.boundary_conditions,
+                           aux_bcs=self.aux_boundary_conditions)
         return sm
