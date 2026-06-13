@@ -233,37 +233,41 @@ class VAM(BaseModel):
             m.momentum_z[kk].expr = sp.expand(
                 m.momentum_z[kk].expr - _zint01(R_om * wt_m * dphi) / mus[kk])
 
-        # 6c — conservative regroup.  The closure/ω̃ substitutions left the
-        # k≥1 rows fully EXPANDED, so the extraction routes their advective
-        # divergences into NCP (path-dependent at shocks) instead of flux.
-        # Regroup the conservative part F_k (the reference-pinned Escalante
-        # flux, mapped to our variables) as a compound ∂_x atom:
-        #   expr − expand(∂_x F.doit()) + Derivative(F, x)   (exact zero-change)
-        # NB: keep ∂_x b-bearing flux parts in their OWN compound atom — the
-        # extraction's diffusion branch fires on any b_x inside a compound
-        # and silently skips bx-free pieces, so a MIXED atom would drop them.
+        # 6c — conservative regroup, DERIVED from OUR OWN modal flux (no paper
+        # hardcoding).  The closure/ω̃ substitutions left the k≥1 rows fully
+        # EXPANDED, so the extraction routes their advective divergences into
+        # NCP (path-dependent at shocks) instead of flux.  The conservative
+        # flux F_k is the Galerkin projection of our ansatz' physical flux,
+        #   F_k = (2k+1) h ∫₀¹ φ_k · flux(ζ) dζ,
+        # flux = u² + p/ρ  (x-momentum),  u·w  (z-momentum), evaluated on the
+        # SAME modal fields (q/h, r/h, P) + closed top modes used everywhere
+        # above.  This reproduces the Escalante flux for ANY Nu (verified
+        # byte-identical at Nu=1) instead of pasting it.  We regroup it as a
+        # compound ∂_x atom:  expr − expand(∂_x F) + Derivative(F, x)  (exact
+        # zero-change).  NB the ∂_x b-bearing flux part is kept in its OWN
+        # compound atom — the extraction's diffusion branch fires on any b_x in
+        # a compound and skips bx-free pieces, so a MIXED atom would drop them.
         Pf = [m.functions.P.head(j, t, x) for j in range(Nu + 1)]
-        if Nu == 1:
-            F_groups = {
-                ("momentum_x", 1): [2 * qf[0] * qf[1] / h + h * Pf[1] / rho],
-                ("momentum_z", 1): [
-                    (qf[0] * rf[1] / h + qf[1] * rf[0] / h
-                     - sp.Rational(2, 5) * qf[1] * (rf[0] - rf[1]) / h),
-                    (sp.Rational(2, 5) * qf[1] * (qf[0] - qf[1]) / h
-                     * sp.Derivative(b, x)),
-                ],
-            }
-            for (fam, kk), Fs in F_groups.items():
-                row = getattr(m, fam)[kk]
-                # normalize to fully-expanded atoms FIRST — the closure
-                # substitutions left compound Derivative atoms behind, and
-                # subtracting an expanded ∂_x F against unexpanded compounds
-                # double-counts the content at extraction
-                e = sp.expand(sp.sympify(row.expr).doit())
-                for F in Fs:
+        u_zeta = sum(qf[j] / h * phis[j] for j in range(Nu + 1))
+        w_zeta = (sum(rf[j] / h * phis[j] for j in range(Nu + 1))
+                  + w_top_cons * phis[Nu + 1])
+        p_zeta = (sum(Pf[j] * phis[j] for j in range(Nu + 1))
+                  - sum(Pf[j] for j in range(Nu + 1)) * phis[Nu + 1])
+        flux_of = {"momentum_x": u_zeta ** 2 + p_zeta / rho,
+                   "momentum_z": u_zeta * w_zeta}
+        bx = sp.Derivative(b, x)
+        for fam, flux in flux_of.items():
+            for kk in range(1, Nu + 1):
+                Fk = sp.expand((2 * kk + 1) * h * _zint01(phis[kk] * flux))
+                F_bx = sum((tm for tm in sp.Add.make_args(Fk) if tm.has(bx)),
+                           sp.S.Zero)
+                e = sp.expand(sp.sympify(getattr(m, fam)[kk].expr).doit())
+                for F in (Fk - F_bx, F_bx):          # bx-free, then bx-bearing
+                    if F == 0:
+                        continue
                     dF = sp.Derivative(F, x)
                     e = sp.expand(e - sp.expand(dF.doit())) + dF
-                row.expr = e
+                getattr(m, fam)[kk].expr = e
 
         self.derivation = m
         self._bed = b
