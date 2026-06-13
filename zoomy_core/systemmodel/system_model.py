@@ -487,6 +487,15 @@ class SystemModel:
     # local expression).  When set from ``Model.position`` it is a
     # Zstruct ``Zstruct(X0=…, X1=…, X2=…)`` even for 2D models.
     position: Optional[Any] = None
+    # Per-state-field applied-Function map — ``h → h(t,x)``, ``ũ → ũ(t,x,ζ)`` —
+    # carrying each field's FULL coordinate signature so per-field dimensionality
+    # survives the ``_state_symbol`` name-collapse (the state twin of
+    # ``aux_function_map``).  Read it via :meth:`is_vertical_dependent`.  Default
+    # ``None`` ⇒ no signatures recorded (e.g. a SystemModel assembled directly).
+    state_function_map: Optional[Dict] = None
+    # The vertical coordinate Symbol (``model.coords[-1]`` / the σ ``ζ`` after the
+    # σ-map), or ``None`` for a depth-collapsed model with no vertical direction.
+    vertical: Optional[Any] = None
     history: List[Dict[str, str]] = field(default_factory=list)
 
     def __post_init__(self):
@@ -944,6 +953,8 @@ class SystemModel:
             diffusion_matrix=ops.get("diffusion_matrix"),
             eigenvalues=None, normal=normal,
             parameter_values=ops["parameter_values"],
+            state_function_map=ops.get("state_function_map"),
+            vertical=getattr(model, "vertical", None),
         )
         sm.history.append({
             "name": "from_model",

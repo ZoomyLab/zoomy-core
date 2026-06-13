@@ -304,12 +304,34 @@ class MLVAM(BaseModel):
                 ml.momentum_z[k].expr = sp.expand(
                     ml.momentum_z[k].expr - _zint01(R_om * wt_m * dphi) / mus[k])
 
+            # DERIVED conservative flux per (row, direction) for the §6c
+            # regroup (no hardcoding): F = (2k+1) h_l ∫ φ_k · flux dζ on this
+            # layer's modal ansatz.  Horizontal: u_d·u_e + p/ρ (diagonal).
+            # Vertical: the BULK advection w_bulk·u_e — the σ-velocity top mode
+            # (∂_t/G-laden, i.e. the kinematic interface part, not a material
+            # spatial flux) stays nonconservative.
+            p_zeta = (sum(P_heads[ell - 1](kp, t, *horiz) * phis[kp]
+                          for kp in range(Nu + 1)) + p_top_mode * phis[top])
+            w_bulk = sum(rfm[j] / h_l * phis[j] for j in range(Nu + 1))
+            flux_F = {}
+            for k2 in range(1, Nu + 1):
+                for di, xd in enumerate(horiz):
+                    for e, xe in enumerate(horiz):
+                        integ = uvel_m[di] * uvel_m[e]
+                        if di == e:
+                            integ = integ + p_zeta / rl
+                        flux_F[(f"momentum_{CN[xd]}", k2, xe)] = (
+                            (2 * k2 + 1) * h_l * _zint01(phis[k2] * integ))
+                for e, xe in enumerate(horiz):
+                    flux_F[("momentum_z", k2, xe)] = (
+                        (2 * k2 + 1) * h_l * _zint01(phis[k2] * (w_bulk * uvel_m[e])))
+
             cont = sp.expand(ml.mass[0].expr)
             constraints = [sp.expand(ml.mass[k].expr) for k in range(1, Nu + 2)]
             momd = {xd: [sp.expand(getattr(ml, f"momentum_{CN[xd]}")[k].expr)
                          for k in range(Nu + 1)] for xd in horiz}
             momz = [sp.expand(ml.momentum_z[k].expr) for k in range(Nu + 1)]
-            return cont, constraints, momd, momz, p_bot_trace_full
+            return cont, constraints, momd, momz, flux_F, p_bot_trace_full
 
         # layers derived TOP-DOWN so the pressure-trace cascade resolves
         layer_eqs = {}
@@ -364,7 +386,7 @@ class MLVAM(BaseModel):
         m.add_equation("bottom", d.t(b))
         m.add_equation("continuity", sp.expand(glob_c.subs(par)))
         for ell in range(1, N + 1):
-            _, constraints, momd, momz = layer_eqs[ell]
+            _, constraints, momd, momz, _flux_F = layer_eqs[ell]
             for xd in horiz:
                 for k in range(Nu + 1):
                     row = momd[xd][k].subs(frac).doit()
@@ -392,62 +414,57 @@ class MLVAM(BaseModel):
 
         m.apply(InvertMassMatrix())
 
-        # ── 6c — conservative regroup.  1-D level-1: the established hardcoded
-        # advective regroup + (x,x) absorption (byte-identical, UNCHANGED).
-        # 2-D: a generalized second-derivative absorption (advective stays in
-        # NCP — a documented accuracy choice for the 2-D non-hydrostatic ML
-        # model) so the extraction can route the bed-curvature / G-geometry
-        # ∂²-terms in ANY spatial direction (incl. the cross term ∂_x∂_y).
+        # ── 6c — conservative regroup, DERIVED from the per-layer modal flux
+        # (no hardcoding, any dim/Nu).  (1) Wrap the advective + pressure flux
+        # F_{row,e} = (2k+1) h ∫ φ_k flux dζ as a conservative ∂_e compound
+        # (bed-slope-free part); (2) a generalized second-derivative absorption
+        # routes the bed-curvature / G-geometry ∂²-terms (any spatial direction,
+        # incl. ∂_x∂_y) into the diffusion operator.
         space = list(horiz)
-        if dim == 2 and Nu == 1:
-            for ell in range(1, N + 1):
-                h_loc = l_all[ell - 1] * ht
-                q0m, q1m = q_mod[ell][x]
-                r0m, r1m = r_mod[ell - 1]
-                P1m = P_mod[ell - 1][1]
-                F_groups = {
-                    f"momentum_x_{ell}_1": [
-                        2 * q0m * q1m / h_loc + h_loc * P1m / rho_s],
-                    f"momentum_z_{ell}_1": [
-                        ((q0m * r1m + q1m * r0m) / h_loc
-                         - sp.Rational(2, 5) * q1m * (r0m - r1m) / h_loc)],
-                }
-                for name, Fs in F_groups.items():
-                    eq = getattr(m, name)
-                    e = sp.expand(sp.sympify(eq.expr).doit())
-                    for F in Fs:
-                        F = sp.expand(sp.sympify(F).subs(par))
-                        dF = sp.Derivative(F, x)
-                        e = sp.expand(e - sp.expand(dF.doit())) + dF
+        for ell in range(1, N + 1):
+            flux_F = layer_eqs[ell][4]
+            by_row = {}
+            for (rowbase, k2, xe), F in flux_F.items():
+                by_row.setdefault((rowbase, k2), []).append((xe, F))
+            for (rowbase, k2), flist in by_row.items():
+                name = f"{rowbase}_{ell}_{k2}"
+                if name not in m._equations:
+                    continue
+                eq = getattr(m, name)
+                ex = sp.expand(sp.sympify(eq.expr).doit())
+                for xe, F in flist:
+                    Fa = sp.expand(sp.sympify(F).subs(frac).doit()
+                                   .subs(sp.Derivative(ht, t), dth_glob)
+                                   .subs(G_sol).subs(par))
+                    # bed-slope-bearing flux stays nonconservative; the rest is
+                    # the conservative advective/pressure ∂_e flux.
+                    F_bed = sum((tm for tm in sp.Add.make_args(Fa) if tm.has(b)),
+                                sp.S.Zero)
+                    F_free = Fa - F_bed
+                    if F_free != 0:
+                        dF = sp.Derivative(F_free, xe)
+                        ex = sp.expand(ex - sp.expand(dF.doit())) + dF
+                eq.expr = ex
+        bases = ([f"momentum_{CN[xd]}_{ell}"
+                  for ell in range(1, N + 1) for xd in horiz]
+                 + [f"momentum_z_{ell}" for ell in range(1, N + 1)])
+        for base in bases:
+            for k in range(Nu + 1):
+                name = f"{base}_{k}"
+                if name not in m._equations:
+                    continue
+                eq = getattr(m, name)
+                e = sp.expand(sp.sympify(eq.expr).doit())
+                for e_dir in space:
                     F_d = sp.S.Zero
                     for a in list(e.atoms(sp.Derivative)):
-                        if a.variables == (x, x):
-                            F_d = F_d + e.coeff(a) * sp.Derivative(a.expr, x)
+                        vs = list(a.variables)
+                        if len(vs) == 2 and vs[0] == e_dir and vs[1] in space:
+                            F_d = F_d + e.coeff(a) * sp.Derivative(a.expr, vs[1])
                     if F_d != 0:
-                        dF = sp.Derivative(sp.expand(F_d), x)
+                        dF = sp.Derivative(sp.expand(F_d), e_dir)
                         e = sp.expand(e - sp.expand(dF.doit())) + dF
-                    eq.expr = e
-        elif dim == 3:
-            bases = ([f"momentum_{CN[xd]}_{ell}"
-                      for ell in range(1, N + 1) for xd in horiz]
-                     + [f"momentum_z_{ell}" for ell in range(1, N + 1)])
-            for base in bases:
-                for k in range(Nu + 1):
-                    name = f"{base}_{k}"
-                    if name not in m._equations:
-                        continue
-                    eq = getattr(m, name)
-                    e = sp.expand(sp.sympify(eq.expr).doit())
-                    for e_dir in space:
-                        F_d = sp.S.Zero
-                        for a in list(e.atoms(sp.Derivative)):
-                            vs = list(a.variables)
-                            if len(vs) == 2 and vs[0] == e_dir and vs[1] in space:
-                                F_d = F_d + e.coeff(a) * sp.Derivative(a.expr, vs[1])
-                        if F_d != 0:
-                            dF = sp.Derivative(sp.expand(F_d), e_dir)
-                            e = sp.expand(e - sp.expand(dF.doit())) + dF
-                    eq.expr = e
+                eq.expr = e
 
         self.derivation = m
         self._bed = b

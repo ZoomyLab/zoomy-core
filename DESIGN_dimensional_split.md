@@ -25,6 +25,40 @@ vertical coord; the σ-map even swaps it in place (`transformations.py:251`:
 At the current `SystemModel`: NO (erased by `_state_symbol`). ⇒ split BEFORE
 extraction, or carry per-field coords into the SystemModel. Recommend the former.
 
+## 0b. RECOMMENDED mechanism — carry per-field dimensionality INTO the SystemModel
+
+The cleanest way to STOP erasing the per-field signature is a **`state_function_map`**,
+the exact twin of the existing `aux_function_map: Dict[Symbol, Function]`
+(`system_model.py:1611, 1676`). `from_model` already receives `Q` as APPLIED
+fields with `.args` intact, and `system_extract.py:150` already iterates them
+(`state = [_state_symbol(f) for f in Q]`). At that same spot:
+
+```python
+state_function_map = {_state_symbol(f): f for f in Q}   # h -> h(t,x), ũ -> ũ(t,x,ζ)
+aux_function_map   = {_state_symbol(f): f for f in Qaux}
+```
+
+Store both on the dataclass (beside the existing `aux_function_map`), plus
+`sm.vertical = model.vertical`. Then dimensionality is recoverable forever:
+
+```python
+def is_3d(sm, s):           # s a state Symbol
+    return sm.vertical in sm.state_function_map[s].args
+# h, b -> 2-D ;  ũ -> 3-D
+```
+
+Properties: **additive / zero-regression** (does not touch `_state_symbol`, the
+operator tensors, or any current consumer — SME/VAM/SWE carry an unused map);
+**precedented** (literal twin of `aux_function_map`); **faithful** (full
+signature, so `(t,x)`, `(t,x,y)`, `(t,x,ζ)`, `(t,x,y,ζ)` are uniform — the
+runtime reads it to size each field: 2-D = `n_horiz` dofs, 3-D =
+`n_horiz × n_layers`, and attaches the column structure to 3-D fields only).
+
+It is **complementary** to the split, and it ENABLES BOTH: with the map present,
+`split_by_dimension` can run AFTER extraction (partition state by `is_3d`) as
+well as before. The map says WHO is 3-D; `space` including ζ + the per-direction
+routing does the actual flux work.
+
 ## 1. Dimensionality as a DERIVED property (not a param switch)
 
 Replace the `dimension`-param behaviour switch (the "dimension=2 no-op" sore

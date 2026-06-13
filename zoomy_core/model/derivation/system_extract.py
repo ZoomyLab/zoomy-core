@@ -149,6 +149,12 @@ def extract_system_operators(model, Q, Qaux=None):
     # ── state / aux Symbol lists (ordered as given) ──────────────────────
     state = [_state_symbol(f) for f in Q]
     aux_state = [_state_symbol(f) for f in Qaux]
+    # Per-state-field applied-Function map: carry each field's FULL coordinate
+    # signature (``h(t,x)``, ``ũ(t,x,ζ)``) so per-field dimensionality survives
+    # the ``_state_symbol`` name-collapse.  Consumed by
+    # ``SystemModel.is_vertical_dependent`` / a dimensional split.  (Aux applied
+    # forms also live in each ``aux_registry`` entry's ``"atom"``.)
+    state_function_map = {s: f for s, f in zip(state, Q)}
     n_eq = len(state)
     n_state = len(state)
 
@@ -246,6 +252,7 @@ def extract_system_operators(model, Q, Qaux=None):
         flux=F, hydrostatic_pressure=P,
         nonconservative_matrix=B, source=S, mass_matrix=M,
         diffusion_matrix=A_out,
+        state_function_map=state_function_map,
     )
 
 
