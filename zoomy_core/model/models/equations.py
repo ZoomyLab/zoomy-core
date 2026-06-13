@@ -214,7 +214,13 @@ class MomentumNonHydrostatic(Equation):
         uvel = [sp.Function(_HNAME[xd] + s, real=True)(*coords) for xd in horiz]
         w = sp.Function("w" + s, real=True)(*coords)
         p = sp.Function("p" + s, real=True)(*coords)
-        txz = sp.Function(self.tau_name, real=True)(*coords)
+        # one shear stress PER horizontal direction.  1 horizontal → keep the
+        # ``tau_name`` (default ``tau_xz``; multilayer overrides to ``tau_<ell>``)
+        # so 1-D / per-layer is byte-identical; 2 horizontals → ``tau_xz, tau_yz``
+        # (+ suffix) so momentum_y closes its OWN shear, not momentum_x's.
+        def _sname(xd):
+            return self.tau_name if len(horiz) == 1 else f"tau_{_CNAME[xd]}z" + s
+        tau = {xd: sp.Function(_sname(xd), real=True)(*coords) for xd in horiz}
         if self.free_surface is not None:
             eta = self.free_surface
         else:
@@ -222,18 +228,19 @@ class MomentumNonHydrostatic(Equation):
             b = sp.Function("b", real=True)(t, *horiz)
             eta = b + h
         model.declare_state(p)
-        model.declare_closure(txz)
+        model.declare_closure(*tau.values())
         for i, xd in enumerate(horiz):
             adv = sum(_DERIV[xe](uvel[i] * uvel[j]) for j, xe in enumerate(horiz))
             model.add_equation(
                 f"momentum_{_CNAME[xd]}",
                 d.t(uvel[i]) + adv + d.z(uvel[i] * w) + g * _DERIV[xd](eta)
-                + _DERIV[xd](p) / rho - d.z(txz) / rho)
+                + _DERIV[xd](p) / rho - d.z(tau[xd]) / rho)
         model.add_equation(
             "momentum_z",
             d.t(w) + sum(_DERIV[xd](uvel[i] * w) for i, xd in enumerate(horiz))
             + d.z(w * w) + d.z(p) / rho)
-        self.uvel, self.w, self.p, self.txz = uvel, w, p, txz
+        self.uvel, self.w, self.p, self.tau = uvel, w, p, tau
+        self.txz = tau[horiz[0]]
         return model
 
 

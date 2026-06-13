@@ -1149,8 +1149,14 @@ class SystemModel:
             # model declares no aux.
             update_aux_variables=(
                 _to_matrix(model.update_aux_variables(), len(aux_state), 1)
-                if aux_state
-                and callable(getattr(model, "update_aux_variables", None))
+                if (aux_state
+                    and callable(getattr(model, "update_aux_variables", None))
+                    # skip the trivial identity (ZArray of the aux symbols) so
+                    # identity-aux models stay true no-ops (None) and don't pay
+                    # a per-step apply; only a real formula (e.g. hinv) is carried.
+                    and list(model.update_aux_variables())
+                        != [model.aux_variables[k]
+                            for k in model.aux_variables.keys()])
                 else None),
             diffusion_matrix=A_diff_impl,
             diffusion_matrix_explicit=A_diff_expl,

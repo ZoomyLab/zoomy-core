@@ -200,25 +200,38 @@ class Solver(param.Parameterized):
         return Q
 
     def update_qaux(self, Q, Qaux, Qold, Qauxold, mesh, model, parameters, time, dt):
-        """Default: walk ``model._chain_systemmodel.aux_registry`` (or
-        ``self._sm.aux_registry`` if set up that way) and fill every
-        ``kind == 'derivative'`` row via ``LSQMesh.compute_derivatives``
-        on the underlying source field (state Q for state derivatives,
-        Qaux for derivatives of function-aux entries).
+        """Fill the auxiliary vector with BOTH legs the SystemModel gathered:
 
-        Subclasses override to supply the ``kind == 'function'`` rows
-        (e.g. user-supplied bathymetry, time-dependent forcing) and
-        call ``super().update_qaux(...)`` to handle the derivative
-        part.
+        1. the LOCAL per-cell aux formula — the lowered
+           ``update_aux_variables`` (e.g. KP ``hinv``), applied per cell like
+           :meth:`update_q`.  Absent/``None`` for models with no aux formula
+           (identity), so this leg is then skipped.
+        2. the NON-LOCAL derivative-aux rows — ``kind == 'derivative'`` entries
+           of ``aux_registry`` filled via ``LSQMesh.compute_derivatives`` (state
+           ``Q`` for state derivatives, the WORKING aux for function-aux
+           derivatives).
 
-        No-op if no SystemModel / registry is attached.
+        Subclasses override to supply the ``kind == 'function'`` rows and call
+        ``super().update_qaux(...)``.  No-op if neither leg is present.
         """
+        out = Qaux
+        # (1) LOCAL aux formula leg — per-cell (only present when the model
+        # declares a real, non-identity update_aux_variables).
+        local_fn = getattr(model, "update_aux_variables", None)
+        if local_fn is not None and Qaux.shape[0] > 0:
+            out = np.array(Qaux, copy=True)
+            for c in range(Q.shape[1]):
+                vals = np.asarray(
+                    local_fn(Q[:, c], Qaux[:, c], parameters),
+                    dtype=float).ravel()
+                out[:vals.shape[0], c] = vals
+        # (2) DERIVATIVE aux leg — LSQ gradients from the registry.
         sm = self._sm_from_solver_or_model(model)
-        if sm is None:
-            return Qaux
-        registry = getattr(sm, "aux_registry", None) or []
+        registry = getattr(sm, "aux_registry", None) if sm is not None else None
         if not registry:
-            return Qaux
+            return out
+        if out is Qaux:                 # don't mutate the caller's array
+            out = np.array(Qaux, copy=True)
         nc = Q.shape[1]
         n_cells = mesh.n_cells
         u_full = np.zeros(n_cells)
@@ -231,7 +244,7 @@ class Solver(param.Parameterized):
             if tk == "state":
                 u_full[:nc] = Q[entry["state_index"], :]
             elif tk == "function":
-                u_full[:nc] = Qaux[entry["function_row"], :]
+                u_full[:nc] = out[entry["function_row"], :]
             else:
                 # Unknown target — leave whatever the caller put there.
                 continue
@@ -244,8 +257,8 @@ class Solver(param.Parameterized):
                 u_full, degree=max(mi), derivatives_multi_index=[mi],
                 u_boundary_face="extrapolation",
             )
-            Qaux[row, :] = d[:nc, 0]
-        return Qaux
+            out[row, :] = d[:nc, 0]
+        return out
 
     def _sm_from_solver_or_model(self, model):
         """Look up the SystemModel: prefer ``self.sm`` (when the
