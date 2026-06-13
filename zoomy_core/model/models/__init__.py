@@ -3,7 +3,7 @@
 After the Model-class rewrite, primitives moved out of this package
 into ``zoomy_core/model/{basemodel,equation,state,operations}.py``.
 This package retains only the derivation subclasses
-(``SigmaReference``, ``SME``, ``VAM``).
+(``SME``, ``VAM``, …).
 
 Lazy import (PEP 562) is used so that importing
 ``zoomy_core.model.derivation.basisfunctions`` (e.g. from
@@ -15,7 +15,7 @@ Users get the eager-looking surface (``from zoomy_core.model.models
 import SME``) without the cycle.
 """
 
-__all__ = ["SigmaReference", "SWE", "MalpassetSWE", "SME", "ElderSME", "KESME",
+__all__ = ["SWE", "MalpassetSWE", "SME", "ElderSME", "KESME",
            "VAM", "MLSWE", "MLSME", "MLVAM", "ClosureState",
            # composable stress / interface closures (closures.py) — the ONLY
            # stress-closure path (the legacy MaterialModel was removed)
@@ -25,9 +25,6 @@ __all__ = ["SigmaReference", "SWE", "MalpassetSWE", "SME", "ElderSME", "KESME",
 
 
 def __getattr__(name):
-    if name == "SigmaReference":
-        from zoomy_core.model.models.legacy.sigmaref import SigmaReference
-        return SigmaReference
     if name == "SWE":
         from zoomy_core.model.models.swe import SWE
         return SWE

@@ -11,8 +11,6 @@ Class hierarchy:
                       HydrostaticPressure, … are oriented Expression subclasses —
                       there is no separate Relation/Assumption/Material class.
 
-    FullINS(state)  — builds INS equations from a StateSpace
-
 Design: the user drives every step. No hidden assumptions.
 """
 
@@ -2258,10 +2256,6 @@ class ApplyKinematicBCs(Operation):
         return " \\\\ ".join(p for p in parts if p)
 
 
-# ---------------------------------------------------------------------------
-# FullINS: 3D INS equations built from a StateSpace
-# ---------------------------------------------------------------------------
-
 _integrate_cache: dict = {}
 _integrate_cache_stats = {"hits": 0, "misses": 0}
 
@@ -4477,153 +4471,6 @@ class ProductRule(Operation):
 
     def _repr_latex_(self):
         return ""
-
-
-class _INSBuilder:
-    """Internal: builds INS equations from a StateSpace."""
-
-    def __init__(self, state: StateSpace):
-        self.state = state
-        self.dim = state.dim
-
-    def _stress_divergence(self, row):
-        s = self.state
-        labels = ["x", "y", "z"] if s.has_y else ["x", "z"]
-        coord_map = {"x": s.x, "y": s.y, "z": s.z}
-        expr = S.Zero
-        for j in labels:
-            expr += Derivative(s.tau[row + j], coord_map[j])
-        return expr
-
-    @property
-    def continuity(self):
-        s = self.state
-        expr = Derivative(s.u, s.x) + Derivative(s.w, s.z)
-        if s.has_y:
-            expr += Derivative(s.v, s.y)
-        return Expression(expr, "continuity")
-
-    def _momentum(self, vel, name, gravity=S.Zero):
-        """Build a momentum equation with canonical term ordering.
-
-        Order: temporal → convection → pressure → stress → source
-        """
-        s = self.state
-        row = name.split("_")[0]  # "x", "y", "z"
-
-        temporal = Derivative(vel, s.t)
-
-        convection = Derivative(vel * s.u, s.x) + Derivative(vel * s.w, s.z)
-        if s.has_y:
-            convection += Derivative(vel * s.v, s.y)
-
-        pressure = Rational(1, 1) / s.rho * Derivative(s.p, {"x": s.x, "y": s.y, "z": s.z}[row])
-        stress = -Rational(1, 1) / s.rho * self._stress_divergence(row)
-
-        groups = {"temporal": temporal, "convection": convection,
-                  "pressure": pressure, "stress": stress}
-        if gravity != S.Zero:
-            groups["source"] = gravity
-
-        full_expr = sum(groups.values())
-        return Expression(full_expr, name, term_groups=groups)
-
-    @property
-    def x_momentum(self):
-        return self._momentum(self.state.u, "x_momentum")
-
-    @property
-    def y_momentum(self):
-        if not self.state.has_y:
-            return None
-        return self._momentum(self.state.v, "y_momentum")
-
-    @property
-    def z_momentum(self):
-        return self._momentum(self.state.w, "z_momentum", gravity=self.state.g)
-
-    @property
-    def equations(self):
-        eqs = [self.continuity, self.x_momentum]
-        if self.state.has_y:
-            eqs.append(self.y_momentum)
-        eqs.append(self.z_momentum)
-        return eqs
-
-    def describe(self, header=True, final_equation=True, strip_args=True,
-                 **kwargs):
-        """Composable description of the full INS system.
-
-        Returns a ``Description`` that renders as markdown in Jupyter.
-        """
-        from zoomy_core.misc.description import Description
-
-        parts = []
-        if header:
-            dim_label = "3D (x,y,z)" if self.state.has_y else "2D (x,z)"
-            parts.append(f"**Incompressible Navier-Stokes** ({dim_label})")
-
-        if final_equation:
-            for eq in self.equations:
-                tex = eq.latex(strip_args=strip_args)
-                parts.append(f"\n**{eq.name}:**\n$$\n{tex} = 0\n$$")
-
-        return Description("\n".join(parts))
-
-    def _repr_markdown_(self):
-        return self.describe()._repr_markdown_()
-
-
-def FullINS(state, equations=None):
-    """Build the incompressible Navier-Stokes as a ``System`` tree.
-
-    Tree shape::
-
-        system
-        ├── continuity   (scalar leaf)
-        └── momentum     (intermediate Zstruct)
-            ├── x        (leaf)
-            ├── y        (leaf, only in 3D)
-            └── z        (leaf)
-
-    Access::
-
-        ins = FullINS(state)
-        ins.continuity                  # scalar proxy
-        ins.momentum                    # intermediate proxy
-        ins.momentum.x.apply(op)        # mutate one component leaf
-        ins.momentum.apply(op)          # mutate every component leaf
-
-    Parameters
-    ----------
-    state : StateSpace
-    equations : list of str, optional
-        Components to include.  Options: ``"continuity"``, ``"momentum.x"``,
-        ``"momentum.y"``, ``"momentum.z"``.  Top-level ``"momentum"`` means
-        all momentum components.  Default: everything.
-    """
-    from zoomy_core.model.models.legacy.derived_system import System
-
-    builder = _INSBuilder(state)
-    system = System("INS", state)
-
-    want_continuity = (equations is None) or ("continuity" in equations)
-    want_all_momentum = (equations is None) or ("momentum" in equations)
-    momentum_components = []
-    for axis in ("x", "y", "z"):
-        if axis == "y" and not state.has_y:
-            continue
-        if want_all_momentum or f"momentum.{axis}" in (equations or ()):
-            momentum_components.append(axis)
-
-    if want_continuity:
-        system.add_equation("continuity", builder.continuity)
-
-    for axis in momentum_components:
-        expr = getattr(builder, f"{axis}_momentum")
-        system.add_equation(("momentum", axis), expr)
-
-    return system
 
 
 # ---------------------------------------------------------------------------
