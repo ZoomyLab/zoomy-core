@@ -419,6 +419,12 @@ class NumpyRuntimeModel:
         _register("source_jacobian", sm.source_jacobian, std_sig)
         _register("update_variables",
                   _column_to_rank1(sm.update_variables), std_sig)
+        # Per-cell aux formula (e.g. KP hinv), lowered exactly like
+        # ``update_variables``; the solver applies it to Qaux each step.
+        # ``getattr`` (not a formal slot yet) ⇒ None short-circuits in _register.
+        _register("update_aux_variables",
+                  _column_to_rank1(getattr(sm, "update_aux_variables", None)),
+                  std_sig)
         _register("eigenvalues", _column_to_rank1(sm.eigenvalues), eig_sig)
         # ``state_update``: explicit-update operator for split substeps
         # (e.g. Chorin corrector).  Returns a rank-1 array of length
