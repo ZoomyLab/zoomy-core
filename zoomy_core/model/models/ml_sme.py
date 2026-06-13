@@ -281,6 +281,49 @@ class MLSME(BaseModel):
                            else f"momentum_{CN[xd]}_{ell}_{k}")
                     m.add_equation(enm, sp.expand(mom.subs(par).doit()))
 
+        # ── basic operators: interpolate_to_3d + project_from_3d, PIECEWISE over
+        # the moving layers, so ML-SME exposes the same canonical operators as
+        # SME (postprocessing / coupling consume model.interpolate_to_3d).
+        # Layer ℓ spans global ζ ∈ [c_{ℓ-1}, c_ℓ] (c_ℓ = Σ_{j≤ℓ} l_j); within it
+        #   u_ℓ(ζ) = Σ_k (q_ℓ_k / h_ℓ)·P_k(2 ζ_loc − 1),  ζ_loc = (ζ−c_{ℓ-1})/l_ℓ,
+        # h_ℓ = l_ℓ·ht.  Field order [b, h, u(, v), w, p] (SME convention).
+        cum = [sp.S.Zero]
+        for lf in l_all:
+            cum.append(cum[-1] + lf)
+
+        def _u_piecewise(xd):
+            pieces = []
+            for ell in range(1, N + 1):
+                lf, c0 = l_all[ell - 1], cum[ell - 1]
+                zloc = (zeta - c0) / lf
+                u_l = sum((q_mod[ell][xd][k] / (lf * ht)) * sp.legendre(k, 2 * zloc - 1)
+                          for k in range(Nu + 1))
+                pieces.append((u_l, (zeta <= cum[ell]) if ell < N else True))
+            return sp.Piecewise(*pieces)
+
+        interp = {0: b, 1: ht}
+        interp[2] = _u_piecewise(x).subs(par)
+        if dim == 3:
+            interp[3] = _u_piecewise(y).subs(par)
+        interp[4] = sp.S.Zero            # TODO: per-layer kinematic w reconstruction
+        interp[5] = m.parameters.rho * m.parameters.g * ht * (1 - zeta)
+        self._interpolate_rows = interp
+
+        # inverse: q_ℓ_k = (2k+1)·h·∫_{c_{ℓ-1}}^{c_ℓ} P3_<vel>(ζ)·P_k(2 ζ_loc−1) dζ
+        P3 = {f: sp.Symbol(f"P3_{f}", real=True) for f in ("b", "h")}
+        proj = {b: P3["b"], ht: P3["h"]}
+        for xd in horiz:
+            P3vel = sp.Function(f"P3_{HNAME[xd]}", real=True)(zeta)
+            for ell in range(1, N + 1):
+                lf = l_all[ell - 1].subs(par)
+                c0, c1 = cum[ell - 1].subs(par), cum[ell].subs(par)
+                for k in range(Nu + 1):
+                    proj[q_mod[ell][xd][k]] = (
+                        (2 * k + 1) * P3["h"]
+                        * sp.Integral(P3vel * sp.legendre(k, 2 * (zeta - c0) / lf - 1),
+                                      (zeta, c0, c1)))
+        self._project_rows = proj
+
         self.derivation = m
         self._bed = b
         self._ht = ht
@@ -297,7 +340,7 @@ class MLSME(BaseModel):
     def system_model(self) -> SystemModel:
         m = self.derivation
         sm = SystemModel.from_model(
-            m, Q=[self._bed, self._ht, *self._q_flat])
+            m, Q=[self._bed, self._ht, *self._q_flat], canonical_source=self)
         from zoomy_core.model.boundary_conditions import resolve_and_attach
         resolve_and_attach(sm, self.boundary_conditions,
                            aux_bcs=self.aux_boundary_conditions)
