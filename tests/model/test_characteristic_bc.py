@@ -4,7 +4,8 @@ incoming characteristics carry the target's information (the data-level
 analogue of Roe upwinding; the principled coupled-boundary ghost)."""
 import numpy as np
 
-from zoomy_core.model.models import SME, newtonian_navier_slip
+from zoomy_core.model.models import SME
+from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
 from zoomy_core.mesh import BaseMesh
 import zoomy_core.model.initial_conditions as IC
 from zoomy_core.model.boundary_conditions import (
@@ -15,7 +16,7 @@ from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
 
 
 def _run(bcs, ic, t_end, nc=100):
-    sm = SME(material=newtonian_navier_slip(), level=0, boundary_conditions=bcs).system_model
+    sm = SME(closures=[Newtonian(), NavierSlip(), StressFree()], level=0, boundary_conditions=bcs).system_model
     sm.initial_conditions = IC.UserFunction(function=ic)
     sm.aux_initial_conditions = IC.Constant(constants=lambda n: np.zeros(n))
     mesh = BaseMesh.create_1d(domain=(0.0, 10.0), n_inner_cells=nc)

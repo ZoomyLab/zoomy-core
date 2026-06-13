@@ -46,11 +46,12 @@ class VAM(BaseModel):
     _finalize_lazy = True               # declarative path
     level = param.Integer(default=1, bounds=(0, None))
     closures = param.List(default=[], doc=(
-        "Composable stress Closure pieces (closures.py); takes precedence over "
-        "`material`.  Empty + material=None leaves tau_xz UNCLOSED."))
-    material = param.Parameter(default=None, doc=(
-        "DEPRECATED - use `closures=[...]`.  Legacy MaterialModel stress "
-        "closure; None leaves tau_xz UNCLOSED (modal moments stay free)."))
+        "Composable stress Closure pieces (closures.py).  Empty leaves tau_xz "
+        "UNCLOSED (modal moments stay free)."))
+    small_slope = param.Boolean(default=True, doc=(
+        "Resolve the opaque boundary frame to its n→ẑ limit (drop O(slope) "
+        "traction corrections) — the shallow form.  False keeps the slope-aware "
+        "tractions."))
 
     def derive_model(self):
         Nu = int(self.level)
@@ -72,7 +73,8 @@ class VAM(BaseModel):
         # balance blueprints (equations.py): Mass registers u, w; the
         # non-hydrostatic Momentum registers p (state) + tau_xz (closure) and
         # carries g·∂_x(b+h) in x, only ∂_z p in z.
-        from zoomy_core.model.models.equations import Mass, MomentumNonHydrostatic
+        from zoomy_core.model.models.equations import (
+            Mass, MomentumNonHydrostatic, small_slope_scaling)
         m.declare_state(h)
         m.add_equation("bottom", d.t(b))
         m.add_equation(Mass(m))
@@ -106,15 +108,19 @@ class VAM(BaseModel):
         mx.apply(m.kbc_bot); mx.apply(m.kbc_top)
         mx.apply({sp.Derivative(b, t): 0})
         mx.apply({pp.at(1): 0})              # dynamic surface BC p(ζ=1)=0
-        tau, uu = m.functions.tau_xz, m.functions.u
-        # Navier slip: τ(0) = +λ·u_b (same sign as the slip velocity)
+        # boundary closures prescribe the traction in the local frame {n,t_α};
+        # bulk closures are diagonal constitutive (s.u → axis velocity)
         from zoomy_core.model.models.material import ClosureState
         from zoomy_core.model.models.closures import apply_stress_closures
-        def _state(at):
-            return ClosureState(m.functions, params=m.parameters,
-                                h=h, x=x, zeta=zeta, at=at)
-        has_bulk = apply_stress_closures(self.closures, self.material, m, mx, tau, _state)
+        def _state(at, *, alias=None, btag=None):
+            return ClosureState(m.functions, params=m.parameters, h=h, x=x,
+                                zeta=zeta, at=at, alias=alias,
+                                boundary_tag=btag, horiz=[x])
+        axes = [{"mx": mx, "tau": m.functions.tau_xz, "velname": "u"}]
+        has_bulk = apply_stress_closures(self.closures, m, axes, _state, [x])
         mx.apply(Simplify())
+        if bool(self.small_slope):
+            small_slope_scaling(m)
 
         mz = m.momentum_z
         mz.apply(Multiply(h)); mz.apply(Multiply(c(zeta) * phi_k))

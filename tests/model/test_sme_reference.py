@@ -32,7 +32,8 @@ Shape, count and smoke checks are NEVER sufficient — pin every term.
 import pytest
 import sympy as sp
 
-from zoomy_core.model.models import SME, newtonian_navier_slip
+from zoomy_core.model.models import SME
+from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
 
 
 def _kt_reference_rows(sm, N):
@@ -73,11 +74,13 @@ def _kt_reference_rows(sm, N):
 
     rows = [Dt(b)]                                               # inert bed
     rows.append(Dt(h) + Dx(h * um))                              # mass
+    e_x = sm.parameters.e_x                       # K&T 4.7 downslope body force
     rows.append(                                                 # mean (4.7)
         Dt(h * um)
         + Dx(h * (um**2 + sum(alpha[j]**2 / (2 * j + 1) for j in J))
              + g * h**2 / 2)
         + g * h * Dx(b)
+        - g * h * e_x
         + lam_s * (um + sum(alpha[j] for j in J)))
     for i in J:                                                  # moments (4.10)
         row = (Dt(h * alpha[i])
@@ -95,7 +98,7 @@ def _kt_reference_rows(sm, N):
 
 @pytest.mark.parametrize("level", [1, 2, 3])
 def test_sme_rows_match_kowalski_torrilhon(level):
-    sm = SME(material=newtonian_navier_slip(), level=level).system_model
+    sm = SME(closures=[Newtonian(), NavierSlip(), StressFree()], level=level).system_model
     assert [str(s) for s in sm.state] == (
         ["b", "h"] + [f"q_{i}" for i in range(level + 1)])
     rv = sm.reconstruct_residuals()

@@ -32,20 +32,6 @@ def _flat(z):
     return out
 
 
-def test_closures_list_equals_material_term_by_term():
-    """closures=[...] reproduces material=... in EVERY operator entry."""
-    pars = {"nu": 0.1, "lambda_s": 0.5}
-    legacy = SME(level=2, material=newtonian_navier_slip(), parameters=pars).system_model
-    composed = SME(level=2, parameters=pars,
-                   closures=[Newtonian(), NavierSlip(), StressFree()]).system_model
-    assert [str(s) for s in legacy.state] == [str(s) for s in composed.state]
-    for name in _OPERATORS:
-        fa, fb = _flat(getattr(legacy, name)), _flat(getattr(composed, name))
-        assert len(fa) == len(fb), f"{name}: length {len(fa)} != {len(fb)}"
-        for k, (a, b) in enumerate(zip(fa, fb)):
-            assert sp.simplify(a - b) == 0, f"{name}[{k}] differs: {sp.simplify(a - b)}"
-
-
 def _termwise_equal(A, B):
     if [str(s) for s in A.state] != [str(s) for s in B.state]:
         return False
@@ -82,6 +68,18 @@ def test_ml_interface_closures_equal_selector():
 def test_empty_closures_leave_stress_unclosed():
     sm = SME(level=2).system_model
     assert any("sigma" in str(s) for s in sm.aux_state)
+
+
+def test_bingham_bulk_closes_via_quadrature():
+    """Bingham (viscoplastic) bulk material: rational/√ in ζ → no analytic
+    Galerkin bracket; closes with quadrature_order>0 (Gauss-Legendre)."""
+    from zoomy_core.model.models.closures import Bingham
+    sm = SME(level=2, quadrature_order=8,
+             parameters={"nu": 0.1, "tau_y": 0.5, "lambda_s": 0.5},
+             closures=[Bingham(), NavierSlip(), StressFree()]).system_model
+    surv = sum(len(sp.sympify(sm.source[i, 0]).atoms(sp.Integral))
+               for i in range(sm.n_equations))
+    assert surv == 0, "Bingham bulk must close via quadrature (no loose integrals)"
 
 
 def test_rough_wall_is_bottom_only_bulk_free():

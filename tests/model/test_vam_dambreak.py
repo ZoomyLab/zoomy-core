@@ -13,7 +13,8 @@ import numpy as np
 import pytest
 import sympy as sp
 
-from zoomy_core.model.models import VAM, newtonian_navier_slip
+from zoomy_core.model.models import VAM
+from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
 from zoomy_core.mesh import BaseMesh
 import zoomy_core.model.initial_conditions as IC
 from zoomy_core.model.boundary_conditions import BoundaryConditions, Extrapolation
@@ -22,7 +23,7 @@ from zoomy_core.fvm.solver_chorin_vam_numpy import ChorinSplitVAMSolver
 
 @pytest.fixture(scope="module")
 def vam_sm():
-    return VAM(material=newtonian_navier_slip(), level=1).system_model
+    return VAM(closures=[Newtonian(), NavierSlip(), StressFree()], level=1).system_model
 
 
 def test_vam_is_a_square_dae_with_pressure_constraints(vam_sm):
@@ -41,7 +42,7 @@ def test_vam_is_a_square_dae_with_pressure_constraints(vam_sm):
 
 
 def test_vam_chorin_split_roles(vam_sm):
-    split = VAM(material=newtonian_navier_slip(), level=1).chorin_split(system_model=vam_sm)
+    split = VAM(closures=[Newtonian(), NavierSlip(), StressFree()], level=1).chorin_split(system_model=vam_sm)
     assert split.SM_pred.equation_names == [
         "pred_b", "pred_h", "pred_q_0", "pred_q_1", "pred_r_0", "pred_r_1"]
     assert split.SM_press.equation_names == ["elliptic_P_0", "elliptic_P_1"]
@@ -55,7 +56,7 @@ def test_vam_dambreak_over_bump():
     """Short dam break over a Gaussian bump: finite, positive depth, mass
     conserved, bounded non-hydrostatic pressure."""
     nc = 60
-    model = VAM(material=newtonian_navier_slip(), level=1)
+    model = VAM(closures=[Newtonian(), NavierSlip(), StressFree()], level=1)
     sm = model.system_model
 
     def _bump_ic(xv):

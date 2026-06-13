@@ -34,36 +34,71 @@ from zoomy_core.model.operations import Operation
 from zoomy_core.model.models.material import ClosureState   # the full-access state
 
 
-def apply_stress_closures(closures, material, m, mx, tau, state):
-    """Inject stress closures at the projected x-momentum (shared by SME / VAM /
-    the multilayer models).
+def _solve_traction(P, s, nh):
+    """Solve the boundary frame system ``t_α·(τ·n) = P_α`` for the shear-stress
+    traces ``τ_iz`` (``i = 0…nh−1``), given the prescribed tangential tractions
+    ``P`` and the local frame on the :class:`ClosureState` ``s``.
 
-    ``closures`` is the composable list (closures.py); ``material`` is the legacy
-    MaterialModel fallback used only when ``closures`` is empty.  ``state`` is a
-    callable ``at -> ClosureState``.  Boundary traces (surface/bottom) are
-    substituted BEFORE the bulk field so the trace substitutions are not
-    pre-empted by the bulk rewrite.  Returns True iff a BULK closure was applied
-    (else the caller leaves the bulk stress free / modally expanded)."""
-    pieces = []                                       # (closes_tag, expression_fn)
-    if closures:
-        for c in closures:
-            c.register(m)
-        for c in closures:
-            c.check(m)
-            pieces.append((c.closes, c.expression))
-    elif material is not None:
-        if material.surface is not None: pieces.append(("surface", material.surface))
-        if material.bottom is not None:  pieces.append(("bottom", material.bottom))
-        if material.bulk is not None:    pieces.append(("bulk", material.bulk))
-    order = {"surface": 0, "bottom": 1, "bulk": 2}
-    pieces.sort(key=lambda p: order[p[0]])
-    target = {"surface": tau.at(1), "bottom": tau.at(0), "bulk": tau.expr}
-    loc = {"surface": 1, "bottom": 0, "bulk": None}
-    has_bulk = False
-    for closes, fn in pieces:
-        mx.apply({target[closes]: fn(state(loc[closes]))})
-        has_bulk = has_bulk or closes == "bulk"
-    return has_bulk
+    Our stress tensor carries only the shear components ``τ_xz, τ_yz`` (the
+    in-plane components were dropped by ``moment_scaling``), so
+    ``(τ·n)_horiz_i = τ_iz n_z`` and ``(τ·n)_z = Σ_i τ_iz n_i``.  Returns the
+    ``τ_iz`` as expressions in the OPAQUE frame slopes; under
+    ``small_slope_scaling`` (slopes → 0, ``n → ẑ``) they collapse to
+    ``τ_iz = P_i`` — the flat-boundary trace.  In 1-D, exactly
+    ``τ_0 = P_0·(1+σ²)/(1−σ²)`` → ``P_0``."""
+    nvec, tans = s.normal, s.tangents
+    tau = [sp.Symbol(f"__tauz{i}") for i in range(nh)]
+    nz = nvec[nh]
+    taudotn = sp.Matrix([tau[i] * nz for i in range(nh)]
+                        + [sum(tau[i] * nvec[i] for i in range(nh))])
+    eqs = [sp.Eq((tans[a].T * taudotn)[0], P[a]) for a in range(nh)]
+    sol = sp.solve(eqs, tau, dict=True)
+    if not sol:
+        raise ValueError("boundary traction frame solve failed for "
+                         f"P={P} (nh={nh})")
+    return [sp.simplify(sol[0][tau[i]]) for i in range(nh)]
+
+
+def apply_stress_closures(closures, m, axes, state, horiz):
+    """Inject stress closures at the projected momentum (shared by SME / VAM /
+    the multilayer models) — frame-aware, dimension-agnostic.
+
+    Boundary closures prescribe the traction in the local frame ``{n, t_α}``
+    (:meth:`Closure.traction` → ``{"normal", "tangent"}``) and
+    :func:`_solve_traction` recovers the per-direction shear traces; bulk
+    closures stay diagonal (one constitutive :meth:`Closure.expression` per
+    direction, ``s.u`` aliased to that direction's velocity).
+
+    ``axes`` is a list of ``{"mx": eq, "tau": FieldHandle, "velname": "u"|"v"}``
+    (one per horizontal momentum component) and ``state`` is
+    ``state(at, *, alias=None, btag=None) -> ClosureState``.  Boundary traces
+    (surface/bottom) are substituted BEFORE the bulk field.  Returns True iff a
+    BULK closure was applied (else the caller leaves the bulk stress free /
+    modally expanded)."""
+    nh = len(axes)
+    for c in closures:
+        c.register(m)
+    for c in closures:
+        c.check(m)
+    surface = [c for c in closures if c.closes == "surface"]
+    bottom = [c for c in closures if c.closes == "bottom"]
+    bulk = [c for c in closures if c.closes == "bulk"]
+    for at, btag, pieces in ((1, "eta", surface), (0, "b", bottom)):
+        if not pieces:
+            continue
+        P = [sp.S.Zero] * nh
+        for c in pieces:
+            tang = c.traction(state(at, btag=btag)).get("tangent") or []
+            for i in range(min(nh, len(tang))):
+                P[i] += tang[i]
+        traces = _solve_traction(P, state(at, btag=btag), nh)
+        for i, ax in enumerate(axes):
+            ax["mx"].apply({ax["tau"].at(at): traces[i]})
+    for c in bulk:                                # diagonal constitutive
+        for ax in axes:
+            ax["mx"].apply({ax["tau"].expr:
+                            c.expression(state(None, alias={"u": ax["velname"]}))})
+    return bool(bulk)
 
 
 class Closure(Operation):
@@ -93,6 +128,18 @@ class Closure(Operation):
     def expression(self, s):
         """Return the symbolic relation for this stress component (override)."""
         raise NotImplementedError
+
+    def traction(self, s):
+        """BOUNDARY traction in the local frame ``{n, t_α}``:
+        ``{"normal": <n·σn or None>, "tangent": [t_α·σn, …]}`` (one entry per
+        horizontal direction).  Default wraps the scalar :meth:`expression` as a
+        single tangential component — the 1-D / diagonal fallback.  Boundary
+        closures whose components COUPLE (friction magnitude ``|U|``, a
+        prescribed wind/tension direction) override this to return the full
+        vector; ``"normal"=None`` leaves the normal traction (pressure) to the
+        hydrostatic step.  Only consulted for ``closes ∈ {"bottom","surface"}``
+        under the frame-aware caller."""
+        return {"normal": None, "tangent": [self.expression(s)]}
 
 
 # ── bulk closures ──────────────────────────────────────────────────────────
@@ -171,6 +218,13 @@ class NavierSlip(Closure):
     def expression(self, s):
         return s.par.lambda_s * s.u
 
+    def traction(self, s):
+        """Tangential traction ∝ slip velocity, per axis (linear — no coupling;
+        the per-axis form is just the slip components in the frame).  Reduces to
+        ``τ_iz|_b = λ_s u_i`` under small-slope scaling."""
+        return {"normal": None,
+                "tangent": [s.par.lambda_s * ut for ut in s.u_tangent]}
+
 
 class RoughWall(Closure):
     """Turbulent ROUGH-WALL bed drag (OpenFOAM ``nutkRoughWallFunction`` family):
@@ -189,6 +243,16 @@ class RoughWall(Closure):
     def expression(self, s):
         Cf = (s.par.kappa / sp.log(s.par.z_p / (s.par.k_s / 30))) ** 2
         return s.par.rho * Cf * s.u * sp.Abs(s.u)
+
+    def traction(self, s):
+        """Quadratic bed drag as a VECTOR traction opposing the slip velocity:
+        ``τ_b,i = ρ C_f |U_t| u_{t,i}`` — the magnitude ``|U_t| = √(Σ u_{t,α}²)``
+        couples the x/y components (a single scalar per axis would wrongly use
+        ``|u_i|``).  Reduces to ``ρ C_f u_b|u_b|`` in 1-D under small-slope."""
+        Cf = (s.par.kappa / sp.log(s.par.z_p / (s.par.k_s / 30))) ** 2
+        speed = sp.sqrt(sum(ut ** 2 for ut in s.u_tangent))
+        return {"normal": None,
+                "tangent": [s.par.rho * Cf * speed * ut for ut in s.u_tangent]}
 
 
 # ── depth-averaged SWE closures (bed friction + horizontal mixing) ──────────
@@ -254,6 +318,11 @@ class StressFree(Closure):
 
     def expression(self, s):
         return sp.S.Zero
+
+    def traction(self, s):
+        """Zero tangential traction on every axis (the normal traction — the
+        free-surface pressure — is left to the hydrostatic step, as before)."""
+        return {"normal": None, "tangent": [sp.S.Zero for _ in s.tangents]}
 
 
 # ── interface-transfer closures (multilayer) ───────────────────────────────

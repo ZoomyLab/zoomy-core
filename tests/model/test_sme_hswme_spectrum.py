@@ -21,12 +21,13 @@ import numpy as np
 import sympy as sp
 import pytest
 
-from zoomy_core.model.models import SME, newtonian_navier_slip
+from zoomy_core.model.models import SME
+from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
 
 
 def test_sme_registers_symbolic_hswme_spectrum_exact_at_level1():
-    sm = SME(level=1, material=newtonian_navier_slip()).system_model
+    sm = SME(level=1, closures=[Newtonian(), NavierSlip(), StressFree()]).system_model
     assert sm.eigenvalue_mode == "symbolic"
     by = {str(s): s for s in sm.state}
     g = sm.parameters.g
@@ -53,7 +54,7 @@ def test_sme_registers_symbolic_hswme_spectrum_exact_at_level1():
 
 @pytest.mark.parametrize("level", [2, 3])
 def test_hswme_bound_quality_in_hyperbolic_regime(level):
-    sm = SME(level=level, material=newtonian_navier_slip(),
+    sm = SME(level=level, closures=[Newtonian(), NavierSlip(), StressFree()],
              parameters={"lambda_s": 0.5, "nu": 1e-3}).system_model
     rt = NumpyRuntimeModel.from_system_model(sm)
     n_v = sm.n_state

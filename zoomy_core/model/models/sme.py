@@ -56,6 +56,14 @@ class SME(BaseModel):
         "3 → coords (t, x, y, z), two horizontal directions (q_x_i, q_y_i).  "
         "Closures and boundary conditions are dimension-agnostic; only the state "
         "setup and the per-direction projection loops switch on this."))
+    small_slope = param.Boolean(default=True, doc=(
+        "Apply small_slope_scaling — resolve the opaque boundary frame to its "
+        "n→ẑ limit (drop the O(slope) traction corrections), recovering the "
+        "K&T shallow-moment form.  True (default) = the standard shallow model "
+        "(byte-identical to the hand-derived SME).  False = keep the "
+        "geometrically-exact, slope-aware boundary tractions (the higher-order "
+        "model); the projected-traction closures then carry the bed/surface "
+        "slope explicitly."))
     quadrature_order = param.Integer(default=0, bounds=(0, None), doc=(
         "Gauss-Legendre order for NUMERICAL integration of Galerkin "
         "integrals that survive the analytic bracket machinery "
@@ -66,12 +74,8 @@ class SME(BaseModel):
         "List of composable stress Closure pieces (closures.py), e.g. "
         "closures=[Newtonian(), NavierSlip(), StressFree()] or "
         "closures=[KEpsilonViscosity(), RoughWall()].  Each closes one stress "
-        "component (bulk / bottom / surface).  Takes precedence over `material`; "
-        "an empty list with material=None leaves tau_xz UNCLOSED."))
-    material = param.Parameter(default=None, doc=(
-        "DEPRECATED — use `closures=[...]`.  Legacy MaterialModel stress "
-        "closure; None (default) leaves tau_xz UNCLOSED (modal moments stay "
-        "free functions)."))
+        "component (bulk / bottom / surface).  An empty list leaves tau_xz "
+        "UNCLOSED (modal moments stay free)."))
 
     def derive_model(self):
         """Build the declarative SME model (stored as ``self.derivation``) and
@@ -105,7 +109,9 @@ class SME(BaseModel):
         # (equations.py).  Mass registers u, w (state); Momentum registers p
         # (state) and tau_xz (closure) and builds the (x, z) momentum with the
         # incline body force −g·e_x; h is the geometry state, b the bed.
-        from zoomy_core.model.models.equations import Mass, Momentum, moment_scaling
+        from zoomy_core.model.models.equations import (
+            Mass, Momentum, moment_scaling, small_slope_scaling)
+        horiz = (x,)                              # 1 horizontal direction (dim 2)
         m.declare_state(h)
         m.add_equation("bottom", d.t(b))
         m.add_equation(Mass(m))
@@ -146,7 +152,6 @@ class SME(BaseModel):
         mx.apply(Integrate(zeta, bounds=(0, 1)))
         mx.apply(ResolveIntegral())
         mx.apply(m.kbc_bot); mx.apply(m.kbc_top); mx.apply({sp.Derivative(b, t): 0})
-        tau, uu = m.functions.tau_xz, m.functions.u
         # stress BCs: free surface τ(1)=0; Navier slip τ(0)=+λ·u_b — stress
         # and slip velocity carry the SAME sign (τ = ρν/h·∂_ζu > 0 for u_b>0),
         # so the projected source DAMPS: s[q_0] = −λ·u_b/ρ.  (A minus here
@@ -155,12 +160,24 @@ class SME(BaseModel):
         from zoomy_core.model.models.material import ClosureState
         from zoomy_core.model.models.closures import apply_stress_closures
         # full-access state handed to a closure: fields (s.u, …), σ-aware
-        # derivatives (s.dz/s.dx) and parameters (s.par).
-        def _state(at):
-            return ClosureState(m.functions, params=m.parameters,
-                                h=h, x=x, zeta=zeta, at=at)
-        has_bulk = apply_stress_closures(self.closures, self.material, m, mx, tau, _state)
+        # derivatives (s.dz/s.dx), parameters (s.par), and — for a BOUNDARY
+        # closure — the opaque local frame {n, t_α} (boundary_tag picks the bed
+        # 'b' / free-surface 'eta' interface).  `alias` rebinds the generic
+        # `s.u` to a direction's velocity for the diagonal bulk closure.
+        def _state(at, *, alias=None, btag=None):
+            return ClosureState(m.functions, params=m.parameters, h=h, x=x,
+                                zeta=zeta, at=at, alias=alias,
+                                boundary_tag=btag, horiz=list(horiz))
+        # one "axis" per horizontal momentum component; boundary closures
+        # prescribe the traction in {n, t_α} and the frame solve recovers the
+        # shear traces, bulk closures stay diagonal (s.u → that axis velocity).
+        axes = [{"mx": mx, "tau": m.functions.tau_xz, "velname": "u"}]
+        has_bulk = apply_stress_closures(self.closures, m, axes, _state, list(horiz))
         mx.apply(Simplify())
+        # small-slope frame resolution (tracked, removable) — n→ẑ recovers the
+        # K&T shallow traces; skip it (small_slope=False) to keep slope-aware.
+        if bool(self.small_slope):
+            small_slope_scaling(m)
 
         # 6 — separation of variables: u → û_i (N_u), w → ŵ_j (N_u + 1)
         uh = sp.Function(r"\hat{u}", real=True); wh = sp.Function(r"\hat{w}", real=True)
