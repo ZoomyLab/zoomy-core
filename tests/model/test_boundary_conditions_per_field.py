@@ -99,6 +99,54 @@ def test_whole_patch_bcs_pass_through_unwrapped():
                            Wall("left", on="momentum")], STATE, aliases={"momentum": "q"})
 
 
+def test_named_bc_family_in_flat_per_field():
+    """The named BC family is available in the new flat per-field style and each
+    resolves to the right per-slot ghost: ZeroNeumann (copy), Dirichlet (value),
+    Flux (normal-gradient), Lambda (callable), Wall (momentum reflect)."""
+    from zoomy_core.model.boundary_conditions import (
+        ZeroNeumann, Dirichlet, Flux, Lambda)
+    bcs = resolve_per_field(
+        [Wall("left", on="momentum"),
+         Dirichlet("left", on="h", value=1.5),
+         ZeroNeumann("left", on="b")],
+        STATE, aliases={"momentum": "q"})            # STATE=[b,h,q_0,q_1,q_2]
+    left = bcs.boundary_conditions_list_dict["left"]
+    Qin = np.array([0.3, 1.0, 0.7, 0.2, -0.1])
+    n = np.array([-1.0])
+    g = left.face_value(Qin, np.zeros(0), n, 0.5, 0.0, np.zeros(0))
+    assert np.isclose(g[0], 0.3)                      # b: ZeroNeumann → copy
+    assert np.isclose(g[1], 1.5)                      # h: Dirichlet → value
+    assert np.isclose(g[2], -0.7) and np.isclose(g[3], -0.2)   # q_0,q_1 reflect
+    # Lambda (symbolic/codegen-path BC) is available in the flat list and
+    # resolves per-field: its slot delegates to the Lambda, others extrapolate.
+    lb = resolve_per_field([Lambda("right", on="q_0",
+                                   prescribe_fields={2: lambda *a: 9.0})],
+                           STATE, aliases={})
+    right = lb.boundary_conditions_list_dict["right"]
+    assert isinstance(right, PerFieldBoundary)
+    assert isinstance(right._slot_bc[2], Lambda)      # q_0 served by the Lambda
+    # Flux: prescribed normal gradient on its slot, value extrapolates
+    fbcs = resolve_per_field([Flux("right", on="h", gradient=2.0)], STATE, aliases={})
+    fr = fbcs.boundary_conditions_list_dict["right"]
+    grad = fr.face_gradient(Qin, Qin, np.zeros(0), np.array([1.0]), 0.5, 0.0, np.zeros(0))
+    assert np.isclose(grad[1], 2.0)                   # h gets the prescribed flux
+
+
+def test_coupling_bcs_available_and_whole_patch():
+    """Coupling BCs — full-state (Coupled / preCICE) and characteristic — are
+    available; the whole-patch ones pass through resolve_per_field unwrapped."""
+    from zoomy_core.model.boundary_conditions import (
+        Coupled, Characteristic, CharacteristicWall, FromData)
+    bcs = resolve_per_field([Coupled("top", mesh_name="fluidMesh")],
+                            STATE, aliases={})
+    assert type(bcs.boundary_conditions_list_dict["top"]) is Coupled
+    # characteristic + FromData construct in the flat list (system-level resolve
+    # against the SystemModel happens in resolve_and_attach)
+    assert Characteristic("left").tag == "left"
+    assert CharacteristicWall("left").tag == "left"
+    assert FromData("left").tag == "left"
+
+
 def test_conflicting_bcs_raise():
     import pytest
     with pytest.raises(ValueError, match="conflicting"):

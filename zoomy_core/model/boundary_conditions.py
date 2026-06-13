@@ -172,6 +172,65 @@ class Extrapolation(BoundaryCondition):
         return np.zeros_like(np.asarray(Q_inner, dtype=float))
 
 
+class ZeroNeumann(Extrapolation):
+    """Zero-gradient (∂Q/∂n = 0) — the named alias of :class:`Extrapolation`.
+    Ghost = interior cell value; zero normal gradient.  Per-field via ``on=``."""
+
+
+class Dirichlet(BoundaryCondition):
+    """Prescribed VALUE on the field(s) this BC covers (``on=``).  ``value`` is a
+    scalar (or symbolic expression on the codegen path) imposed on every slot the
+    BC owns; other slots are untouched (the :class:`PerFieldBoundary` picks only
+    this BC's slots).  Example: ``Dirichlet("left", on="h", value=1.5)``."""
+
+    value = param.Number(default=0.0)
+
+    def __init__(self, tag=None, on=None, value=None, **params):
+        if value is not None:
+            params["value"] = value
+        super().__init__(tag=tag, on=on, **params)
+
+    def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
+        n = len(Q.get_list()) if hasattr(Q, "get_list") else len(Q)
+        out = ZArray(Q)
+        for i in range(n):
+            out[i] = self.value
+        return out
+
+    def face_value(self, Q_inner, Qaux_inner, normal, d_face, time, parameters):
+        return np.full(np.asarray(Q_inner, dtype=float).shape, float(self.value))
+
+
+class Flux(BoundaryCondition):
+    """Prescribed normal-gradient (Neumann flux ``∂Q/∂n = gradient``) on the
+    field(s) this BC covers (``on=``).  Ghost VALUE extrapolates; the boundary
+    GRADIENT is set to ``gradient`` (consumed by the diffusion path).  Example:
+    ``Flux("top", on="q", gradient=tau_s/nu)``."""
+
+    gradient = param.Number(default=0.0)
+
+    def __init__(self, tag=None, on=None, gradient=None, **params):
+        if gradient is not None:
+            params["gradient"] = gradient
+        super().__init__(tag=tag, on=on, **params)
+
+    def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
+        return ZArray(Q)                      # value extrapolates
+
+    def compute_boundary_gradient(self, time, X, dX, Q, Qaux, parameters, normal):
+        n = len(Q.get_list()) if hasattr(Q, "get_list") else len(Q)
+        out = ZArray.zeros(n)
+        for i in range(n):
+            out[i] = self.gradient
+        return out
+
+    def face_value(self, Q_inner, Qaux_inner, normal, d_face, time, parameters):
+        return np.asarray(Q_inner, dtype=float).copy()
+
+    def face_gradient(self, Q_inner, Q_face, Qaux_inner, normal, d_face, time, parameters):
+        return np.full(np.asarray(Q_inner, dtype=float).shape, float(self.gradient))
+
+
 class Coupled(BoundaryCondition):
     """preCICE-coupled boundary patch.
 
