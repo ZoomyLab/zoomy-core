@@ -290,6 +290,22 @@ class ManningFriction(Closure):
         h_eff = sp.Max(s.h, sp.Float(self.h_floor)) if self.h_floor > 0 else s.h
         return -s.par.g * s.par.n ** 2 * s.speed / h_eff ** sp.Rational(1, 3)
 
+    def traction(self, s):
+        """Bed-shear-stress VECTOR for the moment hierarchy (SME / VAM bottom
+        trace): ``τ_b,i = ρ g n² |U_t| u_{t,i} / h^{1/3}`` — the Manning analog
+        of :meth:`RoughWall.traction`, with ``C_f = g n²/h^{1/3}`` and the speed
+        ``|U_t| = √(Σ u_{t,α}²)`` from the frame tangents (couples x/y).  This is
+        the depth-resolved STRESS form; the depth-averaged SWE path consumes the
+        scalar :meth:`expression` (a rate) instead.  Uses the untraced column
+        depth ``s.depth`` (NOT ``s.h`` — depth has no vertical profile to trace
+        at the bed)."""
+        h = s.depth
+        h_eff = sp.Max(h, sp.Float(self.h_floor)) if self.h_floor > 0 else h
+        Cf = s.par.g * s.par.n ** 2 / h_eff ** sp.Rational(1, 3)
+        speed = sp.sqrt(sum(ut ** 2 for ut in s.u_tangent))
+        return {"normal": None,
+                "tangent": [s.par.rho * Cf * speed * ut for ut in s.u_tangent]}
+
 
 class EddyViscosity(Closure):
     """Horizontal eddy viscosity as a HORIZONTAL-stress closure.
