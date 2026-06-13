@@ -384,13 +384,14 @@ def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
     func_to_sym = dict(zip(state_funcs, state_syms))
 
     # Auto-tag every residual (converting Symbol state to Function form
-    # for the tag classifier).
-    from zoomy_core.model.models.legacy.ins_generator import Expression
+    # for the tag classifier).  ``auto_solver_tag`` returns a SolverTagged
+    # carrier keyed under ``name`` in ``tagged`` — the carrier's own ``.name``
+    # is unused downstream (collect_solver_tag keys off the dict).
     tagged: dict = {}
     for name, res in zip(eq_names, eq_residuals):
         res_func = sp.sympify(res).xreplace(sym_to_func)
         tagged[name] = auto_solver_tag(
-            Expression(res_func, name=name),
+            res_func,
             state_funcs=state_funcs,
             gravity_param=g_param,
             t=t, x=x,

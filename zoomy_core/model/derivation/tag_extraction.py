@@ -30,6 +30,56 @@ from sympy import Add, Derivative, Mul, S
 from zoomy_core.model.derivation.tag_catalog import canonical_solver_tag
 
 
+class SolverTagged:
+    """Lightweight carrier of a residual plus its solver-tag groups.
+
+    The return type of :func:`auto_solver_tag` and the minimal object
+    :func:`collect_solver_tag` consumes — the native
+    :class:`~zoomy_core.model.equation.Equation` implements the SAME
+    duck-typed surface (``expr`` / ``_solver_groups`` / ``solver_tags`` /
+    ``get_solver_tag`` / ``untagged_remainder``).  This replaces the
+    heavyweight legacy ``ins_generator.Expression`` on the tag-routing path so
+    the derivation pipeline carries no legacy dependency.
+
+    Holds the raw residual ``expr``, an optional ``name``, and
+    ``_solver_groups`` mapping each canonical solver tag to its sub-expression.
+    """
+
+    def __init__(self, expr, name="", solver_groups=None):
+        self.expr = sp.sympify(expr)
+        self.name = name
+        self._solver_groups = dict(solver_groups) if solver_groups else None
+
+    def solver_tag(self, **named_groups):
+        """Attach/replace solver-tag groups (names normalized via the alias
+        catalog, so ``convection=`` and ``flux=`` both write ``flux``).
+        Returns a new carrier."""
+        merged = dict(self._solver_groups or {})
+        for k, v in named_groups.items():
+            merged[canonical_solver_tag(k)] = (
+                v.expr if isinstance(v, SolverTagged) else sp.sympify(v))
+        return SolverTagged(self.expr, self.name, solver_groups=merged)
+
+    @property
+    def solver_tags(self):
+        """Dict of canonical solver tags, or empty dict if none set."""
+        return dict(self._solver_groups) if self._solver_groups else {}
+
+    def get_solver_tag(self, name):
+        """The sp.Expr for a solver tag (any alias), or None if unset."""
+        if not self._solver_groups:
+            return None
+        return self._solver_groups.get(canonical_solver_tag(name))
+
+    def untagged_remainder(self):
+        """``expr - sum(solver_tags.values())``, expanded.  Zero means every
+        term was routed; non-zero drives the ``untagged_policy``."""
+        if not self._solver_groups:
+            return self.expr
+        tagged_sum = sum(self._solver_groups.values(), S.Zero)
+        return sp.expand(self.expr - tagged_sum)
+
+
 # ---------------------------------------------------------------------------
 # Per-canonical extraction helpers (private)
 # ---------------------------------------------------------------------------
@@ -331,17 +381,13 @@ def _classify_term(term, *, state_funcs, gravity_param, t, x):
 def auto_solver_tag(expr_or_leaf, *, state_funcs, t, x, gravity_param=None):
     """Walk additive terms and auto-tag with canonical solver tags.
 
-    Returns an :class:`Expression` carrying the grouped solver tags so
+    Returns a :class:`SolverTagged` carrying the grouped solver tags so
     :func:`collect_solver_tag` can extract operator matrices from it.
     """
-    from zoomy_core.model.models.legacy.ins_generator import Expression
-
-    raw = (expr_or_leaf.expr
-           if isinstance(expr_or_leaf, Expression)
-           else sp.sympify(expr_or_leaf))
-    name = (expr_or_leaf.name
-            if isinstance(expr_or_leaf, Expression)
-            else "")
+    if isinstance(expr_or_leaf, SolverTagged):
+        raw, name = expr_or_leaf.expr, expr_or_leaf.name
+    else:
+        raw, name = sp.sympify(expr_or_leaf), ""
     groups: dict[str, sp.Expr] = {}
     for term in sp.Add.make_args(sp.expand(raw)):
         if term == sp.S.Zero:
@@ -351,4 +397,4 @@ def auto_solver_tag(expr_or_leaf, *, state_funcs, t, x, gravity_param=None):
             t=t, x=x,
         )
         groups[tag] = groups.get(tag, sp.S.Zero) + term
-    return Expression(raw, name).solver_tag(**groups)
+    return SolverTagged(raw, name).solver_tag(**groups)
