@@ -446,6 +446,11 @@ class SystemModel:
     # Backends that support only one treatment (e.g. explicit-only FV)
     # may *compound* the two: ``F_total = F_explicit + F_implicit``.
     update_variables: Optional[ZArray] = None        # (n_eq,)
+    # Per-cell LOCAL aux formula (e.g. KP-desingularized hinv); symmetric to
+    # update_variables but for the aux vector.  ``None`` ⇒ identity.  The
+    # runtime lowers + applies it (the aux leg of post_step).  Derivative-aux
+    # (LSQ gradients) is a SEPARATE, non-local leg (aux_registry) — not this.
+    update_aux_variables: Optional[ZArray] = None     # (n_aux_decl, 1)
     diffusion_matrix: Optional[ZArray] = None         # (n_eq, n_state, n_dim, n_dim) — implicit
     diffusion_matrix_explicit: Optional[ZArray] = None  # (n_eq, n_state, n_dim, n_dim) — explicit
     source_explicit: Optional[ZArray] = None          # (n_eq,) — explicit
@@ -1137,6 +1142,16 @@ class SystemModel:
             aux_initial_conditions=getattr(
                 model, "aux_initial_conditions", None),
             update_variables=_to_matrix(model.update_variables(), n_eq, 1),
+            # Carry the model's per-cell LOCAL aux formula (e.g. hinv) so it
+            # reaches the runtime generically.  getattr-guarded: only the
+            # basemodel branch reaches here (derivation models dispatch to
+            # _from_derivation_model, which has no such method); skip when the
+            # model declares no aux.
+            update_aux_variables=(
+                _to_matrix(model.update_aux_variables(), len(aux_state), 1)
+                if aux_state
+                and callable(getattr(model, "update_aux_variables", None))
+                else None),
             diffusion_matrix=A_diff_impl,
             diffusion_matrix_explicit=A_diff_expl,
             source_explicit=S_expl_mat,
