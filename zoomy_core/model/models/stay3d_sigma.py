@@ -78,6 +78,13 @@ class Stay3DSigma(BaseModel):
         "Total spatial dimension INCLUDING the vertical: 2 → coords (t,x,z), one "
         "horizontal (U=U_x); 3 → coords (t,x,y,z), two horizontals.  Only dim=2 "
         "is wired today; dim=3 needs the SME HAXES-loop treatment."))
+    closures = param.List(default=[], doc=(
+        "Stress closures applied to the RESOLVED 3-D σ-momentum (closures.py): the "
+        "bulk (Newtonian) closure becomes the vertical viscous diffusion "
+        "∂_ζ(ρν/h ∂_ζ ũ); the bottom (NavierSlip/RoughWall) closure sets the bed "
+        "friction traction τ̃_xz(0); StressFree the free surface.  Empty → defaults "
+        "to [Newtonian(), NavierSlip(), StressFree()] (slip + viscous; the friction "
+        "magnitude is set by the parameters nu / lambda_s)."))
 
     def derive_model(self):
         if int(self.dimension) != 2:
@@ -116,11 +123,40 @@ class Stay3DSigma(BaseModel):
         # 3 — σ-map z = b + h·ζ (decorates u→ũ, w→w̃, τ→τ̃; σ-maps the KBCs).
         m.apply(PDETransformation({z: (zeta, sp.Eq(z, b + h * zeta))}))
 
+        # 3b — CLOSE the material/stress on the resolved σ-momentum.  Bulk
+        # (Newtonian) τ̃_xz = ρν/h ∂_ζ ũ  → the vertical viscous diffusion
+        # ∂_ζ(ρν/h ∂_ζ ũ); bottom (NavierSlip/RoughWall) → the bed friction
+        # traction; StressFree → the free surface.  Same machinery as SME.
+        from zoomy_core.model.models.closures import (
+            Newtonian, NavierSlip, StressFree, apply_stress_closures)
+        from zoomy_core.model.models.material import ClosureState
+        clos = self.closures or [Newtonian(), NavierSlip(), StressFree()]
+
+        def _cstate(at, *, alias=None, btag=None):
+            return ClosureState(m.functions, params=m.parameters, h=h, x=x,
+                                zeta=zeta, at=at, alias=alias,
+                                boundary_tag=btag, horiz=[x])
+        axes = [{"mx": m.momentum.x, "tau": m.functions.tau_xz, "velname": "u"}]
+        apply_stress_closures(clos, m, axes, _cstate, [x])
+        m.momentum.x.apply(Simplify())
+
         def _head(name):
             pool = m.momentum.x.expr.atoms(sp.Function)
             return next(a.func for a in pool if str(a.func) == name)
         ut = _head(r"\tilde{u}")(t, x, zeta)
         wt = _head(r"\tilde{w}")(t, x, zeta)
+
+        # 3c — vertical-face boundary conditions (the friction lives HERE for a
+        # resolved column, not in the PDE): bed = Navier slip τ̃_xz(0)=ρλ_s ũ(0)
+        # (λ_s→∞ ⇒ no-slip ũ(0)=0); surface = stress-free τ̃_xz(1)=0.  Consumed by
+        # the 3-D solve's ζ=0 / ζ=1 face fluxes.  τ̃_xz = ρν/h ∂_ζ ũ (Newtonian).
+        rho_, nu_, lam_ = m.parameters.rho, m.parameters.nu, m.parameters.lambda_s
+        dzu = sp.Derivative(ut, zeta)
+        self._vertical_bcs = {
+            "bed":     sp.Eq(rho_ * nu_ / h * dzu.subs(zeta, 0),
+                             rho_ * lam_ * ut.subs(zeta, 0)),
+            "surface": sp.Eq(dzu.subs(zeta, 1), 0),
+        }
 
         # 3-D conservative-σ ingredients for the forthcoming 3-D extraction
         # (verified: σ-momentum(×h) ≡ ∂_t(hu)+∂_x(hu²+gh²/2)+∂_ζ(h u ω)+ghb_x−e_x g h−τ̃_z/ρ).
