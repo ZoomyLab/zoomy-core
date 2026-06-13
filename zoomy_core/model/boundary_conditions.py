@@ -1112,6 +1112,25 @@ def _resolve_on(on, state_names, aliases):
         f"alias. Known fields: {state_names}; aliases: {sorted(aliases)}")
 
 
+def _momentum_groups(slots, state_names):
+    """Group momentum slots into VECTORS per moment level — dimension-agnostic.
+
+    Slots sharing a trailing moment index are the (x[, y[, z]]) components of ONE
+    momentum vector; a :class:`Wall` decomposes each group into normal+transverse
+    w.r.t. the face normal and reflects ONLY the normal component (transverse
+    keeps slip).  1-D → one component per group (``[[q_0],[q_1],…]`` → each
+    reflects); 2-D/3-D → ``[[q_x_i, q_y_i, …], …]`` ordered by direction name."""
+    import re
+    by_level = {}
+    for s in slots:
+        nm = state_names[s]
+        m = re.search(r"(\d+)$", nm)
+        lvl = int(m.group(1)) if m else 0
+        by_level.setdefault(lvl, []).append(s)
+    return [sorted(by_level[l], key=lambda s: state_names[s])
+            for l in sorted(by_level)]
+
+
 class PerFieldBoundary(BoundaryCondition):
     """Composite BC for one tag: each state slot delegates to the BC assigned to
     its field.  Built by :func:`resolve_per_field`; unclaimed slots fall back to
@@ -1173,7 +1192,10 @@ def resolve_per_field(bc_list, state_names, aliases=None):
         for bc in bcs:
             slots = _resolve_on(bc.on, state_names, aliases)
             if isinstance(bc, Wall):
-                bc.momentum_field_indices = [[s] for s in slots]
+                # group momentum components into VECTORS per moment level so the
+                # Wall decomposes into normal/transverse and reflects only the
+                # NORMAL component — dimension-agnostic (1-D, 2-D, 3-D).
+                bc.momentum_field_indices = _momentum_groups(slots, state_names)
             for s in slots:
                 if s in slot_bc and slot_bc[s] is not bc:
                     raise ValueError(

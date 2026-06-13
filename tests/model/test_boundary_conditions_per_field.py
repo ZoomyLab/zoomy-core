@@ -67,6 +67,20 @@ def test_on_resolves_any_field_generically():
     assert np.isclose(g[4], Qin[4]) and np.isclose(g[6], Qin[6]), "k_*, T_0 copy"
 
 
+def test_wall_is_dimension_agnostic_normal_transverse():
+    """Wall must reflect only the NORMAL momentum component and keep the
+    transverse — for ANY dimension (momentum components grouped into vectors per
+    moment level), not reflect each scalar slot."""
+    # 2-D momentum: q_x_i (x) and q_y_i (y) per moment level
+    state2d = ["b", "h", "q_x_0", "q_y_0", "q_x_1", "q_y_1"]
+    bcs = resolve_per_field([Wall("left", on="momentum")], state2d, aliases={"momentum": "q"})
+    left = bcs.boundary_conditions_list_dict["left"]
+    Qin = np.array([0.0, 1.5, 0.7, 0.3, 0.2, -0.1])     # q_x_0,q_y_0,q_x_1,q_y_1
+    g = left.face_value(Qin, np.zeros(0), np.array([1.0, 0.0]), 0.5, 0.0, np.zeros(0))  # normal = +x
+    assert np.isclose(g[2], -0.7) and np.isclose(g[4], -0.2), "q_x (normal) must reflect"
+    assert np.isclose(g[3], 0.3) and np.isclose(g[5], -0.1), "q_y (transverse) must be kept"
+
+
 def test_conflicting_bcs_raise():
     import pytest
     with pytest.raises(ValueError, match="conflicting"):
