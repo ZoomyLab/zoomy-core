@@ -81,6 +81,24 @@ def test_wall_is_dimension_agnostic_normal_transverse():
     assert np.isclose(g[3], 0.3) and np.isclose(g[5], -0.1), "q_y (transverse) must be kept"
 
 
+def test_whole_patch_bcs_pass_through_unwrapped():
+    """Periodic / Coupled are whole-patch BCs detected by TYPE at the tag level
+    (resolve_periodic_bcs; preCICE/OpenFOAM). They must NOT be wrapped in a
+    PerFieldBoundary, and can't be mixed with per-field BCs at the same tag."""
+    from zoomy_core.model.boundary_conditions import Periodic, Coupled
+    bcs = resolve_per_field(
+        [Periodic("left", periodic_to_physical_tag="right"), Coupled("top"),
+         Wall("front", on="momentum"), Extrapolation("front", on="h")],
+        STATE, aliases={"momentum": "q"})
+    d = bcs.boundary_conditions_list_dict
+    assert type(d["left"]) is Periodic and type(d["top"]) is Coupled
+    assert isinstance(d["front"], PerFieldBoundary)
+    import pytest
+    with pytest.raises(ValueError, match="whole-patch"):
+        resolve_per_field([Periodic("left", periodic_to_physical_tag="right"),
+                           Wall("left", on="momentum")], STATE, aliases={"momentum": "q"})
+
+
 def test_conflicting_bcs_raise():
     import pytest
     with pytest.raises(ValueError, match="conflicting"):

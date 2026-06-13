@@ -1187,7 +1187,22 @@ def resolve_per_field(bc_list, state_names, aliases=None):
     for bc in bc_list:
         by_tag.setdefault(bc.tag, []).append(bc)
     out = []
+    # WHOLE-PATCH BCs own the entire boundary and are detected by TYPE at the
+    # tag level by the runtime (Periodic → mesh.resolve_periodic_bcs;
+    # Coupled → the preCICE/OpenFOAM path).  They must pass through UNWRAPPED —
+    # composing them into a PerFieldBoundary would hide them from those
+    # detectors.  They cannot be mixed with per-field BCs at the same tag.
+    whole_patch = (Periodic, Coupled)
     for tag, bcs in by_tag.items():
+        wp = [bc for bc in bcs if isinstance(bc, whole_patch)]
+        if wp:
+            if len(bcs) > 1:
+                raise ValueError(
+                    f"tag {tag!r}: {type(wp[0]).__name__} is a whole-patch "
+                    f"boundary condition — it cannot be combined with per-field "
+                    f"BCs at the same tag")
+            out.append(wp[0])                 # pass through, unwrapped
+            continue
         slot_bc = {}
         for bc in bcs:
             slots = _resolve_on(bc.on, state_names, aliases)
