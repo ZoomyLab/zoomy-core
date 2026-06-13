@@ -87,16 +87,18 @@ class Momentum(Equation):
         uvel = [sp.Function(_HNAME[xd], real=True)(*coords) for xd in horiz]
         w = sp.Function("w", real=True)(*coords)
         p = sp.Function("p", real=True)(*coords)
-        txz = sp.Function("tau_xz", real=True)(*coords)
+        # PER-DIRECTION shear stress τ_{d}z (one closure variable per horizontal
+        # direction): 1-D → just tau_xz (byte-identical); 2-D → tau_xz + tau_yz.
+        txz = [sp.Function(f"tau_{_CNAME[xd]}z", real=True)(*coords) for xd in horiz]
         model.declare_state(p)
-        model.declare_closure(txz)
-        # horizontal momenta
+        model.declare_closure(*txz)
+        # horizontal momenta — each uses ITS OWN stress τ_{d}z
         comps = []
         for i, xd in enumerate(horiz):
             adv = sum(_DERIV[xe](uvel[i] * uvel[j]) for j, xe in enumerate(horiz))
             incline = g * e_x if xd == C.x else sp.S.Zero
             comps.append(d.t(uvel[i]) + adv + d.z(uvel[i] * w)
-                         + _DERIV[xd](p) / rho - d.z(txz) / rho - incline)
+                         + _DERIV[xd](p) / rho - d.z(txz[i]) / rho - incline)
         # vertical momentum (for hydrostatic elimination)
         comps.append(d.t(w) + sum(_DERIV[xd](uvel[i] * w) for i, xd in enumerate(horiz))
                      + d.z(w * w) + d.z(p) / rho + g)
