@@ -1,0 +1,269 @@
+"""Viscous wet/dry SWE (the Malpasset variant) — derived from the canonical
+:class:`~zoomy_core.model.models.swe.SWE` basis.
+
+This is the model the Firedrake dam-break / Malpasset tutorials and the
+``thesis/cases/parabolic_bowl`` cases run.  It is the level-0 SWE basis
+plus the pieces a real wetting/drying, friction-and-viscosity flood run
+needs, kept as a SUBCLASS of :class:`SWE` so there is exactly one
+shallow-water basis in ``zoomy_core/model/models`` (no hand-rolled model
+classes living in tutorial/thesis scripts):
+
+* state ``[b, h, hu, hv]`` (2-D), aux ``[hinv]`` (desingularised 1/h),
+* ``reconstruction_variables`` — INHERITED from :class:`SWE`: limit the
+  free surface ``eta = b + h`` (well-balanced, inert at lake-at-rest),
+* ``flux`` — convective only (``hu ⊗ u`` via the bounded ``hinv``); the
+  ``½ g h²`` pressure is a SEPARATE operator,
+* ``hydrostatic_pressure`` — ``½ g h²`` on the momentum diagonal, the
+  operator the Audusse well-balanced Riemann solvers
+  (``PositiveNonconservative{HLL,Rusanov}``) add to the physical flux and
+  use for the hydrostatic-reconstruction corrections,
+* ``nonconservative_matrix`` — bed slope ``g h ∂_d b`` only (the pressure
+  must NOT be folded in here — see :meth:`nonconservative_matrix`),
+* ``source`` — Manning bed friction with a floored ``h^{-1/3}``,
+* ``diffusion_matrix_explicit`` — depth-averaged eddy viscosity that
+  diffuses VELOCITY (diagonal on ``hu`` + cross term on ``h``),
+* ``update_variables`` — per-cell momentum capping (``h`` untouched),
+* ``update_aux_variables`` — Kurganov–Petrova desingularised ``hinv``,
+* ``eigenvalues`` — velocity from the bounded ``hinv``, optional dry-cell
+  wave-speed gate (``ev_gate``).
+
+Every operator is the SAME expression as the previous hand-rolled
+tutorial class — only its HOME changed (tutorial script → canonical
+models package).  ``SystemModel.from_model`` picks the methods up by name
+(``hasattr``/``callable``), so the Firedrake solver consumes the derived
+model identically to the old standalone one.
+"""
+from __future__ import annotations
+
+import sympy as sp
+from sympy import sqrt
+
+from zoomy_core.misc.misc import ZArray
+from zoomy_core.model.boundary_conditions import BoundaryConditions
+from zoomy_core.model.models.swe import SWE
+from zoomy_core.model.models.closures import (
+    ManningFriction, EddyViscosity, swe_closure_state)
+
+__all__ = ["MalpassetSWE"]
+
+
+class MalpassetSWE(SWE):
+    """Viscous wetting/drying SWE, ``[b, h, hu, hv]`` + aux ``[hinv]``."""
+
+    # Own state + parameter set (overrides the SWE class defaults so the
+    # SWE.__init__ parameter merge does NOT drag in n_m / h_in / q_in).
+    variables = ["b", "h", "hu", "hv"]
+    parameters = {
+        "g":   (9.81, "positive"),
+        "n":   (0.033, "nonnegative"),   # Manning roughness
+        "nu":  (1.0, "nonnegative"),     # eddy viscosity
+        "eps": (1e-2, "positive"),       # wet/dry depth threshold
+    }
+
+    #: per-cell velocity cap used by :meth:`update_variables` (m/s).
+    U_MAX = 30.0
+
+    def __init__(self, *, g=9.81, n=0.033, nu=1.0, eps=1e-2,
+                 h_friction_floor=0.5, ev_gate=True, closures=None, **kw):
+        # Numerical constants that are NOT physical parameters (kept off
+        # the parameter vector so the SystemModel parameter set stays
+        # exactly {g, n, nu, eps}).
+        self._h_friction_floor = float(h_friction_floor)
+        self._ev_gate = bool(ev_gate)
+        # Dissipation is CLOSED by composable closures (closures.py): bed
+        # friction (bottom trace) + horizontal eddy mixing (τ_xx/τ_xy).
+        # source() / diffusion_matrix_explicit() are BUILT from these — no
+        # hand-rolled dissipation operators.  Set before super().__init__ so
+        # the init-time operator lambdification can consume them.
+        self.closures = (list(closures) if closures is not None else
+                         [ManningFriction(h_floor=float(h_friction_floor)),
+                          EddyViscosity()])
+        # SWE.__init__ pops boundary_conditions into ``_coupling_bcs`` and
+        # only re-attaches it in the ``.system_model`` PROPERTY.  The
+        # Firedrake solver bypasses that property (it calls
+        # ``SystemModel.from_model(model)`` + ``UFLRuntimeModel(model)``
+        # directly), so we restore ``self.boundary_conditions`` after the
+        # base init or the wall/inflow BCs are silently lost.
+        super().__init__(
+            dimension=2,
+            aux_variables=["hinv"],
+            parameters={
+                "g":   (float(g),  "positive"),
+                "n":   (float(n),  "nonnegative"),
+                "nu":  (float(nu), "nonnegative"),
+                "eps": (float(eps), "positive"),
+            },
+            eigenvalue_mode="symbolic",
+            **kw,
+        )
+        if self._coupling_bcs is not None:
+            self.boundary_conditions = self._coupling_bcs
+
+    # The Firedrake path does not use the declarative function groups
+    # (interpolate / project / boundary:<name>); BCs reach the runtime
+    # model through the ``boundary_conditions`` param.  SWE's groups
+    # reference inflow params (h_in / q_in) this model does not carry, so
+    # build none here.  ``reconstruction_variables`` is a METHOD (inherited
+    # from SWE) and is unaffected.
+    def _build_function_groups(self):
+        return {}
+
+    # -- convenience -----------------------------------------------------
+    @property
+    def _parameter_symbols(self):
+        return self.parameters
+
+    def _primitives(self):
+        v = self.variables
+        a = self.aux_variables
+        return v.b, v.h, v.hu, v.hv, a.hinv
+
+    # -- operators -------------------------------------------------------
+    def flux(self):
+        _, h, hu, hv, hinv = self._primitives()
+        F = sp.Matrix.zeros(4, 2)
+        # mass equation
+        F[1, 0] = hu
+        F[1, 1] = hv
+        # momentum: pure convective (no pressure here — see NCP / pressure)
+        F[2, 0] = hu * hu * hinv
+        F[2, 1] = hu * hv * hinv
+        F[3, 0] = hu * hv * hinv
+        F[3, 1] = hv * hv * hinv
+        return ZArray(F)
+
+    def hydrostatic_pressure(self):
+        # ½ g h² on the momentum diagonal, as a SEPARATE operator (not
+        # folded into ``flux`` or the NCP).  This is the encoding the
+        # ``PositiveNonconservative{HLL,Rusanov}`` solvers are built
+        # around: the fan sees the pressure jump via
+        # ``_physical_flux_n = F·n + P·n`` and the Audusse well-balancing
+        # corrections at hydrostatically reconstructed faces are exactly
+        # ``(P_raw − P_star)·n``.
+        _, h, _, _, _ = self._primitives()
+        g = self._parameter_symbols.g
+        P = ZArray.zeros(4, 2)
+        P[2, 0] = g * h ** 2 / 2
+        P[3, 1] = g * h ** 2 / 2
+        return P
+
+    def nonconservative_matrix(self):
+        # Bed-slope coupling ONLY (``g h ∂_d b``).  The pressure term must
+        # NOT be encoded here as ``g h ∂_d h``: the NCP path-integral in
+        # the WB Riemann solvers is evaluated over hydrostatically
+        # reconstructed face states (where ``Δb* = 0`` and ``Δh*`` is
+        # shoreline-clipped), so a pressure-in-NCP encoding loses the
+        # bathymetry reaction force at clipped wet/dry faces.
+        _, h, _, _, _ = self._primitives()
+        g = self._parameter_symbols.g
+        N = ZArray.zeros(4, 4, 2)
+        N[2, 0, 0] = g * h
+        N[3, 0, 1] = g * h
+        return N
+
+    def source(self):
+        """Bed-friction momentum sink, CLOSED by the ``bottom`` closures.
+
+        Each bottom closure supplies a friction RATE ``r`` (per unit
+        velocity, e.g. Manning ``-g n² |u| / max(h,h_floor)^{1/3}``); the
+        momentum sink is ``r · u_i`` on each component (the conservative
+        ``-g n² u_i |u| / h^{1/3}``).  ``b``/``h`` rows stay source-free.
+        Vanishes for ``u = 0`` (no spurious lake-at-rest forcing).
+        """
+        _, h, hu, hv, hinv = self._primitives()
+        u, w = hu * hinv, hv * hinv
+        st = swe_closure_state(self)
+        rate = sum((c.expression(st) for c in self.closures
+                    if c.closes == "bottom"), sp.S.Zero)
+        return ZArray([sp.S.Zero, sp.S.Zero, rate * u, rate * w])
+
+    def diffusion_matrix_explicit(self):
+        """Horizontal eddy mixing on the momentum rows (explicit), CLOSED by
+        the ``horizontal`` closures.
+
+        Each horizontal closure supplies an isotropic kinematic eddy
+        viscosity ``D`` (e.g. ``EddyViscosity`` → ``ν``); the model builds
+        the velocity-diffusion tensor ``∇·(D h ∇u)`` — diagonal ``D`` on the
+        momentum rows plus the chain-rule cross term ``-D u_i`` on ``h``
+        (so the operator diffuses VELOCITY ``u=hu/h``, not momentum).  Both
+        vanish at lake-at-rest (``u = w = 0``) → well-balanced.  Explicit:
+        the parabolic CFL (``dt ≤ h²/2ν`` ~ 10³–10⁴ s) never constrains the
+        hyperbolic step and the implicit source Jacobian stays block-diagonal.
+        """
+        _, h, hu, hv, hinv = self._primitives()
+        u, w = hu * hinv, hv * hinv
+        st = swe_closure_state(self)
+        D = sum((c.expression(st) for c in self.closures
+                 if c.closes == "horizontal"), sp.S.Zero)
+        A = sp.MutableDenseNDimArray.zeros(4, 4, 2, 2)
+        for d in (0, 1):
+            A[2, 2, d, d] = D
+            A[3, 3, d, d] = D
+            A[2, 1, d, d] = -D * u
+            A[3, 1, d, d] = -D * w
+        return ZArray(A)
+
+    # -- state hygiene (SystemModel update_variables / aux slots) --------
+    def update_variables(self):
+        v = self.variables
+        p = self._parameter_symbols
+        h, hu, hv = v.h, v.hu, v.hv
+        u_max = sp.Float(self.U_MAX)
+        # Wet-mask cap: in cells with ``h ≤ eps`` clamp ``hu`` to zero (a
+        # nearly-dry bleeding edge must not carry u_max of momentum); ``h``
+        # is never modified.  ``Max(h − eps, 0)·u_max`` collapses smoothly
+        # to zero at ``h = eps`` using Min/Max only (lowers through every
+        # backend; no Heaviside/sign).
+        h_wet = sp.Max(h - p.eps, sp.S.Zero)
+        max_hu = h_wet * u_max
+
+        def cap(c):
+            return sp.Max(-max_hu, sp.Min(c, max_hu))
+
+        return ZArray([v.b, h, cap(hu), cap(hv)])
+
+    def update_variables_jacobian_wrt_variables(self):
+        # The Min/Max cap would differentiate to non-serialisable
+        # Piecewise/sign; this Jacobian is only used by IMEX implicit-update
+        # Newton (which the Firedrake backend does not run on
+        # update_variables), so return explicit zeros.
+        n = self.n_variables
+        return ZArray.zeros(n, n)
+
+    def eigenvalues(self):
+        _, h, hu, hv, hinv = self._primitives()
+        p = self._parameter_symbols
+        n = self.normal
+        # Velocity from the bounded aux ``hinv`` (= KP-desingularised 1/h);
+        # this regularises the velocity expression, it does NOT modify h.
+        u = hu * hinv
+        w = hv * hinv
+        un = u * n.n0 + w * n.n1
+        c = sqrt(p.g * sp.Max(h, p.eps))
+        raw_ev = [sp.S.Zero, un, un - c, un + c]
+        # Optional wet/dry wave-speed gate.  With the KP-desingularised
+        # hinv the dry-cell speeds stay bounded at √(g·eps) WITHOUT the
+        # gate, and the gate can undersize the Rusanov face dissipation at
+        # wet/dry faces (breaking the Xing-Zhang cell-mean-positivity
+        # decomposition), so it defaults OFF here (ev_gate from the
+        # constructor).
+        if not self._ev_gate:
+            return ZArray(raw_ev)
+        cond = sp.Function("conditional")
+        gated = [cond(h > p.eps, e, sp.S.Zero) for e in raw_ev]
+        return ZArray(gated)
+
+    def update_aux_variables(self):
+        """Kurganov–Petrova desingularised inverse depth
+        ``hinv = √2 · h / √(h⁴ + max(h, eps)⁴)``: equals ``1/h`` for
+        ``h ≥ eps`` but tends smoothly to ZERO as ``h → 0`` (instead of
+        saturating at ``1/eps``), so the derived velocity ``u = hu·hinv``
+        decays to zero at DG(1) wet/dry interfaces — the missing piece
+        that lets DG(1) avoid dt-collapse at the shoreline.
+        """
+        v = self.variables
+        p = self._parameter_symbols
+        h = v.h
+        h_floor = sp.Max(h, p.eps)
+        denom = sqrt(h ** 4 + h_floor ** 4)
+        return ZArray([sqrt(2) * h / denom])
