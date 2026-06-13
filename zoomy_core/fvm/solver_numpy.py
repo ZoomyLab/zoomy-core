@@ -936,6 +936,7 @@ class HyperbolicSolver(Solver):
             output_hdf5_path = os.path.join(
                 self.settings.output.directory, f"{self.settings.output.filename}.h5"
             )
+            io.write_mesh_to_hdf5(output_hdf5_path, mesh)   # self-describing output
             self._sim_save_fields = io.get_save_fields(output_hdf5_path, write_all=False)
         else:
             self._sim_save_fields = lambda time, time_stamp, i_snapshot, Q, Qaux: i_snapshot

@@ -273,8 +273,15 @@ def read_ledger(csv_path):
 
 # ── plot functions ───────────────────────────────────────────────────────────
 
-def plot_water_columns(ax, cf, tq, style="fill", color="tab:blue", **kw):
-    """Water region (fill) or surface line h(x) from column data."""
+def plot_water_columns(ax, cf, tq, style="fill", color="tab:blue",
+                       grid=False, grid_kw=None, **kw):
+    """Water region (fill) or surface line h(x) from column data.
+
+    ``grid=True`` (default off) overlays the FULL σ-mesh as a 3-D-extruded
+    wireframe would look: the K+1 horizontal layer interfaces ``z = b + h·ζ``
+    (breathing with ``h``) AND the vertical column edges from bed to surface at
+    every slice node — i.e. the ``(x, ζ→z)`` quad cells.  ``grid_kw`` overrides
+    the line style (default thin grey)."""
     i = cf.at(tq)
     h = cf.fields["h"][i, :, 0]
     b = cf.fields["b"][i, :, 0]
@@ -282,6 +289,14 @@ def plot_water_columns(ax, cf, tq, style="fill", color="tab:blue", **kw):
         ax.fill_between(cf.x, b, b + h, color=color, alpha=0.8, **kw)
     else:
         ax.plot(cf.x, b + h, color=color, **kw)
+    if grid:
+        gk = {"color": "k", "lw": 0.4, "alpha": 0.35}
+        gk.update(grid_kw or {})
+        K = cf.fields["h"].shape[2]
+        for zk in np.linspace(0.0, 1.0, K + 1):       # horizontal σ-layer interfaces
+            ax.plot(cf.x, b + h * zk, **gk)
+        ax.vlines(cf.x, b, b + h, colors=gk["color"],  # vertical column edges → quad cells
+                  linewidths=gk["lw"], alpha=gk["alpha"])
     return ax
 
 

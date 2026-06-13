@@ -257,6 +257,28 @@ def _save_hdf5(_filepath, i_snapshot, time, Q, Qaux, overwrite=True):
     return i_snapshot + 1.0
 
 
+def write_mesh_to_hdf5(_filepath, mesh):
+    """Initialise the solver output h5 with the mesh topology under ``/mesh/`` so
+    the file is SELF-DESCRIBING for the postprocessing readers
+    (``zoomy_plotting.read_hdf5`` → ``columns_from_slice`` / the column & mesh
+    plots).  Written once at setup (fresh file); the per-snapshot field writer
+    then appends ``/fields/``.  No-op without h5py."""
+    if not _HAVE_H5PY:
+        return
+    main_dir = misc.get_main_directory()
+    filepath = os.path.join(main_dir, _filepath)
+    os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
+    with h5py.File(filepath, "w") as f:
+        g = f.create_group("mesh")
+        g.attrs["format_version"] = 2
+        g.create_dataset("dimension", data=mesh.dimension)
+        g.create_dataset("type", data=mesh.type)
+        g.create_dataset("n_cells", data=mesh.n_cells)
+        g.create_dataset("n_inner_cells", data=mesh.n_inner_cells)
+        g.create_dataset("vertex_coordinates", data=mesh.vertex_coordinates)
+        g.create_dataset("cell_vertices", data=mesh.cell_vertices)
+
+
 def get_save_fields(_filepath, write_all=False, overwrite=True):
     """Factory for a time-gated field writer compatible with solver time-stepping loops."""
     if _HAVE_H5PY:
