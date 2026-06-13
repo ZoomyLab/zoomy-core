@@ -11,7 +11,7 @@ Pinned: 2-D state layout (q_x_ℓ_i, q_y_ℓ_i) and x↔y flux rotational symmet
 import sympy as sp
 import pytest
 
-from zoomy_core.model.models import MLSME, MLSWE
+from zoomy_core.model.models import MLSME, MLSWE, MLVAM
 from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
 
 PARS = {"nu": 0.1, "lambda_s": 0.5}
@@ -51,3 +51,14 @@ def test_mlswe_2d():
     st = [str(s) for s in sm.state]
     assert "q_x_1_0" in st and "q_y_2_0" in st
     _flux_symmetry(sm, layers=(1, 2), modes=(0,))
+
+
+def test_mlvam_2d():
+    sm = MLVAM(n_layers=2, level=1, dimension=3, parameters=PARS,
+               closures=CLO).system_model
+    assert sm.n_dim == 2
+    st = [str(s) for s in sm.state]
+    # 2-D: q_x/q_y per layer; r (w-moments) and P (pressure) stay scalar
+    assert "q_x_1_0" in st and "q_y_2_1" in st
+    assert "r_1_0" in st and "P_2_1" in st
+    _flux_symmetry(sm, layers=(1, 2), modes=(0, 1))
