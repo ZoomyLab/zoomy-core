@@ -69,42 +69,75 @@ class Mass(Equation):
 
 
 class Momentum(Equation):
-    """3-D momentum balance (horizontal + vertical), with the pressure ``p`` as a
-    state variable (eliminated hydrostatically later) and the shear stress
-    ``tau_xz`` as a closure variable (free unless a bulk closure substitutes it).
+    """GENERAL 3-D momentum balance — the FULL stress tensor, no shallow
+    simplification baked in:
 
-    Reproduces the SME momentum exactly for ``coords=(t, x, z)``::
+        ∂_t u_i + Σ_j ∂_j(u_i u_j) + ∂_i p/ρ − Σ_j ∂_j τ_ij /ρ − g e_i = 0
 
-        ∂_t u + ∂_x(u u) + ∂_z(u w) + ∂_x p/ρ − ∂_z τ/ρ − g e_x      (x)
-        ∂_t w + ∂_x(u w) + ∂_z(w w) + ∂_z p/ρ + g                    (z)
+    The complete symmetric stress tensor ``τ_ij`` is declared as closure
+    variables — 1-D: ``tau_xx, tau_xz``; 2-D: ``tau_xx, tau_xy, tau_xz, tau_yy,
+    tau_yz`` (``j`` runs over the horizontals AND z).  The shallow / thin-layer
+    simplification that drops the in-plane components (``tau_xx`` …) is NOT built
+    in — it is applied explicitly and tracked by :func:`moment_scaling`.  The
+    pressure ``p`` is a state variable (eliminated hydrostatically).
     """
 
     def add_to(self, model):
         coords = model.coords
+        t, zc = coords[0], coords[-1]
         horiz = coords[1:-1]
         g, rho = model.parameters.g, model.parameters.rho
         e_x = model.parameter("e_x", 0.0)
         uvel = [sp.Function(_HNAME[xd], real=True)(*coords) for xd in horiz]
         w = sp.Function("w", real=True)(*coords)
         p = sp.Function("p", real=True)(*coords)
-        # PER-DIRECTION shear stress τ_{d}z (one closure variable per horizontal
-        # direction): 1-D → just tau_xz (byte-identical); 2-D → tau_xz + tau_yz.
-        txz = [sp.Function(f"tau_{_CNAME[xd]}z", real=True)(*coords) for xd in horiz]
-        model.declare_state(p)
-        model.declare_closure(*txz)
-        # horizontal momenta — each uses ITS OWN stress τ_{d}z
+        dname = lambda cc: "z" if cc == zc else _CNAME[cc]
+        dop = lambda cc: d.z if cc == zc else _DERIV[cc]
+        tau = {}                               # symmetric stress tensor, by name
+
+        def stress(a, b):
+            key = "".join(sorted([dname(a), dname(b)]))   # τ_ij = τ_ji
+            if key not in tau:
+                tau[key] = sp.Function(f"tau_{key}", real=True)(*coords)
+            return tau[key]
+
         comps = []
-        for i, xd in enumerate(horiz):
-            adv = sum(_DERIV[xe](uvel[i] * uvel[j]) for j, xe in enumerate(horiz))
-            incline = g * e_x if xd == C.x else sp.S.Zero
-            comps.append(d.t(uvel[i]) + adv + d.z(uvel[i] * w)
-                         + _DERIV[xd](p) / rho - d.z(txz[i]) / rho - incline)
-        # vertical momentum (for hydrostatic elimination)
-        comps.append(d.t(w) + sum(_DERIV[xd](uvel[i] * w) for i, xd in enumerate(horiz))
+        for i, xi in enumerate(horiz):
+            adv = (sum(dop(xj)(uvel[i] * uvel[j]) for j, xj in enumerate(horiz))
+                   + d.z(uvel[i] * w))
+            # FULL stress divergence Σ_j ∂_j τ_ij, j over horizontals + z
+            sdiv = (sum(dop(xj)(stress(xi, xj)) for xj in horiz)
+                    + d.z(stress(xi, zc)))
+            incline = g * e_x if xi == C.x else sp.S.Zero
+            comps.append(d.t(uvel[i]) + adv + dop(xi)(p) / rho - sdiv / rho - incline)
+        # vertical momentum (eliminated hydrostatically)
+        comps.append(d.t(w) + sum(dop(xj)(uvel[j] * w) for j, xj in enumerate(horiz))
                      + d.z(w * w) + d.z(p) / rho + g)
+        model.declare_state(p)
+        model.declare_closure(*tau.values())
         model.add_equation("momentum", (len(comps),), comps)
-        self.uvel, self.w, self.p, self.txz = uvel, w, p, txz
+        self.uvel, self.w, self.p, self.tau = uvel, w, p, tau
         return model.momentum
+
+
+def moment_scaling(model, momentum):
+    """Shallow / thin-layer MOMENT SCALING — the explicit, TRACKED derivation
+    step that drops the IN-PLANE stress components (both indices horizontal,
+    e.g. ``tau_xx, tau_xy, tau_yy``) from the full-tensor :class:`Momentum`.
+
+    Under the shallow scaling ``∂_x ~ ε ∂_z`` the in-plane stress divergences are
+    O(ε) smaller than the vertical shears ``∂_z τ_iz`` and are dropped.  The
+    vertical shears ``tau_xz, tau_yz`` survive (the moment models' closure
+    target).  This is the ONE simplification that turns the general momentum
+    balance into the shallow-moment form; recording it keeps the derivation
+    honest (and 1-D recovers K&T exactly because only ``tau_xz`` survives)."""
+    drop = {s: sp.S.Zero for k, s in momentum.tau.items() if "z" not in k}
+    if drop:
+        model.apply(drop)
+        model._history("moment_scaling", "momentum",
+                       description=f"shallow scaling: drop in-plane stresses "
+                                   f"{sorted(k for k in momentum.tau if 'z' not in k)}")
+    return model
 
 
 class MomentumNonHydrostatic(Equation):
@@ -194,4 +227,5 @@ class Transport(Equation):
         return model._equations[self.name]
 
 
-__all__ = ["Equation", "Mass", "Momentum", "MomentumNonHydrostatic", "Transport"]
+__all__ = ["Equation", "Mass", "Momentum", "MomentumNonHydrostatic", "Transport",
+           "moment_scaling"]

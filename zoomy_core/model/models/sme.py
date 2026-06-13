@@ -99,11 +99,12 @@ class SME(BaseModel):
         # (equations.py).  Mass registers u, w (state); Momentum registers p
         # (state) and tau_xz (closure) and builds the (x, z) momentum with the
         # incline body force −g·e_x; h is the geometry state, b the bed.
-        from zoomy_core.model.models.equations import Mass, Momentum
+        from zoomy_core.model.models.equations import Mass, Momentum, moment_scaling
         m.declare_state(h)
         m.add_equation("bottom", d.t(b))
         m.add_equation(Mass(m))
-        m.add_equation(Momentum(m))
+        mom = Momentum(m); m.add_equation(mom)   # FULL stress tensor (tau_xx, tau_xz, …)
+        moment_scaling(m, mom)                    # shallow scaling: drop in-plane τ (tracked)
         m.add_equation("kbc_top", KinematicBC(w=w, u=u, interface=b + h))
         m.add_equation("kbc_bot", KinematicBC(w=w, u=u, interface=b))
 
