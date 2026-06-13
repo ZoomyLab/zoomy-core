@@ -976,6 +976,19 @@ class SystemModel:
                                 canonical_source=canonical_source)
         return sm
 
+    def is_vertical_dependent(self, symbol) -> bool:
+        """``True`` if the state ``symbol`` is a vertical-dependent (3-D) field
+        — e.g. ``ũ(t,x,ζ)`` — and ``False`` for a depth-collapsed field
+        (``h(t,x)``, ``b(t,x)``).  Reads :attr:`state_function_map` against
+        :attr:`vertical`; ``False`` when either is absent (a model with no
+        vertical, e.g. SME/VAM after the moment projection integrates ζ out)."""
+        if self.vertical is None or not self.state_function_map:
+            return False
+        if isinstance(symbol, str):
+            symbol = sp.Symbol(symbol, real=True)
+        f = self.state_function_map.get(symbol)
+        return f is not None and self.vertical in getattr(f, "args", ())
+
     @classmethod
     def from_model(cls, model, Q=None, Qaux=None,
                    canonical_source=None) -> "SystemModel":
@@ -1182,6 +1195,7 @@ class SystemModel:
                     and callable(model.interpolate_to_3d))
                 else None),
             position=getattr(model, "position", None),
+            vertical=getattr(model, "vertical", None),
         )
         if equation_names is not None:
             sm.equation_names = list(equation_names)

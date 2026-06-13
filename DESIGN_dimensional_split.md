@@ -25,7 +25,27 @@ vertical coord; the σ-map even swaps it in place (`transformations.py:251`:
 At the current `SystemModel`: NO (erased by `_state_symbol`). ⇒ split BEFORE
 extraction, or carry per-field coords into the SystemModel. Recommend the former.
 
-## 0b. RECOMMENDED mechanism — carry per-field dimensionality INTO the SystemModel
+## 0b. ✅ DONE — per-field dimensionality is now carried INTO the SystemModel
+
+**Implemented + verified 2026-06-13 (13-test extraction guard green, byte-identical).**
+`SystemModel` now carries:
+- `state_function_map: Optional[Dict]` — `{state_symbol: applied field}`, populated
+  in `system_extract.extract_system_operators` (`{s: f for s, f in zip(state, Q)}`)
+  and set on the declarative `_from_derivation_model` (production path too).
+- `vertical: Optional[Any]` — `model.vertical` (the σ `ζ` / `coords[-1]`).
+- `SystemModel.is_vertical_dependent(symbol) -> bool` — `vertical in
+  state_function_map[symbol].args`.  `h,b → False`; a `(t,x,ζ)` field → `True`;
+  SME/VAM report all-False (ζ projected out).  Zero behavioural change to existing
+  models (the map is additive metadata).
+
+Aux applied forms (e.g. the v1 `ũ` aux) are recoverable from each
+`aux_registry` entry's `"atom"`; add a `state`-style aux map only if the split
+needs it directly.  The split (§2) can now run AFTER extraction by partitioning
+on `sm.is_vertical_dependent`.
+
+---
+
+(original proposal, for reference)
 
 The cleanest way to STOP erasing the per-field signature is a **`state_function_map`**,
 the exact twin of the existing `aux_function_map: Dict[Symbol, Function]`

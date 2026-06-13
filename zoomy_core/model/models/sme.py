@@ -129,6 +129,9 @@ class SME(BaseModel):
         mom = Momentum(m); m.add_equation(mom)
         moment_scaling(m, mom)
         uvel, w, p = mom.uvel, mom.w, mom.p
+        # hook: a turbulence subclass (KESME) declares its extra depth-averaged
+        # state (k, ε) HERE so the bulk stress closure can read them in §5.
+        self._declare_turbulence_fields(m, t, horiz)
 
         def _kbc(interface):
             kw = dict(w=w, u=uvel[0], interface=interface)
@@ -295,9 +298,22 @@ class SME(BaseModel):
                 * sp.Integral(P3vel * sp.legendre(i, 2 * zeta - 1), (zeta, 0, 1))
                 for i in range(Nu + 1)})
 
+        # hook: a turbulence subclass (KESME) adds its transported-scalar
+        # balances (k, ε) now, using the conserved moments q_d (= h û_d).
+        self._add_turbulence_transport(m, t, horiz, h, q_heads)
+
         self.derivation = m
         self._bed = b
         return None
+
+    # ── turbulence hooks (no-op on plain SME; KESME overrides) ──────────────
+    def _declare_turbulence_fields(self, m, t, horiz):
+        """Declare extra depth-averaged transported state (e.g. k, ε) BEFORE
+        the bulk-stress closure, so the closure can read them.  No-op on SME."""
+
+    def _add_turbulence_transport(self, m, t, horiz, h, q_heads):
+        """Add the transported-scalar balances (e.g. the k–ε equations) AFTER
+        the moment system is assembled.  No-op on SME."""
 
     @property
     def system_model(self) -> SystemModel:

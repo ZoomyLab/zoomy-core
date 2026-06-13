@@ -15,8 +15,8 @@ Users get the eager-looking surface (``from zoomy_core.model.models
 import SME``) without the cycle.
 """
 
-__all__ = ["SigmaReference", "SWE", "MalpassetSWE", "SME", "VAM",
-           "MLSWE", "MLSME", "MLVAM", "ClosureState",
+__all__ = ["SigmaReference", "SWE", "MalpassetSWE", "SME", "ElderSME", "KESME",
+           "VAM", "MLSWE", "MLSME", "MLVAM", "ClosureState",
            # composable stress / interface closures (closures.py) — the ONLY
            # stress-closure path (the legacy MaterialModel was removed)
            "Closure", "Newtonian", "NavierSlip", "StressFree", "RoughWall",
@@ -37,6 +37,12 @@ def __getattr__(name):
     if name == "SME":
         from zoomy_core.model.models.sme import SME
         return SME
+    if name == "ElderSME":
+        from zoomy_core.model.models.turbulent_sme import ElderSME
+        return ElderSME
+    if name == "KESME":
+        from zoomy_core.model.models.ke_sme import KESME
+        return KESME
     if name == "VAM":
         from zoomy_core.model.models.vam import VAM
         return VAM
