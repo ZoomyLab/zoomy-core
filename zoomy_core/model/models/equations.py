@@ -140,6 +140,49 @@ def moment_scaling(model, momentum):
     return model
 
 
+# ── opaque boundary frame ────────────────────────────────────────────────────
+# A boundary stress closure prescribes the traction in the local frame
+# ``{n, t_α}`` (see closures.py).  The frame is built from OPAQUE slope symbols
+# — one per (boundary interface, horizontal direction) — NOT from the physical
+# ``∂_d(interface)``, so resolving the frame (``small_slope_scaling`` → 0, or the
+# exact ``∂_d I``) never aliases the topographic source ``g h ∂_x b``.  This is
+# the inject-opaque / resolve-late pattern: a closure references the frame
+# abstractly and is therefore independent of WHEN the frame is resolved.
+
+def frame_slope(tag, direction):
+    """Opaque geometric-slope symbol of a boundary interface (``tag`` ∈
+    ``{"b", "eta"}`` — bed / free surface) in a horizontal ``direction`` ∈
+    ``{"x", "y"}``.  Distinct from the physical ``∂_d(interface)`` so a frame
+    resolution touches only the boundary geometry, never the body force."""
+    return sp.Symbol(f"frameslope_{tag}_{direction}", real=True)
+
+
+def small_slope_scaling(model):
+    """Shallow-moment BOUNDARY scaling — the tracked, removable step that
+    resolves the opaque boundary frame to its small-slope (``n → ẑ``) limit:
+    every :func:`frame_slope` symbol → 0.
+
+    The geometric sibling of :func:`moment_scaling` (which drops the in-plane
+    stress divergence): together they turn the geometrically-exact column model
+    into the shallow-moment (Kowalski & Torrilhon) form.  Applied AFTER the
+    boundary closures are injected — because the frame is opaque, the order is
+    immaterial; resolving the frame symbols to 0 reduces the projected-traction
+    closures to their flat-boundary traces (``τ_iz|_bc`` = the prescribed
+    tangential traction) while leaving the physical bed slope ``∂_x b`` in the
+    body force untouched.  SKIP this step to keep the slope-aware traction (the
+    higher-order model)."""
+    slopes = set()
+    for eq in model._equations.values():
+        slopes |= {s for s in eq.expr.free_symbols
+                   if str(s).startswith("frameslope_")}
+    if slopes:
+        model.apply({s: sp.S.Zero for s in slopes})
+        model._history("small_slope_scaling", "momentum",
+                       description="resolve boundary frame to small-slope limit "
+                                   "n→ẑ (drop O(slope) traction corrections)")
+    return model
+
+
 class MomentumNonHydrostatic(Equation):
     """Non-hydrostatic momentum (VAM): the hydrostatic pressure is PRE-ABSORBED,
     so the horizontal balance carries ``g·∂_x(b+h)`` and ``p`` is only the
@@ -228,4 +271,4 @@ class Transport(Equation):
 
 
 __all__ = ["Equation", "Mass", "Momentum", "MomentumNonHydrostatic", "Transport",
-           "moment_scaling"]
+           "moment_scaling", "small_slope_scaling", "frame_slope"]

@@ -65,7 +65,7 @@ class ClosureState:
     """
 
     def __init__(self, fields, *, params=None, h=None, x=None, zeta=None,
-                 at=None):
+                 at=None, alias=None, boundary_tag=None, horiz=None):
         # ``object.__setattr__`` so __getattr__ does not recurse on these.
         object.__setattr__(self, "_fields", fields)
         object.__setattr__(self, "_params", params)
@@ -73,6 +73,18 @@ class ClosureState:
         object.__setattr__(self, "_x", x)
         object.__setattr__(self, "_zeta", zeta)
         object.__setattr__(self, "_at", at)
+        # Boundary frame: ``boundary_tag`` ∈ {"b","eta"} identifies which
+        # interface this closure sits on (bed / free surface) and ``horiz`` the
+        # horizontal coords — together they pin the OPAQUE slope symbols the
+        # local frame {n, t_α} is built from (see ``s.normal`` / ``s.tangents``).
+        object.__setattr__(self, "_btag", boundary_tag)
+        object.__setattr__(self, "_horiz", list(horiz) if horiz else [])
+        # Field-NAME aliasing for dimension-agnostic closures: e.g. when
+        # closing the y-momentum row, ``alias={"u": "v"}`` makes the generic
+        # ``s.u`` a closure writes resolve to the y-velocity ``v`` — so a single
+        # direction-agnostic closure (``ρν ∂_z u``) closes every horizontal
+        # component.  1-D / x-row pass ``{"u": "u"}`` (a no-op).
+        object.__setattr__(self, "_alias", alias or {})
 
     @property
     def par(self):
@@ -99,7 +111,60 @@ class ClosureState:
         """Horizontal derivative ``∂_x`` of ``e`` (σ-frame, at fixed ζ)."""
         return sp.Derivative(e, self._x)
 
+    # ── opaque boundary frame {n, t_α} (projected-traction closures) ──────────
+    @property
+    def _slopes(self):
+        """Opaque geometric slopes of THIS boundary's interface, one per
+        horizontal direction (built from :func:`equations.frame_slope`)."""
+        from zoomy_core.model.models.equations import frame_slope
+        from zoomy_core import coords as _C
+        cn = {_C.x: "x", _C.y: "y"}
+        return [frame_slope(self._btag, cn[c]) for c in self._horiz]
+
+    @property
+    def normal(self):
+        """Outward unit boundary normal ``n`` as a vector ``[n_x, (n_y,) n_z]``
+        in the OPAQUE slopes — ``(−σ_x, (−σ_y,) 1)/√(1+Σσ²)``.  Resolves to
+        ``ẑ`` under :func:`equations.small_slope_scaling`."""
+        sl = self._slopes
+        comps = [-s for s in sl] + [sp.S.One]
+        norm = sp.sqrt(sum(c ** 2 for c in comps))
+        return sp.Matrix([c / norm for c in comps])
+
+    @property
+    def tangents(self):
+        """Axis-fixed unit tangent basis ``[t_x, (t_y,)]``: ``t_α`` is the
+        surface tangent lying in the ``(x_α, z)`` plane — horizontal part along
+        ``ê_α`` — i.e. ``(ê_α + σ_α ẑ)/√(1+σ_α²)``.  Resolves to ``ê_α`` under
+        small-slope scaling."""
+        sl = self._slopes
+        out = []
+        for a, s in enumerate(sl):
+            vec = [sp.S.Zero] * len(sl) + [s]
+            vec[a] = sp.S.One
+            out.append(sp.Matrix(vec) / sp.sqrt(1 + s ** 2))
+        return out
+
+    @property
+    def _vel3(self):
+        """The full velocity vector at this boundary trace: ``[u, (v,) w]``."""
+        from zoomy_core import coords as _C
+        names = ([{_C.x: "u", _C.y: "v"}[c] for c in self._horiz] + ["w"])
+        return [getattr(self, n) for n in names]
+
+    @property
+    def u_tangent(self):
+        """Tangential slip velocity per axis: ``[u·t_x, (u·t_y,)]``."""
+        vel = sp.Matrix(self._vel3)
+        return [(vel.T * T)[0] for T in self.tangents]
+
+    @property
+    def u_normal(self):
+        """Wall-normal velocity ``u·n`` (zero under no-penetration)."""
+        return (sp.Matrix(self._vel3).T * self.normal)[0]
+
     def _family(self, name):
+        name = self._alias.get(name, name)        # dimension-agnostic rebind
         f = self._fields
         if isinstance(f, dict):
             if name not in f:
