@@ -50,6 +50,12 @@ class SME(BaseModel):
 
     _finalize_lazy = True               # declarative path — skip the production tag pipeline
     level = param.Integer(default=2, bounds=(0, None))
+    dimension = param.Integer(default=2, bounds=(2, 3), doc=(
+        "Total spatial dimension INCLUDING the vertical: 2 → coords (t, x, z), "
+        "one horizontal direction (the canonical 1-horizontal SME, q_0,q_1,…); "
+        "3 → coords (t, x, y, z), two horizontal directions (q_x_i, q_y_i).  "
+        "Closures and boundary conditions are dimension-agnostic; only the state "
+        "setup and the per-direction projection loops switch on this."))
     quadrature_order = param.Integer(default=0, bounds=(0, None), doc=(
         "Gauss-Legendre order for NUMERICAL integration of Galerkin "
         "integrals that survive the analytic bracket machinery "
@@ -306,8 +312,9 @@ class SME(BaseModel):
         eigensolves (the JAX/CUDA blocker, ~90% of the numpy step cost); the bed
         row carries λ = 0.  ``sympy`` factors the truncated char-poly in
         radicals up to level 5; at level ≥ 6 the moment block is Abel-unsolvable
-        — we then leave ``eigenvalues = None`` so the runtime falls back to the
-        opaque numeric ``eigensystem``."""
+        — we then splice in the spectrum of the highest radical-solvable twin
+        (:meth:`_truncated_spectrum`, level 5) and pad the remaining interior
+        slots with the central advection ``n·u_m`` (see that method)."""
         import re
         n_eq = sm.n_equations
         normal = list(sm.normal.values())
@@ -334,9 +341,40 @@ class SME(BaseModel):
                 raise ValueError(f"got {len(lams)} eigenvalues, need {n_eq}")
             sm.eigenvalues = sp.Matrix(n_eq, 1, lams)
         except Exception as exc:                 # Abel wall (level ≥ 6) etc.
-            sm.eigenvalues = None                # → numeric eigensystem fallback
+            self._truncated_spectrum(sm, exc)
+
+    def _truncated_spectrum(self, sm, exc):
+        """Spectrum for level ≥ 6, where the truncated moment block is
+        Abel-unsolvable in radicals.
+
+        The β-HSWME gravity waves ``n·(u_m ± √(g h + α₁²))`` are
+        LEVEL-INDEPENDENT (byte-identical at every level — verified) and bound
+        the entire spectrum, so the spectral radius — all that Rusanov / HLL /
+        CFL need — is captured by the highest level we CAN solve in radicals.
+        Build that twin (``level=5``, same dimension), take its exact spectrum,
+        and pad the extra interior slots with the central advection ``n·u_m``
+        (provably inside the gravity cone).  Sharp wavespeed at any level, no
+        per-face eigensolve.  If even the twin has no symbolic spectrum, leave
+        ``eigenvalues = None`` → the runtime's opaque numeric eigensystem."""
+        n_eq = sm.n_equations
+        twin = SME(level=5, dimension=int(self.dimension),
+                   parameters=dict(self.parameter_values.items())).system_model
+        if twin.eigenvalues is None:
+            sm.eigenvalues = None
             import warnings
             warnings.warn(
-                f"SME(level={self.level}): truncated-HSWME spectrum is not "
-                f"radical-solvable ({type(exc).__name__}: {exc}); falling back "
+                f"SME(level={self.level}): no radical-solvable HSWME spectrum "
+                f"even at the level-5 twin ({type(exc).__name__}); falling back "
                 f"to the opaque numeric eigensystem.")
+            return
+        # the twin's eigenvalues are expressions in h, q_0, q_1 (+ normal) — all
+        # present in this higher-level state, so they drop straight in.
+        lams = [twin.eigenvalues[i] for i in range(twin.n_equations)]
+        normal = list(sm.normal.values())
+        by = {str(s_): s_ for s_ in sm.state}
+        h_s = by["h"]
+        # central advection n·u_m — normal velocity, dimension-agnostic
+        u_m = sum(normal[k] * by[nm] for k, nm in enumerate(
+            (["q_0"] if self.dimension == 2 else ["q_x_0", "q_y_0"]))) / h_s
+        lams += [u_m] * (n_eq - len(lams))         # pad interior, inside the cone
+        sm.eigenvalues = sp.Matrix(n_eq, 1, lams)
