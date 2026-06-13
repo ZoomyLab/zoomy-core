@@ -105,13 +105,19 @@ def extract_system_operators(model, Q, Qaux=None):
         ``SystemModel(...)``.
     """
     t = model.coords[0]
-    # One spatial Symbol per horizontal direction (``n_dim`` ≥ 1).  The coords
-    # are real Symbols (``zoomy_core.coords``), so reusing them directly
-    # guarantees the residual's ``∂_{x_d}`` derivative variables match these
-    # spatial symbols.  A single horizontal recovers the 1-D path verbatim.
-    horizontals = (list(model.horizontal) if model.horizontal
-                   else [model.coords[1]])
-    space = list(horizontals)
+    # ``space`` = the spatial coordinates the STATE fields actually depend on, in
+    # coord order (horizontals first, then the — possibly σ-mapped — vertical).
+    # The vertical is NOT special-cased out of the flux directions: the σ-map
+    # having converted ``z → ζ`` in ``coords`` is funneled straight through, so a
+    # stay-3D model carrying ``ũ(t, x, ζ)`` extracts over ``space = (x, ζ)`` (∂_ζ
+    # routes as a genuine flux / diffusion direction).  A depth-reduced model
+    # (SME / VAM / multilayer — the vertical integrated out, every state field in
+    # ``(t, *horiz)``) yields exactly its horizontals, byte-identical to the
+    # former ``model.horizontal`` path.  The fallback keeps ≥1 horizontal for a
+    # degenerate all-spatially-constant state.
+    spatial = list(model.coords[1:])
+    used = {a for f in Q for a in getattr(f, "args", ()) if a in spatial}
+    space = [c for c in spatial if c in used] or [model.coords[1]]
     n_dim = len(space)
 
     param_names = set(model.parameters.keys())
