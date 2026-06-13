@@ -4,7 +4,8 @@ import numpy as np
 import pytest
 import sympy as sp
 
-from zoomy_core.model.models import MLSME, newtonian_navier_slip
+from zoomy_core.model.models import MLSME
+from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
 from zoomy_core.mesh import BaseMesh
 import zoomy_core.model.initial_conditions as IC
 from zoomy_core.model.boundary_conditions import BoundaryConditions, Extrapolation
@@ -14,7 +15,7 @@ from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
 
 
 def test_mlsme_structure():
-    mod = MLSME(material=newtonian_navier_slip(), n_layers=2, level=1, interface_velocity="mean")
+    mod = MLSME(closures=[Newtonian(), NavierSlip(), StressFree()], n_layers=2, level=1, interface_velocity="mean")
     sm = mod.system_model
     assert [str(s) for s in sm.state] == [
         "b", "h", "q_1_0", "q_1_1", "q_2_0", "q_2_1"]
@@ -34,7 +35,7 @@ def test_mlsme_structure():
 @pytest.mark.parametrize("ustar", ["upwind", "mean"])
 def test_mlsme_dambreak_with_shear(ustar):
     nc = 100
-    sm = MLSME(material=newtonian_navier_slip(), n_layers=2, level=1, interface_velocity=ustar,
+    sm = MLSME(closures=[Newtonian(), NavierSlip(), StressFree()], n_layers=2, level=1, interface_velocity=ustar,
                boundary_conditions=BoundaryConditions(
                    [Extrapolation(tag="left"), Extrapolation(tag="right")])
                ).system_model

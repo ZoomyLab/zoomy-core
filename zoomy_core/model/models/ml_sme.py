@@ -51,10 +51,7 @@ class MLSME(BaseModel):
     closures = param.List(default=[], doc=(
         "Composable Closure pieces (closures.py): stress (Newtonian/RoughWall/…) "
         "AND the interface transfer scheme (MeanInterface/UpwindInterface).  "
-        "Takes precedence over `material` / `interface_velocity`."))
-    material = param.Parameter(default=None, doc=(
-        "DEPRECATED - use `closures=[...]`.  Legacy MaterialModel stress "
-        "closure; None leaves tau_xz UNCLOSED (modal moments stay free)."))
+        "Empty leaves tau UNCLOSED (modal moments stay free)."))
     interface_velocity = param.Selector(
         default="upwind", objects=["upwind", "mean"],
         doc="DEPRECATED - use closures=[UpwindInterface()/MeanInterface()].  "
@@ -117,17 +114,22 @@ class MLSME(BaseModel):
                 getattr(ml, nm).apply({sp.Derivative(b, t): 0})
             tau = getattr(ml.functions, f"tau_{ell}")
             uu = getattr(ml.functions, f"u_{ell}")
+            ww = getattr(ml.functions, f"w_{ell}")
             from types import SimpleNamespace
             from zoomy_core.model.models.material import ClosureState
             from zoomy_core.model.models.closures import apply_layer_stress_closures
+            from zoomy_core.model.models.equations import small_slope_scaling
             par_ns = SimpleNamespace(rho=rl, nu=nu_s, lambda_s=lam_s)
-            def _state(at):
-                return ClosureState({"u": uu}, params=par_ns,
-                                    h=h_l, x=C.x, zeta=zeta, at=at)
+            def _state(at, *, alias=None, btag=None):
+                return ClosureState({"u": uu, "w": ww}, params=par_ns, h=h_l,
+                                    x=C.x, zeta=zeta, at=at, alias=alias,
+                                    boundary_tag=btag, horiz=[C.x])
+            axes = [{"mx": ml.momentum_x, "tau": tau, "velname": "u"}]
             has_bulk = apply_layer_stress_closures(
-                self.closures, self.material, ml, ml.momentum_x, tau, _state,
+                self.closures, ml, axes, _state,
                 is_top=(ell == N), is_bottom=(ell == 1))
             ml.momentum_x.apply(Simplify())
+            small_slope_scaling(ml)          # shallow boundary frame (n→ẑ)
             uh = sp.Function(rf"\hat{{u}}_{ell}", real=True)
             wh = sp.Function(rf"\hat{{w}}_{ell}", real=True)
             reset_modal_indices(ml)

@@ -355,42 +355,41 @@ class UpwindInterface(InterfaceFlux):
         return sp.Piecewise((below, G >= 0), (above, True))
 
 
-def apply_layer_stress_closures(closures, material, m, mx, tau, state,
-                                *, is_top, is_bottom):
-    """Per-layer stress-closure injection for the multilayer models.
+def apply_layer_stress_closures(closures, m, axes, state, *, is_top, is_bottom):
+    """Per-layer stress-closure injection for the multilayer models — frame-aware.
 
-    Same as :func:`apply_stress_closures`, but the *surface* closure is applied
-    only on the TOP layer and the *bottom* closure only on the BED layer (the
-    internal interfaces carry no dynamic stress BC).  Returns True iff a bulk
-    closure was applied."""
-    pieces = []
-    if closures:
-        stress = [c for c in closures if c.closes in ("bulk", "bottom", "surface")]
-        for c in stress:
-            c.register(m)
-        for c in stress:
-            if c.closes == "surface" and not is_top:    continue
-            if c.closes == "bottom" and not is_bottom:  continue
-            # NB: no c.check(m) here — the multilayer state maps the generic
-            # field name ("u") to the per-layer field (u_ℓ) explicitly, so the
-            # model-namespace check (which only sees u_1/u_2/…) does not apply.
-            pieces.append((c.closes, c.expression))
-    elif material is not None:
-        if is_top and material.surface is not None:
-            pieces.append(("surface", material.surface))
-        if is_bottom and material.bottom is not None:
-            pieces.append(("bottom", material.bottom))
-        if material.bulk is not None:
-            pieces.append(("bulk", material.bulk))
-    order = {"surface": 0, "bottom": 1, "bulk": 2}
-    pieces.sort(key=lambda p: order[p[0]])
-    target = {"surface": tau.at(1), "bottom": tau.at(0), "bulk": tau.expr}
-    loc = {"surface": 1, "bottom": 0, "bulk": None}
-    has_bulk = False
-    for closes, fn in pieces:
-        mx.apply({target[closes]: fn(state(loc[closes]))})
-        has_bulk = has_bulk or closes == "bulk"
-    return has_bulk
+    Same contract as :func:`apply_stress_closures` (boundary closures prescribe
+    the traction in the local frame {n, t_α}, bulk closures stay diagonal), but
+    the *surface* closure fires only on the TOP layer and the *bottom* closure
+    only on the BED layer (internal interfaces carry no dynamic stress BC — they
+    use the InterfaceFlux family).  ``axes`` = ``[{"mx","tau","velname"}]`` per
+    horizontal component, ``state(at, *, alias=None, btag=None)``.  No
+    ``c.check(m)`` — the per-layer state maps the generic name ("u") to the
+    layer field (u_ℓ) explicitly, so the model-namespace check does not apply.
+    Returns True iff a BULK closure was applied."""
+    nh = len(axes)
+    stress = [c for c in closures if c.closes in ("bulk", "bottom", "surface")]
+    for c in stress:
+        c.register(m)
+    surface = [c for c in stress if c.closes == "surface"] if is_top else []
+    bottom = [c for c in stress if c.closes == "bottom"] if is_bottom else []
+    bulk = [c for c in stress if c.closes == "bulk"]
+    for at, btag, pieces in ((1, "eta", surface), (0, "b", bottom)):
+        if not pieces:
+            continue
+        P = [sp.S.Zero] * nh
+        for c in pieces:
+            tang = c.traction(state(at, btag=btag)).get("tangent") or []
+            for i in range(min(nh, len(tang))):
+                P[i] += tang[i]
+        traces = _solve_traction(P, state(at, btag=btag), nh)
+        for i, ax in enumerate(axes):
+            ax["mx"].apply({ax["tau"].at(at): traces[i]})
+    for c in bulk:
+        for ax in axes:
+            ax["mx"].apply({ax["tau"].expr:
+                            c.expression(state(None, alias={"u": ax["velname"]}))})
+    return bool(bulk)
 
 
 def interface_closure(closures):

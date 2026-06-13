@@ -1,14 +1,13 @@
-"""Composable stress closures (closures.py) on SME.
+"""Composable stress closures (closures.py) on SME / MLSME.
 
-The contract: a closure LIST reproduces the legacy MaterialModel system
-term-by-term, the new turbulent pieces build, and a boundary-only closure
-leaves the bulk stress free.
+The contract: the closure LIST is the ONLY stress-closure path (no legacy
+MaterialModel), the interface-velocity selector equals its closure form, the
+turbulent pieces build, and a boundary-only closure leaves the bulk free.
 """
 import sympy as sp
 import numpy as np
 
 from zoomy_core.model.models import SME
-from zoomy_core.model.models.material import newtonian_navier_slip
 from zoomy_core.model.models.closures import (
     Newtonian, NavierSlip, StressFree, RoughWall)
 
@@ -43,15 +42,6 @@ def _termwise_equal(A, B):
         if any(sp.simplify((p or 0) - (q or 0)) != 0 for p, q in zip(fa, fb)):
             return False
     return True
-
-
-def test_ml_stress_closures_equal_material():
-    from zoomy_core.model.models import MLSME
-    pars = {"nu": 0.1, "lambda_s": 0.5}
-    a = MLSME(n_layers=2, level=1, material=newtonian_navier_slip(), parameters=pars).system_model
-    b = MLSME(n_layers=2, level=1, parameters=pars,
-              closures=[Newtonian(), NavierSlip(), StressFree()]).system_model
-    assert _termwise_equal(a, b)
 
 
 def test_ml_interface_closures_equal_selector():

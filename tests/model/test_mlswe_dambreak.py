@@ -10,7 +10,8 @@ import numpy as np
 import pytest
 import sympy as sp
 
-from zoomy_core.model.models import MLSWE, newtonian_navier_slip
+from zoomy_core.model.models import MLSWE
+from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
 from zoomy_core.mesh import BaseMesh
 import zoomy_core.model.initial_conditions as IC
 from zoomy_core.model.boundary_conditions import BoundaryConditions, Extrapolation
@@ -20,7 +21,7 @@ from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
 
 
 def test_mlswe_structure_and_closed_G():
-    mod = MLSWE(material=newtonian_navier_slip(), n_layers=2, interface_velocity="mean")
+    mod = MLSWE(closures=[Newtonian(), NavierSlip(), StressFree()], n_layers=2, interface_velocity="mean")
     sm = mod.system_model
     assert [str(s) for s in sm.state] == ["b", "h", "q_1_0", "q_2_0"]
     M = sp.Matrix(sm.mass_matrix.tolist())
@@ -40,7 +41,7 @@ def test_mlswe_dambreak_with_shear(ustar):
     """Sheared two-layer dam break: finite, positive depth, mass conserved,
     shear bounded — for both interface-velocity variants."""
     nc = 100
-    sm = MLSWE(material=newtonian_navier_slip(), n_layers=2, interface_velocity=ustar,
+    sm = MLSWE(closures=[Newtonian(), NavierSlip(), StressFree()], n_layers=2, interface_velocity=ustar,
                boundary_conditions=BoundaryConditions(
                    [Extrapolation(tag="left"), Extrapolation(tag="right")])
                ).system_model

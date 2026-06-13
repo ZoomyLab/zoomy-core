@@ -16,14 +16,12 @@ import SME``) without the cycle.
 """
 
 __all__ = ["SigmaReference", "SWE", "MalpassetSWE", "SME", "VAM",
-           "MLSWE", "MLSME", "MLVAM",
-           "MaterialModel", "ClosureState",
-           # composable stress / interface closures (closures.py)
+           "MLSWE", "MLSME", "MLVAM", "ClosureState",
+           # composable stress / interface closures (closures.py) — the ONLY
+           # stress-closure path (the legacy MaterialModel was removed)
            "Closure", "Newtonian", "NavierSlip", "StressFree", "RoughWall",
-           "KEpsilonViscosity", "InterfaceFlux", "MeanInterface",
-           "UpwindInterface",
-           # legacy MaterialModel factories (deprecated)
-           "newtonian_navier_slip", "bingham_navier_slip"]
+           "Bingham", "KEpsilonViscosity", "ElderViscosity",
+           "InterfaceFlux", "MeanInterface", "UpwindInterface"]
 
 
 def __getattr__(name):
@@ -51,15 +49,12 @@ def __getattr__(name):
     if name == "MLVAM":
         from zoomy_core.model.models.ml_vam import MLVAM
         return MLVAM
-    if name == "MaterialModel":
-        from zoomy_core.model.models.material import MaterialModel
-        return MaterialModel
-    if name in ("ClosureState", "newtonian_navier_slip", "bingham_navier_slip"):
-        from zoomy_core.model.models import material as _mat
-        return getattr(_mat, name)
+    if name == "ClosureState":
+        from zoomy_core.model.models.material import ClosureState
+        return ClosureState
     if name in ("Closure", "Newtonian", "NavierSlip", "StressFree", "RoughWall",
-                "KEpsilonViscosity", "InterfaceFlux", "MeanInterface",
-                "UpwindInterface"):
+                "Bingham", "KEpsilonViscosity", "ElderViscosity",
+                "InterfaceFlux", "MeanInterface", "UpwindInterface"):
         from zoomy_core.model.models import closures as _cl
         return getattr(_cl, name)
     raise AttributeError(f"module 'zoomy_core.model.models' has no attribute {name!r}")

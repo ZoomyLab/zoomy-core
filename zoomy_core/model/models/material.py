@@ -181,110 +181,12 @@ class ClosureState:
         return fam.expr if self._at is None else fam.at(self._at)
 
 
-class MaterialModel:
-    """Stress closure record: ``bulk``, ``bottom``, ``surface`` callables,
-    each ``f(s)`` over a full-access :class:`ClosureState` (see module
-    docstring).  Entries left ``None`` keep that part of the stress unclosed."""
-
-    def __init__(self, *, bulk=None, bottom=None, surface=None,
-                 name="material"):
-        self.bulk = bulk
-        self.bottom = bottom
-        self.surface = surface
-        self.name = name
-
-    def __repr__(self):
-        parts = [k for k in ("bulk", "bottom", "surface")
-                 if getattr(self, k) is not None]
-        return f"MaterialModel({self.name!r}: {', '.join(parts) or 'unclosed'})"
-
-
-def newtonian_navier_slip():
-    """The standard closure: Newtonian bulk stress ``τ = ρ ν ∂_z u``,
-    Navier slip at the bed ``τ_b = λ_s·u_b``, stress-free surface.
-    Reproduces the historically hard-coded model closures exactly (the
-    term-by-term reference tests pin this against K&T / Escalante)."""
-    return MaterialModel(
-        bulk=lambda s: s.par.rho * s.par.nu * s.dz(s.u),
-        bottom=lambda s: s.par.lambda_s * s.u,
-        surface=lambda s: 0,
-        name="newtonian+navier-slip",
-    )
-
-
-def bingham_navier_slip():
-    """Regularized BINGHAM closure: τ = (ρν + τ_y/√((∂_z u)² + ε²))·∂_z u
-    (smooth square-root regularization — rigid below the yield stress
-    in the ε→0 limit; the ε² floor keeps the root argument POSITIVE
-    in floating point even when sympy expands the square — the
-    |γ̇|+ε form NaN-ed at plug formation), Navier slip at the bed,
-    stress-free
-    surface.  Requires the parameters ``tau_y`` (yield stress) and
-    ``eps_reg`` (regularization rate scale) on the model, e.g.::
-
-        SME(level=3, material=bingham_navier_slip(), quadrature_order=8,
-            parameters={"nu": 0.1, "lambda_s": 50.0,
-                        "tau_y": 0.3, "eps_reg": 1e-3})
-
-    The Galerkin projection of this stress is NOT analytically
-    integrable — the model must be built with ``quadrature_order > 0``
-    so the surviving integrals are replaced by Gauss–Legendre
-    quadrature (:class:`~zoomy_core.model.derivation.GaussQuadrature`)."""
-    return MaterialModel(
-        bulk=lambda s: (s.par.rho * s.par.nu
-                        + s.par.tau_y
-                        / sp.sqrt(s.dz(s.u) ** 2 + s.par.eps_reg ** 2))
-                       * s.dz(s.u),
-        bottom=lambda s: s.par.lambda_s * s.u,
-        surface=lambda s: 0,
-        name="bingham+navier-slip",
-    )
-
-
-def rough_wall(kappa=0.41, k_s=0.001, z_p=0.1):
-    """Turbulent ROUGH-WALL bed closure (OpenFOAM ``nutkRoughWallFunction``
-    family) — the physically-correct replacement for Navier slip in a
-    turbulent free-surface flow.  Quadratic bed drag
-
-        τ_b = ρ C_f · u_b |u_b|,   C_f = (κ / ln(z_p / z_0))²,  z_0 = k_s/30
-
-    with ``u_b = state.u`` the bed velocity trace, ``k_s`` the Nikuradse
-    roughness height and ``z_p`` the reference (first-point) height.  Same
-    sign convention as :func:`newtonian_navier_slip` (the τ(0) trace carries
-    the slip-velocity sign; the projection turns it into damping).  Bulk is
-    left ``None`` (combine with a bulk eddy viscosity, e.g.
-    :func:`kepsilon_eddy_viscosity`, for the full turbulent model).
-
-    The friction velocity ``u_⋆ = √(C_f) |u_b|`` recovered here is exactly
-    what feeds the k–ε bed sources ``P_kv = c_k u_⋆³/h`` and the wall
-    dissipation ``ε_p = u_⋆³/(κ z_p)`` (Rastogi & Rodi 1978)."""
-    z0 = k_s / 30
-    Cf = (kappa / sp.log(z_p / z0)) ** 2
-    return MaterialModel(
-        bottom=lambda s: s.par.rho * Cf * s.u * sp.Abs(s.u),
-        surface=lambda s: 0,
-        name="rough-wall",
-    )
-
-
-def kepsilon_eddy_viscosity(C_mu=0.09):
-    """Turbulent BULK closure ``τ = ρ ν_t ∂_z u`` with the standard k–ε eddy
-    viscosity ``ν_t = C_μ k²/ε``.  Demonstrates the full-state closure
-    interface: the bulk callable reads ``state.k`` and ``state.varepsilon``
-    (the transported turbulence fields), not just the velocity.
-
-    The model must carry fields named ``k`` and ``varepsilon`` (a k–ε model).
-    The projection of this stress is RATIONAL in ζ and does not close
-    analytically — build with ``quadrature_order > 0`` (Gauss–Legendre).
-    Pair with :func:`rough_wall` for the bed."""
-    return MaterialModel(
-        bulk=lambda s: s.par.rho * C_mu * s.k ** 2 / s.varepsilon * s.dz(s.u),
-        bottom=lambda s: 0,
-        surface=lambda s: 0,
-        name="k-epsilon eddy viscosity",
-    )
-
-
-# The pre-closed convenience factories (NewtonianSME, NewtonianVAM, …) were
-# removed — they are superseded by the composable closure list, e.g.
-#   SME(level=2, closures=[Newtonian(), NavierSlip(), StressFree()]).
+# MaterialModel and its factories (newtonian_navier_slip, bingham_navier_slip,
+# rough_wall, kepsilon_eddy_viscosity) were REMOVED in the clean cut to the
+# composable closure list — there is no legacy stress-closure path.  Their
+# physics now lives as composable Closure pieces in closures.py:
+#   newtonian_navier_slip  →  [Newtonian(), NavierSlip(), StressFree()]
+#   bingham_navier_slip    →  [Bingham(), NavierSlip(), StressFree()]  (+ quadrature_order>0)
+#   rough_wall             →  [RoughWall()]
+#   kepsilon_eddy_viscosity→  [KEpsilonViscosity()]   (+ quadrature_order>0)
+# Only ClosureState (above) remains here — the full-access state object f(s).
