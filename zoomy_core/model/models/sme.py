@@ -29,7 +29,7 @@ from zoomy_core.model.derivation import (
     Model as DModel, PDETransformation, Simplify, ResolveIntegral, Basis,
     Consolidate, ExpandSums, EvaluateSums, PullConstants, ExtractBrackets,
     ResolveModes, ResolveBasis, GaussQuadrature, InvertMassMatrix, SolveLinearSystem, ChangeOfVariables,
-    separation_of_variables, reset_modal_indices, modal_bound,
+    separation_of_variables, reset_modal_indices, modal_bound, test_index,
 )
 from zoomy_core.model.derivation.projection import Integrate          # abstract ζ-integral
 from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
@@ -37,7 +37,7 @@ from zoomy_core.model.operations import Multiply, ProductRule, KinematicBC
 from zoomy_core.model.operations import Integrate as IntegrateZ       # vertical (pressure) integral
 from zoomy_core.systemmodel import SystemModel
 
-t, x, z = C.t, C.x, C.z
+t, x, y, z = C.t, C.x, C.y, C.z
 zeta = sp.Symbol("zeta", real=True)
 
 
@@ -95,190 +95,205 @@ class SME(BaseModel):
         user_vals = getattr(self, "parameter_values", None)
         if user_vals is not None and hasattr(user_vals, "items"):
             values.update({k: float(v) for k, v in user_vals.items()})
-        m = DModel(coords=(t, x, z), parameters=values)
-        g, rho = m.parameters.g, m.parameters.rho
-        nu, lam = m.parameters.nu, m.parameters.lambda_s
-        u = sp.Function("u", real=True)(t, x, z)
-        w = sp.Function("w", real=True)(t, x, z)
-        p = sp.Function("p", real=True)(t, x, z)
-        h = sp.Function("h", positive=True)(t, x)
-        b = sp.Function("b", real=True)(t, x)
-        txz = sp.Function("tau_xz", real=True)(t, x, z)
-
-        # 1 — full system in (t, x, z), assembled from balance blueprints
-        # (equations.py).  Mass registers u, w (state); Momentum registers p
-        # (state) and tau_xz (closure) and builds the (x, z) momentum with the
-        # incline body force −g·e_x; h is the geometry state, b the bed.
         from zoomy_core.model.models.equations import (
             Mass, Momentum, moment_scaling, small_slope_scaling)
-        horiz = (x,)                              # 1 horizontal direction (dim 2)
+        from zoomy_core.model.models.material import ClosureState
+        from zoomy_core.model.models.closures import apply_stress_closures
+
+        # dimension setup: dim=2 → (t,x,z), ONE horizontal direction (the
+        # canonical K&T SME, q_0,q_1,…); dim=3 → (t,x,y,z), TWO horizontals
+        # (q_x_i, q_y_i).  Every step below loops over the horizontal directions
+        # / velocity fields, so dim=2 reduces to exactly the 1-horizontal form.
+        dim = int(self.dimension)
+        coords = (t, x, z) if dim == 2 else (t, x, y, z)
+        horiz = (x,) if dim == 2 else (x, y)
+        HAXES = ("x",) if dim == 2 else ("x", "y")
+        HNAME = {x: "u", y: "v"}; DERIV = {x: d.x, y: d.y}
+        # conserved-moment family per direction: 1 horizontal keeps the bare
+        # `q` (byte-identical to K&T); 2 horizontals use `q_x` / `q_y`.
+        QNAME = ["q"] if dim == 2 else ["q_x", "q_y"]
+        SHAT = [r"\hat{u}"] if dim == 2 else [r"\hat{u}", r"\hat{v}"]
+
+        m = DModel(coords=coords, parameters=values)
+        g, rho = m.parameters.g, m.parameters.rho
+        h = sp.Function("h", positive=True)(t, *horiz)
+        b = sp.Function("b", real=True)(t, *horiz)
+
+        # 1 — full system, assembled from balance blueprints (equations.py).
+        # Mass registers the horizontal velocity(ies) + w; Momentum (full stress
+        # tensor) registers p (state) + the shear stresses (closure) with the
+        # incline body force −g·e_x; moment_scaling drops the in-plane stresses.
         m.declare_state(h)
         m.add_equation("bottom", d.t(b))
         m.add_equation(Mass(m))
-        mom = Momentum(m); m.add_equation(mom)   # FULL stress tensor (tau_xx, tau_xz, …)
-        moment_scaling(m, mom)                    # shallow scaling: drop in-plane τ (tracked)
-        m.add_equation("kbc_top", KinematicBC(w=w, u=u, interface=b + h))
-        m.add_equation("kbc_bot", KinematicBC(w=w, u=u, interface=b))
+        mom = Momentum(m); m.add_equation(mom)
+        moment_scaling(m, mom)
+        uvel, w, p = mom.uvel, mom.w, mom.p
 
-        # 2 — hydrostatic: z-momentum → eliminate p
-        m.momentum.z.apply({d.t(w): 0, d.x(u * w): 0, d.z(w * w): 0})
-        m.momentum.z.apply(IntegrateZ(z, z, b + h, method="analytical"))
-        m.momentum.z.apply({p.subs(z, b + h): 0})
-        m.momentum.x.apply(m.momentum.z.solve_for(p)); m.momentum.z.remove()
-        m.momentum.x.apply(Simplify())
+        def _kbc(interface):
+            kw = dict(w=w, u=uvel[0], interface=interface)
+            if dim == 3:
+                kw["v"] = uvel[1]
+            return KinematicBC(**kw)
+        m.add_equation("kbc_top", _kbc(b + h))
+        m.add_equation("kbc_bot", _kbc(b))
+
+        # 2 — hydrostatic: drop the inertial vertical-momentum terms, integrate
+        # for p, broadcast the solved pressure into EVERY horizontal component,
+        # then drop the vertical row.
+        mz = m.momentum.z
+        zdrop = {d.t(w): 0, d.z(w * w): 0}
+        for i, xd in enumerate(horiz):
+            zdrop[DERIV[xd](uvel[i] * w)] = 0
+        mz.apply(zdrop)
+        mz.apply(IntegrateZ(z, z, b + h, method="analytical"))
+        mz.apply({p.subs(z, b + h): 0})
+        psol = mz.solve_for(p)
+        for ax in HAXES:
+            getattr(m.momentum, ax).apply(psol)
+        mz.remove()
+        for ax in HAXES:
+            getattr(m.momentum, ax).apply(Simplify())
 
         # 3 — σ-map the whole model: z = b + h·ζ
         m.apply(PDETransformation({z: (zeta, sp.Eq(z, b + h * zeta))}))
 
         basis = Basis(symbol="phi", weight="c"); c = basis.weight
-        k = sp.Symbol("k", integer=True, nonnegative=True); phi_k = basis.phi(k, zeta)
+        # the Galerkin TEST index — "l", which _INDEX_NAMES reserves and never
+        # auto-mints, so it can't collide with the trial indices of the SoV
+        # families (û, v̂, ŵ); a raw Symbol("k") collided with the 3rd minted
+        # trial index in 2-D and silently diagonalised the ŵ bracket.
+        k = test_index(); phi_k = basis.phi(k, zeta)
         legendre = Legendre_shifted(level=Nu + 2)        # need φ_{N_u+2} for the top w-mode
 
-        # 4 — moment-project the MASS balance + kinematic BCs (pre-SoV)
-        m.mass.apply(Multiply(h))
-        m.mass.apply(Multiply(c(zeta) * phi_k))
+        # 4 — moment-project the MASS balance + kinematic BCs (pre-SoV).  The
+        # ∂_y v term rides along automatically in 2-D.
+        m.mass.apply(Multiply(h)); m.mass.apply(Multiply(c(zeta) * phi_k))
         m.mass.apply(ProductRule(variables=[zeta]))
-        m.mass.apply(Integrate(zeta, bounds=(0, 1)))
-        m.mass.apply(ResolveIntegral())
+        m.mass.apply(Integrate(zeta, bounds=(0, 1))); m.mass.apply(ResolveIntegral())
         m.mass.apply(m.kbc_bot); m.mass.apply(m.kbc_top)
-        m.mass.apply({sp.Derivative(b, t): 0})
-        m.mass.apply(Simplify())
+        m.mass.apply({sp.Derivative(b, t): 0}); m.mass.apply(Simplify())
 
-        # 5 — project the X-MOMENTUM + close the stress (before SoV)
-        mx = m.momentum.x
-        mx.apply(Multiply(h))
-        mx.apply(Multiply(c(zeta) * phi_k))
-        mx.apply(ProductRule(variables=[zeta]))
-        mx.apply(Integrate(zeta, bounds=(0, 1)))
-        mx.apply(ResolveIntegral())
-        mx.apply(m.kbc_bot); mx.apply(m.kbc_top); mx.apply({sp.Derivative(b, t): 0})
-        # stress BCs: free surface τ(1)=0; Navier slip τ(0)=+λ·u_b — stress
-        # and slip velocity carry the SAME sign (τ = ρν/h·∂_ζu > 0 for u_b>0),
-        # so the projected source DAMPS: s[q_0] = −λ·u_b/ρ.  (A minus here
-        # flips the friction into anti-damping — coupling caught it as
-        # exponential growth of uniform flow.)
-        from zoomy_core.model.models.material import ClosureState
-        from zoomy_core.model.models.closures import apply_stress_closures
-        # full-access state handed to a closure: fields (s.u, …), σ-aware
-        # derivatives (s.dz/s.dx), parameters (s.par), and — for a BOUNDARY
-        # closure — the opaque local frame {n, t_α} (boundary_tag picks the bed
-        # 'b' / free-surface 'eta' interface).  `alias` rebinds the generic
-        # `s.u` to a direction's velocity for the diagonal bulk closure.
+        # 5 — project EACH horizontal momentum component, then close the stress.
         def _state(at, *, alias=None, btag=None):
             return ClosureState(m.functions, params=m.parameters, h=h, x=x,
                                 zeta=zeta, at=at, alias=alias,
                                 boundary_tag=btag, horiz=list(horiz))
-        # one "axis" per horizontal momentum component; boundary closures
-        # prescribe the traction in {n, t_α} and the frame solve recovers the
-        # shear traces, bulk closures stay diagonal (s.u → that axis velocity).
-        axes = [{"mx": mx, "tau": m.functions.tau_xz, "velname": "u"}]
+        for ax in HAXES:
+            mxi = getattr(m.momentum, ax)
+            mxi.apply(Multiply(h)); mxi.apply(Multiply(c(zeta) * phi_k))
+            mxi.apply(ProductRule(variables=[zeta]))
+            mxi.apply(Integrate(zeta, bounds=(0, 1))); mxi.apply(ResolveIntegral())
+            mxi.apply(m.kbc_bot); mxi.apply(m.kbc_top); mxi.apply({sp.Derivative(b, t): 0})
+        # boundary closures prescribe the traction in {n,t_α} (the frame solve
+        # couples the directions for vector tractions like rough-wall friction);
+        # bulk closures stay diagonal (s.u aliased to each axis velocity).
+        tau_h = {"x": m.functions.tau_xz}
+        if dim == 3:
+            tau_h["y"] = m.functions.tau_yz
+        axes = [{"mx": getattr(m.momentum, ax), "tau": tau_h[ax],
+                 "velname": HNAME[xd]} for ax, xd in zip(HAXES, horiz)]
         has_bulk = apply_stress_closures(self.closures, m, axes, _state, list(horiz))
-        mx.apply(Simplify())
+        for ax in HAXES:
+            getattr(m.momentum, ax).apply(Simplify())
         # small-slope frame resolution (tracked, removable) — n→ẑ recovers the
         # K&T shallow traces; skip it (small_slope=False) to keep slope-aware.
         if bool(self.small_slope):
             small_slope_scaling(m)
 
-        # 6 — separation of variables: u → û_i (N_u), w → ŵ_j (N_u + 1)
-        uh = sp.Function(r"\hat{u}", real=True); wh = sp.Function(r"\hat{w}", real=True)
+        # 6 — separation of variables: each u_i → û/v̂ (N_u), w → ŵ (N_u + 1)
+        coeff_heads = [sp.Function(nm, real=True) for nm in SHAT]
+        wh = sp.Function(r"\hat{w}", real=True)
         reset_modal_indices(m)
         N_u = modal_bound("N_u")
-        m.apply(separation_of_variables(u, uh(t, x), basis, N_u))
-        m.apply(separation_of_variables(w, wh(t, x), basis, N_u + 1))
+        for i in range(len(horiz)):
+            m.apply(separation_of_variables(uvel[i], coeff_heads[i](t, *horiz), basis, N_u))
+        m.apply(separation_of_variables(w, wh(t, *horiz), basis, N_u + 1))
         if not has_bulk:
-            # UNCLOSED bulk stress: expand tau in the modal basis too — its
-            # moments remain free functions (K&T pre-closure form).  This also
-            # covers a BOUNDARY-ONLY closure (e.g. RoughWall: bottom set, bulk
-            # left free) — the dynamic BC traces are already baked in §5, the
-            # bulk stays a free modal field.
-            sh_ = sp.Function(r"\hat{\sigma}", real=True)
-            m.apply(separation_of_variables(txz, sh_(t, x), basis, N_u + 1))
+            # UNCLOSED bulk stress: expand each shear stress modally — its
+            # moments stay free (K&T pre-closure / boundary-only-closure form).
+            for ax, xd in zip(HAXES, horiz):
+                txz_i = sp.Function(f"tau_{ax}z", real=True)(*coords)
+                signame = r"\hat{\sigma}" if dim == 2 else rf"\hat{{\sigma}}_{HNAME[xd]}"
+                m.apply(separation_of_variables(txz_i, sp.Function(signame, real=True)(t, *horiz),
+                                                basis, N_u + 1))
 
-        # 7 — basis → h-equation (k=0) and the ŵ closure (k=1…N_u+2)
-        m.mass.apply(ExpandSums())
-        m.mass.apply(PullConstants())
-        m.mass.apply(ExtractBrackets(basis, var=zeta))
-        m.mass.apply({N_u: Nu})
+        # 7 — basis → h-equation (k=0) and the ŵ closure (k=1…N_u+2).  In 2-D
+        # the ŵ closure couples û and v̂; the h-equation is ∂_t h = −Σ_d ∂_d(h û_d^0).
+        m.mass.apply(ExpandSums()); m.mass.apply(PullConstants())
+        m.mass.apply(ExtractBrackets(basis, var=zeta)); m.mass.apply({N_u: Nu})
         m.mass.apply(EvaluateSums())
         m.mass.apply(ResolveModes(index=k, modes=range(Nu + 3)))
         m.mass.apply(ResolveBasis(legendre, var=zeta))
-        h_eq = m.mass[0].solve_for(d.t(h))                # ∂_t h = −∂_x(h û_0)
+        h_eq = m.mass[0].solve_for(d.t(h))
         for row in m.mass[1:Nu + 3]:
             row.apply(h_eq)
         w_closure = SolveLinearSystem(
-            m.mass[1:Nu + 3], [wh(j, t, x) for j in range(Nu + 2)]).solve()
-        for row in m.mass[1:Nu + 3]:                      # collapse the spent moment rows
+            m.mass[1:Nu + 3], [wh(j, t, *horiz) for j in range(Nu + 2)]).solve()
+        for row in m.mass[1:Nu + 3]:
             row.apply(w_closure)
 
-        # 8 — substitute the ŵ closure into the x-momentum, resolve
-        mx.apply(ExpandSums())
-        mx.apply(PullConstants())
-        mx.apply(ExtractBrackets(basis, var=zeta))
-        mx.apply({N_u: Nu})
-        mx.apply(EvaluateSums())
-        mx.apply(w_closure)
-        mx.apply(ResolveModes(index=k, modes=range(Nu + 1)))
-        m.momentum.x.apply(ResolveBasis(legendre, var=zeta))
-        if int(self.quadrature_order) > 0:
-            # numerical integration of the analytically unintegrable
-            # closure terms (the user-chosen escape hatch — see the
-            # quadrature_order doc)
-            m.momentum.x.apply(GaussQuadrature(
-                var=zeta, order=int(self.quadrature_order)))
+        # 8 — substitute the ŵ closure into each horizontal momentum, resolve.
+        # (Re-fetch the component AFTER ResolveModes' in-place promotion.)
+        for ax in HAXES:
+            mxi = getattr(m.momentum, ax)
+            mxi.apply(ExpandSums()); mxi.apply(PullConstants())
+            mxi.apply(ExtractBrackets(basis, var=zeta)); mxi.apply({N_u: Nu})
+            mxi.apply(EvaluateSums()); mxi.apply(w_closure)
+            mxi.apply(ResolveModes(index=k, modes=range(Nu + 1)))
+        for ax in HAXES:
+            getattr(m.momentum, ax).apply(ResolveBasis(legendre, var=zeta))
+            if int(self.quadrature_order) > 0:
+                getattr(m.momentum, ax).apply(
+                    GaussQuadrature(var=zeta, order=int(self.quadrature_order)))
 
-        # 9 — kill loose ∂_t h, consolidate the pressure, conservative CoV û→q/h
-        for kk in range(Nu + 1):
-            m.momentum.x[kk].apply(h_eq)
-            m.momentum.x[kk].apply(Consolidate())
-        m.apply(ChangeOfVariables(r"\hat{u}", "q", lambda q_i: q_i / h))
-        # unit ∂_t coefficients — the runtime integrates ∂_t Q = RHS
+        # 9 — kill loose ∂_t h, consolidate, conservative CoV û_d → q_d/h
+        for ax in HAXES:
+            mxi = getattr(m.momentum, ax)
+            for kk in range(Nu + 1):
+                mxi[kk].apply(h_eq); mxi[kk].apply(Consolidate())
+        for nm, qn in zip(SHAT, QNAME):
+            m.apply(ChangeOfVariables(nm, qn, lambda q_i: q_i / h))
         m.apply(InvertMassMatrix())
 
-        # 10 — vertical reconstruction → interpolate (ŵ_j inlined as their closure)
-        q = m.functions.q.head
-        cov = {uh(i, t, x): q(i, t, x) / h for i in range(Nu + 1)}
-        u_interp = sum((q(i, t, x) / h) * sp.legendre(i, 2 * zeta - 1)
-                       for i in range(Nu + 1))
-        w_interp = sum(sp.expand(w_closure[j].rhs.subs(cov)) * sp.legendre(j, 2 * zeta - 1)
-                       for j in range(Nu + 2))
-        # canonical operator: built here, returned by interpolate_to_3d()
-        # (basemodel), parsed by the extraction — never copied by hand.
-        self._interpolate_rows = {0: b, 1: h, 2: u_interp, 4: w_interp,
-                                  5: rho * g * h * (1 - zeta)}
+        # 10 — vertical reconstruction → interpolate (field order [b,h,u,v,w,p];
+        # v at index 3 only in 2-D, ŵ_j inlined as their closure)
+        q_heads = [getattr(m.functions, qn).head for qn in QNAME]
+        cov = {}
+        for i, qh in enumerate(q_heads):
+            cov.update({coeff_heads[i](j, t, *horiz): qh(j, t, *horiz) / h
+                        for j in range(Nu + 1)})
+        interp = {0: b, 1: h}
+        for vi, qh in enumerate(q_heads):
+            interp[2 + vi] = sum((qh(i, t, *horiz) / h) * sp.legendre(i, 2 * zeta - 1)
+                                 for i in range(Nu + 1))
+        interp[4] = sum(sp.expand(w_closure[j].rhs.subs(cov)) * sp.legendre(j, 2 * zeta - 1)
+                        for j in range(Nu + 2))
+        interp[5] = rho * g * h * (1 - zeta)
+        self._interpolate_rows = interp
 
-        # 11 — model-derived lateral wall BC: the mirror state u(ζ) → −u(ζ)
-        # flips EVERY moment (odd reflection, ⟨−u φ_i⟩ = −q_i/h); h and b
-        # extrapolate.  Keyed by the FIELD (no hard-coded state slots) —
-        # runtime access: FromModel(tag=…, definition="wall").
-        for i in range(Nu + 1):
-            m.register_group("boundary:wall", q(i, t, x), -q(i, t, x))
+        # 11 — model-derived lateral wall BC: mirror u(ζ) → −u(ζ) flips EVERY
+        # moment of EVERY direction; h, b extrapolate.
+        for qh in q_heads:
+            for i in range(Nu + 1):
+                m.register_group("boundary:wall", qh(i, t, *horiz), -qh(i, t, *horiz))
 
-        # 12 — WB reconstruction: the model OWNS its primitive map.  Limit the
-        # free surface η = b + h and the modal velocities u_i = q_i/h instead
-        # of the conservative state (bounds limited values by physical scales;
-        # removes momentum overshoot at wet/dry fronts).  b reconstructs as
-        # itself (identity default).
+        # 12 — WB reconstruction: limit η = b+h and the modal velocities q_d/h.
         self._reconstruction_rows = {h: b + h}
-        self._reconstruction_rows.update(
-            {q(i, t, x): q(i, t, x) / h for i in range(Nu + 1)})
+        for qh in q_heads:
+            self._reconstruction_rows.update(
+                {qh(i, t, *horiz): qh(i, t, *horiz) / h for i in range(Nu + 1)})
 
-        # 13 — project (inverse of interpolate): the EXACT Galerkin reduction
-        # over the ζ-resolved column contract (z[] = water-relative ζ∈[0,1]
-        # in both directions; adapters own the absolute→ζ map):
-        #   q_i = (2i+1) · h · ∫₀¹ u(ζ) φ_i(ζ) dζ ,
-        # registered as a sympy Integral over the sampled-profile head
-        # ``P3_u(ζ)`` — the printer lowers ∫₀¹ to the normalized-trapezoid
-        # column sum.  Scalar profile slots (b, h) reduce as depth averages.
-        # A constant u (level-0 / flat profile) recovers q_0 = h·⟨u⟩ and
-        # zero higher moments — backward compatible with the averaged
-        # contract.
+        # 13 — project (inverse of interpolate): q_{d,i} = (2i+1)·h·∫₀¹ u_d φ_i dζ,
+        # one sampled-profile head P3_<vel> per direction.
         P3 = {f: sp.Symbol(f"P3_{f}", real=True) for f in ("b", "h")}
-        P3u = sp.Function("P3_u", real=True)(zeta)
         self._project_rows = {b: P3["b"], h: P3["h"]}
-        self._project_rows.update({
-            q(i, t, x): (2 * i + 1) * P3["h"]
-            * sp.Integral(P3u * sp.legendre(i, 2 * zeta - 1), (zeta, 0, 1))
-            for i in range(Nu + 1)})
+        for xd, qh in zip(horiz, q_heads):
+            P3vel = sp.Function(f"P3_{HNAME[xd]}", real=True)(zeta)
+            self._project_rows.update({
+                qh(i, t, *horiz): (2 * i + 1) * P3["h"]
+                * sp.Integral(P3vel * sp.legendre(i, 2 * zeta - 1), (zeta, 0, 1))
+                for i in range(Nu + 1)})
 
         self.derivation = m
         self._bed = b
