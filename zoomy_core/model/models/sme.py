@@ -285,32 +285,58 @@ class SME(BaseModel):
         return sm
 
     def _register_hswme_spectrum(self, sm):
-        """Register the closed-form β-HSWME spectrum (Koellermeier &
-        Rominger 2020, Thm 3.5) as the SystemModel's symbolic eigenvalues:
+        """Register the β-HSWME spectrum as the SystemModel's symbolic
+        eigenvalues — computed DIRECTLY from the truncated quasilinear matrix
+        (dimension-agnostic, any 1-D / 2-D normal):
 
-            λ_{1,2} = n·(u_m ∓ √(g h + α₁²)),
-            λ_{i+2} = n·(u_m + c_{i,N}·α₁),   c_{i,N} = roots of P_N,
+        Take the normal-projected quasilinear matrix ``A·n = Σ_d n_d·
+        quasilinear_matrix[:,:,d]``, ZERO the higher-order moment coefficients
+        (``q_i, q_{x/y,i}`` for ``i ≥ 2`` → 0 — the β-HSWME hyperbolic
+        truncation that drops the α_{≥2} coupling), and take its symbolic
+        eigenvalues.  This reproduces the Koellermeier-Rominger (2020, Thm 3.5)
+        spectrum — gravity waves ``n·(u_m ± √(g h + α₁²))`` plus the moment
+        waves ``n·(u_m + c_{i}·α₁)`` — but with the CORRECT characteristic
+        roots ``c_i`` (the truncated matrix's own; the previous closed form
+        wrongly used the Gauss-Legendre quadrature nodes, e.g. ±1/√3 instead of
+        ±1/√5 at level 2), and it generalises to a 2-D normal with no extra
+        logic (``A·n`` carries ``n_x, n_y``; the transverse moment advection
+        adds ``n·u_m`` eigenvalues automatically).
 
-        with u_m = q_0/h and α₁ = −q_1/h in our shifted-Legendre basis
-        (their φ₁ = 1−2ζ = −ours; the spectrum is invariant under
-        α₁ → −α₁ since the Legendre roots come in ± pairs).  All
-        eigenvalues lie inside [u_m−√(gh+α₁²), u_m+√(gh+α₁²)], so this
-        gives a SHARP Rusanov wavespeed / CFL bound for the full SME
-        without per-face numerical eigensolves (the JAX/CUDA blocker and
-        ~90% of the numpy step cost).  The bed row carries λ = 0."""
-        import numpy as _np
-        Nu = int(self.level)
-        by = {str(s_): s_ for s_ in sm.state}
-        h_s = by["h"]
-        u_m = by["q_0"] / h_s
-        g_s = sm.parameters.g
-        n_x = sm.normal[0]
-        a1 = (-by["q_1"] / h_s) if Nu >= 1 else sp.S.Zero
-        c_wave = sp.sqrt(g_s * h_s + a1 ** 2)
-        lams = [sp.S.Zero,                       # inert bed row
-                n_x * (u_m - c_wave), n_x * (u_m + c_wave)]
-        if Nu >= 1:
-            roots = _np.polynomial.legendre.leggauss(Nu)[0]   # roots of P_N
-            lams += [n_x * (u_m + sp.Float(float(c_)) * a1) for c_ in roots]
-        assert len(lams) == sm.n_equations
-        sm.eigenvalues = sp.Matrix(sm.n_equations, 1, lams)
+        Gives a sharp Rusanov wavespeed / CFL bound without per-face numerical
+        eigensolves (the JAX/CUDA blocker, ~90% of the numpy step cost); the bed
+        row carries λ = 0.  ``sympy`` factors the truncated char-poly in
+        radicals up to level 5; at level ≥ 6 the moment block is Abel-unsolvable
+        — we then leave ``eigenvalues = None`` so the runtime falls back to the
+        opaque numeric ``eigensystem``."""
+        import re
+        n_eq = sm.n_equations
+        normal = list(sm.normal.values())
+        A = sp.zeros(n_eq, n_eq)
+        for k in range(sm.n_dim):
+            for i in range(n_eq):
+                for j in range(n_eq):
+                    A[i, j] += normal[k] * sm.quasilinear_matrix[i, j, k]
+        # β-HSWME truncation: drop the higher-order moment coefficients
+        # (moment index ≥ 2) — the regularisation that makes the spectrum
+        # computable.  Matches q_2…, q_x_2…, q_y_2… (1-D and 2-D names alike).
+        drop = {}
+        for s_ in sm.state:
+            mtc = re.match(r"q(?:_[xy])?_(\d+)$", str(s_))
+            if mtc and int(mtc.group(1)) >= 2:
+                drop[s_] = sp.S.Zero
+        A = sp.Matrix(A).subs(drop)
+        try:
+            ev = A.eigenvals()
+            lams = []
+            for root, mult in ev.items():
+                lams += [root] * int(mult)
+            if len(lams) != n_eq:
+                raise ValueError(f"got {len(lams)} eigenvalues, need {n_eq}")
+            sm.eigenvalues = sp.Matrix(n_eq, 1, lams)
+        except Exception as exc:                 # Abel wall (level ≥ 6) etc.
+            sm.eigenvalues = None                # → numeric eigensystem fallback
+            import warnings
+            warnings.warn(
+                f"SME(level={self.level}): truncated-HSWME spectrum is not "
+                f"radical-solvable ({type(exc).__name__}: {exc}); falling back "
+                f"to the opaque numeric eigensystem.")

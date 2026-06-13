@@ -33,14 +33,22 @@ def test_sme_registers_symbolic_hswme_spectrum_exact_at_level1():
     u = by["q_0"] / by["h"]
     c = sp.sqrt(g * by["h"] + (by["q_1"] / by["h"]) ** 2)
     n0 = sm.normal[0]
-    got = {sp.simplify(e / n0) if e != 0 else sp.S.Zero
-           for e in sm.eigenvalues}
-    # level 1: HSWME ≡ SME — spectrum {0(bed), u±√(gh+α₁²), u}, K&T (4.16)
-    expected = {sp.S.Zero, sp.simplify(u - c), sp.simplify(u + c),
-                sp.simplify(u)}
-    assert {sp.simplify(a - b_) == 0 for a in got for b_ in expected}
-    for e in got:
-        assert any(sp.simplify(e - x) == 0 for x in expected), str(e)
+    got = [sp.simplify(e / n0) if e != 0 else sp.S.Zero
+           for e in sm.eigenvalues]
+    # level 1: HSWME ≡ SME — spectrum {0(bed), u±√(gh+α₁²), u}, K&T (4.16).
+    # Compare the eigenvalue SETS numerically over random positive states:
+    # the symbolic forms agree only under h>0 (the spectrum carries
+    # √(g h³+q_1²)/h, equal to √(g h+(q_1/h)²) but not pulled out of the
+    # radical without the assumption), so a symbolic `simplify(a-b)==0` is too
+    # brittle — a numeric set match is the honest, h>0-safe check.
+    expected = [sp.S.Zero, u - c, u + c, u]
+    rng = np.random.default_rng(3)
+    for _ in range(20):
+        sub = {by["h"]: rng.uniform(0.1, 3.0), by["q_0"]: rng.normal(),
+               by["q_1"]: rng.normal(), g: 9.81}
+        got_v = sorted(float(e.subs(sub)) for e in got)
+        exp_v = sorted(float(e.subs(sub)) for e in expected)
+        assert np.allclose(got_v, exp_v), f"{got_v} != {exp_v}"
 
 
 @pytest.mark.parametrize("level", [2, 3])
