@@ -576,26 +576,49 @@ class HyperbolicSolver(Solver):
         return NonconservativeRusanov(symbolic_model)
 
     def _build_diffusion_operators(self, mesh, symbolic_model, dim, n_vars):
-        """Build DiffusionOperatorV2 per variable when the SystemModel
-        carries a non-zero ``diffusion_matrix`` and positive viscosity.
+        """Build the diffusion operators from the SystemModel's rank-4
+        ``diffusion_matrix`` ``A(Q, Qaux, p)`` (shape ``(n_eq, n_state,
+        n_dim, n_dim)``) — the constitutive tensor in ``div(A : grad Q)``.
 
-        ``diffusion_matrix`` is a stored SystemModel field — a rank-4
-        tensor ``A(Q, Qaux, p)`` of shape ``(n_eq, n_state, n_dim, n_dim)``
-        carried over from the Model by ``from_model``.  The numpy
-        diffusion backend is the (legacy) scalar-viscosity path; it
-        triggers when ``A`` has any symbolic non-zero entry and the
-        model exposes a positive ``nu`` parameter."""
+        For each DIAGONAL entry ``A[v, v, d, d]`` the per-cell diffusivity is the
+        STATE-DEPENDENT field ``−A[v, v, d, d]`` (e.g. stay-3D's ``ν/h²``),
+        lambdified here and evaluated each step (``self._diffusivity_fns``) — NOT
+        a constant ``ν``.  Only those variables diffuse (``b``/``h`` no longer get
+        a spurious Laplacian).  Cross-variable / cross-derivative entries raise
+        (not wired in the numpy backend).  Returns ``None`` when ``A`` is empty
+        or ``ν ≤ 0`` (so SME's source-viscosity and VAM's inviscid runs are
+        untouched)."""
         sym_A = getattr(symbolic_model, 'diffusion_matrix', None)
         if sym_A is None:
             return None
-        # Rank-4 NDimArray: scan every entry for a non-zero atom.
         if all(sp.simplify(e) == 0 for e in sp.flatten(sym_A)):
             return None
-        from zoomy_core.fvm.reconstruction import DiffusionOperatorV2
         nu_val = _param_value(symbolic_model, "nu", default=0.0)
         if nu_val <= 0:
             return None
-        return {v: DiffusionOperatorV2(mesh, dim, nu=nu_val) for v in range(n_vars)}
+        from zoomy_core.fvm.reconstruction import DiffusionOperatorV2
+        import itertools
+        n_eq, n_st, n_d = sym_A.shape[0], sym_A.shape[1], sym_A.shape[2]
+        diffusivity = {}                       # variable row → diffusivity expr (= −A[v,v,d,d])
+        for i, j, d, e in itertools.product(range(n_eq), range(n_st),
+                                            range(n_d), range(n_d)):
+            a = sp.sympify(sym_A[i, j, d, e])
+            if a == 0:
+                continue
+            if i == j and d == e:
+                diffusivity[i] = sp.sympify(diffusivity.get(i, 0)) - a
+            else:
+                raise NotImplementedError(
+                    f"diffusion_matrix A[{i},{j},{d},{e}]={a}: cross-variable / "
+                    "cross-derivative state-dependent diffusion is not wired in "
+                    "the numpy backend (only diagonal A[v,v,d,d]).")
+        state = list(symbolic_model.variables.get_list())
+        aux = list(symbolic_model.aux_variables.get_list())
+        par = list(symbolic_model.parameters.get_list())
+        self._diffusivity_fns = {
+            v: sp.lambdify(state + aux + par, expr, "numpy")
+            for v, expr in diffusivity.items()}
+        return {v: DiffusionOperatorV2(mesh, dim, nu=nu_val) for v in diffusivity}
 
     def _build_reconstruction(self, mesh, symbolic_model):
         """Build ghost-cell-free face reconstruction."""
@@ -871,8 +894,15 @@ class HyperbolicSolver(Solver):
                     d_face, normals_arr, face_centers, n_bf, n_vars, has_aux,
                     time, parameters,
                 )
+                fns = getattr(self, "_diffusivity_fns", {})
                 for v, diff_op in self._diffusion_ops.items():
-                    dQ[v, :] += diff_op.explicit_with_bc(Q[v, :], bf_grads[v])
+                    nu_cell = None
+                    if v in fns:                 # state-dependent diffusivity −A[v,v,d,d]
+                        val = fns[v](*Q, *Qaux, *parameters)
+                        nu_cell = np.broadcast_to(
+                            np.asarray(val, dtype=float), (Q.shape[1],)).astype(float)
+                    dQ[v, :] += diff_op.explicit_with_bc(
+                        Q[v, :], bf_grads[v], nu_cell=nu_cell)
 
             return dQ
         return flux_operator

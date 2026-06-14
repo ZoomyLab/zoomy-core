@@ -281,9 +281,12 @@ class Stay3DSigma(BaseModel):
             if kind == "bottom":
                 if isinstance(c, NavierSlip):
                     lam = sm.parameters.lambda_s
-                    # Navier slip ∂_ζ mom = (h²/ν)·λ_s·u_t (u_t=mom/h flat); the
-                    # bed-face diffusive-flux convention of the solver's boundary
-                    # operator makes friction (momentum SINK) the negative sign.
+                    # Navier slip: the OUTWARD-normal σ-gradient of mom at the bed
+                    # (ζ=0 face, outward = −ζ) is −∂_ζ mom = −λ_s·h·mom/ν
+                    # (from ∂_ζ mom(0)=λ_s·h·mom/ν, u_t=mom/h flat/small-slope).
+                    # The diffusion op supplies the matching diffusivity ν/h²
+                    # (= −A[mom,mom,ζ,ζ]), so this is the physical relation — no
+                    # sign/magnitude fudge.
                     out.append(Flux(tag="bottom", on="mom",
                                     gradient=-lam * hS * momS / nu))
                 else:
