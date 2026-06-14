@@ -275,19 +275,32 @@ class DerivativeAwareSolverMixin:
     """Computes declared derivative buffer entries and fills Qaux."""
 
     def update_qaux(self, Q, Qaux, Qold, Qauxold, mesh, model, parameters, time, dt):
-        """Update qaux."""
+        """Run the canonical aux legs, then overlay any ``derivative_specs``.
+
+        COMPOSE, don't shadow.  ``super().update_qaux`` resolves (via the MRO
+        of every concrete user — IMEXSolver, DerivativeAwareSolver — past this
+        mixin to ``Solver.update_qaux``) and fills the two canonical legs: the
+        local ``update_aux_variables`` formula (e.g. KP ``hinv``) and the
+        non-local ``aux_registry`` spatial-derivative rows.  Canonical
+        ``aux_registry`` models (SME/VAM/…) carry no ``derivative_specs``, so
+        they get *exactly* the explicit ``HyperbolicSolver`` aux path —
+        previously this method early-returned ``Qaux`` unchanged and silently
+        froze their aux at the IC.  On top, any model that DOES declare
+        ``derivative_specs`` (StructuredDerivativeModel / Green-Naghdi) gets
+        its declared buffer rows — including the ``(Q-Qold)/dt`` time
+        derivative, the one capability the canonical leg lacks — overlaid here.
+        """
+        out = super().update_qaux(
+            Q, Qaux, Qold, Qauxold, mesh, model, parameters, time, dt)
         symbolic_model = model.model if hasattr(model, "model") else model
-        if not hasattr(symbolic_model, "derivative_specs"):
-            return Qaux
+        specs = getattr(symbolic_model, "derivative_specs", None)
+        if not specs:
+            return out
 
-        if not symbolic_model.derivative_specs:
-            return Qaux
-
+        out = np.array(out, copy=True)
         var_keys = symbolic_model.variables.keys()
         field_to_index = {name: i for i, name in enumerate(var_keys)}
-        out = np.array(Qaux, copy=True)
-
-        for spec in symbolic_model.derivative_specs:
+        for spec in specs:
             i_aux = symbolic_model.derivative_key_to_index[spec.key]
             i_q = field_to_index[spec.field]
             out[i_aux, :] = self._compute_derivative(spec.axes, Q[i_q], Qold[i_q], mesh, dt)
