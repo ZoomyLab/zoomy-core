@@ -274,18 +274,40 @@ def read_ledger(csv_path):
 # ── plot functions ───────────────────────────────────────────────────────────
 
 def plot_water_columns(ax, cf, tq, style="fill", color="tab:blue",
-                       grid=False, grid_kw=None, **kw):
-    """Water region (fill) or surface line h(x) from column data.
+                       grid=False, grid_kw=None, field=None, cmap="viridis",
+                       vlim=None, **kw):
+    """Water region (fill) / surface line h(x), or a FIELD on the true 3-D
+    ``(x, z)`` quad mesh, from column data.
 
-    ``grid=True`` (default off) overlays the FULL σ-mesh as a 3-D-extruded
-    wireframe would look: the K+1 horizontal layer interfaces ``z = b + h·ζ``
-    (breathing with ``h``) AND the vertical column edges from bed to surface at
-    every slice node — i.e. the ``(x, ζ→z)`` quad cells.  ``grid_kw`` overrides
-    the line style (default thin grey)."""
+    ``field=<name>`` (e.g. ``"u"``) colours the actual ``(x, ζ→z)`` cells via
+    ``pcolormesh`` on the cell-EDGE grid — x edges × physical-z edges
+    ``z = b + h·ζ`` with ζ running the full ``[0, 1]`` (bed→surface).  Because
+    the mesh is built from EDGES (not cell centres) it fills the entire water
+    column with NO white gap between the top cell row and the free surface.
+    Returns the ``QuadMesh`` mappable (for ``fig.colorbar``); otherwise ``ax``.
+
+    ``grid=True`` overlays the σ-mesh wireframe: the K+1 layer interfaces
+    ``z = b + h·ζ`` AND the vertical column edges (the ``(x, ζ→z)`` quad cells).
+    ``grid_kw`` overrides the line style (default thin grey)."""
     i = cf.at(tq)
     h = cf.fields["h"][i, :, 0]
     b = cf.fields["b"][i, :, 0]
-    if style == "fill":
+    out = ax
+    if field is not None:
+        F = cf.fields[field][i]                        # (X, K) cell-centred
+        X = np.asarray(cf.x); K = F.shape[1]
+        xe = np.empty(len(X) + 1)                      # x cell edges
+        xe[1:-1] = 0.5 * (X[:-1] + X[1:])
+        xe[0] = X[0] - (X[1] - X[0]) / 2
+        xe[-1] = X[-1] + (X[-1] - X[-2]) / 2
+        ze = np.linspace(0.0, 1.0, K + 1)              # ζ edges 0→1 (bed→surface)
+        be = np.interp(xe, X, b); he = np.interp(xe, X, h)
+        XX = np.repeat(xe[:, None], K + 1, axis=1)     # (X+1, K+1) vertices
+        ZZ = be[:, None] + he[:, None] * ze[None, :]   # physical z = b + h·ζ
+        vmin, vmax = (vlim if vlim is not None else (float(F.min()), float(F.max())))
+        out = ax.pcolormesh(XX, ZZ, F, cmap=cmap, vmin=vmin, vmax=vmax,
+                            shading="flat", **kw)
+    elif style == "fill":
         ax.fill_between(cf.x, b, b + h, color=color, alpha=0.8, **kw)
     else:
         ax.plot(cf.x, b + h, color=color, **kw)
@@ -297,7 +319,7 @@ def plot_water_columns(ax, cf, tq, style="fill", color="tab:blue",
             ax.plot(cf.x, b + h * zk, **gk)
         ax.vlines(cf.x, b, b + h, colors=gk["color"],  # vertical column edges → quad cells
                   linewidths=gk["lw"], alpha=gk["alpha"])
-    return ax
+    return out
 
 
 def plot_water_vof(ax, raw, tq, smooth=True, extent=None, cmap="Blues",
