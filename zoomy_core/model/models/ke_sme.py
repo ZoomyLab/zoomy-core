@@ -76,7 +76,11 @@ class KESME(SME):
         Nk = int(self.turbulence_level)
         values = {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0, "e_x": 0.0,
                   "C_mu": 0.09, "C_1": 1.44, "C_2": 1.92,
-                  "sigma_k": 1.0, "sigma_e": 1.3}
+                  "sigma_k": 1.0, "sigma_e": 1.3,
+                  # wall-function ε bed BC (weak/penalty): ε(0) → C_μ^{3/4}
+                  # k(0)^{3/2}/(κ z_p); kappa & z_p the log-law constant & wall
+                  # reference height; eps_wall_penalty the relaxation rate.
+                  "kappa": 0.41, "z_p": 0.05, "eps_wall_penalty": 50.0}
         user_vals = getattr(self, "parameter_values", None)
         if user_vals is not None and hasattr(user_vals, "items"):
             values.update({k: float(v) for k, v in user_vals.items()})
@@ -289,6 +293,30 @@ class KESME(SME):
         m.apply(ChangeOfVariables(r"\hat{\varepsilon}", "E", lambda Ei: Ei / h))
         m.apply(InvertMassMatrix())
 
+        # 9b — wall-function k AND ε bed BCs (weak/penalty), pinned to the
+        # channel friction velocity u_*² = g h e_x (the uniform open-channel bed
+        # shear τ_b/ρ).  φ_i(ζ=0)=P_i(−1)=(−1)^i, so the bed traces are
+        # k(0)=Σ(K_i/h)(−1)^i, ε(0)=Σ(E_i/h)(−1)^i.  Drive
+        #   k(0) → k_wall = u_*²/√C_μ           (kqRWallFunction: SUSTAINS k)
+        #   ε(0) → ε_wall = u_*³/(κ z_p)         (epsilonWallFunction: anchors ε)
+        # via τ_p·(−1)^l·(trace − wall) on mode l.  Using u_*²(=g h e_x) — NOT
+        # the modal k(0)^{3/2} — keeps both wall values positive (no √(k(0)<0))
+        # and makes the turbulence self-sustaining from the slope forcing.
+        K_head = m.functions.K.head
+        E_head = m.functions.E.head
+        kap, z_p = m.parameters.kappa, m.parameters.z_p
+        tau_p = m.parameters.eps_wall_penalty
+        ustar2 = g * h * m.parameters.e_x
+        k_wall = ustar2 / sp.sqrt(C_mu)
+        eps_wall = ustar2 ** sp.Rational(3, 2) / (kap * z_p)
+        k0 = sum((K_head(i, t, *horiz) / h) * (-1) ** i for i in range(Nk + 1))
+        e0 = sum((E_head(i, t, *horiz) / h) * (-1) ** i for i in range(Nk + 1))
+        for l in range(Nk + 1):
+            m.k[l].expr = (sp.sympify(m.k[l].expr)
+                           + tau_p * (-1) ** l * (k0 - k_wall))
+            m.varepsilon[l].expr = (sp.sympify(m.varepsilon[l].expr)
+                                    + tau_p * (-1) ** l * (e0 - eps_wall))
+
         # 10 — vertical reconstruction → interpolate
         q_heads = [getattr(m.functions, qn).head for qn in QNAME]
         cov = {}
@@ -328,6 +356,16 @@ class KESME(SME):
         self.derivation = m
         self._bed = b
         return None
+
+    @property
+    def system_model(self):
+        """SME.system_model + flag the k, ε moments as positivity-constrained
+        so ``NumericalSystemModel(regularization.positivity_floor>0)`` floors
+        their singular source dependence (ν_t=C_μk²/ε, wall √k)."""
+        sm = super().system_model
+        sm.positive_state = [s for s in sm.state
+                             if str(s).startswith(("K_", "E_"))]
+        return sm
 
     def _register_hswme_spectrum(self, sm):
         """HSWME spectrum EXCLUDING k, ε (they are not critical for the CFL

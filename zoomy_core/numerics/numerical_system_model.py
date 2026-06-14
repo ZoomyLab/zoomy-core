@@ -75,8 +75,55 @@ class RegularizationSpec:
     numerical-eigenvalue path; without it, dry/near-dry SWE cells
     yield ``A·n`` matrices with repeated zero eigenvalues and the
     LAPACK eigensolve can spike spurious large modes.
+
+    ``positivity_floor`` desingularises every singular dependence of the
+    source on a positivity-constrained state (``sm.positive_state`` — e.g. the
+    k, ε moments of KESME): each ``base**p`` with ``base`` containing such a
+    state and ``p`` negative (denominator) OR non-integer (root) has its base
+    replaced by ``√(base² + floor²)``.  This keeps ν_t=C_μk²/ε finite and the
+    wall-function √k(0) real WITHOUT touching the symbolic derivation — the
+    numerical realizability safeguard lives here, in the NSM.  0 = off.
     """
     eigenvalue_eps: float = 1e-8
+    positivity_floor: float = 0.0
+
+
+def _desingularize_positivity(sm, floor):
+    """Floor the source's singular dependence on positivity-constrained state.
+
+    For each ``base**p`` in a source row where ``base`` involves a symbol in
+    ``sm.positive_state`` and ``p`` is negative (denominator) or non-integer
+    (root), replace ``base`` by ``√(base² + floor²)``.  Recomputes
+    ``source_jacobian`` from the regularised source.  No-op if the model
+    declares no ``positive_state``."""
+    import sympy as sp
+    from zoomy_core.misc.misc import ZArray
+    protected = set(getattr(sm, "positive_state", []) or [])
+    if not protected:
+        return
+    f2 = sp.Float(floor) ** 2
+
+    def safe(expr):
+        e = sp.sympify(expr)
+        repl = {}
+        for p in e.atoms(sp.Pow):
+            if (p.exp.is_number and (p.exp < 0 or not p.exp.is_integer)
+                    and (p.base.free_symbols & protected)):
+                repl[p] = sp.Pow(sp.sqrt(p.base ** 2 + f2), p.exp)
+        return e.xreplace(repl) if repl else e
+
+    n = sm.n_equations
+    state = list(sm.state)
+    new_src = sp.zeros(n, 1)
+    for i in range(n):
+        new_src[i, 0] = safe(sm.source[i, 0])
+    sm.source = ZArray(new_src)
+    J = sp.zeros(n, len(state))
+    for i in range(n):
+        si = sp.sympify(sm.source[i, 0])
+        for j, s in enumerate(state):
+            J[i, j] = sp.diff(si, s)
+    sm.source_jacobian = ZArray(J)
 
 
 # ── The NSM itself ───────────────────────────────────────────────────
@@ -177,6 +224,8 @@ class NumericalSystemModel:
             diffusion = DiffusionSpec(enabled=_diffusion_auto_enabled(sm))
         if regularization is None:
             regularization = RegularizationSpec()
+        if regularization.positivity_floor > 0:
+            _desingularize_positivity(sm, regularization.positivity_floor)
         return cls(
             sm=sm,
             riemann=riemann,
