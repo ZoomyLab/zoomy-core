@@ -84,6 +84,9 @@ class VAM(BaseModel):
         g, rho = m.parameters.g, m.parameters.rho
         h = sp.Function("h", positive=True)(t, *horiz)
         b = sp.Function("b", real=True)(t, *horiz)
+        # Free-surface hydrostatic pressure flux; tagged explicitly in
+        # ``system_model`` (the extractor no longer auto-detects pressure).
+        self._pressure_flux = g * h ** 2 / 2
 
         # 1 — full system (hydrostatic pressure pre-absorbed) from blueprints
         m.declare_state(h)
@@ -316,7 +319,12 @@ class VAM(BaseModel):
         qs = list(m.explicit_state())
         if self._bed not in qs:
             qs = [self._bed, *qs]
+        # Manual hydrostatic-pressure tag (one-liner): mark g·h²/2 → pressure.
+        from zoomy_core.model.derivation.system_extract import HydrostaticPressure
+        pf = self._pressure_flux
+        m.apply({pf: HydrostaticPressure(pf)})
         sm = SystemModel.from_model(m, Q=[*qs, *P_modes])
+        m.apply({HydrostaticPressure(pf): pf})   # un-tag: leave derivation clean
         from zoomy_core.model.boundary_conditions import resolve_and_attach
         resolve_and_attach(sm, self.boundary_conditions,
                            aux_bcs=self.aux_boundary_conditions)

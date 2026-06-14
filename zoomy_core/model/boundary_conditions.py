@@ -1,5 +1,6 @@
 """Module `zoomy_core.model.boundary_conditions`."""
 
+import functools
 import numpy as np
 from time import time as get_time
 import sympy
@@ -9,6 +10,52 @@ from typing import Callable, List
 
 from zoomy_core.misc.misc import Zstruct, ZArray
 from zoomy_core.model.basefunction import Function
+
+
+# ── per-field ``on=`` masking, rooted on the base BoundaryCondition ──────────
+# Every BC carries an ``on`` selector (a field name / family / alias / "all").
+# A BC must only write the ghost slots it OWNS; the rest fall back to the
+# interior (extrapolation) for values and to zero-Neumann for gradients.  This
+# masking is implemented ONCE here and applied to EVERY BC subclass via
+# ``BoundaryCondition.__init_subclass__`` — so ``on=`` works natively for all
+# BCs (no PerFieldBoundary wrapper needed for the common single-BC-per-tag
+# case).  The slot indices are bound against the model state by ``bind_on``.
+#
+# Map: method name -> (index of the interior-state arg in *args, is_gradient,
+# symbolic).  Value methods default non-owned slots to the interior; gradient
+# methods default them to 0 (zero Neumann).  ``compute_*`` are the symbolic
+# (codegen / ZArray) kernels; ``face_*`` are the numeric (numpy) kernels.
+_BC_ON_METHODS = {
+    "compute_boundary_condition": (3, False, True),
+    "compute_boundary_gradient":  (3, True,  True),
+    "face_value":                 (0, False, False),
+    "face_state":                 (0, False, False),
+    "face_gradient":              (0, True,  False),
+}
+
+
+def _wrap_on_method(fn, interior_idx, is_grad, symbolic):
+    """Wrap a BC value/gradient producer so its result is applied ONLY to the
+    slots in ``self._on_slots`` (``None`` ⇒ owns all ⇒ pass through unchanged,
+    bit-identical to the un-wrapped behaviour)."""
+    @functools.wraps(fn)
+    def wrapped(self, *args, **kw):
+        full = fn(self, *args, **kw)
+        slots = getattr(self, "_on_slots", None)
+        if slots is None:                       # owns everything → no masking
+            return full
+        n = len(full)
+        if symbolic:
+            base = ZArray.zeros(n) if is_grad else ZArray(args[interior_idx])
+        else:
+            arr = np.asarray(full, dtype=float)
+            base = (np.zeros_like(arr) if is_grad
+                    else np.asarray(args[interior_idx], dtype=float).copy())
+        for s in slots:
+            base[s] = full[s]
+        return base
+    wrapped._on_wrapped = True
+    return wrapped
 
 
 # --- Helper Function (Unchanged) ---
@@ -50,12 +97,39 @@ class BoundaryCondition(param.Parameterized):
         "Field/family/group this BC applies to ('h', 'q', 'q_0', 'momentum', "
         "'all'); resolved against the model's declared state."))
 
+    # Resolved slot indices this BC owns (None ⇒ all ⇒ no masking).  Set by
+    # ``bind_on`` once the model state is known (see SystemModel.attach_*).
+    _on_slots = None
+
+    def __init_subclass__(cls, **kw):
+        """Apply the ``on=`` mask to EVERY subclass automatically: each
+        value/gradient producer defined on the subclass is wrapped so it only
+        writes the slots the BC owns.  Inherited (un-overridden) producers are
+        already wrapped on the base class, so they mask too."""
+        super().__init_subclass__(**kw)
+        for name, (idx, is_grad, symbolic) in _BC_ON_METHODS.items():
+            fn = cls.__dict__.get(name)
+            if fn is not None and not getattr(fn, "_on_wrapped", False):
+                setattr(cls, name, _wrap_on_method(fn, idx, is_grad, symbolic))
+
     def __init__(self, tag=None, on=None, **params):
         if tag is not None:
             params["tag"] = tag
         if on is not None:
             params["on"] = on
         super().__init__(**params)
+
+    def bind_on(self, state_names, aliases=None):
+        """Resolve this BC's ``on=`` selector to the state-slot indices it owns
+        (``None`` ⇒ ``"all"`` ⇒ owns everything, masking disabled).  Idempotent;
+        called by ``SystemModel.attach_boundary_conditions`` against the declared
+        state so the per-field mask is honored at EVERY entry point."""
+        on = self.on or "all"
+        if on in ("all", ""):
+            self._on_slots = None
+        else:
+            self._on_slots = _resolve_on(
+                on, list(state_names), aliases or {"momentum": "q"})
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
         """Symbolic builder for the boundary *value* — used by
@@ -146,6 +220,15 @@ class BoundaryCondition(param.Parameterized):
         return (Q_face - Q_inner) / max(d_face, 1e-30)
 
 
+# Wrap the base class's OWN producers too (``__init_subclass__`` fires only for
+# subclasses, not for ``BoundaryCondition`` itself), so inherited methods mask.
+for _name, (_idx, _grad, _sym) in _BC_ON_METHODS.items():
+    _fn = BoundaryCondition.__dict__.get(_name)
+    if _fn is not None and not getattr(_fn, "_on_wrapped", False):
+        setattr(BoundaryCondition, _name,
+                _wrap_on_method(_fn, _idx, _grad, _sym))
+
+
 # --- Derived Boundary Conditions (Unchanged) ---
 
 
@@ -202,17 +285,60 @@ class Dirichlet(BoundaryCondition):
 
 
 class Flux(BoundaryCondition):
-    """Prescribed normal-gradient (Neumann flux ``∂Q/∂n = gradient``) on the
-    field(s) this BC covers (``on=``).  Ghost VALUE extrapolates; the boundary
-    GRADIENT is set to ``gradient`` (consumed by the diffusion path).  Example:
-    ``Flux("top", on="q", gradient=tau_s/nu)``."""
+    """Prescribed normal-gradient (Neumann / Robin flux ``∂Q/∂n = gradient``) on
+    the field(s) this BC covers (``on=``).  The ghost VALUE extrapolates; the
+    boundary GRADIENT is set to ``gradient`` (consumed by the diffusion path).
 
-    gradient = param.Number(default=0.0)
+    ``gradient`` is general and, like ``on=`` / ``tag``, needs NO live objects —
+    it is one of:
+
+    * a **number** — constant Neumann, e.g. ``Flux("top", on="mom", gradient=0)``
+      (stress-free);
+    * a **string formula** in field / parameter NAMES — the recommended Robin
+      form, e.g. Navier slip ``Flux("bottom", on="mom", gradient="lambda_s*h*mom/nu")``;
+      the names are resolved against ``sm`` at attach time, exactly the way
+      ``on="mom"`` is resolved against the declared state — so the BC is written
+      before the SystemModel exists;
+    * a **callable** ``(Q, Qaux, normal, d, t, p) → value`` (numpy escape hatch);
+    * a **sympy expression** (free symbols matched to ``sm`` by name).
+
+    :meth:`resolve` (called from ``attach_boundary_conditions``) binds the names
+    to the SystemModel's ``(state, aux, parameters)`` — storing the resolved
+    expression for the codegen path and a lambda for the numpy path, so
+    :meth:`face_gradient` evaluates it from the adjacent interior cell.  Only
+    this BC's ``on=`` slots receive the gradient (root masking)."""
+
+    gradient = param.Parameter(default=0.0)
 
     def __init__(self, tag=None, on=None, gradient=None, **params):
         if gradient is not None:
             params["gradient"] = gradient
         super().__init__(tag=tag, on=on, **params)
+        self._resolved_grad = None     # sympy expr in sm symbols (codegen)
+        self._grad_lambda = None       # numpy evaluator (state, aux, params)
+
+    def resolve(self, sm):
+        """Resolve a string / sympy ``gradient`` against ``sm`` BY NAME (numbers
+        and callables pass through).  ``"lambda_s*h*mom/nu"`` → the expression in
+        this SystemModel's actual state / aux / parameter symbols; then lambdify
+        for the numpy path."""
+        g = self.gradient
+        if callable(g) and not isinstance(g, sympy.Basic):
+            return
+        syms = (list(sm.variables.get_list())
+                + list(sm.aux_variables.get_list())
+                + list(sm.parameters.get_list()))
+        name_map = {str(s): s for s in syms}
+        if isinstance(g, str):
+            expr = sympy.sympify(g, locals=name_map)
+        elif isinstance(g, sympy.Basic):
+            expr = g.subs({fs: name_map[fs.name] for fs in g.free_symbols
+                           if fs.name in name_map})
+        else:
+            return                                          # plain number
+        self._resolved_grad = expr
+        if not expr.is_number:
+            self._grad_lambda = sympy.lambdify(syms, expr, "numpy")
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
         return ZArray(Q)                      # value extrapolates
@@ -220,15 +346,29 @@ class Flux(BoundaryCondition):
     def compute_boundary_gradient(self, time, X, dX, Q, Qaux, parameters, normal):
         n = len(Q.get_list()) if hasattr(Q, "get_list") else len(Q)
         out = ZArray.zeros(n)
+        g = self._resolved_grad if self._resolved_grad is not None else self.gradient
+        g = g if isinstance(g, sympy.Basic) else sympy.sympify(
+            g if not callable(g) else 0)
         for i in range(n):
-            out[i] = self.gradient
+            out[i] = g
         return out
 
     def face_value(self, Q_inner, Qaux_inner, normal, d_face, time, parameters):
         return np.asarray(Q_inner, dtype=float).copy()
 
     def face_gradient(self, Q_inner, Q_face, Qaux_inner, normal, d_face, time, parameters):
-        return np.full(np.asarray(Q_inner, dtype=float).shape, float(self.gradient))
+        g = self.gradient
+        if callable(g) and not isinstance(g, sympy.Basic):
+            val = g(Q_inner, Qaux_inner, normal, d_face, time, parameters)
+        elif self._grad_lambda is not None:                 # string / symbolic
+            val = self._grad_lambda(*np.asarray(Q_inner, dtype=float),
+                                    *np.asarray(Qaux_inner, dtype=float),
+                                    *np.asarray(parameters, dtype=float))
+        elif self._resolved_grad is not None:               # resolved constant
+            val = float(self._resolved_grad)
+        else:                                               # plain number
+            val = float(g)
+        return np.full(np.asarray(Q_inner, dtype=float).shape, float(val))
 
 
 class Coupled(BoundaryCondition):

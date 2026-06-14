@@ -101,6 +101,9 @@ class Stay3DSigma(BaseModel):
         g, rho, e_x = m.parameters.g, m.parameters.rho, m.parameters.e_x
         h = sp.Function("h", positive=True)(t, x)
         b = sp.Function("b", real=True)(t, x)
+        # Free-surface hydrostatic pressure flux; tagged explicitly in
+        # ``system_model`` (the extractor no longer auto-detects pressure).
+        self._pressure_flux = g * h ** 2 / 2
 
         # 1 — general 3-D mass + momentum (full stress tensor), shallow scaling.
         m.declare_state(h)
@@ -131,6 +134,7 @@ class Stay3DSigma(BaseModel):
             Newtonian, NavierSlip, StressFree, apply_stress_closures)
         from zoomy_core.model.models.material import ClosureState
         clos = self.closures or [Newtonian(), NavierSlip(), StressFree()]
+        self._closures_resolved = clos      # for the closure → ζ-face-BC reduction
 
         def _cstate(at, *, alias=None, btag=None):
             return ClosureState(m.functions, params=m.parameters, h=h, x=x,
@@ -146,19 +150,14 @@ class Stay3DSigma(BaseModel):
         ut = _head(r"\tilde{u}")(t, x, zeta)
         wt = _head(r"\tilde{w}")(t, x, zeta)
 
-        # 3c — vertical-face boundary conditions (the friction lives HERE for a
-        # resolved column, not in the PDE): bed = Navier slip τ̃_xz(0)=ρλ_s ũ(0)
-        # (λ_s→∞ ⇒ no-slip ũ(0)=0); surface = stress-free τ̃_xz(1)=0.  Consumed by
-        # the 3-D solve's ζ=0 / ζ=1 face fluxes.  τ̃_xz = ρν/h ∂_ζ ũ (Newtonian).
-        rho_, nu_, lam_ = m.parameters.rho, m.parameters.nu, m.parameters.lambda_s
-        dzu = sp.Derivative(ut, zeta)
-        self._vertical_bcs = {
-            "bed":     sp.Eq(rho_ * nu_ / h * dzu.subs(zeta, 0),
-                             rho_ * lam_ * ut.subs(zeta, 0)),
-            "surface": sp.Eq(dzu.subs(zeta, 1), 0),
-        }
+        # 3c — the bed/surface conditions are NOT folded into the PDE (the model
+        # keeps a real ζ-discretization): bed = no-penetration ω(0)=0 + Navier
+        # slip τ̃·t=λ_s u_t, top = ω(1)=0 + stress-free τ̃·t=0.  They are honored
+        # as ordinary, FRAME-AWARE solver boundary conditions at the ζ=0 / ζ=1
+        # faces (physical {n,t}; sourced from the closures' .traction()), applied
+        # at solve time — never the old dead ``_vertical_bcs`` stash.
 
-        # 3-D conservative-σ ingredients for the forthcoming 3-D extraction
+        # 3-D conservative-σ ingredients for the conservative momentum below
         # (verified: σ-momentum(×h) ≡ ∂_t(hu)+∂_x(hu²+gh²/2)+∂_ζ(h u ω)+ghb_x−e_x g h−τ̃_z/ρ).
         zc = b + h * zeta
         self._omega_def = wt - sp.Derivative(zc, t) - ut * sp.Derivative(zc, x)   # = h·ω
@@ -186,25 +185,112 @@ class Stay3DSigma(BaseModel):
             f"height equation mismatch: {m.mass.expr} != ∂_t h + ∂_x(h U)")
         self._U_def = vint                                # U = ∫₀¹ ũ dζ
 
-        # 5 — v1 reduced system: stash, then drop the 3-D momentum so the
-        # extractor sees only the classifiable depth-reduced rows.  (The 3-D
-        # momentum becomes SystemModel state once ζ is a flux direction.)
+        # 5 — STAY 3-D: the conserved momentum mom = h·ũ and the contravariant
+        # vertical velocity ω, both (t, x, ζ).  u = mom/h with RAW 1/h — the KP
+        # desingularization of 1/h is the NumericalSystemModel's regularization,
+        # never the analytical model.
+        nu = m.parameters.nu
+        mom = sp.Function("mom", real=True)(t, x, zeta)        # conserved h·ũ
+        omega = sp.Function("omega", real=True)(t, x, zeta)    # σ vertical velocity
+        u = mom / h
+        # conservative-σ momentum (raw 1/h; viscous −∂_ζ(ν/h ∂_ζ u) from Newtonian).
+        cons_mom = (d.t(mom) + d.x(mom * u + g * h**2 / 2) + d.zeta(mom * omega)
+                    + g * h * d.x(b) - e_x * g * h - d.zeta(nu / h * d.zeta(u)))
+        # VERIFY the clean conservative form ≡ the derived σ-momentum (ũ=mom/h,
+        # w̃=h·ω+∂_t z+ũ ∂_x z) — a faithful derivation, not a hand-write.
+        wt_sub = h * omega + sp.Derivative(zc, t) + (mom / h) * sp.Derivative(zc, x)
+        derived = self._momentum_sigma_x.subs(wt, wt_sub).subs(ut, mom / h)
+        assert sp.simplify(sp.expand((cons_mom - derived).doit())) == 0, (
+            "stay-3D conservative-σ momentum mismatch vs the derived σ-momentum")
+
+        # 6 — swap the σ-momentum for its conservative form; mom becomes state.
         m.remove("momentum")
+        m.add_equation("momentum", cons_mom)
+        m.declare_state(h, mom)
+
+        # 7 — rewrite the integral auxes in the conserved variable u = mom/h:
+        #   U = ∫₀¹ u dζ  (full depth-mean);  ω diagnosed from continuity as the
+        #   RUNNING integral  h·ω = ζ ∂_x(hU) − ∂_x(h ∫₀^ζ u dζ').  Both integrals
+        #   are supplied per-backend by the same integrate-over-z function.
+        m.apply({ut: mom / h})                            # ũ → mom/h in the U def
+        zp = sp.Symbol("zeta_p", real=True)
+        W_run = sp.Integral(u.subs(zeta, zp), (zp, 0, zeta))   # ∫₀^ζ u dζ'
+        omega_run = (zeta * d.x(h * U) - d.x(h * W_run)) / h
+        m.add_equation("omega", sp.Eq(omega, omega_run), group="aux")
+
         self.derivation = m
         self._bed = b
         return None
 
     @property
     def system_model(self) -> SystemModel:
-        """Height-reduced operator system: state ``[b, h]``, flux ``F[h] = U·h``;
-        ``U`` (depth-mean) auto-exposed as an auxiliary, ``ũ`` carried as the 3-D
-        field it integrates from."""
+        """Full 3-D conservative-σ operator system over ``(x, ζ)``.
+
+        State ``[b, h, mom]`` (``mom = h·ũ``); ζ is a genuine flux direction.
+        ``U`` (depth-mean) and ``ω`` (σ vertical velocity) are integral
+        auxiliaries supplied per-backend by integrate-over-z.  The free-surface
+        pressure ``g·h²/2`` is tagged hydrostatic (manual, one-liner); ``1/h``
+        stays raw (regularization is the NumericalSystemModel's job)."""
         m = self.derivation
         qs = list(m.explicit_state())
         if self._bed not in qs:
             qs = [self._bed, *qs]
+        # Manual hydrostatic-pressure tag (one-liner): route g·h²/2 → pressure.
+        from zoomy_core.model.derivation.system_extract import HydrostaticPressure
+        pf = self._pressure_flux
+        m.apply({pf: HydrostaticPressure(pf)})
         sm = SystemModel.from_model(m, Q=qs, canonical_source=self)
-        from zoomy_core.model.boundary_conditions import resolve_and_attach
-        resolve_and_attach(sm, self.boundary_conditions,
-                           aux_bcs=self.aux_boundary_conditions)
+        m.apply({HydrostaticPressure(pf): pf})   # un-tag: leave derivation clean
+        # CLOSURE → ζ-FACE-BC REDUCTION: the user states the bed/surface
+        # conditions as physical closures; here the reduction emits them as
+        # ordinary solver BCs on the ζ-faces (combined with the user's
+        # horizontal BCs).  ω(0)=ω(1)=0 (no-penetration) is structural in the ω
+        # aux, so only the viscous tractions become BCs.
+        from zoomy_core.model.boundary_conditions import (
+            resolve_and_attach, Extrapolation)
+        user = self.boundary_conditions
+        if user is None:
+            horiz_bcs = [Extrapolation(tag="left"), Extrapolation(tag="right")]
+        elif isinstance(user, list):
+            horiz_bcs = list(user)
+        else:
+            horiz_bcs = list(user.boundary_conditions_list)
+        all_bcs = horiz_bcs + self._vertical_face_bcs(sm)
+        resolve_and_attach(sm, all_bcs, aux_bcs=self.aux_boundary_conditions)
         return sm
+
+    def _vertical_face_bcs(self, sm):
+        """Translate the bed/surface CLOSURES into ζ-face solver BCs (the user
+        never writes σ-specific strings).  Newtonian bulk ⇒ ζζ viscous diffusion
+        (already in the PDE); NavierSlip bed ⇒ a Robin viscous-flux BC
+        ``∂_ζ mom = (h²/ν)·λ_s·u_t`` (small-slope/flat: ``u_t = mom/h`` →
+        ``λ_s·h·mom/ν``; the slope-aware ``u_t`` comes from
+        ``ClosureState.get_normal_tangential``); StressFree surface ⇒ zero viscous
+        flux (``gradient=0``).  Delivered through the generalized :class:`Flux`."""
+        from zoomy_core.model.models.closures import NavierSlip, StressFree
+        from zoomy_core.model.boundary_conditions import Flux
+        names = [str(s) for s in sm.state]
+        if "mom" not in names:
+            return []
+        hS, momS = sm.state[names.index("h")], sm.state[names.index("mom")]
+        nu = sm.parameters.nu
+        clos = getattr(self, "_closures_resolved", [])
+        out = []
+        for c in clos:
+            kind = getattr(c, "closes", None)
+            if kind == "bottom":
+                if isinstance(c, NavierSlip):
+                    lam = sm.parameters.lambda_s
+                    # Navier slip ∂_ζ mom = (h²/ν)·λ_s·u_t (u_t=mom/h flat); the
+                    # bed-face diffusive-flux convention of the solver's boundary
+                    # operator makes friction (momentum SINK) the negative sign.
+                    out.append(Flux(tag="bottom", on="mom",
+                                    gradient=-lam * hS * momS / nu))
+                else:
+                    raise NotImplementedError(
+                        f"bed closure {type(c).__name__} → ζ-face BC not wired "
+                        "(v1 supports NavierSlip; RoughWall via its .traction is "
+                        "the documented extension).")
+            elif kind == "surface" and isinstance(c, StressFree):
+                out.append(Flux(tag="top", on="mom", gradient=0))
+        return out

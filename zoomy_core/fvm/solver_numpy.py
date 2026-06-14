@@ -677,6 +677,23 @@ class HyperbolicSolver(Solver):
         bf_fidx = mesh.boundary_face_face_indices
         bc_indices = np.asarray(
             mesh.boundary_face_function_numbers[:n_bf], dtype=int)
+        # Align the mesh's per-face function-number order with the (tag-sorted)
+        # BoundaryConditions Piecewise branch order — they can differ (the mesh
+        # numbers tags by position, e.g. create_2d left=0,right=1,bottom=2,top=3;
+        # BoundaryConditions sorts tags alphabetically), which would route e.g.
+        # "bottom" faces to the "right" BC.  Remap by TAG NAME.  No-op when the
+        # two orders already agree (single-tag / same-order meshes).
+        mesh_names = list(getattr(mesh, "boundary_conditions_sorted_names", []) or [])
+        bc_src = (getattr(symbolic_model, "_bc_source", None)
+                  or getattr(model, "_bc_source", None))
+        bc_tags = list(bc_src.list_sorted_function_names) if bc_src is not None else []
+        if mesh_names and bc_tags and list(mesh_names) != list(bc_tags):
+            name_to_branch = {}
+            for _i, _t in enumerate(bc_tags):
+                name_to_branch.setdefault(_t, _i)
+            remap = np.array([name_to_branch.get(mesh_names[fn], fn)
+                              for fn in range(len(mesh_names))], dtype=int)
+            bc_indices = remap[bc_indices]
         bc_fn = model.boundary_conditions
         face_centers = mesh.face_centers
 

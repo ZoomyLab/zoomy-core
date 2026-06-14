@@ -8,8 +8,11 @@ Verifies (run, not asserted by hand):
   vertical velocity h·ω = w̃ − ∂_t z − ũ ∂_x z and ω(0)=ω(1)=0 ⟺ the two KBCs;
 * extract_system_operators treats the VERTICAL as a genuine flux direction —
   a σ-dependent STATE field extracts over space=(x,ζ) (∂_ζ as flux + diffusion);
+* the FULL stay-3D system (state [b,h,mom]) extracts over space=(x,ζ) with
+  per-field dimensionality — the depth h(t,x) stays ζ-independent so the viscous
+  ζζ diffusion of mom/h carries no spurious ∂_ζ h coupling;
 * depth-reduced models keep their horizontals (the space-fix is byte-identical
-  for them): a stay-3D height-only system stays space=(x).
+  for them).
 """
 import sympy as sp
 
@@ -53,17 +56,38 @@ def _sigma_mapped_model():
     return m, h, b, ut, wt
 
 
-def test_height_equation_and_aux_extract():
-    """∂_t h + ∂_x(h·U) = 0, U aux, no Integral, flux F[h]=U·h, space=(x)."""
+def test_full_3d_conservative_sigma_extract():
+    """Full 3-D conservative-σ system: state ``[b, h, mom]`` over ``space=(x,ζ)``.
+
+    Height eq ``∂_t h + ∂_x(h·U) = 0`` (U aux, integral absorbed); momentum
+    x-flux ``mom²/h`` (RAW 1/h — regularization is the NumericalSystemModel's
+    job) + the ζ-flux ``mom·ω``; pressure ``g·h²/2`` tagged hydrostatic
+    (manual); viscous ``−ν/h²`` as the ζζ diffusion of mom with NO spurious
+    ``∂_ζ h`` coupling (per-field dims); bed slope ``g·h`` in the NCP; ``e_x·g·h``
+    source."""
     from zoomy_core.model.models.stay3d_sigma import Stay3DSigma
-    mdl = Stay3DSigma(); mdl.derive_model()          # internal assert: == ∂_t h+∂_x(hU)
-    m = mdl.derivation
+    mdl = Stay3DSigma(parameters={"nu": 0.7, "e_x": 0.3, "g": 9.81,
+                                  "rho": 1.0, "lambda_s": 0.5})
+    m = mdl.derivation                               # internal asserts ran in derive
     assert not m.mass.expr.atoms(sp.Integral)        # integral absorbed into U
     sm = mdl.system_model
-    names = {str(s) for s in sm.state}
-    assert {"b", "h"} <= names
-    assert sm.space == [x]                            # reduced surface system
-    assert "U" in {str(s) for s in sm.aux_state}      # depth-mean velocity aux
+    names = [str(s) for s in sm.state]
+    assert names[:3] == ["b", "h", "mom"]
+    assert sm.space == [x, zeta]                      # ζ IS a genuine flux direction
+    assert {"U", "omega"} <= {str(s) for s in sm.aux_state}
+    hrow, mrow, brow = names.index("h"), names.index("mom"), names.index("b")
+    g = sm.parameters.g
+    # height flux F[h]=U·h (x only); momentum x-flux mom²/h + ζ-flux mom·ω
+    assert sm.flux[hrow, 0] != 0 and sm.flux[hrow, 1] == 0
+    assert sm.flux[mrow, 0] != 0 and sm.flux[mrow, 1] != 0
+    # g·h²/2 routed to hydrostatic_pressure (manual tag), not flux
+    assert sm.hydrostatic_pressure[mrow, 0].has(g)
+    assert not sm.flux[mrow, 0].has(g)
+    # viscous −ν/h² is the ONLY ζζ diffusion entry of the mom row (no ∂_ζ h term)
+    assert sm.diffusion_matrix[mrow, mrow, 1, 1] != 0
+    assert sm.diffusion_matrix[mrow, hrow, 1, 1] == 0
+    # bed slope g·h is the NCP coupling mom←b
+    assert sm.nonconservative_matrix[mrow, brow, 0] != 0
 
 
 def test_conservative_sigma_identity():

@@ -118,6 +118,10 @@ class SME(BaseModel):
         g, rho = m.parameters.g, m.parameters.rho
         h = sp.Function("h", positive=True)(t, *horiz)
         b = sp.Function("b", real=True)(t, *horiz)
+        # Free-surface hydrostatic pressure flux; tagged explicitly in
+        # ``system_model`` so the extractor routes it to hydrostatic_pressure
+        # (the extractor no longer auto-detects pressure by gravity).
+        self._pressure_flux = g * h ** 2 / 2
 
         # 1 — full system, assembled from balance blueprints (equations.py).
         # Mass registers the horizontal velocity(ies) + w; Momentum (full stress
@@ -330,7 +334,14 @@ class SME(BaseModel):
         # already an explicit unknown; prepend only if absent.
         if self._bed not in qs:
             qs = [self._bed, *qs]
+        # Manual hydrostatic-pressure tag (one-liner): mark g·h²/2 so the
+        # structural extractor routes it to hydrostatic_pressure (well-balanced
+        # reconstruction) instead of the conservative flux.
+        from zoomy_core.model.derivation.system_extract import HydrostaticPressure
+        pf = self._pressure_flux
+        m.apply({pf: HydrostaticPressure(pf)})
         sm = SystemModel.from_model(m, Q=qs, canonical_source=self)
+        m.apply({HydrostaticPressure(pf): pf})   # un-tag: leave derivation clean
         self._register_hswme_spectrum(sm)
         # legacy BoundaryConditions container OR the new flat per-field list
         from zoomy_core.model.boundary_conditions import resolve_and_attach

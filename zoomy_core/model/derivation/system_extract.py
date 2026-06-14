@@ -44,7 +44,26 @@ import sympy as sp
 from zoomy_core.misc.misc import Zstruct
 
 
-__all__ = ["extract_system_operators"]
+__all__ = ["extract_system_operators", "HydrostaticPressure"]
+
+
+class HydrostaticPressure(sp.Function):
+    """Opaque marker wrapping a pressure-flux argument.
+
+    A conservative term ``∂_x(HydrostaticPressure(P))`` is routed to the
+    ``hydrostatic_pressure`` operator (which feeds the well-balanced
+    hydrostatic reconstruction); every OTHER conservative ``∂_x(F(state))``
+    goes to ``flux``.  Routing to pressure is therefore an EXPLICIT, manual
+    step the model takes — e.g. ``eq.apply({g*h**2/2: HydrostaticPressure(g*h**2/2)})``
+    — never guessed from the presence of gravity.  ``eval`` returns ``None`` so
+    the marker stays unevaluated AND is excluded from field collection (it
+    carries an ``eval``, so it is not an undefined field)."""
+
+    nargs = 1
+
+    @classmethod
+    def eval(cls, arg):
+        return None
 
 
 def _field_name(field):
@@ -164,12 +183,20 @@ def extract_system_operators(model, Q, Qaux=None):
     n_eq = len(state)
     n_state = len(state)
 
-    # Map every field application → its state/aux Symbol-as-(t, *space)-function
-    # so structural ``∂_t`` / ``∂_{x_d}`` collection is well-defined in every
-    # horizontal direction.  ``space`` are the SystemModel spatial Symbols; the
-    # field's own horizontal coords are rewritten onto them.
-    state_fn = {s: sp.Function(str(s), real=True)(t, *space) for s in state}
-    aux_fn = {s: sp.Function(str(s), real=True)(t, *space) for s in aux_state}
+    # Map every field application → its state/aux Symbol-as-function, carrying
+    # ONLY the spatial coords that field actually depends on (in ``space`` order)
+    # — PER-FIELD dimensionality.  A depth field ``h(t,x)`` therefore stays
+    # ζ-INDEPENDENT (``∂_ζ h ≡ 0``) even on a stay-3D ``(x,ζ)`` extraction, so a
+    # ζ-diffusion of ``mom/h`` yields ``∂_ζ(ν/h² ∂_ζ mom)`` alone — no spurious
+    # ``∂_ζ h`` coupling.  Depth-reduced models (every field on ``(t,*horiz)``,
+    # ``space == horiz``) get ``(t,*space)`` for every field, byte-identical to
+    # the former uniform mapping.
+    def _canon(s, f):
+        used_sp = [c for c in space if c in getattr(f, "args", ())]
+        return sp.Function(str(s), real=True)(t, *used_sp)
+
+    state_fn = {_state_symbol(f): _canon(_state_symbol(f), f) for f in Q}
+    aux_fn = {_state_symbol(f): _canon(_state_symbol(f), f) for f in Qaux}
     field_to_fn = {}
     for f in Q:
         field_to_fn[f] = state_fn[_state_symbol(f)]
@@ -349,11 +376,10 @@ def _classify_row(residual, i, state, state_funcs, t, space, gravity_param,
         # ``q_i/h·∂_{x_d} q_j``) stay in B.
         if inner in sym_of_func:
             if not coeff_has_state and not coeff.has(x) and not coeff.has(t):
-                flux_i = coeff * inner
-                if gravity_param is not None and flux_i.has(gravity_param):
-                    P[i, d] = P[i, d] + flux_i
-                else:
-                    F[i, d] = F[i, d] + flux_i
+                # Bare-state conservative flux ∂_{x_d}(c·Q_j) → flux.  (A bare
+                # state is never a pressure term — pressure is g·h²/2, marked
+                # explicitly and handled in branch 5.)
+                F[i, d] = F[i, d] + coeff * inner
                 continue
             j = state_funcs.index(inner)
             B[i, j, d] = B[i, j, d] + coeff
@@ -361,13 +387,20 @@ def _classify_row(residual, i, state, state_funcs, t, space, gravity_param,
 
         inner_has_state = any(inner.has(f) for f in state_set)
 
-        # 5. ∂_{x_d}(F(state)) with state-free coeff → flux / pressure (col d).
+        # 5. ∂_{x_d}(F(state)) with state-free coeff → flux (col d), UNLESS a
+        # summand is wrapped in the HydrostaticPressure marker → that summand
+        # routes to hydrostatic_pressure (unwrapped).  Pressure routing is
+        # MANUAL: the model marks ``g·h²/2`` (no gravity-guessing here), which
+        # also splits a bundled ∂_x(g h²/2 + advection) correctly.
         if inner_has_state and not coeff_has_state:
-            flux_i = coeff * inner
-            if gravity_param is not None and inner.has(gravity_param):
-                P[i, d] = P[i, d] + flux_i
-            else:
-                F[i, d] = F[i, d] + flux_i
+            for piece in sp.Add.make_args(sp.expand(inner)):
+                if piece.has(HydrostaticPressure):
+                    unwrapped = piece.replace(
+                        lambda e: isinstance(e, HydrostaticPressure),
+                        lambda e: e.args[0])
+                    P[i, d] = P[i, d] + coeff * unwrapped
+                else:
+                    F[i, d] = F[i, d] + coeff * piece
             continue
 
         # 6. state-dependent coeff on a ∂_{x_d} argument — the non-conservative

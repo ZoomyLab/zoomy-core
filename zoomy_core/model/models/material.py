@@ -152,16 +152,29 @@ class ClosureState:
         names = ([{_C.x: "u", _C.y: "v"}[c] for c in self._horiz] + ["w"])
         return [getattr(self, n) for n in names]
 
+    def get_normal_tangential(self, vec):
+        """Decompose ANY 3-D vector field ``vec = [f_x, (f_y,) f_z]`` into its
+        local boundary-frame components — returns ``(f_n, [f_t1, (f_t2)])``: the
+        normal projection ``vec·n̂`` and the per-axis tangential projections
+        ``vec·t̂_α`` in the slope-aware frame ``{n, t_α}`` (:attr:`normal` /
+        :attr:`tangents`).  Velocity → slip / penetration; ``σ·n`` → traction;
+        etc.  Dimension-agnostic: one tangent in 2-D, two in 3-D."""
+        v = sp.Matrix(vec)
+        f_n = (v.T * self.normal)[0]
+        f_t = [(v.T * T)[0] for T in self.tangents]
+        return f_n, f_t
+
     @property
     def u_tangent(self):
-        """Tangential slip velocity per axis: ``[u·t_x, (u·t_y,)]``."""
-        vel = sp.Matrix(self._vel3)
-        return [(vel.T * T)[0] for T in self.tangents]
+        """Tangential slip velocity per axis ``[u·t_x, (u·t_y,)]`` — the
+        tangential part of :meth:`get_normal_tangential` on the velocity."""
+        return self.get_normal_tangential(self._vel3)[1]
 
     @property
     def u_normal(self):
-        """Wall-normal velocity ``u·n`` (zero under no-penetration)."""
-        return (sp.Matrix(self._vel3).T * self.normal)[0]
+        """Wall-normal velocity ``u·n`` (zero under no-penetration) — the normal
+        part of :meth:`get_normal_tangential` on the velocity."""
+        return self.get_normal_tangential(self._vel3)[0]
 
     def _family(self, name):
         name = self._alias.get(name, name)        # dimension-agnostic rebind

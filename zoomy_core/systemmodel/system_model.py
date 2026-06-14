@@ -606,13 +606,45 @@ class SystemModel:
         Extrapolation.  Optional — a SystemModel without BCs still builds; the
         solver only needs them at run time.  Returns ``self``.
         """
-        from zoomy_core.model.boundary_conditions import BoundaryConditions
+        from zoomy_core.model.boundary_conditions import (
+            BoundaryConditions, PerFieldBoundary, Periodic, Coupled,
+            resolve_per_field)
         import zoomy_core.model.aux_boundary_conditions as AuxBC
-        # BCs that need the SystemModel (FromModel: boundary_specs;
-        # Characteristic: eigensystem + state layout) expose .resolve(sm).
-        for bc in bcs.boundary_conditions_list:
+        state_names = [str(s) for s in self.state]
+        # The ``on=`` field mask is rooted on BoundaryCondition (each BC self-
+        # masks its owned slots), so a single per-field BC per tag needs no
+        # wrapper.  Only tags carrying MULTIPLE explicit BCs must be merged into
+        # one PerFieldBoundary (the runtime dispatches ONE bc per tag).  Accept a
+        # flat list or a BoundaryConditions container; whole-patch BCs pass
+        # through.  Already-composed input (resolve_and_attach) is left as-is.
+        raw = (list(bcs) if isinstance(bcs, list)
+               else list(bcs.boundary_conditions_list))
+        by_tag = {}
+        for bc in raw:
+            by_tag.setdefault(bc.tag, []).append(bc)
+        merged = []
+        for tag, group in by_tag.items():
+            non_patch = [b for b in group
+                         if not isinstance(b, (PerFieldBoundary, Periodic, Coupled))]
+            if len(non_patch) > 1:               # multiple BCs at one tag → merge
+                merged.extend(
+                    resolve_per_field(group, state_names,
+                                      aliases={"momentum": "q"}).boundary_conditions_list)
+            else:
+                merged.extend(group)
+        bcs = BoundaryConditions(merged)
+        # Bind each BC's ``on=`` to slot indices against this state (so the root
+        # mask fires), and run the SystemModel-needing hooks (FromModel,
+        # Characteristic).  Recurse into any PerFieldBoundary slot BCs.
+        def _prepare(bc):
             if hasattr(bc, "resolve"):
                 bc.resolve(self)
+            bc.bind_on(state_names)
+            for inner in {id(v): v for v in
+                          getattr(bc, "_slot_bc", {}).values()}.values():
+                _prepare(inner)
+        for bc in bcs.boundary_conditions_list:
+            _prepare(bc)
         if self.position is None:
             # the BC kernel signature needs a 3-component position; models
             # without registered function groups never set one.
