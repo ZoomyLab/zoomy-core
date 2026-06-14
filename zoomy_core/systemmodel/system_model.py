@@ -157,35 +157,53 @@ def register_function_slot(group_name: str, sm_attr: str) -> None:
     _FUNCTION_SLOTS[group_name] = sm_attr
 
 
-def _grad_aux_name(base) -> str:
-    """Name a spatial-gradient aux symbol after the field it differentiates:
-    ``∂_x h → dhdx``, ``∂_x q_0 → dq0dx``, ``∂_x b → dbdx`` (legacy convention)."""
+def _grad_aux_name(base, axis="x") -> str:
+    """Name a spatial-gradient aux symbol after the field it differentiates and
+    the axis/axes it is taken along: ``∂_x h → dhdx``, ``∂_y q_0 → dq0dy``,
+    ``∂_x∂_x b → dbdxx`` (``axis`` carries the concatenated axis letters)."""
     if isinstance(base, sp.Function):
         head = base.func.__name__
         idx = "".join(str(int(a)) for a in base.args
                       if getattr(a, "is_Integer", False))
-        return f"d{head}{idx}dx"
-    return f"d{base}dx"
+        return f"d{head}{idx}d{axis}"
+    return f"d{base}d{axis}"
 
 
-def _gradients_to_aux(expr, x):
-    """Replace every ``∂_x(field)`` in ``expr`` with a fresh gradient-aux
-    Symbol; return ``(new_expr, [aux_symbols])`` (order-stable, de-duplicated).
-    These are the runtime aux the solver supplies from its stencil — the reason
-    a reconstructed ``w`` needs ``∂_x h``, ``∂_x q_i`` available."""
+def _gradients_to_aux(expr, spaces):
+    """Replace every PURELY-SPATIAL ``∂(field)`` in ``expr`` (along ANY of the
+    ``spaces`` coordinates, to any order) with a fresh gradient-aux Symbol.
+
+    Returns ``(new_expr, grads)`` with ``grads`` an order-stable, de-duplicated
+    list of ``(aux_symbol, differentiated_field, multi_index_tuple)`` — the
+    runtime aux the solver supplies from its LSQ stencil, and the metadata the
+    caller registers in ``aux_registry`` so :meth:`Solver._walk_derivative_aux`
+    fills them.  This is what a reconstructed ``w`` (and any derivative-carrying
+    reconstruction slot) needs to lower cleanly: it leaves NO raw ``Derivative``
+    atoms for the backend printer (which would otherwise drop the slot — e.g.
+    the jax ``interpolate_to_3d`` drop) and is dimension-complete (x AND y AND
+    z), not the old x-only conversion that left ``∂_y`` raw in the 2-D w slot.
+    """
+    space_index = {s: d for d, s in enumerate(spaces)}
+    n_dim = len(spaces)
     grads: list = []
+    seen: set = set()
 
-    def _is_dx(e):
+    def _is_spatial_grad(e):
         return (isinstance(e, sp.Derivative)
-                and any(v == x for v, _ in e.variable_count))
+                and all(v in space_index for v, _ in e.variable_count))
 
     def _to_sym(e):
-        s = sp.Symbol(_grad_aux_name(e.expr), real=True)
-        if s not in grads:
-            grads.append(s)
+        mi = [0] * n_dim
+        for v, n in e.variable_count:
+            mi[space_index[v]] += int(n)
+        axis = "".join(str(spaces[d]) for d in range(n_dim) for _ in range(mi[d]))
+        s = sp.Symbol(_grad_aux_name(e.expr, axis), real=True)
+        if s.name not in seen:
+            seen.add(s.name)
+            grads.append((s, e.expr, tuple(mi)))
         return s
 
-    return expr.replace(_is_dx, _to_sym), grads
+    return expr.replace(_is_spatial_grad, _to_sym), grads
 
 
 def _fields_to_state_symbols(expr, x):
@@ -255,7 +273,7 @@ def _attach_function_groups(sm, model, canonical_source=None) -> None:
         # ``.doit()`` expands derivatives of compounds (the CoV leaves
         # ``∂_x(q_i/h)``) into the bare-field gradients ``∂_x q_i``, ``∂_x h``
         # so the gradient aux are named cleanly (``dq0dx``, ``dhdx``).
-        e, grads = _gradients_to_aux(sp.sympify(rhs).doit(), x)
+        e, grads = _gradients_to_aux(sp.sympify(rhs).doit(), sm.space)
         new_aux.extend(grads)
         e = _fields_to_state_symbols(sp.expand(e), x)
         if e.has(zeta) and e.has(z_pos):
@@ -315,9 +333,44 @@ def _attach_function_groups(sm, model, canonical_source=None) -> None:
         )
         sm.state_from_reconstruction = invert_reconstruction(
             sm.reconstruction_variables, list(sm.state))
-    for g in sorted(set(new_aux), key=str):
-        if g not in sm.aux_state:
-            sm.aux_state = list(sm.aux_state) + [g]
+    # Append the reconstruction gradient aux to aux_state AND register them in
+    # aux_registry, so the solver's shared derivative-aux walk
+    # (Solver._walk_derivative_aux / the jax canonical update_qaux) computes
+    # them.  WITHOUT the registration the slot lowers but reads ZERO
+    # derivatives (a wrong w); WITHOUT the dimension-complete _gradients_to_aux
+    # above the 2-D w slot kept raw ``∂_y`` atoms and was dropped by the jax
+    # printer.  Append to whatever operator-scan registry expose_aux_atoms
+    # already built; de-dup by symbol name (a derivative may appear in both an
+    # operator and a reconstruction slot).
+    state_syms = {str(s): i for i, s in enumerate(sm.state)}
+    registry = list(getattr(sm, "aux_registry", None) or [])
+    registered = {e.get("name") for e in registry}
+    for sym, target, mi in new_aux:
+        if sym not in sm.aux_state:
+            sm.aux_state = list(sm.aux_state) + [sym]
+        if sym.name in registered:
+            continue
+        tname = str(_fields_to_state_symbols(sp.sympify(target), x))
+        entry = {
+            "kind": "derivative", "name": sym.name,
+            "row": list(sm.aux_state).index(sym), "atom": None,
+            "aux_symbol": sym, "target_name": tname, "multi_index": tuple(mi),
+        }
+        if tname in state_syms:
+            entry["target_kind"] = "state"
+            entry["state_index"] = state_syms[tname]
+        else:
+            frow = next((e["row"] for e in registry
+                         if e.get("kind") == "function"
+                         and e.get("name") == tname), None)
+            if frow is not None:
+                entry["target_kind"] = "function"
+                entry["function_row"] = frow
+            else:
+                entry["target_kind"] = "unknown"
+        registry.append(entry)
+        registered.add(sym.name)
+    sm.aux_registry = registry
     if sm.position is None:
         sm.position = Zstruct(X0=x, X1=y_pos, X2=z_pos)
 
