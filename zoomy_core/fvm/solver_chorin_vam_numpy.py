@@ -727,79 +727,29 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         return Q_face
 
     def update_aux_variables(self):
-        """Refresh derivative-aux rows by LSQ in each sub-system's
-        ``Qaux`` pool.  Each sub-system has its own ``aux_state``
-        ordering (auto-scan ordering depends on which atoms appear
-        in that sub-system's operators) — we walk all three
-        registries and fill each one's Qaux array independently.
+        """Refresh derivative-aux rows by LSQ in each sub-system's ``Qaux``
+        pool, via the shared :meth:`Solver._walk_derivative_aux` — one call per
+        pool (predictor / pressure / corrector), the same single source the
+        canonical ``update_qaux`` uses.
 
-        Function-aux rows (``b`` topography) are left untouched —
-        the user sets them once via :meth:`set_function_aux` and they
-        stay static through the simulation.
-        """
-        Q = self._sim_Q
-        nc = Q.shape[1]
-        n_cells = self._sim_mesh.n_cells
-        mesh = self._sim_mesh
-        u_full = np.zeros(n_cells)
-
-        # BC-correct face state for state-derivative aux entries.
-        # Function-aux fields (e.g. bathymetry ``b``) fall back to
-        # extrapolation since their BC isn't carried by the SystemModel
-        # BC kernel — but ``b`` is static so its derivatives also are.
-        Q_face = self._compute_boundary_face_state()
-
-        for sm in (self.sm_pred, self.sm_press, self.sm_corr):
-            Qaux, registry = self._aux_pool_for(sm)
-            for entry in registry:
-                if entry["kind"] not in ("derivative", "limited_derivative"):
-                    continue
-                row = entry["row"]
-                if row >= Qaux.shape[0]:
-                    continue
-                mi = entry["multi_index"]
-                tk = entry["target_kind"]
-                if tk == "state":
-                    state_i = entry["state_index"]
-                    u_full[:nc] = Q[state_i, :]
-                    # FORCE extrapolation BC everywhere to match the
-                    # old chain behaviour (silent extrapolation default
-                    # before this session) AND the JAX-legacy convention
-                    # for h/b/P — see ``apply_bc`` in
-                    # ``/tmp/vam_legacy_jax.py``.  Apples-to-apples
-                    # comparison with JAX requires identical BC
-                    # treatment for the LSQ-recomputed aux.  Prescribed-
-                    # Dirichlet inflow values are handled separately
-                    # (predictor flux only); the elliptic block sees
-                    # ∂_n = 0 at the boundary face.
-                    u_face = "extrapolation"
-                elif tk == "function":
-                    u_full[:nc] = Qaux[entry["function_row"], :]
-                    # Function-aux (e.g. static bathymetry ``b``) — the
-                    # SystemModel doesn't carry a per-field BC kernel
-                    # here, so default to extrapolation (Neumann-zero,
-                    # appropriate for static topography).
-                    u_face = "extrapolation"
-                else:
-                    continue
-                d = mesh.compute_derivatives(
-                    u_full, degree=max(mi),
-                    derivatives_multi_index=[mi],
-                    u_boundary_face=u_face,
-                )
-                grad_lsq = d[:nc, 0]
-                # Apply TVD limiter to the LSQ gradient if the aux entry
-                # is flagged as ``limited_derivative`` (via the symbolic
-                # ``limit(D, scheme)`` wrapper) or if its name matches an
-                # entry in ``self.limited_aux_fields`` (for ad-hoc
-                # solver-level limiting without modifying the model).
-                scheme = (entry.get("limiter_scheme")
-                          if entry["kind"] == "limited_derivative"
-                          else self.limited_aux_fields.get(entry["name"]))
-                if scheme is not None:
-                    grad_lsq = _apply_cell_limiter(
-                        u_full[:nc], grad_lsq, mi, scheme, mesh)
-                Qaux[row, :] = grad_lsq
+        Each sub-system has its own ``aux_state`` ordering, so each registry is
+        walked against its own pool.  Function-aux rows (``b`` topography, set
+        once via :meth:`set_function_aux`) are left untouched.
+        ``limited_derivative`` rows (and ad-hoc ``limited_aux_fields``) get the
+        TVD limiter via :func:`_apply_cell_limiter`.  Boundary faces use
+        extrapolation (Neumann-zero) — matching the previous chain behaviour;
+        prescribed-Dirichlet inflow is handled in the predictor flux only.
+        ``copy=False`` refreshes each pool array in place (no stale refs)."""
+        kw = dict(kinds=("derivative", "limited_derivative"),
+                  limited_aux_fields=self.limited_aux_fields,
+                  limiter_fn=_apply_cell_limiter, copy=False)
+        Q, mesh = self._sim_Q, self._sim_mesh
+        self._sim_Qaux = self._walk_derivative_aux(
+            self.sm_pred, self._sim_Qaux, Q, mesh, **kw)
+        self.Qaux_press = self._walk_derivative_aux(
+            self.sm_press, self.Qaux_press, Q, mesh, **kw)
+        self.Qaux_corr = self._walk_derivative_aux(
+            self.sm_corr, self.Qaux_corr, Q, mesh, **kw)
 
     def set_function_aux(self, name, values):
         """Set a function-aux row (e.g. static topography ``b``) on

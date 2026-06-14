@@ -225,20 +225,43 @@ class Solver(param.Parameterized):
                     local_fn(Q[:, c], Qaux[:, c], parameters),
                     dtype=float).ravel()
                 out[:vals.shape[0], c] = vals
-        # (2) DERIVATIVE aux leg — LSQ gradients from the registry.
-        sm = self._sm_from_solver_or_model(model)
+        # (2) DERIVATIVE aux leg — the non-local LSQ-gradient rows the
+        # SystemModel gathered in aux_registry, via the shared walk (the SINGLE
+        # source the Chorin per-pool refresh also calls).
+        return self._walk_derivative_aux(
+            self._sm_from_solver_or_model(model), out, Q, mesh)
+
+    def _walk_derivative_aux(self, sm, Qaux, Q, mesh, *,
+                             kinds=("derivative",),
+                             limited_aux_fields=None, limiter_fn=None,
+                             copy=True):
+        """Fill ``aux_registry`` derivative rows of ONE SystemModel by LSQ —
+        the single source the canonical :meth:`update_qaux` AND
+        ``ChorinSplitVAMSolver.update_aux_variables`` (per sub-system pool)
+        both call.
+
+        ``kinds`` / ``limiter_fn`` keep each caller's exact scope: the
+        canonical post-step walks plain spatial ``derivative`` rows with no
+        limiter (defaults → byte-identical to the old inline leg); the Chorin
+        pools also walk ``limited_derivative`` rows and apply a TVD limiter
+        (``limiter_fn`` resolved from ``entry['limiter_scheme']`` or
+        ``limited_aux_fields[name]``).  State-derivative targets read ``Q``;
+        function-aux targets read the working aux; boundary faces use
+        extrapolation (Neumann-zero).  ``copy=True`` returns a fresh array
+        (canonical: don't clobber the caller's Qaux); ``copy=False`` mutates
+        in place (Chorin: refresh the pool array itself)."""
         registry = getattr(sm, "aux_registry", None) if sm is not None else None
         if not registry:
-            return out
-        if out is Qaux:                 # don't mutate the caller's array
-            out = np.array(Qaux, copy=True)
+            return Qaux
+        out = np.array(Qaux, copy=True) if copy else Qaux
         nc = Q.shape[1]
-        n_cells = mesh.n_cells
-        u_full = np.zeros(n_cells)
+        u_full = np.zeros(mesh.n_cells)
         for entry in registry:
-            if entry["kind"] != "derivative":
+            if entry["kind"] not in kinds:
                 continue
             row = entry["row"]
+            if row >= out.shape[0]:
+                continue
             mi = entry["multi_index"]
             tk = entry["target_kind"]
             if tk == "state":
@@ -248,16 +271,17 @@ class Solver(param.Parameterized):
             else:
                 # Unknown target — leave whatever the caller put there.
                 continue
-            # TODO(boundary-aware-LSQ): supply BC-evaluated face values
-            # for state-aux derivatives (analogous to
-            # ChorinSplitVAMSolver._compute_boundary_face_state).  For
-            # now the predictor's parent uses extrapolation = Neumann-
-            # zero, matching the legacy behaviour at boundary cells.
-            d = mesh.compute_derivatives(
+            grad = mesh.compute_derivatives(
                 u_full, degree=max(mi), derivatives_multi_index=[mi],
                 u_boundary_face="extrapolation",
-            )
-            out[row, :] = d[:nc, 0]
+            )[:nc, 0]
+            if limiter_fn is not None:
+                scheme = (entry.get("limiter_scheme")
+                          if entry["kind"] == "limited_derivative"
+                          else (limited_aux_fields or {}).get(entry["name"]))
+                if scheme is not None:
+                    grad = limiter_fn(u_full[:nc], grad, mi, scheme, mesh)
+            out[row, :] = grad
         return out
 
     def _sm_from_solver_or_model(self, model):
