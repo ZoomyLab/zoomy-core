@@ -270,7 +270,13 @@ class UFLRuntimeModel(NumpyRuntimeModel):
         "cosh": ufl.cosh,
         "tanh": ufl.tanh,
         # --- Piecewise / conditional logic ---
-        "Heaviside": lambda x: ufl.conditional(x >= 0, 1.0, 0.0),
+        # SymPy emits ``Heaviside(x, h0)`` (2-arg) when it arises from a
+        # subgradient, e.g. d/dx Max(x, c) = Heaviside(x - c, 1/2): the 2nd
+        # arg is the value AT x == 0.  That set is measure-zero under FEM
+        # quadrature, but the lambda must still accept it (else lowering the
+        # symbolic source Jacobian of a floored Manning friction fails).
+        "Heaviside": lambda x, *h0: ufl.conditional(
+            x > 0, 1.0, ufl.conditional(x < 0, 0.0, h0[0] if h0 else 0.5)),
         "Piecewise": ufl.conditional,
         "signum": ufl.sign,
         # --- Vector & tensor ops ---
