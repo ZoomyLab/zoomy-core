@@ -228,8 +228,21 @@ class SplittingSolver(IMEXSolver):
             Q_star, Qaux, parameters, time_now, dt,
         )
 
+        # Unified post-step pair (update_q THEN update_qaux), mirroring
+        # HyperbolicSolver/IMEX: previously Splitting committed only _sim_Q and
+        # _sim_pressure, leaving Qaux FROZEN at the IC — wrong for any
+        # free-surface model (FSFSplittingSolver) whose flux/source read aux
+        # (hinv / derivative-aux).  ``self.update_qaux`` resolves through the
+        # composing DerivativeAwareSolverMixin to the canonical aux_registry
+        # walk (local update_aux_variables prefix + LSQ-gradient rows).
+        mesh, model = self._sim_mesh, self._sim_model
+        Qnew = self.update_q(Qnew, Qaux, mesh, model, parameters)
+        Qauxnew = self.update_qaux(
+            Qnew, Qaux, Q, Qaux, mesh, model, parameters, time_now + dt, dt)
+
         # Commit new state
         self._sim_Q = Qnew
+        self._sim_Qaux = Qauxnew
         self._sim_pressure = p
 
     def _apply_viscous_diffusion(self, Q_star, Qaux, parameters, time_now, dt):
