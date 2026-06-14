@@ -165,9 +165,11 @@ class KEpsilonViscosity(Closure):
 
     def register(self, m):
         m.parameter("C_mu", 0.09)
+        m.parameter("nu", 0.0)        # molecular part: ν_eff = ν + ν_t
 
     def expression(self, s):
-        return s.par.rho * s.par.C_mu * s.k ** 2 / s.varepsilon * s.dz(s.u)
+        nu_t = s.par.C_mu * s.k ** 2 / s.varepsilon
+        return s.par.rho * (s.par.nu + nu_t) * s.dz(s.u)
 
 
 class Bingham(Closure):
@@ -199,10 +201,11 @@ class ElderViscosity(Closure):
     def register(self, m):
         m.parameter("kappa", 0.41)
         m.parameter("u_star", 0.0)
+        m.parameter("nu", 0.0)        # molecular part: ν_eff = ν + ν_t
 
     def expression(self, s):
         nu_t = s.par.kappa * s.par.u_star * s.depth * s.zeta * (1 - s.zeta)
-        return s.par.rho * nu_t * s.dz(s.u)
+        return s.par.rho * (s.par.nu + nu_t) * s.dz(s.u)
 
 
 # ── bottom (bed) closures ──────────────────────────────────────────────────
