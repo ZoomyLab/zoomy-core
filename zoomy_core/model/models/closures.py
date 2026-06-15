@@ -160,15 +160,31 @@ class KEpsilonViscosity(Closure):
     """Turbulent bulk stress with the standard k–ε eddy viscosity
     ``τ = ρ ν_t ∂_z u``,  ``ν_t = C_μ k²/ε`` — reads the transported turbulence
     fields ``k`` and ``ε`` (only available on a k–ε model class).  The Galerkin
-    projection is rational in ζ → build with ``quadrature_order > 0``."""
+    projection is rational in ζ → build with ``quadrature_order > 0``.
+
+    ``wall_floor`` (default on) adds the WALL-FUNCTION-consistent near-wall eddy
+    viscosity ``ν_t,wall = C_μ^{1/4}√k · κ z_p`` (the log-layer ``κ u_⋆ z_p`` with
+    ``u_⋆=C_μ^{1/4}√k``).  Why: ``C_μ k²/ε`` VANISHES at the wall, so in the moment
+    projection it provides almost no damping of the velocity-shape moments
+    (their stress-trace damping scales with the viscosity AT the wall — see
+    :class:`QRViscosity`).  The mixing-length floor keeps ν_t non-zero there and
+    restores that damping.  Set ``wall_floor=False`` for the bare ``C_μ k²/ε``."""
     closes = "bulk"; requires = ("u", "k", "varepsilon")
+
+    def __init__(self, name=None, wall_floor=True):
+        super().__init__(name=name)
+        self.wall_floor = bool(wall_floor)
 
     def register(self, m):
         m.parameter("C_mu", 0.09)
         m.parameter("nu", 0.0)        # molecular part: ν_eff = ν + ν_t
+        if self.wall_floor:
+            m.parameter("kappa", 0.41); m.parameter("z_p", 0.1)
 
     def expression(self, s):
         nu_t = s.par.C_mu * s.k ** 2 / s.varepsilon
+        if self.wall_floor:
+            nu_t += s.par.C_mu ** sp.Rational(1, 4) * sp.sqrt(s.k) * s.par.kappa * s.par.z_p
         return s.par.rho * (s.par.nu + nu_t) * s.dz(s.u)
 
 
@@ -182,12 +198,29 @@ class QRViscosity(Closure):
     Galerkin projection is rational in ζ → build with ``quadrature_order > 0``."""
     closes = "bulk"; requires = ("u", "sk", "se")
 
+    def __init__(self, name=None, wall_floor=True):
+        super().__init__(name=name)
+        self.wall_floor = bool(wall_floor)
+
     def register(self, m):
         m.parameter("C_mu", 0.09)
         m.parameter("nu", 0.0)        # molecular part: ν_eff = ν + ν_t
+        if self.wall_floor:
+            m.parameter("kappa", 0.41); m.parameter("z_p", 0.1)
 
     def expression(self, s):
+        # ν_t = C_μ k²/ε = C_μ sk⁴/se²  (sk=√k, se=√ε)
         nu_t = s.par.C_mu * s.sk ** 4 / s.se ** 2
+        if self.wall_floor:
+            # WALL-FUNCTION-consistent near-wall eddy viscosity, the
+            # Prandtl–Kolmogorov form with the wall mixing length ℓ=κ z_p:
+            #   ν_t,wall = C_μ^{1/4}√k · κ z_p  (= log-layer κ u_⋆ z_p, u_⋆=C_μ^{1/4}√k).
+            # C_μ sk⁴/se² VANISHES at the wall, so on its own it barely damps the
+            # velocity-shape moments (whose stress-trace damping scales with the
+            # viscosity AT the wall — q₁'s eddy damping ∝ SK₁, the √k gradient,
+            # and is zero for uniform turbulence).  This floor keeps ν_t non-zero
+            # at the wall and restores the strong stress-trace damping path.
+            nu_t += s.par.C_mu ** sp.Rational(1, 4) * s.sk * s.par.kappa * s.par.z_p
         return s.par.rho * (s.par.nu + nu_t) * s.dz(s.u)
 
 
