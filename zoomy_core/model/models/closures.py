@@ -184,7 +184,9 @@ class KEpsilonViscosity(Closure):
     def expression(self, s):
         nu_t = s.par.C_mu * s.k ** 2 / s.varepsilon
         if self.wall_floor:
-            nu_t += s.par.C_mu ** sp.Rational(1, 4) * sp.sqrt(s.k) * s.par.kappa * s.par.z_p
+            # offset log-layer mixing length ℓ=κ(z+z_p) (see QRViscosity)
+            nu_t += (s.par.C_mu ** sp.Rational(1, 4) * sp.sqrt(s.k) * s.par.kappa
+                     * (s.par.z_p + s.depth * s.zeta))
         return s.par.rho * (s.par.nu + nu_t) * s.dz(s.u)
 
 
@@ -214,15 +216,20 @@ class QRViscosity(Closure):
         # realizability floor keeps the denominator off zero (see QRKESME).
         nu_t = s.par.C_mu * s.sk ** 4 / (s.se ** 2 + s.par.eps_min)
         if self.wall_floor:
-            # WALL-FUNCTION-consistent near-wall eddy viscosity, the
-            # Prandtl–Kolmogorov form with the wall mixing length ℓ=κ z_p:
-            #   ν_t,wall = C_μ^{1/4}√k · κ z_p  (= log-layer κ u_⋆ z_p, u_⋆=C_μ^{1/4}√k).
-            # C_μ sk⁴/se² VANISHES at the wall, so on its own it barely damps the
-            # velocity-shape moments (whose stress-trace damping scales with the
-            # viscosity AT the wall — q₁'s eddy damping ∝ SK₁, the √k gradient,
-            # and is zero for uniform turbulence).  This floor keeps ν_t non-zero
-            # at the wall and restores the strong stress-trace damping path.
-            nu_t += s.par.C_mu ** sp.Rational(1, 4) * s.sk * s.par.kappa * s.par.z_p
+            # WALL-FUNCTION-consistent near-wall eddy viscosity — the
+            # Prandtl–Kolmogorov form with the log-layer mixing length, OFFSET by
+            # z_p so it stays finite at the wall:  ℓ = κ(z + z_p) = κ(h ζ + z_p).
+            #   ν_t,wall = C_μ^{1/4}√k · κ(z+z_p)   (= κ u_⋆ (z+z_p), u_⋆=C_μ^{1/4}√k).
+            # SME is valid only ABOVE the wall layer, so the wall distance is
+            # offset by z_p (the reference height): ℓ→κz_p at the bed (the
+            # wall-function value) and GROWS with height like the physical κz —
+            # the opposite of the bed-heavy ν_t=C_μ sk⁴/se² (which is inverted
+            # because ε is under-resolved near the wall), so it straightens the
+            # velocity profile.  C_μ sk⁴/se² also VANISHES at the wall, so this
+            # term additionally restores the stress-trace damping of the velocity
+            # moments (q₁'s eddy damping ∝ the √k gradient, else too weak).
+            nu_t += (s.par.C_mu ** sp.Rational(1, 4) * s.sk * s.par.kappa
+                     * (s.par.z_p + s.depth * s.zeta))
         return s.par.rho * (s.par.nu + nu_t) * s.dz(s.u)
 
 
