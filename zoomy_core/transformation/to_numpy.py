@@ -52,6 +52,10 @@ class NumpyRuntimeModel:
         "clamp_positive": lambda x: np.maximum(x, 0.0),
         "clamp_momentum": lambda hu, h, u_max: np.clip(hu, -h * u_max, h * u_max),
         "max_wavespeed": None,  # must be provided by the solver before compilation
+        # NON-LOCAL spatial derivative aux — solver injects the mesh-bound
+        # impl (mesh.compute_derivatives) before the update_aux_variables slot
+        # is compiled, mirroring max_wavespeed.
+        "compute_derivative": None,
         "eigensystem": _eigensystem_numpy,
     }
     printer = "numpy"
