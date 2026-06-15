@@ -172,6 +172,25 @@ class KEpsilonViscosity(Closure):
         return s.par.rho * (s.par.nu + nu_t) * s.dz(s.u)
 
 
+class QRViscosity(Closure):
+    """Turbulent bulk stress for the q–r (positivity-by-construction) k–ε model.
+
+    Same eddy viscosity ``ν_t = C_μ k²/ε`` as :class:`KEpsilonViscosity`, but the
+    transported state is ``sk = √k`` and ``se = √ε`` (Fe et al. 2009, k=q², ε=r²),
+    so ``ν_t = C_μ sk⁴/se²`` — k=sk²≥0 and ε=se²≥0 hold by construction.  Reads
+    the transported ``sk``, ``se`` fields (only on a q–r k–ε model class); the
+    Galerkin projection is rational in ζ → build with ``quadrature_order > 0``."""
+    closes = "bulk"; requires = ("u", "sk", "se")
+
+    def register(self, m):
+        m.parameter("C_mu", 0.09)
+        m.parameter("nu", 0.0)        # molecular part: ν_eff = ν + ν_t
+
+    def expression(self, s):
+        nu_t = s.par.C_mu * s.sk ** 4 / s.se ** 2
+        return s.par.rho * (s.par.nu + nu_t) * s.dz(s.u)
+
+
 class Bingham(Closure):
     """Regularized BINGHAM (viscoplastic) bulk stress
     ``τ = (ρν + τ_y/√((∂_z u)² + ε²))·∂_z u`` — rigid below the yield stress
@@ -452,6 +471,6 @@ def swe_closure_state(model):
 
 __all__ = ["Closure", "ClosureState", "apply_stress_closures",
            "apply_layer_stress_closures", "interface_closure",
-           "Newtonian", "KEpsilonViscosity", "NavierSlip", "RoughWall",
+           "Newtonian", "KEpsilonViscosity", "QRViscosity", "NavierSlip", "RoughWall",
            "StressFree", "InterfaceFlux", "MeanInterface", "UpwindInterface",
            "ManningFriction", "EddyViscosity", "swe_closure_state"]
