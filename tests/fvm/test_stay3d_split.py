@@ -70,6 +70,34 @@ def test_bbsm13_stays_accurate_long_time():
     assert eta1 < 0.05, f"t=5 surface drift too large: {eta1:.4e}"
 
 
+def test_relaxes_to_steady_state_from_perturbed_ic():
+    """Different IC → SAME steady state: a localized depth-bump perturbation of
+    BBSM13 radiates out the transmissive boundaries and the solution RETURNS to
+    the cosine steady state (relaxes to the truncation floor of the exact-IC
+    run).  The bump carries the BBSM13 vertical structure, so ω≠0 and the
+    baroclinic state is recovered — unlike a vertically-uniform IC, which has no
+    inviscid shear-generation mechanism and would settle to the SWE state."""
+    model = _bbsm13_model()
+    DELTA, X0, W = 0.15, -1.5, 0.6                     # initial |Δη| ≈ 0.15
+    def ic_bump(x, zeta):
+        h = _h(x) + DELTA * np.exp(-((x - X0) / W) ** 2)
+        zb = _zb(x)
+        return zb, h, h * _u(x, zb + zeta * h)
+
+    NX, NY, dom = 120, 12, (-5., 5., 0., 1.)
+    rp = Stay3DSplitSolver(NX, NY, domain=dom, cfl=0.4, rk=2).solve(model, ic_bump, 3.0)
+    re = Stay3DSplitSolver(NX, NY, domain=dom, cfl=0.4, rk=2).solve(model, _ic, 3.0)
+    xc, zc = rp["x"], rp["zeta"]
+
+    dEta = float(np.max(np.abs(rp["b"] + rp["h"] - (_zb(xc) + _h(xc)))))
+    assert dEta < 0.02, f"did not relax (initial bump 0.15): surface drift {dEta:.3e}"
+    # different IC reaches the SAME steady state as the exact-IC run
+    assert float(np.max(np.abs(rp["h"] - re["h"]))) < 5e-3, "did not converge to BBSM13 depth"
+    uref = np.array([[_u(xc[i], _zb(xc[i]) + zc[k] * _h(xc[i]))
+                      for k in range(NY)] for i in range(NX)])
+    assert float(np.mean(np.abs(rp["u"] - uref))) < 0.04, "velocity did not return to cosine"
+
+
 def test_viscous_navierslip_dambreak_stable():
     """Viscous + Navier-slip dam break: stable, mass-conserving, sheared."""
     model = Stay3DSigma(closures=[Newtonian(), NavierSlip(), StressFree()],
