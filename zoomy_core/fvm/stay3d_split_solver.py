@@ -1,0 +1,238 @@
+"""Barotropic / baroclinic split solver for the stay-3D σ model — with a
+FACE-CONSISTENT vertical velocity ω.
+
+This is the *reference* numerical solver for
+:class:`zoomy_core.model.models.stay3d_sigma.Stay3DSigma`.  It realises the
+dimensional split the model is built for:
+
+* a 2-D (here 1-D-x) BAROTROPIC system for ``h`` driven by the column mass flux,
+* a 3-D (x, ζ) BAROCLINIC system for ``mom = h·ũ`` carried as genuine layers,
+
+coupled by the contravariant vertical velocity ``ω``.
+
+Why a dedicated structured solver (not the generic ``HyperbolicSolver``)
+--------------------------------------------------------------------------
+``ω`` is *not* a local algebraic function of the cell-centre state — it is a
+vertical integral diagnosed from continuity.  A pointwise aux fill that
+central-differences the cell-centre column integral (the previous prototype)
+de-couples ω from the FV face fluxes: ω ∝ ∂ₓ(state) then amplifies the
+grid-scale mode by 1/Δx and ``∂_ζ(mom·ω)`` feeds it back — a dispersive
+instability that *worsens* under refinement (verified non-convergent on
+inviscid BBSM13/AHS26).
+
+The fix is to assemble ω from the SAME numerical horizontal mass fluxes the
+height and momentum equations use, as a running partial sum over ζ:
+
+    φ_{i+½,k}  = per-layer horizontal mass flux (Rusanov on ``mom``,
+                 with the SHARED column wave speed a_{i+½})
+    M_{i+½}    = Σ_k φ_{i+½,k} Δζ   (== the Rusanov height flux — telescopes)
+    G_{i,k+½}  = G_{i,k-½} − Δζ·( ∂_t h_i + (φ_{i+½,k} − φ_{i-½,k})/Δx )   ,  G_{i,-½}=0
+    ω_{i,k+½}  = G_{i,k+½} / h_i
+
+Two exact discrete properties this gives, which the central difference did not:
+
+1.  **ω(0)=ω(1)=0 to machine precision** — because Σ_k φ Δζ = M *by
+    construction*, the top partial sum telescopes to 0 on every grid.
+2.  **discretely divergence-free ω** (DGCL / freestream preservation) — a
+    uniform ``mom`` is preserved by the vertical advection, and the ω↔mom loop
+    inherits the FV upwind dissipation instead of central anti-diffusion.
+
+Result: ``|ω|max`` stays bounded under refinement and the error decays at
+O(Δx) at the standard CFL, for all times (verified on BBSM13/AHS26).
+
+Scope (v1): one horizontal direction (``dimension=2`` ⇒ coords (t,x,ζ)),
+structured grid, Rusanov horizontal flux, explicit RK1/RK2.  Handles the
+inviscid case and the viscous + Navier-slip / stress-free closures.  Horizontal
+BCs: ``Extrapolation`` (transmissive), ``Wall`` (reflective), ``Periodic``.
+"""
+from __future__ import annotations
+
+import numpy as np
+
+
+class Stay3DSplitSolver:
+    """Explicit structured (x, ζ) coupled solver with face-consistent ω.
+
+    Parameters
+    ----------
+    nx, ny : int
+        Horizontal cells and vertical (ζ) layers.
+    domain : (x0, x1, z0, z1)
+        ζ runs over ``[z0, z1]`` (normally 0..1); only its extent is used.
+    cfl : float
+        Advective CFL on ``max(|u| + √(gh))``.
+    rk : {1, 2}
+        Forward-Euler (1) or SSP-RK2 / Heun (2).
+    """
+
+    def __init__(self, nx, ny, domain=(-5.0, 5.0, 0.0, 1.0), cfl=0.4, rk=2):
+        self.nx = int(nx)
+        self.ny = int(ny)
+        self.domain = tuple(float(v) for v in domain)
+        self.cfl = float(cfl)
+        self.rk = int(rk)
+
+    # ------------------------------------------------------------------ params
+    @staticmethod
+    def _params(model):
+        """Resolve the physical parameters exactly like ``derive_model``."""
+        values = {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0, "e_x": 0.0}
+        user = getattr(model, "parameter_values", None)
+        if user is not None and hasattr(user, "items"):
+            values.update({k: float(v) for k, v in user.items()})
+        return values
+
+    @staticmethod
+    def _closure_kinds(model):
+        """Return (has_bulk_viscosity, has_navier_slip, has_stress_free)."""
+        clos = getattr(model, "_closures_resolved", None)
+        if not clos:
+            clos = model.closures or []
+        kinds = {getattr(c, "closes", None) for c in clos}
+        # default closure set (empty list) ⇒ Newtonian+NavierSlip+StressFree
+        if not clos:
+            return True, True, True
+        return ("bulk" in kinds), ("bottom" in kinds), ("surface" in kinds)
+
+    def _x_bc_kind(self, model):
+        """Map the model's horizontal BCs to a ghost rule. left/right may differ."""
+        bcs = getattr(model, "boundary_conditions", None)
+        kind = {"left": "extrapolation", "right": "extrapolation"}
+        if not bcs:
+            return kind
+        lst = bcs if isinstance(bcs, list) else getattr(
+            bcs, "boundary_conditions_list", [])
+        for bc in lst:
+            tag = str(getattr(bc, "tag", "")).lower()
+            cn = type(bc).__name__.lower()
+            if "periodic" in cn:
+                kind["left"] = kind["right"] = "periodic"
+            elif "wall" in cn or "reflect" in cn:
+                if tag in kind:
+                    kind[tag] = "wall"
+            elif "extrapolation" in cn or "outflow" in cn or "transmissive" in cn:
+                if tag in kind:
+                    kind[tag] = "extrapolation"
+        return kind
+
+    # ------------------------------------------------------------------- solve
+    def solve(self, model, ic, t_end):
+        """Run to ``t_end``.
+
+        ``ic(x, zeta)`` → ``(b, h, mom)`` per (cell-centre x, layer-centre ζ).
+
+        Returns a dict: ``x, zeta, b, h, mom, u, t``.
+        """
+        NX, NY = self.nx, self.ny
+        x0, x1, z0, z1 = self.domain
+        dx = (x1 - x0) / NX
+        dz = (z1 - z0) / NY
+        xc = x0 + (np.arange(NX) + 0.5) * dx
+        zc = z0 + (np.arange(NY) + 0.5) * dz
+
+        p = self._params(model)
+        g, nu, lam, e_x = p["g"], p["nu"], p["lambda_s"], p["e_x"]
+        has_bulk, has_slip, has_free = self._closure_kinds(model)
+        nu_eff = nu if has_bulk else 0.0
+        lam_eff = lam if has_slip else 0.0
+        xbc = self._x_bc_kind(model)
+
+        # initial condition
+        b = np.empty(NX)
+        h = np.empty(NX)
+        mom = np.empty((NX, NY))
+        for i in range(NX):
+            for k in range(NY):
+                bi, hi, mi = ic(xc[i], zc[k])
+                mom[i, k] = mi
+                if k == 0:
+                    b[i] = bi
+                    h[i] = hi
+
+        # central bed slope (one-sided at ends)
+        dbdx = np.zeros(NX)
+        dbdx[1:-1] = (b[2:] - b[:-2]) / (2 * dx)
+        dbdx[0] = (b[1] - b[0]) / dx
+        dbdx[-1] = (b[-1] - b[-2]) / dx
+
+        self.omega_max = 0.0
+
+        def _faces(h, mom):
+            """Column states at the NX+1 x-faces, honouring the x-BC ghost rule."""
+            u = mom / h[:, None]
+            hL = np.empty(NX + 1); hR = np.empty(NX + 1)
+            mL = np.empty((NX + 1, NY)); mR = np.empty((NX + 1, NY))
+            # interior faces 1..NX-1 share cell i-1 (L) / i (R)
+            hL[1:] = h; hR[:-1] = h
+            mL[1:] = mom; mR[:-1] = mom
+            lk, rk_ = xbc["left"], xbc["right"]
+            if lk == "periodic" or rk_ == "periodic":
+                hL[0] = h[-1]; hR[-1] = h[0]
+                mL[0] = mom[-1]; mR[-1] = mom[0]
+            else:
+                # left boundary face (index 0): ghost = column 0
+                hL[0] = h[0]; mL[0] = mom[0] if lk != "wall" else -mom[0]
+                # right boundary face (index NX): ghost = column NX-1
+                hR[-1] = h[-1]; mR[-1] = mom[-1] if rk_ != "wall" else -mom[-1]
+            return hL, hR, mL, mR
+
+        def rhs(h, mom):
+            hL, hR, mL, mR = _faces(h, mom)
+            uL = mL / hL[:, None]; uR = mR / hR[:, None]
+            cL = np.sqrt(g * hL); cR = np.sqrt(g * hR)
+            a = np.maximum(np.max(np.abs(uL), 1) + cL,
+                           np.max(np.abs(uR), 1) + cR)          # (NX+1,)
+            # per-layer horizontal MASS flux (Rusanov, dissipation on shared h)
+            phi = 0.5 * (mL + mR) - 0.5 * a[:, None] * (hR - hL)[:, None]
+            M = np.sum(phi, 1) * dz                             # = Rusanov height flux
+            dh = -(M[1:] - M[:-1]) / dx
+            # vertical mass flux G[i,k+½] from discrete per-ζ continuity (telescopes)
+            divphi = (phi[1:] - phi[:-1]) / dx
+            G = np.cumsum(-dz * (dh[:, None] + divphi), axis=1)
+            om = G / h[:, None]                                 # ω at interfaces k+½
+            self.omega_max = max(self.omega_max, float(np.max(np.abs(om))))
+            # momentum x-flux (advective + hydrostatic pressure), Rusanov
+            fxL = mL * uL + 0.5 * g * hL[:, None] ** 2
+            fxR = mR * uR + 0.5 * g * hR[:, None] ** 2
+            Fx = 0.5 * (fxL + fxR) - 0.5 * a[:, None] * (mR - mL)
+            dmom = -(Fx[1:] - Fx[:-1]) / dx
+            # momentum ζ-advective flux at interfaces k+½ (upwind by sign ω);
+            # 0 at bed (k=-½) and surface (k=NY-½) since ω=0 there.
+            Fz = np.zeros((NX, NY + 1))
+            w = om[:, :NY - 1]
+            up = np.where(w >= 0, mom[:, :NY - 1], mom[:, 1:NY])
+            Fz[:, 1:NY] = w * up
+            dmom += -(Fz[:, 1:] - Fz[:, :-1]) / dz
+            # bed-slope NCP  −g h ∂ₓb  and the gravity source  +e_x g h
+            dmom += -g * h[:, None] * dbdx[:, None] + e_x * g * h[:, None]
+            # vertical viscous diffusion  ∂_ζ( ν/h² ∂_ζ mom )
+            if nu_eff or lam_eff:
+                diff = nu_eff / h[:, None] ** 2                 # (NX,1) diffusivity
+                Fv = np.zeros((NX, NY + 1))
+                # interior ζ-faces
+                Fv[:, 1:NY] = diff * (mom[:, 1:NY] - mom[:, :NY - 1]) / dz
+                # bed face (k=-½): Navier-slip viscous flux = λ_s · u(0) = λ_s mom/h
+                Fv[:, 0] = lam_eff * mom[:, 0] / h
+                # surface (k=NY-½): stress-free ⇒ 0  (Fv[:,NY] stays 0)
+                dmom += (Fv[:, 1:] - Fv[:, :-1]) / dz
+            return dh, dmom
+
+        t = 0.0
+        while t < t_end - 1e-14:
+            u = mom / h[:, None]
+            amax = float(np.max(np.abs(u) + np.sqrt(g * h)[:, None]))
+            dt = self.cfl * dx / max(amax, 1e-12)
+            dt = min(dt, t_end - t)
+            if self.rk == 1:
+                dh, dm = rhs(h, mom)
+                h = h + dt * dh; mom = mom + dt * dm
+            else:
+                dh1, dm1 = rhs(h, mom)
+                h1 = h + dt * dh1; m1 = mom + dt * dm1
+                dh2, dm2 = rhs(h1, m1)
+                h = 0.5 * (h + h1 + dt * dh2)
+                mom = 0.5 * (mom + m1 + dt * dm2)
+            t += dt
+
+        return {"x": xc, "zeta": zc, "b": b, "h": h, "mom": mom,
+                "u": mom / h[:, None], "t": t}
