@@ -93,6 +93,13 @@ class QRKESME(SME):
         values = {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0, "e_x": 0.0,
                   "C_mu": 0.09, "C_1": 1.44, "C_2": 1.92,
                   "sigma_k": 1.0, "sigma_e": 1.3,
+                  # realizability floors (model-level, BEFORE GaussQuadrature):
+                  # ε → ε+eps_min, k → k+k_min in every singular denominator, so
+                  # quadrature integrates smooth integrands and the modal source
+                  # has no near-zero denominators (the low-turbulence singularity
+                  # cannot be guarded post-quadrature — the denominators are then
+                  # high-degree polynomials no fixed floor can match).
+                  "eps_min": 0.0, "k_min": 0.0,
                   # wall-function bed BC (weak/penalty) on the q-r variables:
                   # sk(0) → √(u_*²/√C_μ),  se(0) → √(u_*³/(κ z_p)); kappa & z_p
                   # the log-law constant & wall reference height, eps_wall_penalty
@@ -143,20 +150,30 @@ class QRKESME(SME):
         Je = sp.Function("J_e", real=True)(*coords)
         m.declare_state(sk, se)
         m.declare_closure(Jk, Je)
-        nu_t = C_mu * sk ** 4 / se ** 2                  # = C_μ k²/ε, rational in ζ
+        # realizability floors: ε=se²→se²+eps_min, k=sk²→sk²+k_min in EVERY
+        # singular denominator (sign-preserving for odd powers, 1/se→se/(se²+ε_min)).
+        # Done here, on the smooth 3-D balance, so GaussQuadrature integrates a
+        # non-singular integrand — the only place the low-turbulence singularity
+        # can be guarded cleanly (post-quadrature the denominators are high-degree).
+        e_min, kk_min = m.parameters.eps_min, m.parameters.k_min
+        inv_se2 = 1 / (se ** 2 + e_min)                  # 1/se²  (ν_t)
+        inv_se = se / (se ** 2 + e_min)                  # 1/se   (sign-preserving)
+        inv_sk2 = 1 / (sk ** 2 + kk_min)                 # 1/sk²
+        inv_sk = sk / (sk ** 2 + kk_min)                 # 1/sk
+        nu_t = C_mu * sk ** 4 * inv_se2                  # = C_μ k²/ε, rational in ζ
         shear = d.z(uvel[0]) ** 2                        # (∂_z u)²  (1-horiz shear)
         adv_k = sum(DERIV[xd](uvel[i] * sk) for i, xd in enumerate(horiz)) + d.z(w * sk)
         adv_e = sum(DERIV[xd](uvel[i] * se) for i, xd in enumerate(horiz)) + d.z(w * se)
         # sk-equation: ∂_t sk + adv − ∂_z J_k − cross_k − prod_k + se²/(2 sk)
-        cross_k = nu_t / (sig_k * sk) * d.z(sk) ** 2
-        prod_k = nu_t / (2 * sk) * shear
+        cross_k = nu_t * inv_sk / sig_k * d.z(sk) ** 2
+        prod_k = nu_t * inv_sk / 2 * shear
         m.add_equation("sk", d.t(sk) + adv_k - d.z(Jk) - cross_k - prod_k
-                       + se ** 2 / (2 * sk))
+                       + se ** 2 * inv_sk / 2)
         # se-equation: ∂_t se + adv − ∂_z J_e − cross_e − prod_e + C_2 se³/(2 sk²)
-        cross_e = nu_t / (sig_e * se) * d.z(se) ** 2
-        prod_e = C_1 * C_mu * sk ** 2 / (2 * se) * shear
+        cross_e = nu_t * inv_se / sig_e * d.z(se) ** 2
+        prod_e = C_1 * C_mu * sk ** 2 * inv_se / 2 * shear
         m.add_equation("se", d.t(se) + adv_e - d.z(Je) - cross_e - prod_e
-                       + C_2 * se ** 3 / (2 * sk ** 2))
+                       + C_2 * se ** 3 * inv_sk2 / 2)
 
         def _kbc(interface):
             kw = dict(w=w, u=uvel[0], interface=interface)

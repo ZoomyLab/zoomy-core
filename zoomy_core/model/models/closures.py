@@ -205,12 +205,14 @@ class QRViscosity(Closure):
     def register(self, m):
         m.parameter("C_mu", 0.09)
         m.parameter("nu", 0.0)        # molecular part: ν_eff = ν + ν_t
+        m.parameter("eps_min", 0.0)   # realizability floor: ε → ε + eps_min
         if self.wall_floor:
             m.parameter("kappa", 0.41); m.parameter("z_p", 0.1)
 
     def expression(self, s):
-        # ν_t = C_μ k²/ε = C_μ sk⁴/se²  (sk=√k, se=√ε)
-        nu_t = s.par.C_mu * s.sk ** 4 / s.se ** 2
+        # ν_t = C_μ k²/ε = C_μ sk⁴/(se²+ε_min)  (sk=√k, se=√ε); the ε_min
+        # realizability floor keeps the denominator off zero (see QRKESME).
+        nu_t = s.par.C_mu * s.sk ** 4 / (s.se ** 2 + s.par.eps_min)
         if self.wall_floor:
             # WALL-FUNCTION-consistent near-wall eddy viscosity, the
             # Prandtl–Kolmogorov form with the wall mixing length ℓ=κ z_p:
