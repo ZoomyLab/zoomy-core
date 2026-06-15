@@ -116,12 +116,18 @@ class Stay3DSplitSolver:
         return kind
 
     # ------------------------------------------------------------------- solve
-    def solve(self, model, ic, t_end):
+    def solve(self, model, ic, t_end, snapshots=None):
         """Run to ``t_end``.
 
         ``ic(x, zeta)`` → ``(b, h, mom)`` per (cell-centre x, layer-centre ζ).
 
-        Returns a dict: ``x, zeta, b, h, mom, u, t``.
+        ``snapshots`` : int | sequence | None
+            If an int ``n``, record ``n`` evenly spaced frames over ``[0, t_end]``
+            (including ``t=0``); if a sequence, record at (just after) each listed
+            time.  Captured frames land in the result under ``"frames"`` as a list
+            of ``{"t", "h", "mom", "u"}`` dicts (for animations / time series).
+
+        Returns a dict: ``x, zeta, b, h, mom, u, t`` (+ ``frames`` if requested).
         """
         NX, NY = self.nx, self.ny
         x0, x1, z0, z1 = self.domain
@@ -217,7 +223,23 @@ class Stay3DSplitSolver:
                 dmom += (Fv[:, 1:] - Fv[:, :-1]) / dz
             return dh, dmom
 
+        # snapshot schedule
+        if snapshots is None:
+            rec_times = []
+        elif np.isscalar(snapshots):
+            rec_times = list(np.linspace(0.0, t_end, int(snapshots)))
+        else:
+            rec_times = [float(s) for s in snapshots]
+        frames = []
+        rec_i = 0
+
+        def _capture(t):
+            frames.append({"t": float(t), "h": h.copy(), "mom": mom.copy(),
+                           "u": (mom / h[:, None]).copy()})
+
         t = 0.0
+        while rec_i < len(rec_times) and rec_times[rec_i] <= t + 1e-14:
+            _capture(t); rec_i += 1
         while t < t_end - 1e-14:
             u = mom / h[:, None]
             amax = float(np.max(np.abs(u) + np.sqrt(g * h)[:, None]))
@@ -233,6 +255,11 @@ class Stay3DSplitSolver:
                 h = 0.5 * (h + h1 + dt * dh2)
                 mom = 0.5 * (mom + m1 + dt * dm2)
             t += dt
+            while rec_i < len(rec_times) and rec_times[rec_i] <= t + 1e-14:
+                _capture(t); rec_i += 1
 
-        return {"x": xc, "zeta": zc, "b": b, "h": h, "mom": mom,
-                "u": mom / h[:, None], "t": t}
+        out = {"x": xc, "zeta": zc, "b": b, "h": h, "mom": mom,
+               "u": mom / h[:, None], "t": t}
+        if snapshots is not None:
+            out["frames"] = frames
+        return out
