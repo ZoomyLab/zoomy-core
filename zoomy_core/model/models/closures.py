@@ -277,6 +277,50 @@ class RoughWall(Closure):
                 "tangent": [s.par.rho * Cf * speed * ut for ut in s.u_tangent]}
 
 
+class WallFunctionBed(Closure):
+    """k–ε ROUGH-WALL-FUNCTION bed stress — the standard turbulent momentum sink.
+
+    Same log-law drag coefficient as :class:`RoughWall`,
+    ``C_f = (κ / ln(z_p/z_0))²``, ``z_0 = k_s/30``, giving the wall shear
+    ``τ_b,i = ρ C_f |U_p| U_{p,i}`` (= ρ u_*² in the flow direction, with
+    ``u_* = κ|U_p|/ln(z_p/z_0)``).  The crucial difference: the reference
+    velocity ``U_p`` is read at the first NEAR-WALL height ``ζ_p = z_p/h`` —
+    NOT at the bed trace ``ζ=0``.
+
+    Why this matters for a moment model: the bed trace ``u(0) = Σ û_i(−1)^i`` is
+    where the log-law velocity is formally singular, and in a truncated moment
+    expansion it COLLAPSES as the higher velocity moments grow (the bulk eddy
+    viscosity ν_t correctly vanishes at the wall and cannot damp those moments),
+    so ``RoughWall``'s ``u(0)``-based drag drops toward zero and the slope-driven
+    flow accelerates without bound.  Evaluating ``U_p`` at ``ζ_p`` instead drains
+    momentum at the physically-correct rate ρu_*² regardless of the profile — the
+    wall-function momentum sink, consistent with the k/ε wall-function BCs.
+
+    Needs ``k_s`` (Nikuradse roughness), ``z_p`` (reference height), ``kappa``."""
+    closes = "bottom"; requires = ("u",)
+
+    def register(self, m):
+        m.parameter("kappa", 0.41); m.parameter("k_s", 1e-3); m.parameter("z_p", 0.1)
+
+    def _Cf(self, s):
+        return (s.par.kappa / sp.log(s.par.z_p / (s.par.k_s / 30))) ** 2
+
+    def expression(self, s):
+        # scalar 1-D fallback: drag from the near-wall reference velocity U_p
+        Up = s.velocity_at(s.par.z_p / s.depth)[0]
+        return s.par.rho * self._Cf(s) * Up * sp.Abs(Up)
+
+    def traction(self, s):
+        """Wall-function bed drag as a VECTOR traction ``τ_b,i = ρ C_f |U_p| U_{p,i}``
+        with ``U_p`` the tangential velocity at the near-wall height ``ζ_p=z_p/h``
+        (couples x/y via ``|U_p|``).  Reduces to ``ρ C_f U_p|U_p|`` in 1-D."""
+        Cf = self._Cf(s)
+        ut = s.u_tangent_at(s.par.z_p / s.depth)
+        speed = sp.sqrt(sum(u ** 2 for u in ut))
+        return {"normal": None,
+                "tangent": [s.par.rho * Cf * speed * u for u in ut]}
+
+
 # ── depth-averaged SWE closures (bed friction + horizontal mixing) ──────────
 # These close the DEPTH-AVERAGED shallow-water momentum, not the vertical
 # moment hierarchy: a depth-averaged model has no resolved vertical profile,
@@ -472,5 +516,6 @@ def swe_closure_state(model):
 __all__ = ["Closure", "ClosureState", "apply_stress_closures",
            "apply_layer_stress_closures", "interface_closure",
            "Newtonian", "KEpsilonViscosity", "QRViscosity", "NavierSlip", "RoughWall",
+           "WallFunctionBed",
            "StressFree", "InterfaceFlux", "MeanInterface", "UpwindInterface",
            "ManningFriction", "EddyViscosity", "swe_closure_state"]

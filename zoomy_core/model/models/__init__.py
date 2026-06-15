@@ -20,8 +20,8 @@ __all__ = ["SWE", "MalpassetSWE", "SME", "ElderSME", "KESME", "QRKESME",
            # composable stress / interface closures (closures.py) — the ONLY
            # stress-closure path (the legacy MaterialModel was removed)
            "Closure", "Newtonian", "NavierSlip", "StressFree", "RoughWall",
-           "Bingham", "KEpsilonViscosity", "QRViscosity", "ElderViscosity",
-           "InterfaceFlux", "MeanInterface", "UpwindInterface"]
+           "WallFunctionBed", "Bingham", "KEpsilonViscosity", "QRViscosity",
+           "ElderViscosity", "InterfaceFlux", "MeanInterface", "UpwindInterface"]
 
 
 def __getattr__(name):
@@ -60,6 +60,7 @@ def __getattr__(name):
         return ClosureState
     if name in ("Closure", "Newtonian", "NavierSlip", "StressFree", "RoughWall",
                 "Bingham", "KEpsilonViscosity", "QRViscosity", "ElderViscosity",
+                "WallFunctionBed",
                 "InterfaceFlux", "MeanInterface", "UpwindInterface"):
         from zoomy_core.model.models import closures as _cl
         return getattr(_cl, name)

@@ -170,6 +170,23 @@ class ClosureState:
         tangential part of :meth:`get_normal_tangential` on the velocity."""
         return self.get_normal_tangential(self._vel3)[1]
 
+    def velocity_at(self, zeta_value):
+        """Full velocity vector ``[u, (v,) w]`` evaluated at the σ-height
+        ``ζ = zeta_value`` (substituting the vertical argument), rather than at
+        the boundary trace ``self._at``.  For WALL FUNCTIONS that read the
+        first near-wall reference velocity ``U_p = u(ζ_p)`` (ζ_p = z_p/h) instead
+        of the bed trace ``u(0)`` — the bed trace is where the log-law velocity is
+        singular and the truncated moment profile collapses."""
+        from zoomy_core import coords as _C
+        names = [{_C.x: "u", _C.y: "v"}[c] for c in self._horiz] + ["w"]
+        return [self._family(n).at(zeta_value) for n in names]
+
+    def u_tangent_at(self, zeta_value):
+        """Tangential velocity per axis with the velocity read at σ-height
+        ``ζ = zeta_value`` (see :meth:`velocity_at`), projected onto this
+        boundary's frame tangents."""
+        return self.get_normal_tangential(self.velocity_at(zeta_value))[1]
+
     @property
     def u_normal(self):
         """Wall-normal velocity ``u·n`` (zero under no-penetration) — the normal
