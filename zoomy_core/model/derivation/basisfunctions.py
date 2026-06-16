@@ -251,7 +251,14 @@ class Basisfunction:
         # structure — resolution must only INSERT VALUES, never restructure.
         expr = expr.replace(lambda e: isinstance(e, sympy.Sum),
                             lambda e: e.doit())
-        expr = sympy.expand(expr)
+        # ``multinomial=False`` distributes products (so the const-Derivative
+        # zombies below surface) WITHOUT expanding ``Pow(sum, n)`` — critical for
+        # rational turbulence closures (ν_t=C_μ sk⁴/se²): a full expand
+        # multinomial-blows ``sk⁴``/``se²`` (sums of Legendre modes) into a
+        # >1-million-term monster here, which then re-expands all down the
+        # pipeline (hours of build).  Those powers are evaluated NUMERICALLY by
+        # GaussQuadrature, so they must stay compact.
+        expr = sympy.expand(expr, multinomial=False)
         # A basis bracket / mode that resolves to a CONSTANT inside ``∂_v(…)`` —
         # a vanishing Gram/Weight (``0``) or the constant 0th mode ``φ_0 = 1`` —
         # leaves an unevaluated ``Derivative(const, v)``: ``replace`` rebuilds the

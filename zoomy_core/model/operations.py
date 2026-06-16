@@ -678,18 +678,24 @@ class Expression(RelationMixin, SymbolicBase):
         # term explicitly via ``apply_to_term(idx, op)``.  Allowing
         # them at whole-leaf level would let the operation implicitly
         # decide which terms to rewrite, which is the anti-pattern.
-        n_terms = len(Add.make_args(sp.expand(self.expr)))
-        if n_terms > 1:
-            for cond in conditions:
-                if isinstance(cond, Operation) and getattr(
-                        cond, "single_term_only", False):
-                    raise RuntimeError(
-                        f"{type(cond).__name__} is single-term-only and "
-                        f"cannot be applied to a multi-term expression "
-                        f"({n_terms} terms in {self.name!r}). Use "
-                        f"expression.apply_to_term(idx, {type(cond).__name__}()) "
-                        f"to target a specific term by index."
-                    )
+        # Only single-term-only ops need the (potentially expensive) term count,
+        # so compute it lazily — a full ``sp.expand`` of a huge rational source
+        # (ν_t = C_μ sk⁴/se², …) just to count terms otherwise dominates the
+        # build (multinomial-expanding sk⁴ — work GaussQuadrature does later).
+        if any(isinstance(c, Operation) and getattr(c, "single_term_only", False)
+               for c in conditions):
+            n_terms = len(Add.make_args(sp.expand(self.expr)))
+            if n_terms > 1:
+                for cond in conditions:
+                    if isinstance(cond, Operation) and getattr(
+                            cond, "single_term_only", False):
+                        raise RuntimeError(
+                            f"{type(cond).__name__} is single-term-only and "
+                            f"cannot be applied to a multi-term expression "
+                            f"({n_terms} terms in {self.name!r}). Use "
+                            f"expression.apply_to_term(idx, {type(cond).__name__}()) "
+                            f"to target a specific term by index."
+                        )
 
         # ``whole_leaf_op`` Operations need the whole leaf at once
         # (cross-term scanning, integral merging, ...).  Route those
