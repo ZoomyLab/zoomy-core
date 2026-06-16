@@ -315,7 +315,13 @@ class VAM(BaseModel):
         the divergence constraints (zero mass-matrix rows)."""
         m = self.derivation
         Nu = int(self.level)
-        P_modes = [self._P_head(j, t, x) for j in range(Nu + 1)]
+        # Pressure modes carry the SAME horizontal dependence as the rest of the
+        # state (see derive_model's ``horiz``): dim=2 → P(j,t,x); dim=3 →
+        # P(j,t,x,y).  A hard-coded ``x`` here mismatches the dim=3 derivation's
+        # P(j,t,x,y) atoms, so from_model fails to recognise them as state and
+        # the pressure silently drops out of every momentum/vertical row.
+        horiz = (x,) if int(self.dimension) == 2 else (x, y)
+        P_modes = [self._P_head(j, t, *horiz) for j in range(Nu + 1)]
         qs = list(m.explicit_state())
         if self._bed not in qs:
             qs = [self._bed, *qs]
