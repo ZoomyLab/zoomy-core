@@ -139,16 +139,17 @@ class InvertMassMatrix(Operation):
 
     def _leaf_sp(self, sp_expr):
         t = self._t
-        expr = sp.expand(sp_expr)
-        # The mass coefficient of a ∂_t atom may be SPLIT across several
-        # expanded terms (fraction-substituted multilayer rows expand
-        # ``(1−l)²h/(h(1−l))·∂_t r`` into three pieces) and may sit INSIDE
-        # the conservative time term (``∂_t(q_k/(2k+1))``).  Collect the
-        # TOTAL coefficient per ∂_t atom, then pick the (unique) one that is
-        # t-free and non-trivial — stray surface/interface traces keep a
-        # t-bearing coefficient and are ignored.
+        # Do NOT ``sp.expand`` the whole row: post-basis it holds the rational
+        # turbulence source (ν_t=C_μ sk⁴/se²) and expanding distributes N·D⁻¹ into
+        # a >1M-char monster.  Work on the top-level terms as-is and divide
+        # TERM-WISE; only the (small) ∂_t mass coefficient is simplify/cancel-ed.
+        terms = list(sp.Add.make_args(sp.sympify(sp_expr)))
+        # The mass coefficient of a ∂_t atom may be SPLIT across several terms
+        # and may sit INSIDE the conservative time term (``∂_t(q_k/(2k+1))``).
+        # Collect the TOTAL coefficient per ∂_t atom, then pick the (unique) one
+        # that is t-free and non-trivial.
         coeffs: dict = {}
-        for term in sp.Add.make_args(expr):
+        for term in terms:
             dts = [D for D in term.atoms(sp.Derivative)
                    if D.variables == (t,)]
             if len(dts) == 1:
@@ -159,13 +160,15 @@ class InvertMassMatrix(Operation):
                     + sp.simplify(term / D) * inner_c
         mass = None
         for _D, cand in coeffs.items():
-            cand = sp.cancel(sp.simplify(cand))
+            cand = sp.cancel(sp.simplify(cand))     # small coeff only — cheap
             if cand not in (sp.S.Zero, sp.S.One) and not cand.has(t):
                 mass = cand
                 break
         if mass in (None, sp.S.Zero, sp.S.One):
             return sp_expr
-        out = sp.expand(expr / mass)
+        # divide each term by the mass coefficient (compact per term; no global
+        # expand of the huge rational source)
+        out = sp.Add(*[term / mass for term in terms])
 
         # normalize the form: pull field-free factors out of Derivatives
         # (linearity) so ``∂_t(q/(2k+1))/(1/(2k+1))`` reads ``∂_t q``.
@@ -175,8 +178,8 @@ class InvertMassMatrix(Operation):
             return (co * sp.Derivative(rest, *a.args[1:])
                     if co != 1 and rest != 1 else a)
 
-        return sp.expand(out.replace(
-            lambda a: isinstance(a, sp.Derivative), _pull))
+        return out.replace(
+            lambda a: isinstance(a, sp.Derivative), _pull)
 
 
 # ── conservative fold (flux/pressure bundling, NCP-preserving) ─────────────
@@ -1141,8 +1144,11 @@ class GaussQuadrature(Operation):
             mid = (b_f + a_f) / 2.0
             # evaluate the ζ-derivatives EXPLICITLY first — substituting a
             # numeric node into an unevaluated Derivative leaves Subs junk
-            # that no code printer accepts
-            fn = sp.expand(sp.sympify(I.function).doit())
+            # that no code printer accepts.  Do NOT sp.expand: for a rational
+            # closure integrand (ν_t=C_μ sk⁴/se²) expand distributes N·D⁻¹ into a
+            # >1M-char monster; node substitution works fine on the compact
+            # ``.doit()`` form and yields a compact per-node summand.
+            fn = sp.sympify(I.function).doit()
             acc = sp.S.Zero
             for xg, wg in zip(x_ref, w_ref):
                 acc += sp.Float(wg * half) * fn.subs(
