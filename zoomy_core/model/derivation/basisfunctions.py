@@ -251,14 +251,29 @@ class Basisfunction:
         # structure — resolution must only INSERT VALUES, never restructure.
         expr = expr.replace(lambda e: isinstance(e, sympy.Sum),
                             lambda e: e.doit())
-        # ``multinomial=False`` distributes products (so the const-Derivative
-        # zombies below surface) WITHOUT expanding ``Pow(sum, n)`` — critical for
-        # rational turbulence closures (ν_t=C_μ sk⁴/se²): a full expand
-        # multinomial-blows ``sk⁴``/``se²`` (sums of Legendre modes) into a
-        # >1-million-term monster here, which then re-expands all down the
-        # pipeline (hours of build).  Those powers are evaluated NUMERICALLY by
-        # GaussQuadrature, so they must stay compact.
-        expr = sympy.expand(expr, multinomial=False)
+        # Expand ONLY outside Integral atoms.  The expand here exists solely to
+        # surface the ``Derivative(const, v)`` zombies dropped just below; it must
+        # NOT distribute the integrand of a deferred rational integral
+        # ``∫ C_μ sk⁴/se² · … dζ`` (a non-analytic closure term left for
+        # GaussQuadrature) — a plain expand fragments that into a >1M-term monster
+        # that then re-expands all down the pipeline (hours of build).  Protect
+        # every Integral as a Dummy, expand the rest, restore — so the rational
+        # integral stays a COMPACT atom and GaussQuadrature evaluates it at nodes.
+        _intmap = {}
+
+        def _protect_integrals(e):
+            if isinstance(e, sympy.Integral):
+                k = sympy.Dummy("_INT")
+                _intmap[k] = e
+                return k
+            if e.args:
+                na = tuple(_protect_integrals(a) for a in e.args)
+                if any(n is not o for n, o in zip(na, e.args)):
+                    return e.func(*na)
+            return e
+        expr = sympy.expand(_protect_integrals(expr))
+        if _intmap:
+            expr = expr.xreplace(_intmap)
         # A basis bracket / mode that resolves to a CONSTANT inside ``∂_v(…)`` —
         # a vanishing Gram/Weight (``0``) or the constant 0th mode ``φ_0 = 1`` —
         # leaves an unevaluated ``Derivative(const, v)``: ``replace`` rebuilds the
