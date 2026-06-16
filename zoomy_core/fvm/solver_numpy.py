@@ -574,13 +574,12 @@ class HyperbolicSolver(Solver):
     def _build_numerics(self, symbolic_model):
         """Build the symbolic Riemann solver. Override for SWE-specific variants.
 
-        When the model requests ``equilibrium_reconstruction="audusse"`` the
-        existing well-balanced ``PositiveNonconservativeRusanov`` (Audusse
-        hydrostatic reconstruction + pressure-jump source) is used, so the
-        model keyword drives the numerics with no change at the call site."""
-        eq = getattr(self.sm, "equilibrium_reconstruction", "none")
-        if eq == "audusse":
-            return _build_free_surface_numerics(symbolic_model)
+        Well-balancing (``equilibrium_reconstruction`` in {'audusse','bernoulli'})
+        is applied as an interface reconstruction + conservative-flux-jump source
+        in the flux operator (the unified ``reconstruct_equilibrium`` hook), on
+        top of the standard non-conservative Rusanov numerics — so both modes go
+        through the SAME path (Audusse is the lake-at-rest check on Bernoulli's
+        wiring)."""
         return NonconservativeRusanov(symbolic_model)
 
     def _build_diffusion_operators(self, mesh, symbolic_model, dim, n_vars):
@@ -678,6 +677,19 @@ class HyperbolicSolver(Solver):
             from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
             ncm = NumpyRuntimeModel.from_system_model(
                 symbolic_model).nonconservative_matrix
+
+        # Bernoulli moving-equilibrium WB: reconstruct interface states to the
+        # common bed b* preserving (q, H(s)); the flux + moment NCP act on the
+        # reconstructed states and the conservative-flux-jump source (below)
+        # well-balances the moving steady state.  Built once.
+        _bern = None
+        _eqr = getattr(self.sm, "equilibrium_reconstruction", "none")
+        if _eqr in ("audusse", "bernoulli"):
+            if dim != 1:
+                raise NotImplementedError("equilibrium-reconstruction WB is 1-D only (v1).")
+            from zoomy_core.fvm.bernoulli_wb import (
+                build_bernoulli_config, reconstruct as _bern_recon)
+            _bern = build_bernoulli_config(symbolic_model, mode=_eqr)
 
         # Build diffusion operators (ghost-cell-free)
         self._diffusion_ops = self._build_diffusion_operators(mesh, symbolic_model, dim, n_vars)
@@ -788,6 +800,20 @@ class HyperbolicSolver(Solver):
                     Q_L[:, fidx], qaux_inner, parameters, normal,
                 )
 
+            # 3c. Bernoulli moving-equilibrium WB reconstruction (all faces):
+            # replace interface states by their reconstruction onto the common
+            # bed b* preserving (q, H(s)); stash the conservative-flux-jump
+            # source Fc(Q)−Fc(Q*) to add during the face scatter below.
+            _bern_src = None
+            if _bern is not None:
+                _bi = _bern["b"]
+                _bstar = np.maximum(Q_L[_bi, :], Q_R[_bi, :])
+                _QL0, _QR0 = Q_L.copy(), Q_R.copy()
+                Q_L = _bern_recon(Q_L, _bstar, _bern)
+                Q_R = _bern_recon(Q_R, _bstar, _bern)
+                _fc = _bern["fc"]
+                _bern_src = (_fc(_QL0) - _fc(Q_L), _fc(_QR0) - _fc(Q_R))
+
             # 3b. Cell-interior non-conservative integral (path-conservative,
             # order ≥ 2): ∫_cell B(Q)·∂_x Q dx ≈ B(Q_c)·s_c, with B evaluated
             # at the cell-centre state and s_c the limited reconstruction slope
@@ -836,6 +862,10 @@ class HyperbolicSolver(Solver):
                           (-(num_flux + Dm) * fv_int / cvA_int).T)
                 np.add.at(dQ.T, iB_int,
                           (-(-num_flux + Dp) * fv_int / cvB_int).T)
+                if _bern_src is not None:
+                    sL, sR = _bern_src
+                    np.add.at(dQ.T, iA_int, (-sL[:, interior_faces] * fv_int / cvA_int).T)
+                    np.add.at(dQ.T, iB_int, (sR[:, interior_faces] * fv_int / cvB_int).T)
 
             # 4b. Boundary faces — one inner cell only
             if use_batched and len(boundary_faces):
@@ -852,6 +882,10 @@ class HyperbolicSolver(Solver):
                 Dm = fluct[n_vars:]
                 np.add.at(dQ.T, iInner_bnd,
                           (-(num_flux + Dm) * fv_bnd / cvInner_bnd).T)
+                if _bern_src is not None:
+                    sL, _sR = _bern_src
+                    np.add.at(dQ.T, iInner_bnd,
+                              (-sL[:, boundary_faces] * fv_bnd / cvInner_bnd).T)
 
             # 4-loop. Per-face fallback for numerics without batch support.
             if not use_batched:
