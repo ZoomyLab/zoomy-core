@@ -572,7 +572,15 @@ class HyperbolicSolver(Solver):
     # -- Flux operator (symbolic Riemann solver) -----------------------
 
     def _build_numerics(self, symbolic_model):
-        """Build the symbolic Riemann solver. Override for SWE-specific variants."""
+        """Build the symbolic Riemann solver. Override for SWE-specific variants.
+
+        When the model requests ``equilibrium_reconstruction="audusse"`` the
+        existing well-balanced ``PositiveNonconservativeRusanov`` (Audusse
+        hydrostatic reconstruction + pressure-jump source) is used, so the
+        model keyword drives the numerics with no change at the call site."""
+        eq = getattr(self.sm, "equilibrium_reconstruction", "none")
+        if eq == "audusse":
+            return _build_free_surface_numerics(symbolic_model)
         return NonconservativeRusanov(symbolic_model)
 
     def _build_diffusion_operators(self, mesh, symbolic_model, dim, n_vars):

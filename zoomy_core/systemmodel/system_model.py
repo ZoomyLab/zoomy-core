@@ -540,6 +540,10 @@ class SystemModel:
     # local expression).  When set from ``Model.position`` it is a
     # Zstruct ``Zstruct(X0=…, X1=…, X2=…)`` even for 2D models.
     position: Optional[Any] = None
+    # Well-balanced reconstruction strategy carried from the declarative Model
+    # (Model.equilibrium_reconstruction): 'none' | 'audusse' | 'bernoulli'.
+    # The numpy solver reads it in ``_build_numerics`` to select the WB numerics.
+    equilibrium_reconstruction: str = "none"
     # Per-state-field applied-Function map — ``h → h(t,x)``, ``ũ → ũ(t,x,ζ)`` —
     # carrying each field's FULL coordinate signature so per-field dimensionality
     # survives the ``_state_symbol`` name-collapse (the state twin of
@@ -1059,6 +1063,10 @@ class SystemModel:
         # SystemModel slots; runtime gradient aux (∂_x h, ∂_x q_i) land in Qaux.
         _attach_function_groups(sm, model,
                                 canonical_source=canonical_source)
+        # Carry the WB reconstruction choice from the declarative Model so the
+        # solver can pick the numerics (e.g. SME(equilibrium_reconstruction=...)).
+        sm.equilibrium_reconstruction = getattr(
+            canonical_source, "equilibrium_reconstruction", "none")
         return sm
 
     def is_vertical_dependent(self, symbol) -> bool:
