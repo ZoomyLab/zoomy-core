@@ -575,11 +575,14 @@ class HyperbolicSolver(Solver):
         """Build the symbolic Riemann solver. Override for SWE-specific variants.
 
         Well-balancing (``equilibrium_reconstruction`` in {'audusse','bernoulli'})
-        is applied as an interface reconstruction + conservative-flux-jump source
-        in the flux operator (the unified ``reconstruct_equilibrium`` hook), on
-        top of the standard non-conservative Rusanov numerics — so both modes go
-        through the SAME path (Audusse is the lake-at-rest check on Bernoulli's
-        wiring)."""
+        is applied as an interface reconstruction + well-balancing source in the
+        flux operator (the unified ``reconstruct_equilibrium`` hook), on top of
+        the standard non-conservative Rusanov numerics — so both modes go through
+        the SAME path (Audusse is the lake-at-rest check on Bernoulli's wiring).
+        The source differs per mode (built in ``bernoulli_wb``): Audusse uses the
+        PRESSURE jump only (momentum-only S̃ — zero mass row, no convective/aux
+        dependence, dimension-agnostic), Bernoulli the full conservative-flux
+        jump (its discharge-preserving reconstruction zeroes the mass row)."""
         return NonconservativeRusanov(symbolic_model)
 
     def _build_diffusion_operators(self, mesh, symbolic_model, dim, n_vars):
@@ -684,9 +687,17 @@ class HyperbolicSolver(Solver):
         # well-balances the moving steady state.  Built once.
         _bern = None
         _eqr = getattr(self.sm, "equilibrium_reconstruction", "none")
-        if _eqr in ("audusse", "bernoulli"):
-            if dim != 1:
-                raise NotImplementedError("equilibrium-reconstruction WB is 1-D only (v1).")
+        # Unified WB wiring: audusse AND bernoulli go through the SAME hook
+        # (interface reconstruction + well-balancing source on the standard
+        # NonconservativeRusanov numerics).  'audusse' is dimension-agnostic
+        # (face-based HR + the momentum-only PRESSURE-jump source).  The MOVING
+        # bernoulli reconstruction is 1-D for now (its per-streamline Bernoulli
+        # head is not yet a 2-D velocity vector).
+        if _eqr in ("audusse", "bernoulli", "projected_bernoulli"):
+            if dim != 1 and _eqr != "audusse":
+                raise NotImplementedError(
+                    "bernoulli moving-equilibrium WB is 1-D only (v1); "
+                    "use equilibrium_reconstruction='audusse' for 2-D lake-at-rest.")
             from zoomy_core.fvm.bernoulli_wb import (
                 build_bernoulli_config, reconstruct as _bern_recon)
             _bern = build_bernoulli_config(symbolic_model, mode=_eqr)
@@ -812,7 +823,10 @@ class HyperbolicSolver(Solver):
                 Q_L = _bern_recon(Q_L, _bstar, _bern)
                 Q_R = _bern_recon(Q_R, _bstar, _bern)
                 _fc = _bern["fc"]
-                _bern_src = (_fc(_QL0) - _fc(Q_L), _fc(_QR0) - _fc(Q_R))
+                # conservative-flux-jump source Fc·n (projected on the per-face
+                # normal -> dimension-agnostic; 1-D recovers the direction-0 flux)
+                _bern_src = (_fc(_QL0, normals_arr) - _fc(Q_L, normals_arr),
+                             _fc(_QR0, normals_arr) - _fc(Q_R, normals_arr))
 
             # 3b. Cell-interior non-conservative integral (path-conservative,
             # order ≥ 2): ∫_cell B(Q)·∂_x Q dx ≈ B(Q_c)·s_c, with B evaluated

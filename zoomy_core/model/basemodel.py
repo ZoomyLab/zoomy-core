@@ -103,12 +103,16 @@ class Model(param.Parameterized, SymbolicRegistrar):
     # every model (default off); meaningful for free-surface models that define
     # the equilibrium.  'none' = standard scheme; 'audusse' = lake-at-rest
     # hydrostatic reconstruction (the existing PositiveNonconservativeRusanov,
-    # exact for still water); 'bernoulli' = moving-equilibrium WB.  The solver
-    # reads this off the SystemModel to pick the numerics.
+    # exact for still water); 'bernoulli' = moving-equilibrium WB (single-signed
+    # profiles, discharge-fraction streamline label); 'projected_bernoulli' =
+    # layered moving WB (σ-parameterized |u| thickness weighting + signed
+    # velocity, handles sign reversal over depth).  The solver reads this off the
+    # SystemModel to pick the numerics.
     equilibrium_reconstruction = param.Selector(
         default="none",
-        objects=["none", "audusse", "bernoulli"],
-        doc="Well-balanced reconstruction strategy: none | audusse | bernoulli."
+        objects=["none", "audusse", "bernoulli", "projected_bernoulli"],
+        doc="Well-balanced reconstruction strategy: "
+            "none | audusse | bernoulli | projected_bernoulli."
     )
 
     variables = param.Parameter(default=1)
