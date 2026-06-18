@@ -457,7 +457,19 @@ class HLL(Numerics):
         sL, sR = self.wave_speed_bounds(qL, qR, auxL, auxR, p, n)
         sLm = sp.Min(sL, sp.Integer(0))
         sRp = sp.Max(sR, sp.Integer(0))
-        eps = self._eps_symbol()
+        # Guard the 0/0 at a fully-dry face (sRp = sLm = 0) with a
+        # FLOATING-POINT floor, NOT the model's wet/dry threshold ``eps``
+        # (~1e-2).  At a WET lake-at-rest face the reconstructed states are
+        # equal, so sRp - sLm = 2c and FLn = FRn = P*·n, dq = 0; a wet/dry-
+        # scale eps then rescales the (otherwise exact) pressure flux by
+        # 1 - eps/(2c) while the Audusse S̃ consistency source stays
+        # unscaled — the two no longer cancel and lake-at-rest drifts by
+        # O(eps) (the PositiveHLL / PositiveNonconservativeHLL WB defect;
+        # max|u| = 1.087·eps measured on the parabolic-bowl WB test).  Same
+        # reasoning as the ``hr_eps = 1e-14`` used in
+        # ``PositiveRusanov.hydrostatic_reconstruction``.  ``PositiveRusanov``
+        # has no denominator, which is why it was already exactly WB.
+        eps = sp.Float(1e-14)
         inv = 1 / (sRp - sLm + eps)
         dq = self._state_jump(qL, qR)
         return (sRp * FLn - sLm * FRn + sLm * sRp * dq) * inv
