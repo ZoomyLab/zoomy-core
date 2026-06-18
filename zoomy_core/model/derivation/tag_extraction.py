@@ -339,7 +339,11 @@ def _classify_term(term, *, state_funcs, gravity_param, t, x):
 
     - any ``Derivative(*, t)`` atom → ``time_derivative``
     - ``coeff * Derivative(state_var, x)`` (deriv arg is a single state
-      Function) → ``nonconservative_flux``
+      Function): ``flux`` if the coefficient is state-free — then it is
+      identically ``Derivative(coeff·state_var, x)``, a CONSERVATIVE flux
+      that telescopes (e.g. the mass flux ``∂_x(q_0)``) — else
+      ``nonconservative_flux`` (state-dependent coefficient, a genuine
+      path-conservative product, e.g. ``g·h·∂_x b``)
     - ``coeff * Derivative(parameter, x)`` (deriv of pure parameter)
       → ``implicit_source``
     - ``coeff(state) * Derivative(F(state), x)`` (state coeff on a
@@ -366,7 +370,15 @@ def _classify_term(term, *, state_funcs, gravity_param, t, x):
         return "implicit_source"
     inner = deriv.args[0]
     if inner in state_funcs:
-        return "nonconservative_flux"
+        # ∂_x(q_j) with a single bare state variable inside.  A STATE-FREE
+        # coefficient makes this identical to ∂_x(coeff·q_j): a CONSERVATIVE
+        # flux (it telescopes / conserves mass), so it must go to ``flux``,
+        # not the non-conservative slot.  The mass flux ∂_x(q_0) is exactly
+        # this case — tagging it NCP breaks the path-conservative product's
+        # telescoping and leaks mass.  Only a STATE-DEPENDENT coefficient
+        # (e.g. g·h·∂_x b) is a genuine non-conservative product.
+        coeff_has_state = any(coeff.has(f) for f in state_funcs)
+        return "nonconservative_flux" if coeff_has_state else "flux"
     inner_has_state = any(inner.has(f) for f in state_funcs)
     if not inner_has_state:
         return "implicit_source"
