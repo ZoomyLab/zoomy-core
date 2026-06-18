@@ -50,6 +50,7 @@ from zoomy_core.model.derivation import (
     Model as DModel, PDETransformation, Simplify, ResolveIntegral, Basis,
     Consolidate, ExpandSums, EvaluateSums, PullConstants, ExtractBrackets,
     ResolveModes, ResolveBasis, GaussQuadrature, InvertMassMatrix,
+    DeferQuadrature, ResolveNumQuad,
     SolveLinearSystem, ChangeOfVariables,
     separation_of_variables, reset_modal_indices, modal_bound, test_index,
 )
@@ -296,9 +297,16 @@ class QRKESME(SME):
             mxi.apply(EvaluateSums()); mxi.apply(w_closure)
             mxi.apply(ResolveModes(index=l, modes=range(Nu + 1)))
         for ax in HAXES:
-            getattr(m.momentum, ax).apply(ResolveBasis(legendre, var=zeta))
+            mxi = getattr(m.momentum, ax)
             if qo > 0:
-                getattr(m.momentum, ax).apply(GaussQuadrature(var=zeta, order=qo))
+                # DEFER quadrature BEFORE ResolveBasis: hide the rational closure
+                # ∫ as an opaque ⟨…⟩^N atom while φ is STILL OPAQUE, so the basis
+                # is substituted only at the Gauss nodes (step 9c) and the
+                # rational never exists in concrete-basis symbolic form.  The
+                # pure-ζ polynomial brackets are NOT wrapped → ResolveBasis closes
+                # them analytically right after.
+                mxi.apply(DeferQuadrature(var=zeta))
+            mxi.apply(ResolveBasis(legendre, var=zeta))
 
         # 8b — sk, se basis resolution (own bound N_k, ŵ closure).  The rational
         # ν_t and the q-r cross/source terms survive ExtractBrackets and are
@@ -315,9 +323,9 @@ class QRKESME(SME):
             eq.apply(ResolveModes(index=l, modes=range(Nk + 1)))
         for nm in ("sk", "se"):
             eq = getattr(m, nm)
-            eq.apply(ResolveBasis(legendre, var=zeta))
             if qo > 0:
-                eq.apply(GaussQuadrature(var=zeta, order=qo))
+                eq.apply(DeferQuadrature(var=zeta))   # ⟨…⟩^N (see momentum note)
+            eq.apply(ResolveBasis(legendre, var=zeta))
 
         # 9 — kill ∂_t h, consolidate, conservative CoV û_d → q_d/h, and the
         #     turbulence moments SK_i = h·sk̂_i, SE_i = h·sê_i (like q = h·û)
@@ -358,6 +366,21 @@ class QRKESME(SME):
                             + tau_p * (-1) ** l * (sk0 - sk_wall))
             m.se[l].expr = (sp.sympify(m.se[l].expr)
                             + tau_p * (-1) ** l * (se0 - se_wall))
+
+        # 9c — resolve the deferred ⟨…⟩^N numerical brackets, the VERY LAST step
+        # before extraction.  The rational closure integrals rode the whole
+        # post-projection pipeline (Consolidate/CoV/InvertMass) as opaque atoms;
+        # only now are they expanded — ONCE, numerically — into their
+        # Gauss–Legendre node sums.  Their bodies still carry OPAQUE φ (the bracket
+        # was formed before ResolveBasis), so ``basis=`` resolves the basis at the
+        # nodes — the only place the rational ever touches the concrete polynomials.
+        if qo > 0:
+            for ax in HAXES:
+                getattr(m.momentum, ax).apply(
+                    ResolveNumQuad(var=zeta, order=qo, basis=legendre))
+            for nm in ("sk", "se"):
+                getattr(m, nm).apply(
+                    ResolveNumQuad(var=zeta, order=qo, basis=legendre))
 
         # 10 — vertical reconstruction → interpolate (velocity rows, as SME)
         q_heads = [getattr(m.functions, qn).head for qn in QNAME]

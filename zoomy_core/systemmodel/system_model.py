@@ -446,11 +446,13 @@ class SystemModel:
     nonconservative_matrix: ZArray           # (n_eq, n_state, n_dim)
     source: ZArray                           # (n_eq,)
     mass_matrix: ZArray                      # (n_eq, n_state)
-    # Derived operators — frozen alongside the primaries.  ``None`` ⇒
-    # ``__post_init__`` computes quasilinear_matrix / source_jacobian
-    # from the primaries; ``eigenvalues`` stays ``None`` when skipped.
-    quasilinear_matrix: Optional[ZArray] = None    # (n_eq, n_state, n_dim)
-    source_jacobian: Optional[ZArray] = None       # (n_eq, n_state)
+    # Derived operators.  ``quasilinear_matrix`` (flux Jacobian) and
+    # ``source_jacobian`` (∂S/∂Q) are LAZY: exposed as cached properties that
+    # compute from the primaries on FIRST access (and cache), not eagerly at
+    # construction.  This keeps building / inspecting / flux-only codegen cheap
+    # — the expensive ``∂S/∂Q`` (a big ``sp.diff`` for rational closures) is
+    # paid only when a consumer (implicit IMEX solve, codegen) actually reads it.
+    # ``eigenvalues`` stays ``None`` when skipped.
     eigenvalues: Optional[ZArray] = None           # (n_eq,)
     normal: Optional[Zstruct] = None
     parameter_values: Optional[Zstruct] = None   # name -> numeric default
@@ -556,6 +558,10 @@ class SystemModel:
     history: List[Dict[str, str]] = field(default_factory=list)
 
     def __post_init__(self):
+        # Lazy derived-operator caches — filled on first property access (see
+        # the ``quasilinear_matrix`` / ``source_jacobian`` properties below).
+        self._quasilinear_matrix = None
+        self._source_jacobian = None
         # Normalise every operator tensor field to ZArray.  Construction
         # sites that still produce sympy types are wrapped transparently.
         self.flux                   = _to_zarray(self.flux)
@@ -563,8 +569,6 @@ class SystemModel:
         self.nonconservative_matrix = _to_zarray(self.nonconservative_matrix)
         self.source                 = _to_zarray(self.source)
         self.mass_matrix            = _to_zarray(self.mass_matrix)
-        self.quasilinear_matrix     = _to_zarray(self.quasilinear_matrix)
-        self.source_jacobian        = _to_zarray(self.source_jacobian)
         self.eigenvalues            = _to_zarray(self.eigenvalues)
         self.update_variables           = _to_zarray(self.update_variables)
         self.diffusion_matrix           = _to_zarray(self.diffusion_matrix)
@@ -585,10 +589,6 @@ class SystemModel:
             self.normal._symbolic_name = "n"
         if self.parameter_values is None:
             self.parameter_values = Zstruct()
-        if self.quasilinear_matrix is None:
-            self.quasilinear_matrix = _to_zarray(self._compute_quasilinear_matrix())
-        if self.source_jacobian is None:
-            self.source_jacobian = _to_zarray(self._compute_source_jacobian())
 
     # ── Shape accessors ────────────────────────────────────────────────
 
@@ -856,6 +856,33 @@ class SystemModel:
             ) from e
 
     # ── Derived-operator computation ────────────────────────────────────
+
+    @property
+    def quasilinear_matrix(self):
+        """Flux Jacobian ``∂F/∂Q + ∂P/∂Q + B`` — LAZY: computed from the
+        primaries on first access, then cached.  Assigning re-seeds the cache
+        (e.g. ``refresh_derived_operators`` after a state change)."""
+        if self._quasilinear_matrix is None:
+            self._quasilinear_matrix = _to_zarray(self._compute_quasilinear_matrix())
+        return self._quasilinear_matrix
+
+    @quasilinear_matrix.setter
+    def quasilinear_matrix(self, value):
+        self._quasilinear_matrix = _to_zarray(value)
+
+    @property
+    def source_jacobian(self):
+        """``∂S/∂Q`` — LAZY: computed on first access, then cached.  This is the
+        expensive one for rational closures (``ν_t=C_μ sk⁴/se²``): a big
+        ``sp.diff``, deferred so building / inspecting / flux-only codegen never
+        pays it.  Assigning re-seeds the cache."""
+        if self._source_jacobian is None:
+            self._source_jacobian = _to_zarray(self._compute_source_jacobian())
+        return self._source_jacobian
+
+    @source_jacobian.setter
+    def source_jacobian(self, value):
+        self._source_jacobian = _to_zarray(value)
 
     def _compute_quasilinear_matrix(self):
         """``∂F/∂Q + ∂P/∂Q + B`` — shape ``(n_eq, n_state, n_dim)``."""

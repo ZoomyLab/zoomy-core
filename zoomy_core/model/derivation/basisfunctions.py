@@ -173,10 +173,30 @@ class Basisfunction:
                     and getattr(e.func, "_is_basis_head", False)
                     and len(e.args) == 1)
 
+        # Protect any opaque numerical bracket ``⟨…⟩^N`` (``_is_numquad``): its φ
+        # are resolved at the Gauss nodes by ResolveNumQuad, NOT concretised here
+        # (concretising them would defeat the whole point — the rational closure
+        # would re-acquire its concrete-basis symbolic form and explode).
+        _nqmap = {}
+
+        def _protect_nq(e):
+            if isinstance(e, sympy.Function) and getattr(e.func, "_is_numquad", False):
+                d = sympy.Dummy("_NQ")
+                _nqmap[d] = e
+                return d
+            if e.args:
+                na = tuple(_protect_nq(a) for a in e.args)
+                if any(n is not o for n, o in zip(na, e.args)):
+                    return e.func(*na)
+            return e
+        body = _protect_nq(body)
+
         body = body.replace(
             _is_phi, lambda e: (self.eval(int(e.args[0]), e.args[1])
                                 if e.args[0].is_Integer else e))
         body = body.replace(_is_c, lambda e: sympy.sympify(self.weight(e.args[0])))
+        if _nqmap:
+            body = body.xreplace(_nqmap)
         return body
 
     def evaluate_bracket(self, body, var, lower=0, upper=1):
@@ -264,6 +284,12 @@ class Basisfunction:
         def _protect_integrals(e):
             if isinstance(e, sympy.Integral):
                 k = sympy.Dummy("_INT")
+                _intmap[k] = e
+                return k
+            # Opaque numerical bracket ⟨…⟩^N: protect like an Integral so expand
+            # never recurses into (and fragments) the rational closure body.
+            if isinstance(e, sympy.Function) and getattr(e.func, "_is_numquad", False):
+                k = sympy.Dummy("_NQ")
                 _intmap[k] = e
                 return k
             if e.args:
