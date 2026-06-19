@@ -448,9 +448,16 @@ class Model(param.Parameterized, SymbolicRegistrar):
             if sg:  # already tagged
                 continue
             try:
+                # Pass the primary horizontal coord only: ``coords`` here
+                # would also contain the vertical ``z`` (``position`` spans
+                # all dims), and ``∂_z`` is not a flux in the averaged
+                # system.  Declarative models (VAM/SME/MLVAM) carry no
+                # ``_equations`` so this fallback is inert for them; the
+                # splitter's N-D ``auto_solver_tag`` call uses the
+                # SystemModel's horizontal ``space`` directly.
                 tagged = auto_solver_tag(
                     eq.expr, state_funcs=state_atoms,
-                    t=t_sym, x=x_sym, gravity_param=gravity_param,
+                    t=t_sym, coords=[x_sym], gravity_param=gravity_param,
                 )
             except Exception:
                 # Heuristic can fail on degenerate shapes; leave

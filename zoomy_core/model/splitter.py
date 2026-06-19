@@ -371,7 +371,6 @@ def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
 
     t = sm_parent.time
     coords = list(sm_parent.space)
-    x = coords[0]
     g_param = (sm_parent.parameters.g
                if sm_parent.parameters.contains("g") else None)
 
@@ -394,7 +393,7 @@ def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
             res_func,
             state_funcs=state_funcs,
             gravity_param=g_param,
-            t=t, x=x,
+            t=t, coords=coords,
         )
 
     class _Holder:

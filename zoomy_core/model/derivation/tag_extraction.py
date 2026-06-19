@@ -332,28 +332,36 @@ def _enforce_untagged_policy(eq, eq_name, policy):
 # Heuristic auto-tagger
 # ---------------------------------------------------------------------------
 
-def _classify_term(term, *, state_funcs, gravity_param, t, x):
+def _classify_term(term, *, state_funcs, gravity_param, t, coords):
     """Classify a single PDE term by canonical solver-tag category.
 
     Heuristic (priority-ordered):
 
     - any ``Derivative(*, t)`` atom → ``time_derivative``
-    - ``coeff * Derivative(state_var, x)`` (deriv arg is a single state
-      Function): ``flux`` if the coefficient is state-free — then it is
-      identically ``Derivative(coeff·state_var, x)``, a CONSERVATIVE flux
-      that telescopes (e.g. the mass flux ``∂_x(q_0)``) — else
-      ``nonconservative_flux`` (state-dependent coefficient, a genuine
-      path-conservative product, e.g. ``g·h·∂_x b``)
-    - ``coeff * Derivative(parameter, x)`` (deriv of pure parameter)
+    - ``coeff * Derivative(state_var, x_i)`` (deriv arg is a single state
+      Function, w.r.t. *any* spatial coord ``x_i ∈ coords``): ``flux`` if
+      the coefficient is state-free — then it is identically
+      ``Derivative(coeff·state_var, x_i)``, a CONSERVATIVE flux that
+      telescopes (e.g. the mass fluxes ``∂_x(q_x_0)`` AND ``∂_y(q_y_0)``)
+      — else ``nonconservative_flux`` (state-dependent coefficient, a
+      genuine path-conservative product, e.g. ``g·h·∂_x b``)
+    - ``coeff * Derivative(parameter, x_i)`` (deriv of pure parameter)
       → ``implicit_source``
-    - ``coeff(state) * Derivative(F(state), x)`` (state coeff on a
+    - ``coeff(state) * Derivative(F(state), x_i)`` (state coeff on a
       compound deriv argument) → ``implicit_source`` (too complex for
       the flux/NC slots)
-    - ``Derivative(F(state), x)`` with state-independent coeff and
+    - ``Derivative(F(state), x_i)`` with state-independent coeff and
       ``g·state`` inside → ``hydrostatic_pressure``
-    - ``Derivative(F(state), x)`` with state-independent coeff
+    - ``Derivative(F(state), x_i)`` with state-independent coeff
       → ``flux``
     - everything else (no derivative, …) → ``implicit_source`` (catch-all).
+
+    The direction check is over the FULL spatial coordinate list ``coords``
+    (``[x]`` in 1-D, ``[x, y]`` in 2-D), so a cross-direction conservative
+    flux ``∂_y(q_y_d)`` is tagged ``flux`` and routed to its own column by
+    the (already N-D) extractor — NOT mis-tagged as a source.  Keying off a
+    single ``x`` instead leaked mass on 2-D meshes (task 0009): the y-flux
+    fell into the source, which does not telescope.
 
     The "source" catch-all uses **implicit_source** as the safe default
     because friction / reaction / stiff body forces benefit from
@@ -366,7 +374,7 @@ def _classify_term(term, *, state_funcs, gravity_param, t, x):
     coeff, deriv = _split_coeff_and_derivative(term)
     if deriv is None:
         return "implicit_source"
-    if len(deriv.variables) != 1 or deriv.variables[0] != x:
+    if len(deriv.variables) != 1 or deriv.variables[0] not in coords:
         return "implicit_source"
     inner = deriv.args[0]
     if inner in state_funcs:
@@ -390,8 +398,13 @@ def _classify_term(term, *, state_funcs, gravity_param, t, x):
     return "flux"
 
 
-def auto_solver_tag(expr_or_leaf, *, state_funcs, t, x, gravity_param=None):
+def auto_solver_tag(expr_or_leaf, *, state_funcs, t, coords, gravity_param=None):
     """Walk additive terms and auto-tag with canonical solver tags.
+
+    ``coords`` is the full spatial coordinate list (``[x]`` / ``[x, y]``);
+    a first-order derivative w.r.t. ANY of them is eligible for the flux /
+    NCP slots, so cross-direction conservative fluxes are not lost into the
+    source (task 0009).
 
     Returns a :class:`SolverTagged` carrying the grouped solver tags so
     :func:`collect_solver_tag` can extract operator matrices from it.
@@ -406,7 +419,7 @@ def auto_solver_tag(expr_or_leaf, *, state_funcs, t, x, gravity_param=None):
             continue
         tag = _classify_term(
             term, state_funcs=state_funcs, gravity_param=gravity_param,
-            t=t, x=x,
+            t=t, coords=coords,
         )
         groups[tag] = groups.get(tag, sp.S.Zero) + term
     return SolverTagged(raw, name).solver_tag(**groups)
