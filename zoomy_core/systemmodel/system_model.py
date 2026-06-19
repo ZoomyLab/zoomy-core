@@ -446,11 +446,13 @@ class SystemModel:
     nonconservative_matrix: ZArray           # (n_eq, n_state, n_dim)
     source: ZArray                           # (n_eq,)
     mass_matrix: ZArray                      # (n_eq, n_state)
-    # Derived operators — frozen alongside the primaries.  ``None`` ⇒
-    # ``__post_init__`` computes quasilinear_matrix / source_jacobian
-    # from the primaries; ``eigenvalues`` stays ``None`` when skipped.
-    quasilinear_matrix: Optional[ZArray] = None    # (n_eq, n_state, n_dim)
-    source_jacobian: Optional[ZArray] = None       # (n_eq, n_state)
+    # Derived operators.  ``quasilinear_matrix`` (flux Jacobian) and
+    # ``source_jacobian`` (∂S/∂Q) are LAZY: exposed as cached properties that
+    # compute from the primaries on FIRST access (and cache), not eagerly at
+    # construction.  This keeps building / inspecting / flux-only codegen cheap
+    # — the expensive ``∂S/∂Q`` (a big ``sp.diff`` for rational closures) is
+    # paid only when a consumer (implicit IMEX solve, codegen) actually reads it.
+    # ``eigenvalues`` stays ``None`` when skipped.
     eigenvalues: Optional[ZArray] = None           # (n_eq,)
     normal: Optional[Zstruct] = None
     parameter_values: Optional[Zstruct] = None   # name -> numeric default
@@ -540,6 +542,10 @@ class SystemModel:
     # local expression).  When set from ``Model.position`` it is a
     # Zstruct ``Zstruct(X0=…, X1=…, X2=…)`` even for 2D models.
     position: Optional[Any] = None
+    # Well-balanced reconstruction strategy carried from the declarative Model
+    # (Model.equilibrium_reconstruction): 'none' | 'audusse' | 'bernoulli'.
+    # The numpy solver reads it in ``_build_numerics`` to select the WB numerics.
+    equilibrium_reconstruction: str = "none"
     # Per-state-field applied-Function map — ``h → h(t,x)``, ``ũ → ũ(t,x,ζ)`` —
     # carrying each field's FULL coordinate signature so per-field dimensionality
     # survives the ``_state_symbol`` name-collapse (the state twin of
@@ -552,6 +558,10 @@ class SystemModel:
     history: List[Dict[str, str]] = field(default_factory=list)
 
     def __post_init__(self):
+        # Lazy derived-operator caches — filled on first property access (see
+        # the ``quasilinear_matrix`` / ``source_jacobian`` properties below).
+        self._quasilinear_matrix = None
+        self._source_jacobian = None
         # Normalise every operator tensor field to ZArray.  Construction
         # sites that still produce sympy types are wrapped transparently.
         self.flux                   = _to_zarray(self.flux)
@@ -559,8 +569,6 @@ class SystemModel:
         self.nonconservative_matrix = _to_zarray(self.nonconservative_matrix)
         self.source                 = _to_zarray(self.source)
         self.mass_matrix            = _to_zarray(self.mass_matrix)
-        self.quasilinear_matrix     = _to_zarray(self.quasilinear_matrix)
-        self.source_jacobian        = _to_zarray(self.source_jacobian)
         self.eigenvalues            = _to_zarray(self.eigenvalues)
         self.update_variables           = _to_zarray(self.update_variables)
         self.diffusion_matrix           = _to_zarray(self.diffusion_matrix)
@@ -581,10 +589,6 @@ class SystemModel:
             self.normal._symbolic_name = "n"
         if self.parameter_values is None:
             self.parameter_values = Zstruct()
-        if self.quasilinear_matrix is None:
-            self.quasilinear_matrix = _to_zarray(self._compute_quasilinear_matrix())
-        if self.source_jacobian is None:
-            self.source_jacobian = _to_zarray(self._compute_source_jacobian())
 
     # ── Shape accessors ────────────────────────────────────────────────
 
@@ -659,13 +663,45 @@ class SystemModel:
         Extrapolation.  Optional — a SystemModel without BCs still builds; the
         solver only needs them at run time.  Returns ``self``.
         """
-        from zoomy_core.model.boundary_conditions import BoundaryConditions
+        from zoomy_core.model.boundary_conditions import (
+            BoundaryConditions, PerFieldBoundary, Periodic, Coupled,
+            resolve_per_field)
         import zoomy_core.model.aux_boundary_conditions as AuxBC
-        # BCs that need the SystemModel (FromModel: boundary_specs;
-        # Characteristic: eigensystem + state layout) expose .resolve(sm).
-        for bc in bcs.boundary_conditions_list:
+        state_names = [str(s) for s in self.state]
+        # The ``on=`` field mask is rooted on BoundaryCondition (each BC self-
+        # masks its owned slots), so a single per-field BC per tag needs no
+        # wrapper.  Only tags carrying MULTIPLE explicit BCs must be merged into
+        # one PerFieldBoundary (the runtime dispatches ONE bc per tag).  Accept a
+        # flat list or a BoundaryConditions container; whole-patch BCs pass
+        # through.  Already-composed input (resolve_and_attach) is left as-is.
+        raw = (list(bcs) if isinstance(bcs, list)
+               else list(bcs.boundary_conditions_list))
+        by_tag = {}
+        for bc in raw:
+            by_tag.setdefault(bc.tag, []).append(bc)
+        merged = []
+        for tag, group in by_tag.items():
+            non_patch = [b for b in group
+                         if not isinstance(b, (PerFieldBoundary, Periodic, Coupled))]
+            if len(non_patch) > 1:               # multiple BCs at one tag → merge
+                merged.extend(
+                    resolve_per_field(group, state_names,
+                                      aliases={"momentum": "q"}).boundary_conditions_list)
+            else:
+                merged.extend(group)
+        bcs = BoundaryConditions(merged)
+        # Bind each BC's ``on=`` to slot indices against this state (so the root
+        # mask fires), and run the SystemModel-needing hooks (FromModel,
+        # Characteristic).  Recurse into any PerFieldBoundary slot BCs.
+        def _prepare(bc):
             if hasattr(bc, "resolve"):
                 bc.resolve(self)
+            bc.bind_on(state_names)
+            for inner in {id(v): v for v in
+                          getattr(bc, "_slot_bc", {}).values()}.values():
+                _prepare(inner)
+        for bc in bcs.boundary_conditions_list:
+            _prepare(bc)
         if self.position is None:
             # the BC kernel signature needs a 3-component position; models
             # without registered function groups never set one.
@@ -820,6 +856,33 @@ class SystemModel:
             ) from e
 
     # ── Derived-operator computation ────────────────────────────────────
+
+    @property
+    def quasilinear_matrix(self):
+        """Flux Jacobian ``∂F/∂Q + ∂P/∂Q + B`` — LAZY: computed from the
+        primaries on first access, then cached.  Assigning re-seeds the cache
+        (e.g. ``refresh_derived_operators`` after a state change)."""
+        if self._quasilinear_matrix is None:
+            self._quasilinear_matrix = _to_zarray(self._compute_quasilinear_matrix())
+        return self._quasilinear_matrix
+
+    @quasilinear_matrix.setter
+    def quasilinear_matrix(self, value):
+        self._quasilinear_matrix = _to_zarray(value)
+
+    @property
+    def source_jacobian(self):
+        """``∂S/∂Q`` — LAZY: computed on first access, then cached.  This is the
+        expensive one for rational closures (``ν_t=C_μ sk⁴/se²``): a big
+        ``sp.diff``, deferred so building / inspecting / flux-only codegen never
+        pays it.  Assigning re-seeds the cache."""
+        if self._source_jacobian is None:
+            self._source_jacobian = _to_zarray(self._compute_source_jacobian())
+        return self._source_jacobian
+
+    @source_jacobian.setter
+    def source_jacobian(self, value):
+        self._source_jacobian = _to_zarray(value)
 
     def _compute_quasilinear_matrix(self):
         """``∂F/∂Q + ∂P/∂Q + B`` — shape ``(n_eq, n_state, n_dim)``."""
@@ -1027,6 +1090,10 @@ class SystemModel:
         # SystemModel slots; runtime gradient aux (∂_x h, ∂_x q_i) land in Qaux.
         _attach_function_groups(sm, model,
                                 canonical_source=canonical_source)
+        # Carry the WB reconstruction choice from the declarative Model so the
+        # solver can pick the numerics (e.g. SME(equilibrium_reconstruction=...)).
+        sm.equilibrium_reconstruction = getattr(
+            canonical_source, "equilibrium_reconstruction", "none")
         return sm
 
     def is_vertical_dependent(self, symbol) -> bool:

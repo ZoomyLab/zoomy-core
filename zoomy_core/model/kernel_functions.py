@@ -98,6 +98,30 @@ class eigensystem(sp.Function):
         return None  # always keep unevaluated
 
 
+class compute_derivative(sp.Function):
+    """``compute_derivative(field, *multi_index)`` — the NON-LOCAL spatial
+    derivative of ``field`` of order ``multi_index`` (e.g.
+    ``compute_derivative(h, 1, 0)`` = ∂ₓh, ``compute_derivative(b, 0, 1)`` =
+    ∂_yb).  Opaque to SymPy; the numeric impl is **injected by the solver**
+    into the backend module dict (exactly like :class:`max_wavespeed`), bound
+    to that backend's LSQ stencil + mesh — numpy ``mesh.compute_derivatives``,
+    jax ``lsq_gradient_per_field``.
+
+    This is the single code-printed source for derivative aux: ``expose_aux``
+    emits it into ``update_aux_variables`` so every backend computes the
+    derivative from ONE symbolic object, given only a ``compute_derivative``
+    entry in its user-functions map.  The carrying slot must be lowered
+    WHOLE-GRID (``field`` arrives as the full row, not a per-cell scalar); the
+    trailing integer args are the static multi-index.
+    """
+    is_commutative = True
+    is_real = True
+
+    @classmethod
+    def eval(cls, *args):
+        return None  # always keep unevaluated (opaque)
+
+
 class conditional(sp.Function):
     """
     A Vector-Aware, Differentiable Conditional Function.

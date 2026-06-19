@@ -160,15 +160,76 @@ class KEpsilonViscosity(Closure):
     """Turbulent bulk stress with the standard k–ε eddy viscosity
     ``τ = ρ ν_t ∂_z u``,  ``ν_t = C_μ k²/ε`` — reads the transported turbulence
     fields ``k`` and ``ε`` (only available on a k–ε model class).  The Galerkin
-    projection is rational in ζ → build with ``quadrature_order > 0``."""
+    projection is rational in ζ → build with ``quadrature_order > 0``.
+
+    ``wall_floor`` (default on) adds the WALL-FUNCTION-consistent near-wall eddy
+    viscosity ``ν_t,wall = C_μ^{1/4}√k · κ z_p`` (the log-layer ``κ u_⋆ z_p`` with
+    ``u_⋆=C_μ^{1/4}√k``).  Why: ``C_μ k²/ε`` VANISHES at the wall, so in the moment
+    projection it provides almost no damping of the velocity-shape moments
+    (their stress-trace damping scales with the viscosity AT the wall — see
+    :class:`QRViscosity`).  The mixing-length floor keeps ν_t non-zero there and
+    restores that damping.  Set ``wall_floor=False`` for the bare ``C_μ k²/ε``."""
     closes = "bulk"; requires = ("u", "k", "varepsilon")
+
+    def __init__(self, name=None, wall_floor=True):
+        super().__init__(name=name)
+        self.wall_floor = bool(wall_floor)
 
     def register(self, m):
         m.parameter("C_mu", 0.09)
         m.parameter("nu", 0.0)        # molecular part: ν_eff = ν + ν_t
+        if self.wall_floor:
+            m.parameter("kappa", 0.41); m.parameter("z_p", 0.1)
 
     def expression(self, s):
         nu_t = s.par.C_mu * s.k ** 2 / s.varepsilon
+        if self.wall_floor:
+            # offset log-layer mixing length ℓ=κ(z+z_p) (see QRViscosity)
+            nu_t += (s.par.C_mu ** sp.Rational(1, 4) * sp.sqrt(s.k) * s.par.kappa
+                     * (s.par.z_p + s.depth * s.zeta))
+        return s.par.rho * (s.par.nu + nu_t) * s.dz(s.u)
+
+
+class QRViscosity(Closure):
+    """Turbulent bulk stress for the q–r (positivity-by-construction) k–ε model.
+
+    Same eddy viscosity ``ν_t = C_μ k²/ε`` as :class:`KEpsilonViscosity`, but the
+    transported state is ``sk = √k`` and ``se = √ε`` (Fe et al. 2009, k=q², ε=r²),
+    so ``ν_t = C_μ sk⁴/se²`` — k=sk²≥0 and ε=se²≥0 hold by construction.  Reads
+    the transported ``sk``, ``se`` fields (only on a q–r k–ε model class); the
+    Galerkin projection is rational in ζ → build with ``quadrature_order > 0``."""
+    closes = "bulk"; requires = ("u", "sk", "se")
+
+    def __init__(self, name=None, wall_floor=True):
+        super().__init__(name=name)
+        self.wall_floor = bool(wall_floor)
+
+    def register(self, m):
+        m.parameter("C_mu", 0.09)
+        m.parameter("nu", 0.0)        # molecular part: ν_eff = ν + ν_t
+        m.parameter("eps_min", 0.0)   # realizability floor: ε → ε + eps_min
+        if self.wall_floor:
+            m.parameter("kappa", 0.41); m.parameter("z_p", 0.1)
+
+    def expression(self, s):
+        # ν_t = C_μ k²/ε = C_μ sk⁴/(se²+ε_min)  (sk=√k, se=√ε); the ε_min
+        # realizability floor keeps the denominator off zero (see QRKESME).
+        nu_t = s.par.C_mu * s.sk ** 4 / (s.se ** 2 + s.par.eps_min)
+        if self.wall_floor:
+            # WALL-FUNCTION-consistent near-wall eddy viscosity — the
+            # Prandtl–Kolmogorov form with the log-layer mixing length, OFFSET by
+            # z_p so it stays finite at the wall:  ℓ = κ(z + z_p) = κ(h ζ + z_p).
+            #   ν_t,wall = C_μ^{1/4}√k · κ(z+z_p)   (= κ u_⋆ (z+z_p), u_⋆=C_μ^{1/4}√k).
+            # SME is valid only ABOVE the wall layer, so the wall distance is
+            # offset by z_p (the reference height): ℓ→κz_p at the bed (the
+            # wall-function value) and GROWS with height like the physical κz —
+            # the opposite of the bed-heavy ν_t=C_μ sk⁴/se² (which is inverted
+            # because ε is under-resolved near the wall), so it straightens the
+            # velocity profile.  C_μ sk⁴/se² also VANISHES at the wall, so this
+            # term additionally restores the stress-trace damping of the velocity
+            # moments (q₁'s eddy damping ∝ the √k gradient, else too weak).
+            nu_t += (s.par.C_mu ** sp.Rational(1, 4) * s.sk * s.par.kappa
+                     * (s.par.z_p + s.depth * s.zeta))
         return s.par.rho * (s.par.nu + nu_t) * s.dz(s.u)
 
 
@@ -256,6 +317,50 @@ class RoughWall(Closure):
         speed = sp.sqrt(sum(ut ** 2 for ut in s.u_tangent))
         return {"normal": None,
                 "tangent": [s.par.rho * Cf * speed * ut for ut in s.u_tangent]}
+
+
+class WallFunctionBed(Closure):
+    """k–ε ROUGH-WALL-FUNCTION bed stress — the standard turbulent momentum sink.
+
+    Same log-law drag coefficient as :class:`RoughWall`,
+    ``C_f = (κ / ln(z_p/z_0))²``, ``z_0 = k_s/30``, giving the wall shear
+    ``τ_b,i = ρ C_f |U_p| U_{p,i}`` (= ρ u_*² in the flow direction, with
+    ``u_* = κ|U_p|/ln(z_p/z_0)``).  The crucial difference: the reference
+    velocity ``U_p`` is read at the first NEAR-WALL height ``ζ_p = z_p/h`` —
+    NOT at the bed trace ``ζ=0``.
+
+    Why this matters for a moment model: the bed trace ``u(0) = Σ û_i(−1)^i`` is
+    where the log-law velocity is formally singular, and in a truncated moment
+    expansion it COLLAPSES as the higher velocity moments grow (the bulk eddy
+    viscosity ν_t correctly vanishes at the wall and cannot damp those moments),
+    so ``RoughWall``'s ``u(0)``-based drag drops toward zero and the slope-driven
+    flow accelerates without bound.  Evaluating ``U_p`` at ``ζ_p`` instead drains
+    momentum at the physically-correct rate ρu_*² regardless of the profile — the
+    wall-function momentum sink, consistent with the k/ε wall-function BCs.
+
+    Needs ``k_s`` (Nikuradse roughness), ``z_p`` (reference height), ``kappa``."""
+    closes = "bottom"; requires = ("u",)
+
+    def register(self, m):
+        m.parameter("kappa", 0.41); m.parameter("k_s", 1e-3); m.parameter("z_p", 0.1)
+
+    def _Cf(self, s):
+        return (s.par.kappa / sp.log(s.par.z_p / (s.par.k_s / 30))) ** 2
+
+    def expression(self, s):
+        # scalar 1-D fallback: drag from the near-wall reference velocity U_p
+        Up = s.velocity_at(s.par.z_p / s.depth)[0]
+        return s.par.rho * self._Cf(s) * Up * sp.Abs(Up)
+
+    def traction(self, s):
+        """Wall-function bed drag as a VECTOR traction ``τ_b,i = ρ C_f |U_p| U_{p,i}``
+        with ``U_p`` the tangential velocity at the near-wall height ``ζ_p=z_p/h``
+        (couples x/y via ``|U_p|``).  Reduces to ``ρ C_f U_p|U_p|`` in 1-D."""
+        Cf = self._Cf(s)
+        ut = s.u_tangent_at(s.par.z_p / s.depth)
+        speed = sp.sqrt(sum(u ** 2 for u in ut))
+        return {"normal": None,
+                "tangent": [s.par.rho * Cf * speed * u for u in ut]}
 
 
 # ── depth-averaged SWE closures (bed friction + horizontal mixing) ──────────
@@ -452,6 +557,7 @@ def swe_closure_state(model):
 
 __all__ = ["Closure", "ClosureState", "apply_stress_closures",
            "apply_layer_stress_closures", "interface_closure",
-           "Newtonian", "KEpsilonViscosity", "NavierSlip", "RoughWall",
+           "Newtonian", "KEpsilonViscosity", "QRViscosity", "NavierSlip", "RoughWall",
+           "WallFunctionBed",
            "StressFree", "InterfaceFlux", "MeanInterface", "UpwindInterface",
            "ManningFriction", "EddyViscosity", "swe_closure_state"]

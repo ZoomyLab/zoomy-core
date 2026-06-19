@@ -7,13 +7,14 @@ colors, marker rotation, print/screen profiles, the below-figure
 ``zoomy_core.postprocessing.style``.
 """
 from zoomy_plotting.plot.style import (  # noqa: F401
-    CONFIG, PlotConfig, apply_style, use, line, figure_legend,
+    CONFIG, PlotConfig, apply_style, use, line, resolve_color, figure_legend,
     CYCLE, COLORS, MARKERS, MARKEVERY,
     CMAP_CONTINUOUS, CMAP_DIVERGING, CMAP_TOPO, PROFILES,
 )
 
 __all__ = [
-    "CONFIG", "PlotConfig", "apply_style", "use", "line", "figure_legend",
+    "CONFIG", "PlotConfig", "apply_style", "use", "line", "resolve_color",
+    "figure_legend",
     "CYCLE", "COLORS", "MARKERS", "MARKEVERY",
     "CMAP_CONTINUOUS", "CMAP_DIVERGING", "CMAP_TOPO", "PROFILES",
 ]

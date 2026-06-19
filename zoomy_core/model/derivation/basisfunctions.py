@@ -173,10 +173,30 @@ class Basisfunction:
                     and getattr(e.func, "_is_basis_head", False)
                     and len(e.args) == 1)
 
+        # Protect any opaque numerical bracket ``⟨…⟩^N`` (``_is_numquad``): its φ
+        # are resolved at the Gauss nodes by ResolveNumQuad, NOT concretised here
+        # (concretising them would defeat the whole point — the rational closure
+        # would re-acquire its concrete-basis symbolic form and explode).
+        _nqmap = {}
+
+        def _protect_nq(e):
+            if isinstance(e, sympy.Function) and getattr(e.func, "_is_numquad", False):
+                d = sympy.Dummy("_NQ")
+                _nqmap[d] = e
+                return d
+            if e.args:
+                na = tuple(_protect_nq(a) for a in e.args)
+                if any(n is not o for n, o in zip(na, e.args)):
+                    return e.func(*na)
+            return e
+        body = _protect_nq(body)
+
         body = body.replace(
             _is_phi, lambda e: (self.eval(int(e.args[0]), e.args[1])
                                 if e.args[0].is_Integer else e))
         body = body.replace(_is_c, lambda e: sympy.sympify(self.weight(e.args[0])))
+        if _nqmap:
+            body = body.xreplace(_nqmap)
         return body
 
     def evaluate_bracket(self, body, var, lower=0, upper=1):
@@ -251,7 +271,35 @@ class Basisfunction:
         # structure — resolution must only INSERT VALUES, never restructure.
         expr = expr.replace(lambda e: isinstance(e, sympy.Sum),
                             lambda e: e.doit())
-        expr = sympy.expand(expr)
+        # Expand ONLY outside Integral atoms.  The expand here exists solely to
+        # surface the ``Derivative(const, v)`` zombies dropped just below; it must
+        # NOT distribute the integrand of a deferred rational integral
+        # ``∫ C_μ sk⁴/se² · … dζ`` (a non-analytic closure term left for
+        # GaussQuadrature) — a plain expand fragments that into a >1M-term monster
+        # that then re-expands all down the pipeline (hours of build).  Protect
+        # every Integral as a Dummy, expand the rest, restore — so the rational
+        # integral stays a COMPACT atom and GaussQuadrature evaluates it at nodes.
+        _intmap = {}
+
+        def _protect_integrals(e):
+            if isinstance(e, sympy.Integral):
+                k = sympy.Dummy("_INT")
+                _intmap[k] = e
+                return k
+            # Opaque numerical bracket ⟨…⟩^N: protect like an Integral so expand
+            # never recurses into (and fragments) the rational closure body.
+            if isinstance(e, sympy.Function) and getattr(e.func, "_is_numquad", False):
+                k = sympy.Dummy("_NQ")
+                _intmap[k] = e
+                return k
+            if e.args:
+                na = tuple(_protect_integrals(a) for a in e.args)
+                if any(n is not o for n, o in zip(na, e.args)):
+                    return e.func(*na)
+            return e
+        expr = sympy.expand(_protect_integrals(expr))
+        if _intmap:
+            expr = expr.xreplace(_intmap)
         # A basis bracket / mode that resolves to a CONSTANT inside ``∂_v(…)`` —
         # a vanishing Gram/Weight (``0``) or the constant 0th mode ``φ_0 = 1`` —
         # leaves an unevaluated ``Derivative(const, v)``: ``replace`` rebuilds the

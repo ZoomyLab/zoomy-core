@@ -43,3 +43,33 @@ def test_vam_2d_flux_x_y_symmetry(vam2d):
         a = sp.sympify(vam2d.flux[idx(f"q_x_{i}"), 0]).xreplace(swap)
         b = sp.sympify(vam2d.flux[idx(f"q_y_{i}"), 1])
         assert sp.simplify(a - b) == 0, f"q_{i} x/y flux asymmetry"
+
+
+def test_vam_2d_pressure_couples_into_momentum(vam2d):
+    """The non-hydrostatic pressure MUST couple into BOTH horizontal momenta
+    (q_x_i, q_y_i) and the vertical (r_i) — exactly as in dim=2.  Regression
+    for the hard-coded single-horizontal P_head(j,t,x) in `system_model`, which
+    dropped every P mode from the dim=3 momentum rows (empty corrector →
+    chorin_split ZeroDivisionError)."""
+    st = [str(s) for s in vam2d.state]
+    e2s = list(vam2d.equation_to_state_index)
+    Ps = {s for s in vam2d.state if str(s).startswith("P_")}
+    Pn = {str(p) for p in Ps}
+    res = vam2d.reconstruct_residuals()
+    carry = {
+        st[e2s[i]] for i in range(vam2d.n_equations)
+        if (sp.sympify(res[i]).free_symbols & Ps)
+        or any(getattr(a, "func", a).__name__ in Pn
+               for a in sp.sympify(res[i]).atoms(sp.Function))
+    }
+    assert carry == {"q_x_0", "q_x_1", "q_y_0", "q_y_1", "r_0", "r_1"}
+
+
+def test_vam_2d_chorin_split(vam2d):
+    """The dim=3 Chorin split builds a non-empty corrector / pressure block."""
+    from zoomy_core.model.models import VAM
+    from zoomy_core.model.models.closures import NavierSlip, StressFree
+    v = VAM(level=1, dimension=3, closures=[NavierSlip(), StressFree()])
+    out = v.chorin_split(sp.Symbol("dt", positive=True))
+    assert out.SM_corr.n_equations == 6      # 2 q_x + 2 q_y + 2 r rows
+    assert out.SM_press.n_equations == 2     # 2 pressure constraints

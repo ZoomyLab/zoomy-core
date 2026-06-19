@@ -15,13 +15,13 @@ Users get the eager-looking surface (``from zoomy_core.model.models
 import SME``) without the cycle.
 """
 
-__all__ = ["SWE", "MalpassetSWE", "SME", "ElderSME", "KESME",
+__all__ = ["SWE", "MalpassetSWE", "SME", "ElderSME", "KESME", "QRKESME",
            "VAM", "MLSWE", "MLSME", "MLVAM", "ClosureState",
            # composable stress / interface closures (closures.py) — the ONLY
            # stress-closure path (the legacy MaterialModel was removed)
            "Closure", "Newtonian", "NavierSlip", "StressFree", "RoughWall",
-           "Bingham", "KEpsilonViscosity", "ElderViscosity",
-           "InterfaceFlux", "MeanInterface", "UpwindInterface"]
+           "WallFunctionBed", "Bingham", "KEpsilonViscosity", "QRViscosity",
+           "ElderViscosity", "InterfaceFlux", "MeanInterface", "UpwindInterface"]
 
 
 def __getattr__(name):
@@ -40,6 +40,9 @@ def __getattr__(name):
     if name == "KESME":
         from zoomy_core.model.models.ke_sme import KESME
         return KESME
+    if name == "QRKESME":
+        from zoomy_core.model.models.qr_kesme import QRKESME
+        return QRKESME
     if name == "VAM":
         from zoomy_core.model.models.vam import VAM
         return VAM
@@ -56,7 +59,8 @@ def __getattr__(name):
         from zoomy_core.model.models.material import ClosureState
         return ClosureState
     if name in ("Closure", "Newtonian", "NavierSlip", "StressFree", "RoughWall",
-                "Bingham", "KEpsilonViscosity", "ElderViscosity",
+                "Bingham", "KEpsilonViscosity", "QRViscosity", "ElderViscosity",
+                "WallFunctionBed",
                 "InterfaceFlux", "MeanInterface", "UpwindInterface"):
         from zoomy_core.model.models import closures as _cl
         return getattr(_cl, name)

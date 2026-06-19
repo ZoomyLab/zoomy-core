@@ -1121,8 +1121,12 @@ class DiffusionOperatorV2:
         normals = mesh.face_normals[:dim, :]
         face_vol = mesh.face_volumes
         cell_vol = mesh.cell_volumes
+        self.nu = nu
 
         L = lil_matrix((nc, nc), dtype=float)
+        # GEOMETRY (nu-free) per face for the STATE-DEPENDENT diffusivity path:
+        # interior face → (a, b, g_a, g_b) with g_x = fv/dist/|n_dot_e|/cv_x.
+        ia, ib, gA, gB = [], [], [], []
 
         # Interior faces only
         for f in range(mesh.n_faces):
@@ -1136,19 +1140,25 @@ class DiffusionOperatorV2:
             n = normals[:, f]
             n_dot_e = np.dot(n, dx / dist)
             n_dot_e = max(abs(n_dot_e), 0.1) * np.sign(n_dot_e + 1e-30)
-            coeff = nu * face_vol[f] / dist / abs(n_dot_e)
+            g = face_vol[f] / dist / abs(n_dot_e)
+            coeff = nu * g
             L[a, b] += coeff / cell_vol[a]
             L[a, a] -= coeff / cell_vol[a]
             L[b, a] += coeff / cell_vol[b]
             L[b, b] -= coeff / cell_vol[b]
+            ia.append(a); ib.append(b)
+            gA.append(g / cell_vol[a]); gB.append(g / cell_vol[b])
 
         self.L = csr_matrix(L)
         self.nc = nc
         self._tol = 1e-8
+        self._ia = np.asarray(ia, dtype=int); self._ib = np.asarray(ib, dtype=int)
+        self._gA = np.asarray(gA, dtype=float); self._gB = np.asarray(gB, dtype=float)
 
-        # Boundary face data: (inner_cell, coefficient, dist)
-        # coefficient = nu * face_vol / dist / |n_dot_e| / cell_vol
+        # Boundary face data: (inner_cell, coefficient, dist) + nu-free geometry
+        # coefficient = nu * face_vol / |n_dot_e| / cell_vol
         self._bf_data = []
+        bf_inner, bf_g = [], []
         for i_bf in range(mesh.n_boundary_faces):
             fidx = mesh.boundary_face_face_indices[i_bf]
             inner = mesh.boundary_face_cells[i_bf]
@@ -1157,32 +1167,56 @@ class DiffusionOperatorV2:
             dist = np.linalg.norm(dx)
             if dist < 1e-30:
                 self._bf_data.append((inner, 0.0, dist))
+                bf_inner.append(inner); bf_g.append(0.0)
                 continue
             n = normals[:, fidx]
             n_dot_e = np.dot(n, dx / dist)
             n_dot_e = max(abs(n_dot_e), 0.1) * np.sign(n_dot_e + 1e-30)
-            coeff = nu * face_vol[fidx] / abs(n_dot_e) / cell_vol[inner]
-            self._bf_data.append((inner, coeff, dist))
+            g = face_vol[fidx] / abs(n_dot_e) / cell_vol[inner]
+            self._bf_data.append((inner, nu * g, dist))
+            bf_inner.append(inner); bf_g.append(g)
+        self._bf_inner = np.asarray(bf_inner, dtype=int)
+        self._bf_g = np.asarray(bf_g, dtype=float)
 
     def explicit(self, u):
         """Interior-only diffusion: L @ u. Returns shape (nc,)."""
         return self.L @ u[:self.nc]
 
-    def explicit_with_bc(self, u, bf_face_normal_grads):
+    def explicit_with_bc(self, u, bf_face_normal_grads, nu_cell=None):
         """Diffusion with boundary face contributions.
 
         Parameters
         ----------
-        u : ndarray, shape (nc,)
-            Scalar field on inner cells.
+        u : ndarray
+            Scalar field (only the first ``nc`` inner-cell entries are used).
         bf_face_normal_grads : ndarray, shape (n_boundary_faces,)
-            Face-normal gradient dQ/dn at each boundary face,
-            from ``BC.face_gradient()``.
+            Face-normal gradient dQ/dn at each boundary face, from
+            ``BC.face_gradient()``.
+        nu_cell : ndarray, optional
+            PER-CELL diffusivity (state-dependent, e.g. ``ν/h²`` = ``−A[v,v,d,d]``).
+            When given, each face uses the average of its two cells' diffusivity
+            and the boundary face uses the inner cell's — i.e. the actual rank-4
+            ``diffusion_matrix`` coefficient, not a constant ``nu``.  ``None``
+            falls back to the constant-``nu`` operator built in ``__init__``.
 
         Returns
         -------
         ndarray, shape (nc,)
         """
+        if nu_cell is not None:
+            u = np.asarray(u, dtype=float)[:self.nc]
+            nu_cell = np.asarray(nu_cell, dtype=float)
+            Lu = np.zeros(self.nc)
+            if self._ia.size:
+                fnu = 0.5 * (nu_cell[self._ia] + nu_cell[self._ib])
+                du = u[self._ib] - u[self._ia]
+                np.add.at(Lu, self._ia, fnu * self._gA * du)
+                np.add.at(Lu, self._ib, -fnu * self._gB * du)
+            if self._bf_inner.size:
+                np.add.at(Lu, self._bf_inner,
+                          nu_cell[self._bf_inner] * self._bf_g
+                          * np.asarray(bf_face_normal_grads, dtype=float))
+            return Lu
         Lu = self.L @ u[:self.nc]
         for i_bf, (inner, coeff, dist) in enumerate(self._bf_data):
             # Diffusive flux contribution: coeff * (du/dn) * dist

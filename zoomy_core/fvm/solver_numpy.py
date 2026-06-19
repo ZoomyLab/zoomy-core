@@ -572,30 +572,63 @@ class HyperbolicSolver(Solver):
     # -- Flux operator (symbolic Riemann solver) -----------------------
 
     def _build_numerics(self, symbolic_model):
-        """Build the symbolic Riemann solver. Override for SWE-specific variants."""
+        """Build the symbolic Riemann solver. Override for SWE-specific variants.
+
+        Well-balancing (``equilibrium_reconstruction`` in {'audusse','bernoulli'})
+        is applied as an interface reconstruction + well-balancing source in the
+        flux operator (the unified ``reconstruct_equilibrium`` hook), on top of
+        the standard non-conservative Rusanov numerics — so both modes go through
+        the SAME path (Audusse is the lake-at-rest check on Bernoulli's wiring).
+        The source differs per mode (built in ``bernoulli_wb``): Audusse uses the
+        PRESSURE jump only (momentum-only S̃ — zero mass row, no convective/aux
+        dependence, dimension-agnostic), Bernoulli the full conservative-flux
+        jump (its discharge-preserving reconstruction zeroes the mass row)."""
         return NonconservativeRusanov(symbolic_model)
 
     def _build_diffusion_operators(self, mesh, symbolic_model, dim, n_vars):
-        """Build DiffusionOperatorV2 per variable when the SystemModel
-        carries a non-zero ``diffusion_matrix`` and positive viscosity.
+        """Build the diffusion operators from the SystemModel's rank-4
+        ``diffusion_matrix`` ``A(Q, Qaux, p)`` (shape ``(n_eq, n_state,
+        n_dim, n_dim)``) — the constitutive tensor in ``div(A : grad Q)``.
 
-        ``diffusion_matrix`` is a stored SystemModel field — a rank-4
-        tensor ``A(Q, Qaux, p)`` of shape ``(n_eq, n_state, n_dim, n_dim)``
-        carried over from the Model by ``from_model``.  The numpy
-        diffusion backend is the (legacy) scalar-viscosity path; it
-        triggers when ``A`` has any symbolic non-zero entry and the
-        model exposes a positive ``nu`` parameter."""
+        For each DIAGONAL entry ``A[v, v, d, d]`` the per-cell diffusivity is the
+        STATE-DEPENDENT field ``−A[v, v, d, d]`` (e.g. stay-3D's ``ν/h²``),
+        lambdified here and evaluated each step (``self._diffusivity_fns``) — NOT
+        a constant ``ν``.  Only those variables diffuse (``b``/``h`` no longer get
+        a spurious Laplacian).  Cross-variable / cross-derivative entries raise
+        (not wired in the numpy backend).  Returns ``None`` when ``A`` is empty
+        or ``ν ≤ 0`` (so SME's source-viscosity and VAM's inviscid runs are
+        untouched)."""
         sym_A = getattr(symbolic_model, 'diffusion_matrix', None)
         if sym_A is None:
             return None
-        # Rank-4 NDimArray: scan every entry for a non-zero atom.
         if all(sp.simplify(e) == 0 for e in sp.flatten(sym_A)):
             return None
-        from zoomy_core.fvm.reconstruction import DiffusionOperatorV2
         nu_val = _param_value(symbolic_model, "nu", default=0.0)
         if nu_val <= 0:
             return None
-        return {v: DiffusionOperatorV2(mesh, dim, nu=nu_val) for v in range(n_vars)}
+        from zoomy_core.fvm.reconstruction import DiffusionOperatorV2
+        import itertools
+        n_eq, n_st, n_d = sym_A.shape[0], sym_A.shape[1], sym_A.shape[2]
+        diffusivity = {}                       # variable row → diffusivity expr (= −A[v,v,d,d])
+        for i, j, d, e in itertools.product(range(n_eq), range(n_st),
+                                            range(n_d), range(n_d)):
+            a = sp.sympify(sym_A[i, j, d, e])
+            if a == 0:
+                continue
+            if i == j and d == e:
+                diffusivity[i] = sp.sympify(diffusivity.get(i, 0)) - a
+            else:
+                raise NotImplementedError(
+                    f"diffusion_matrix A[{i},{j},{d},{e}]={a}: cross-variable / "
+                    "cross-derivative state-dependent diffusion is not wired in "
+                    "the numpy backend (only diagonal A[v,v,d,d]).")
+        state = list(symbolic_model.variables.get_list())
+        aux = list(symbolic_model.aux_variables.get_list())
+        par = list(symbolic_model.parameters.get_list())
+        self._diffusivity_fns = {
+            v: sp.lambdify(state + aux + par, expr, "numpy")
+            for v, expr in diffusivity.items()}
+        return {v: DiffusionOperatorV2(mesh, dim, nu=nu_val) for v in diffusivity}
 
     def _build_reconstruction(self, mesh, symbolic_model):
         """Build ghost-cell-free face reconstruction."""
@@ -648,6 +681,27 @@ class HyperbolicSolver(Solver):
             ncm = NumpyRuntimeModel.from_system_model(
                 symbolic_model).nonconservative_matrix
 
+        # Bernoulli moving-equilibrium WB: reconstruct interface states to the
+        # common bed b* preserving (q, H(s)); the flux + moment NCP act on the
+        # reconstructed states and the conservative-flux-jump source (below)
+        # well-balances the moving steady state.  Built once.
+        _bern = None
+        _eqr = getattr(self.sm, "equilibrium_reconstruction", "none")
+        # Unified WB wiring: audusse AND bernoulli go through the SAME hook
+        # (interface reconstruction + well-balancing source on the standard
+        # NonconservativeRusanov numerics).  'audusse' is dimension-agnostic
+        # (face-based HR + the momentum-only PRESSURE-jump source).  The MOVING
+        # bernoulli reconstruction is 1-D for now (its per-streamline Bernoulli
+        # head is not yet a 2-D velocity vector).
+        if _eqr in ("audusse", "bernoulli", "projected_bernoulli"):
+            if dim != 1 and _eqr != "audusse":
+                raise NotImplementedError(
+                    "bernoulli moving-equilibrium WB is 1-D only (v1); "
+                    "use equilibrium_reconstruction='audusse' for 2-D lake-at-rest.")
+            from zoomy_core.fvm.bernoulli_wb import (
+                build_bernoulli_config, reconstruct as _bern_recon)
+            _bern = build_bernoulli_config(symbolic_model, mode=_eqr)
+
         # Build diffusion operators (ghost-cell-free)
         self._diffusion_ops = self._build_diffusion_operators(mesh, symbolic_model, dim, n_vars)
 
@@ -677,6 +731,23 @@ class HyperbolicSolver(Solver):
         bf_fidx = mesh.boundary_face_face_indices
         bc_indices = np.asarray(
             mesh.boundary_face_function_numbers[:n_bf], dtype=int)
+        # Align the mesh's per-face function-number order with the (tag-sorted)
+        # BoundaryConditions Piecewise branch order — they can differ (the mesh
+        # numbers tags by position, e.g. create_2d left=0,right=1,bottom=2,top=3;
+        # BoundaryConditions sorts tags alphabetically), which would route e.g.
+        # "bottom" faces to the "right" BC.  Remap by TAG NAME.  No-op when the
+        # two orders already agree (single-tag / same-order meshes).
+        mesh_names = list(getattr(mesh, "boundary_conditions_sorted_names", []) or [])
+        bc_src = (getattr(symbolic_model, "_bc_source", None)
+                  or getattr(model, "_bc_source", None))
+        bc_tags = list(bc_src.list_sorted_function_names) if bc_src is not None else []
+        if mesh_names and bc_tags and list(mesh_names) != list(bc_tags):
+            name_to_branch = {}
+            for _i, _t in enumerate(bc_tags):
+                name_to_branch.setdefault(_t, _i)
+            remap = np.array([name_to_branch.get(mesh_names[fn], fn)
+                              for fn in range(len(mesh_names))], dtype=int)
+            bc_indices = remap[bc_indices]
         bc_fn = model.boundary_conditions
         face_centers = mesh.face_centers
 
@@ -740,6 +811,23 @@ class HyperbolicSolver(Solver):
                     Q_L[:, fidx], qaux_inner, parameters, normal,
                 )
 
+            # 3c. Bernoulli moving-equilibrium WB reconstruction (all faces):
+            # replace interface states by their reconstruction onto the common
+            # bed b* preserving (q, H(s)); stash the conservative-flux-jump
+            # source Fc(Q)−Fc(Q*) to add during the face scatter below.
+            _bern_src = None
+            if _bern is not None:
+                _bi = _bern["b"]
+                _bstar = np.maximum(Q_L[_bi, :], Q_R[_bi, :])
+                _QL0, _QR0 = Q_L.copy(), Q_R.copy()
+                Q_L = _bern_recon(Q_L, _bstar, _bern)
+                Q_R = _bern_recon(Q_R, _bstar, _bern)
+                _fc = _bern["fc"]
+                # conservative-flux-jump source Fc·n (projected on the per-face
+                # normal -> dimension-agnostic; 1-D recovers the direction-0 flux)
+                _bern_src = (_fc(_QL0, normals_arr) - _fc(Q_L, normals_arr),
+                             _fc(_QR0, normals_arr) - _fc(Q_R, normals_arr))
+
             # 3b. Cell-interior non-conservative integral (path-conservative,
             # order ≥ 2): ∫_cell B(Q)·∂_x Q dx ≈ B(Q_c)·s_c, with B evaluated
             # at the cell-centre state and s_c the limited reconstruction slope
@@ -788,6 +876,10 @@ class HyperbolicSolver(Solver):
                           (-(num_flux + Dm) * fv_int / cvA_int).T)
                 np.add.at(dQ.T, iB_int,
                           (-(-num_flux + Dp) * fv_int / cvB_int).T)
+                if _bern_src is not None:
+                    sL, sR = _bern_src
+                    np.add.at(dQ.T, iA_int, (-sL[:, interior_faces] * fv_int / cvA_int).T)
+                    np.add.at(dQ.T, iB_int, (sR[:, interior_faces] * fv_int / cvB_int).T)
 
             # 4b. Boundary faces — one inner cell only
             if use_batched and len(boundary_faces):
@@ -804,6 +896,10 @@ class HyperbolicSolver(Solver):
                 Dm = fluct[n_vars:]
                 np.add.at(dQ.T, iInner_bnd,
                           (-(num_flux + Dm) * fv_bnd / cvInner_bnd).T)
+                if _bern_src is not None:
+                    sL, _sR = _bern_src
+                    np.add.at(dQ.T, iInner_bnd,
+                              (-sL[:, boundary_faces] * fv_bnd / cvInner_bnd).T)
 
             # 4-loop. Per-face fallback for numerics without batch support.
             if not use_batched:
@@ -854,8 +950,15 @@ class HyperbolicSolver(Solver):
                     d_face, normals_arr, face_centers, n_bf, n_vars, has_aux,
                     time, parameters,
                 )
+                fns = getattr(self, "_diffusivity_fns", {})
                 for v, diff_op in self._diffusion_ops.items():
-                    dQ[v, :] += diff_op.explicit_with_bc(Q[v, :], bf_grads[v])
+                    nu_cell = None
+                    if v in fns:                 # state-dependent diffusivity −A[v,v,d,d]
+                        val = fns[v](*Q, *Qaux, *parameters)
+                        nu_cell = np.broadcast_to(
+                            np.asarray(val, dtype=float), (Q.shape[1],)).astype(float)
+                    dQ[v, :] += diff_op.explicit_with_bc(
+                        Q[v, :], bf_grads[v], nu_cell=nu_cell)
 
             return dQ
         return flux_operator

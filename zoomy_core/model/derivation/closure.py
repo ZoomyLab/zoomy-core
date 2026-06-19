@@ -139,16 +139,17 @@ class InvertMassMatrix(Operation):
 
     def _leaf_sp(self, sp_expr):
         t = self._t
-        expr = sp.expand(sp_expr)
-        # The mass coefficient of a ∂_t atom may be SPLIT across several
-        # expanded terms (fraction-substituted multilayer rows expand
-        # ``(1−l)²h/(h(1−l))·∂_t r`` into three pieces) and may sit INSIDE
-        # the conservative time term (``∂_t(q_k/(2k+1))``).  Collect the
-        # TOTAL coefficient per ∂_t atom, then pick the (unique) one that is
-        # t-free and non-trivial — stray surface/interface traces keep a
-        # t-bearing coefficient and are ignored.
+        # Do NOT ``sp.expand`` the whole row: post-basis it holds the rational
+        # turbulence source (ν_t=C_μ sk⁴/se²) and expanding distributes N·D⁻¹ into
+        # a >1M-char monster.  Work on the top-level terms as-is and divide
+        # TERM-WISE; only the (small) ∂_t mass coefficient is simplify/cancel-ed.
+        terms = list(sp.Add.make_args(sp.sympify(sp_expr)))
+        # The mass coefficient of a ∂_t atom may be SPLIT across several terms
+        # and may sit INSIDE the conservative time term (``∂_t(q_k/(2k+1))``).
+        # Collect the TOTAL coefficient per ∂_t atom, then pick the (unique) one
+        # that is t-free and non-trivial.
         coeffs: dict = {}
-        for term in sp.Add.make_args(expr):
+        for term in terms:
             dts = [D for D in term.atoms(sp.Derivative)
                    if D.variables == (t,)]
             if len(dts) == 1:
@@ -159,13 +160,15 @@ class InvertMassMatrix(Operation):
                     + sp.simplify(term / D) * inner_c
         mass = None
         for _D, cand in coeffs.items():
-            cand = sp.cancel(sp.simplify(cand))
+            cand = sp.cancel(sp.simplify(cand))     # small coeff only — cheap
             if cand not in (sp.S.Zero, sp.S.One) and not cand.has(t):
                 mass = cand
                 break
         if mass in (None, sp.S.Zero, sp.S.One):
             return sp_expr
-        out = sp.expand(expr / mass)
+        # divide each term by the mass coefficient (compact per term; no global
+        # expand of the huge rational source)
+        out = sp.Add(*[term / mass for term in terms])
 
         # normalize the form: pull field-free factors out of Derivatives
         # (linearity) so ``∂_t(q/(2k+1))/(1/(2k+1))`` reads ``∂_t q``.
@@ -175,8 +178,8 @@ class InvertMassMatrix(Operation):
             return (co * sp.Derivative(rest, *a.args[1:])
                     if co != 1 and rest != 1 else a)
 
-        return sp.expand(out.replace(
-            lambda a: isinstance(a, sp.Derivative), _pull))
+        return out.replace(
+            lambda a: isinstance(a, sp.Derivative), _pull)
 
 
 # ── conservative fold (flux/pressure bundling, NCP-preserving) ─────────────
@@ -1048,6 +1051,12 @@ def consolidate(expr, fold_self=False, fold_sums=False):
     expr = merge_integrals_over_add(expr)
 
     def _rec(e):
+        # Treat the NUMERICAL ⟨…⟩^N quadrature bracket as a true ATOM: do NOT
+        # recurse into its (huge rational) body — that O(n) recursion is exactly
+        # what extracting the bracket avoids.  (Galerkin Gram/Weight brackets are
+        # left to recurse as before — their args are just integer indices.)
+        if isinstance(e, sp.Function) and getattr(e.func, "_is_numquad", False):
+            return e
         if isinstance(e, sp.Integral):
             return e.func(leibniz_fold(_rec(e.function)), *e.args[1:])
         if isinstance(e, sp.Sum):
@@ -1141,14 +1150,136 @@ class GaussQuadrature(Operation):
             mid = (b_f + a_f) / 2.0
             # evaluate the ζ-derivatives EXPLICITLY first — substituting a
             # numeric node into an unevaluated Derivative leaves Subs junk
-            # that no code printer accepts
-            fn = sp.expand(sp.sympify(I.function).doit())
+            # that no code printer accepts.  Do NOT sp.expand: for a rational
+            # closure integrand (ν_t=C_μ sk⁴/se²) expand distributes N·D⁻¹ into a
+            # >1M-char monster; node substitution works fine on the compact
+            # ``.doit()`` form and yields a compact per-node summand.
+            fn = sp.sympify(I.function).doit()
             acc = sp.S.Zero
             for xg, wg in zip(x_ref, w_ref):
                 acc += sp.Float(wg * half) * fn.subs(
                     vv, sp.Float(mid + half * xg))
             repl[I] = acc
         return sp_expr.xreplace(repl) if repl else sp_expr
+
+
+# ── opaque NUMERICAL-quadrature bracket  ⟨…⟩^N  ────────────────────────────
+# Same idea as the Galerkin brackets (an opaque ``_is_bracket`` Function that
+# every expand/fold/Consolidate treats as an ATOM), but for the NON-analytic
+# closure integrals (the rational ν_t=C_μ sk⁴/se² terms).  ``DeferQuadrature``
+# hides each surviving moment-bearing ``∫…dζ`` as ``⟨integrand⟩^N`` BEFORE the
+# basis is substituted — while the body is still an OPAQUE-φ sum, so it stays
+# COMPACT; it then rides the WHOLE post-projection pipeline (ResolveBasis /
+# Consolidate / CoV / InvertMassMatrix) as a compact atom — nothing ever expands
+# the rational body — and ``ResolveNumQuad(basis=…)`` resolves the basis at the
+# Gauss nodes and rewrites it as the node sum at the very end (the system is
+# settled).  This is what keeps high-N_k builds from blowing up: the rational
+# never exists in concrete-basis symbolic form, only as numbers at the nodes.
+
+
+def _numquad_latex(expr, printer=None, exp=None):
+    render = printer._print if printer is not None else sp.latex
+    inner = render(expr.args[0])
+    s = rf"\left\langle {inner} \right\rangle^{{N}}"
+    return s if exp is None else f"\\left({s}\\right)^{{{exp}}}"
+
+
+# ``NumQuad(integrand)`` — opaque numerical bracket over ζ∈[0,1].  ``_is_bracket``
+# makes the fold/Consolidate machinery treat it as an atom; ``_is_numquad`` lets
+# ResolveNumQuad target ONLY these (not the Galerkin Gram/Weight brackets).
+NumQuad = type("NumQuad", (sp.Function,),
+               {"_latex": _numquad_latex, "_is_bracket": True, "_is_numquad": True})
+
+
+class DeferQuadrature(Operation):
+    """Hide every surviving definite ``∫ f(ζ) dζ`` (ζ∈[0,1]) as an opaque
+    ``NumQuad(f)`` (⟨f⟩^N) so the non-analytic rational closure integrals ride
+    the rest of the derivation as ATOMS — Consolidate / CoV / InvertMassMatrix
+    never see (let alone expand) the rational body.  Apply BEFORE
+    :class:`ResolveBasis`, while the body is still an OPAQUE-φ sum: the basis is
+    substituted ONLY at the Gauss nodes (:class:`ResolveNumQuad` with ``basis=``),
+    so the rational ``ν_t = C_μ sk⁴/se²`` never exists in concrete-basis symbolic
+    form — that is what keeps high-``N_k`` builds from exploding.  Only the
+    NON-bracket (moment-bearing) integrals are wrapped; the pure-ζ polynomial
+    Galerkin ``⟨…⟩`` brackets are left for :class:`ResolveBasis` to close
+    analytically (exact, cheap)."""
+
+    whole_leaf_op = True
+    log_level = 1
+
+    def __init__(self, var=None, name="defer_quadrature"):
+        self._var = var if var is not None else sp.Symbol("zeta", real=True)
+        super().__init__(name=name,
+                         description="∫dζ → opaque ⟨…⟩^N numerical bracket")
+
+    def _leaf_sp(self, sp_expr):
+        from zoomy_core.model.operations import is_bracket
+        e = sp.sympify(sp_expr)
+        repl = {}
+        for I in e.atoms(sp.Integral):
+            # match ANY definite 1-D ∫_0^1 (like GaussQuadrature, by the
+            # integral's OWN variable — the projection renames ζ to a Dummy ζ̂,
+            # so a hard ``== zeta`` filter would miss every real integral) and
+            # store that variable as the bracket's 2nd arg for resolution.
+            # SKIP pure-ζ polynomial brackets (``is_bracket``) — those resolve
+            # exactly via ResolveBasis; only the moment-bearing rational closure
+            # integral needs the numerical ⟨…⟩^N treatment.
+            if len(I.limits) == 1 and len(I.limits[0]) == 3 and not is_bracket(I):
+                vv, a, b = I.limits[0]
+                try:
+                    if float(a) == 0.0 and float(b) == 1.0:
+                        repl[I] = NumQuad(I.function, vv)
+                except TypeError:
+                    pass
+        return e.xreplace(repl) if repl else sp_expr
+
+
+class ResolveNumQuad(Operation):
+    """Resolve every opaque ``NumQuad(f)`` (⟨f⟩^N) to its ``order``-point
+    Gauss–Legendre sum over ζ∈[0,1]: ``Σ_g w_g f(ζ_g)``.  Run as the VERY LAST
+    derivation step (the system is settled) — the rational body is expanded ONCE,
+    numerically.  ``basis`` (optional) resolves any opaque ``φ(k,ζ)`` left in the
+    body at the nodes; if the body is already in the concrete basis (DeferQuadrature
+    applied after ResolveBasis) it is unused."""
+
+    whole_leaf_op = True
+    log_level = 1
+
+    def __init__(self, var=None, order=8, basis=None, name=None):
+        self._var = var if var is not None else sp.Symbol("zeta", real=True)
+        self._order = int(order)
+        self._basis = basis
+        super().__init__(name=name or f"resolve_numquad[{self._order}]",
+                         description=f"⟨…⟩^N → {self._order}-pt Gauss–Legendre sum")
+
+    def _leaf_sp(self, sp_expr):
+        import numpy as _np
+        e = sp.sympify(sp_expr)
+        nqs = [a for a in e.atoms(sp.Function)
+               if getattr(a.func, "_is_numquad", False)]
+        if not nqs:
+            return sp_expr
+        x_ref, w_ref = _np.polynomial.legendre.leggauss(self._order)
+        repl = {}
+        for nq in nqs:
+            vv = nq.args[1]                         # the bracket's own ζ̂ variable
+            # If the body still carries OPAQUE φ (DeferQuadrature applied BEFORE
+            # ResolveBasis — the design that keeps the rational compact), resolve
+            # the basis to concrete polynomials FIRST, then ``.doit()`` to collapse
+            # the now-concrete φ-derivatives (``∂ζ̂ P_i``) and any nested running
+            # integral ``∫_0^ζ̂`` — only THEN sum the node values.  Doing ``.doit()``
+            # AFTER concretisation is essential: a ``Derivative`` of an opaque φ
+            # cannot collapse, and a stray ``Derivative(·, ζ̂)`` survives into the
+            # node sub (``ζ̂ → number``) and breaks lambdify.
+            fn = sp.sympify(nq.args[0])
+            if self._basis is not None:
+                fn = self._basis.resolve(fn, vv)
+            fn = fn.doit()
+            acc = sp.S.Zero
+            for xg, wg in zip(x_ref, w_ref):
+                acc += sp.Float(0.5 * wg) * fn.subs(vv, sp.Float(0.5 * xg + 0.5))
+            repl[nq] = acc
+        return e.xreplace(repl) if repl else sp_expr
 
 
 class Simplify(Operation):

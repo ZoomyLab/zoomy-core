@@ -84,6 +84,9 @@ class VAM(BaseModel):
         g, rho = m.parameters.g, m.parameters.rho
         h = sp.Function("h", positive=True)(t, *horiz)
         b = sp.Function("b", real=True)(t, *horiz)
+        # Free-surface hydrostatic pressure flux; tagged explicitly in
+        # ``system_model`` (the extractor no longer auto-detects pressure).
+        self._pressure_flux = g * h ** 2 / 2
 
         # 1 — full system (hydrostatic pressure pre-absorbed) from blueprints
         m.declare_state(h)
@@ -312,11 +315,22 @@ class VAM(BaseModel):
         the divergence constraints (zero mass-matrix rows)."""
         m = self.derivation
         Nu = int(self.level)
-        P_modes = [self._P_head(j, t, x) for j in range(Nu + 1)]
+        # Pressure modes carry the SAME horizontal dependence as the rest of the
+        # state (see derive_model's ``horiz``): dim=2 → P(j,t,x); dim=3 →
+        # P(j,t,x,y).  A hard-coded ``x`` here mismatches the dim=3 derivation's
+        # P(j,t,x,y) atoms, so from_model fails to recognise them as state and
+        # the pressure silently drops out of every momentum/vertical row.
+        horiz = (x,) if int(self.dimension) == 2 else (x, y)
+        P_modes = [self._P_head(j, t, *horiz) for j in range(Nu + 1)]
         qs = list(m.explicit_state())
         if self._bed not in qs:
             qs = [self._bed, *qs]
+        # Manual hydrostatic-pressure tag (one-liner): mark g·h²/2 → pressure.
+        from zoomy_core.model.derivation.system_extract import HydrostaticPressure
+        pf = self._pressure_flux
+        m.apply({pf: HydrostaticPressure(pf)})
         sm = SystemModel.from_model(m, Q=[*qs, *P_modes])
+        m.apply({HydrostaticPressure(pf): pf})   # un-tag: leave derivation clean
         from zoomy_core.model.boundary_conditions import resolve_and_attach
         resolve_and_attach(sm, self.boundary_conditions,
                            aux_bcs=self.aux_boundary_conditions)

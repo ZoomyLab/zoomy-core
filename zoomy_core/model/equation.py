@@ -222,7 +222,15 @@ class Equation(RelationMixin):
     # ── term ↔ expression bridges ─────────────────────────────────
     @staticmethod
     def to_terms(expression):
-        return list(sp.Add.make_args(sp.expand(expression)))
+        # ``mul`` distributes products into additive terms (what we need to split
+        # a leaf into Terms); ``multinomial=False`` leaves ``Pow(sum, n)``
+        # UNEXPANDED — critical for rational turbulence sources, where a deep
+        # expand would multinomial-blow ``sk⁴``/``(se²+ε_min)`` (work
+        # GaussQuadrature does numerically later), turning the build from seconds
+        # into ~hours.  Polynomial sources have no ``Pow(Add, n)`` at leaf level,
+        # so the term split is unchanged for them.
+        return list(sp.Add.make_args(
+            sp.expand(expression, multinomial=False)))
 
     @staticmethod
     def to_expression(terms):
