@@ -1,0 +1,224 @@
+"""Content-addressed cache keys for the symbolic derivation pipeline.
+
+The derivation cache (task 0018) skips the heavy ``ResolveModes`` /
+``ResolveBasis`` / ``simplify`` passes by keying intermediate results on the
+symbolic CONTENT that produced them.  This module is the single source of those
+keys — kept here (not as a mixin scattered across ~25 operation classes) so the
+keying logic is testable in one place and carries no merge surface into the op
+definitions.
+
+Design — **safe by default**.  ``cache_key`` hashes the *full* symbolic state of
+an object (every ``__dict__`` entry, recursively), denylisting only fields that
+are provably cosmetic (``name`` / ``description`` / ``log_level``) or volatile
+(``_model`` back-reference).  Capturing too much only costs a spurious cache MISS
+(slower, still correct); capturing too little would return a STALE result.  We
+always choose the former.  Round-trips rely on ``sympy.srepr`` being a
+deterministic, structural string for any expression.
+
+Lambdas (e.g. ``ChangeOfVariables(transform=lambda qi: qi/h)``) are hashed by
+their *symbolic effect*, not their object id: the transform is applied to a probe
+symbol and the result srepr'd, so ``lambda qi: qi/h`` keys as ``"__probe__/h"``
+(and any closed-over ``h(t, x)`` shows up in that result automatically).
+"""
+from __future__ import annotations
+
+import hashlib
+
+import sympy as sp
+
+from zoomy_core.model.derivation.basisfunctions import Basisfunction
+from zoomy_core.model.derivation.basis_cache import _basis_fingerprint
+
+# Bump when the derivation pipeline changes in a way that invalidates every
+# cached entry (new op semantics, changed extraction, etc.).
+CACHE_VERSION = "v1"
+
+# Fields that never affect the math: display names, verbosity, back-references.
+_COSMETIC_FIELDS = frozenset({"name", "description", "log_level", "_model"})
+
+_PROBE = sp.Symbol("__cache_probe__")
+
+
+def _canonical(value) -> str:
+    """Deterministic structural string for any value that can appear in an
+    operation's state or a model spec.  Falls back to ``repr`` only for opaque
+    leaves (which is still stable for the primitives we encounter)."""
+    # sympy objects → srepr (structural, deterministic)
+    if isinstance(value, sp.Basic):
+        return sp.srepr(value)
+    # basis instance → reuse the matrix-cache fingerprint (name|level|bounds|…)
+    if isinstance(value, Basisfunction):
+        return f"Basis({_basis_fingerprint(value)})"
+    # a basis CLASS (some ops store the class, not an instance)
+    if isinstance(value, type) and issubclass(value, Basisfunction):
+        return f"BasisCls({value.__name__})"
+    # primitives
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return repr(value)
+    # callables (lambdas / functions) → symbolic effect on a probe symbol
+    if callable(value) and not isinstance(value, sp.Basic):
+        try:
+            return f"fn({sp.srepr(sp.sympify(value(_PROBE)))})"
+        except Exception:
+            # last resort: the bytecode (stable for an unchanged source lambda)
+            code = getattr(value, "__code__", None)
+            return f"fn-opaque({getattr(code, 'co_code', repr(value))!r})"
+    # ordered containers → element-wise (order matters)
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_canonical(v) for v in value) + "]"
+    # sets / frozensets → sorted (order does NOT matter)
+    if isinstance(value, (set, frozenset)):
+        return "{" + ",".join(sorted(_canonical(v) for v in value)) + "}"
+    # dicts → sorted by canonical key
+    if isinstance(value, dict):
+        items = sorted((_canonical(k), _canonical(v)) for k, v in value.items())
+        return "{" + ",".join(f"{k}:{v}" for k, v in items) + "}"
+    # a class type that isn't a basis
+    if isinstance(value, type):
+        return f"type({value.__module__}.{value.__name__})"
+    # opaque object that carries its own cache key (e.g. nested op / StateSpace)
+    if hasattr(value, "_key_content"):
+        return f"{type(value).__name__}({value._key_content()})"
+    # unknown object → its own __dict__ (recurse), so we never silently drop state
+    if hasattr(value, "__dict__"):
+        return f"{type(value).__name__}(" + _state_repr(vars(value)) + ")"
+    return repr(value)
+
+
+def _state_repr(state: dict) -> str:
+    """Canonical string for an object's ``__dict__``, minus cosmetic fields."""
+    parts = []
+    for key in sorted(state):
+        if key in _COSMETIC_FIELDS:
+            continue
+        parts.append(f"{key}={_canonical(state[key])}")
+    return ";".join(parts)
+
+
+def op_key_content(op) -> str:
+    """Result-affecting content string for a single derivation Operation.
+
+    Generic: ``TypeName(field=canonical;…)`` over the op's full ``__dict__``
+    (cosmetic fields removed).  ``ChangeOfVariables`` etc. need no special case —
+    its ``_relation`` lambda is handled by :func:`_canonical`'s callable branch.
+    """
+    return f"{type(op).__name__}({_state_repr(vars(op))})"
+
+
+def cache_key(obj) -> str:
+    """SHA-256 hex digest of an object's result-affecting content.
+
+    Accepts a derivation ``Operation``, an ``Equation``/``Expression`` (anything
+    exposing ``.expr``), or any value :func:`_canonical` understands.  Always
+    prefixed with :data:`CACHE_VERSION`.
+    """
+    if hasattr(obj, "_key_content"):
+        content = obj._key_content()
+    elif _looks_like_operation(obj):
+        content = op_key_content(obj)
+    elif hasattr(obj, "expr"):                       # Equation / Expression
+        content = f"Equation({_canonical(obj.expr)})"
+    else:
+        content = _canonical(obj)
+    return hashlib.sha256(f"{CACHE_VERSION}|{content}".encode()).hexdigest()
+
+
+def _looks_like_operation(obj) -> bool:
+    # Operation lives in model.operations; detect structurally to avoid an import
+    # cycle (operations.py would otherwise import this module's consumers).
+    return hasattr(obj, "_apply_leaf") or hasattr(obj, "apply_to_model") \
+        or hasattr(obj, "apply_to_equation")
+
+
+# ---------------------------------------------------------------------------
+# Model-spec + op-sequence keys (the L0 / L-final composite keys)
+# ---------------------------------------------------------------------------
+
+# Declarative-model (``param.Parameterized``) params that do NOT change the
+# symbolic derivation OR the cached SystemModel's operators — excluded from the
+# spec key.  ``name`` is cosmetic; the BC/IC params are runtime-attached and are
+# keyed separately by the cache layer when it decides pre/post-attach caching.
+_NON_DERIVATION_PARAMS = frozenset({
+    "name",
+    "boundary_conditions", "aux_boundary_conditions",
+    "initial_conditions", "aux_initial_conditions",
+})
+
+
+def model_spec_key(model, *, include_bc_ic=False) -> str:
+    """Key for the model's derivation IDENTITY.
+
+    For a declarative ``param.Parameterized`` model (VAM / SME / MLVAM) this is
+    the class name plus every constructor param value EXCEPT the cosmetic /
+    runtime-attached ones (``name``, BC/IC) — those don't change the symbolic
+    operators.  Pass ``include_bc_ic=True`` to fold the BC/IC params in too (when
+    the caller caches a BC-attached SystemModel and must not return one with the
+    wrong boundary handling).
+
+    For a raw derivation ``Model`` (no ``param``) this falls back to the
+    basis/level-agnostic state: coords, declared field heads, parameters, and
+    σ-map state — so two such models with the same spec share an L0 derivation.
+    """
+    cls = type(model)
+    parts = [f"cls={cls.__module__}.{cls.__name__}"]
+
+    if hasattr(model, "param") and hasattr(model.param, "values"):
+        skip = set(_NON_DERIVATION_PARAMS)
+        if include_bc_ic:
+            skip = {"name"}
+        for name in sorted(model.param.values().keys()):
+            if name in skip:
+                continue
+            parts.append(f"{name}=" + _canonical(getattr(model, name)))
+        return hashlib.sha256(
+            f"{CACHE_VERSION}|spec|{'|'.join(parts)}".encode()).hexdigest()
+
+    # raw derivation Model
+    parts.append("coords=" + _canonical(tuple(getattr(model, "_coords", ()) or ())))
+    Q = getattr(model, "_Q", None)
+    if isinstance(Q, dict):
+        parts.append("Q=" + _canonical(dict(Q)))
+    params = getattr(model, "parameters", None)
+    if params is not None and hasattr(params, "keys"):
+        parts.append("params=" + _canonical(sorted(params.keys())))
+    for attr in ("coord_relations", "_field_decoration", "_sigma_from", "_vertical"):
+        val = getattr(model, attr, None)
+        if val:
+            parts.append(f"{attr}=" + _canonical(val))
+    return hashlib.sha256(
+        f"{CACHE_VERSION}|spec|{'|'.join(parts)}".encode()).hexdigest()
+
+
+def equations_key(model) -> str:
+    """Key for the current set of equation residuals on a model (the actual math
+    state).  Order-independent over equation NAMES (a dict), content-sensitive."""
+    eqs = getattr(model, "_equations", None) or {}
+    items = sorted((name, _canonical(eq.expr)) for name, eq in eqs.items())
+    body = ";".join(f"{n}={c}" for n, c in items)
+    return hashlib.sha256(
+        f"{CACHE_VERSION}|eqs|{body}".encode()).hexdigest()
+
+
+def op_sequence_key(ops) -> str:
+    """Key for an ordered sequence of operations (the recipe)."""
+    body = ">".join(cache_key(op) for op in ops)
+    return hashlib.sha256(
+        f"{CACHE_VERSION}|ops|{body}".encode()).hexdigest()
+
+
+def basis_key(basis) -> str:
+    """Key for a concrete basis (reuses the matrix-cache fingerprint)."""
+    return hashlib.sha256(
+        f"{CACHE_VERSION}|basis|{_basis_fingerprint(basis)}".encode()
+    ).hexdigest()
+
+
+__all__ = [
+    "CACHE_VERSION",
+    "cache_key",
+    "op_key_content",
+    "model_spec_key",
+    "equations_key",
+    "op_sequence_key",
+    "basis_key",
+]
