@@ -48,6 +48,7 @@ class MLSWE(BaseModel):
     """Multilayer SWE, ``n_layers`` moving-with-the-surface layers."""
 
     _finalize_lazy = True
+    _cacheable_derivation = True        # derive_model returns m; byproducts on m
     n_layers = param.Integer(default=2, bounds=(2, None))
     dimension = param.Integer(default=2, bounds=(2, 3), doc=(
         "Total spatial dimension incl. vertical: 2 → (t,x,z), one horizontal "
@@ -254,19 +255,18 @@ class MLSWE(BaseModel):
                        else f"momentum_{CN[xd]}_{ell}")
                 m.add_equation(enm, sp.expand(mom.subs(par).doit()))
 
-        self.derivation = m
-        self._bed = b
-        self._ht = ht
-        self._q_l = [q_l[ell][xd] for ell in range(1, N + 1) for xd in horiz]
-        self._G_closed = {str(k): sp.simplify(v.subs(par))
-                          for k, v in G_sol.items()}
-        return None
+        m.bed = b
+        m.ht = ht
+        m.q_l = [q_l[ell][xd] for ell in range(1, N + 1) for xd in horiz]
+        m.G_closed = {str(k): sp.simplify(v.subs(par))
+                      for k, v in G_sol.items()}
+        return m
 
     @property
     def system_model(self) -> SystemModel:
         m = self.derivation
         sm = SystemModel.from_model(
-            m, Q=[self._bed, self._ht, *self._q_l])
+            m, Q=[m.bed, m.ht, *m.q_l])
         from zoomy_core.model.boundary_conditions import resolve_and_attach
         resolve_and_attach(sm, self.boundary_conditions,
                            aux_bcs=self.aux_boundary_conditions)

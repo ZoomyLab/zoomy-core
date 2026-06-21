@@ -46,6 +46,7 @@ class MLSME(BaseModel):
     moment column of order ``level``."""
 
     _finalize_lazy = True
+    _cacheable_derivation = True        # derive_model returns m; byproducts on m
     n_layers = param.Integer(default=2, bounds=(2, None))
     level = param.Integer(default=1, bounds=(0, None))
     dimension = param.Integer(default=2, bounds=(2, 3), doc=(
@@ -307,7 +308,7 @@ class MLSME(BaseModel):
             interp[3] = _u_piecewise(y).subs(par)
         interp[4] = sp.S.Zero            # TODO: per-layer kinematic w reconstruction
         interp[5] = m.parameters.rho * m.parameters.g * ht * (1 - zeta)
-        self._interpolate_rows = interp
+        m.interpolate_rows = interp
 
         # inverse: q_ℓ_k = (2k+1)·h·∫_{c_{ℓ-1}}^{c_ℓ} P3_<vel>(ζ)·P_k(2 ζ_loc−1) dζ
         P3 = {f: sp.Symbol(f"P3_{f}", real=True) for f in ("b", "h")}
@@ -322,25 +323,24 @@ class MLSME(BaseModel):
                         (2 * k + 1) * P3["h"]
                         * sp.Integral(P3vel * sp.legendre(k, 2 * (zeta - c0) / lf - 1),
                                       (zeta, c0, c1)))
-        self._project_rows = proj
+        m.project_rows = proj
 
-        self.derivation = m
-        self._bed = b
-        self._ht = ht
+        m.bed = b
+        m.ht = ht
         # state order: layer-major, then direction, then mode (matches the
         # equation registration order above)
-        self._q_flat = [q_mod[ell][xd][k]
-                        for ell in range(1, N + 1)
-                        for xd in horiz for k in range(Nu + 1)]
-        self._G_closed = {str(kk_): sp.simplify(v.subs(par))
-                          for kk_, v in G_sol.items()}
-        return None
+        m.q_flat = [q_mod[ell][xd][k]
+                    for ell in range(1, N + 1)
+                    for xd in horiz for k in range(Nu + 1)]
+        m.G_closed = {str(kk_): sp.simplify(v.subs(par))
+                      for kk_, v in G_sol.items()}
+        return m
 
     @property
     def system_model(self) -> SystemModel:
         m = self.derivation
         sm = SystemModel.from_model(
-            m, Q=[self._bed, self._ht, *self._q_flat], canonical_source=self)
+            m, Q=[m.bed, m.ht, *m.q_flat], canonical_source=self)
         from zoomy_core.model.boundary_conditions import resolve_and_attach
         resolve_and_attach(sm, self.boundary_conditions,
                            aux_bcs=self.aux_boundary_conditions)

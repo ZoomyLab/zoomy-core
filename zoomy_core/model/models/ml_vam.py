@@ -63,6 +63,7 @@ class MLVAM(BaseModel):
     moment column with u ∈ P_level and w, p ∈ P_{level+1} (closed top modes)."""
 
     _finalize_lazy = True
+    _cacheable_derivation = True        # derive_model returns m; byproducts on m
     n_layers = param.Integer(default=2, bounds=(2, None))
     level = param.Integer(default=1, bounds=(0, None))
     dimension = param.Integer(default=2, bounds=(2, 3), doc=(
@@ -339,7 +340,7 @@ class MLVAM(BaseModel):
         for ell in range(N, 0, -1):
             *eqs_l, p_trace = derive_layer(ell, p_trace)
             layer_eqs[ell] = tuple(eqs_l)
-        self._layer_eqs_debug = layer_eqs        # pre-assembly rows (tests)
+        _layer_eqs_debug = layer_eqs             # pre-assembly rows (attached to m below)
 
         # ── Hörnschemeyer closure + per-direction shared u* transfer ──
         ht = sp.Function("h", positive=True)(t, *horiz)
@@ -466,22 +467,21 @@ class MLVAM(BaseModel):
                         e = sp.expand(e - sp.expand(dF.doit())) + dF
                 eq.expr = e
 
-        self.derivation = m
-        self._bed = b
-        self._ht = ht
-        self._q_flat = [q_mod[ell][xd][k]
-                        for ell in range(1, N + 1)
-                        for xd in horiz for k in range(Nu + 1)]
-        self._r_flat = [r for layer in r_mod for r in layer]
-        self._P_flat = [p for layer in P_mod for p in layer]
-        return None
+        m.bed = b
+        m.ht = ht
+        m.q_flat = [q_mod[ell][xd][k]
+                    for ell in range(1, N + 1)
+                    for xd in horiz for k in range(Nu + 1)]
+        m.r_flat = [r for layer in r_mod for r in layer]
+        m.P_flat = [p for layer in P_mod for p in layer]
+        m.layer_eqs_debug = _layer_eqs_debug
+        return m
 
     @property
     def system_model(self) -> SystemModel:
         m = self.derivation
         sm = SystemModel.from_model(
-            m, Q=[self._bed, self._ht, *self._q_flat, *self._r_flat,
-                  *self._P_flat])
+            m, Q=[m.bed, m.ht, *m.q_flat, *m.r_flat, *m.P_flat])
         from zoomy_core.model.boundary_conditions import resolve_and_attach
         resolve_and_attach(sm, self.boundary_conditions,
                            aux_bcs=self.aux_boundary_conditions)
