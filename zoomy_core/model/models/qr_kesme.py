@@ -76,6 +76,8 @@ class QRKESME(SME):
     positive by construction), turbulent rough-wall bed, stress-free surface.
     Build with ``quadrature_order>0`` (default 6): ν_t(ζ) is rational."""
 
+    _cacheable_derivation = True        # derive_model returns m; byproducts on m
+
     turbulence_level = param.Integer(default=1, bounds=(0, None), doc=(
         "Modal order N_k of the transported sk=√k, se=√ε fields, INDEPENDENT of "
         "the velocity order ``level`` (N_u)."))
@@ -126,8 +128,8 @@ class QRKESME(SME):
         g, rho = m.parameters.g, m.parameters.rho
         h = sp.Function("h", positive=True)(t, *horiz)
         b = sp.Function("b", real=True)(t, *horiz)
-        # hydrostatic pressure flux, tagged in the inherited SME.system_model
-        self._pressure_flux = g * h ** 2 / 2
+        # hydrostatic pressure flux (g·h²/2): recomputed in the inherited
+        # SME.system_model from m, not stashed on self.
 
         # 1 — full system from blueprints (mass, momentum, moment_scaling)
         m.declare_state(h)
@@ -395,7 +397,7 @@ class QRKESME(SME):
         interp[4] = sum(sp.expand(w_closure[j].rhs.subs(cov)) * sp.legendre(j, 2 * zeta - 1)
                         for j in range(Nu + 2))
         interp[5] = rho * g * h * (1 - zeta)
-        self._interpolate_rows = interp
+        m.interpolate_rows = interp
 
         # 11 — lateral wall BC: mirror moments
         for qh in q_heads:
@@ -403,24 +405,22 @@ class QRKESME(SME):
                 m.register_group("boundary:wall", qh(i, t, *horiz), -qh(i, t, *horiz))
 
         # 12 — WB reconstruction rows
-        self._reconstruction_rows = {h: b + h}
+        m.reconstruction_rows = {h: b + h}
         for qh in q_heads:
-            self._reconstruction_rows.update(
+            m.reconstruction_rows.update(
                 {qh(i, t, *horiz): qh(i, t, *horiz) / h for i in range(Nu + 1)})
 
         # 13 — project rows (inverse of interpolate)
         P3 = {f: sp.Symbol(f"P3_{f}", real=True) for f in ("b", "h")}
-        self._project_rows = {b: P3["b"], h: P3["h"]}
+        m.project_rows = {b: P3["b"], h: P3["h"]}
         for xd, qh in zip(horiz, q_heads):
             P3vel = sp.Function(f"P3_{HNAME[xd]}", real=True)(zeta)
-            self._project_rows.update({
+            m.project_rows.update({
                 qh(i, t, *horiz): (2 * i + 1) * P3["h"]
                 * sp.Integral(P3vel * sp.legendre(i, 2 * zeta - 1), (zeta, 0, 1))
                 for i in range(Nu + 1)})
 
-        self.derivation = m
-        self._bed = b
-        return None
+        return m
 
     @property
     def system_model(self):
