@@ -130,6 +130,23 @@ def _looks_like_operation(obj) -> bool:
         or hasattr(obj, "apply_to_equation")
 
 
+def argument_key(obj) -> str:
+    """Content key for a function ARGUMENT (used by the ``@derivation_cache``
+    decorator).  Routes by kind so a declarative model keys on its spec rather
+    than its (huge, mutable) ``__dict__``:
+
+    * a declarative ``param.Parameterized`` model → :func:`model_spec_key`;
+    * a derivation Operation / Equation → :func:`cache_key`;
+    * everything else → canonical srepr.
+    """
+    if hasattr(obj, "param") and hasattr(getattr(obj, "param"), "values"):
+        return model_spec_key(obj)
+    if _looks_like_operation(obj) or hasattr(obj, "_key_content") \
+            or hasattr(obj, "expr"):
+        return cache_key(obj)
+    return _canonical(obj)
+
+
 # ---------------------------------------------------------------------------
 # Model-spec + op-sequence keys (the L0 / L-final composite keys)
 # ---------------------------------------------------------------------------
@@ -216,6 +233,7 @@ def basis_key(basis) -> str:
 __all__ = [
     "CACHE_VERSION",
     "cache_key",
+    "argument_key",
     "op_key_content",
     "model_spec_key",
     "equations_key",
