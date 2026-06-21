@@ -49,6 +49,7 @@ class SME(BaseModel):
     """
 
     _finalize_lazy = True               # declarative path — skip the production tag pipeline
+    _cacheable_derivation = True        # derive_model returns m; byproducts ride on m
     level = param.Integer(default=2, bounds=(0, None))
     dimension = param.Integer(default=2, bounds=(2, 3), doc=(
         "Total spatial dimension INCLUDING the vertical: 2 → coords (t, x, z), "
@@ -118,10 +119,9 @@ class SME(BaseModel):
         g, rho = m.parameters.g, m.parameters.rho
         h = sp.Function("h", positive=True)(t, *horiz)
         b = sp.Function("b", real=True)(t, *horiz)
-        # Free-surface hydrostatic pressure flux; tagged explicitly in
-        # ``system_model`` so the extractor routes it to hydrostatic_pressure
-        # (the extractor no longer auto-detects pressure by gravity).
-        self._pressure_flux = g * h ** 2 / 2
+        # Free-surface hydrostatic pressure flux (g·h²/2); recomputed in
+        # ``system_model`` from ``m`` and tagged there so the extractor routes
+        # it to hydrostatic_pressure (no longer stashed on ``self``).
 
         # 1 — full system, assembled from balance blueprints (equations.py).
         # Mass registers the horizontal velocity(ies) + w; Momentum (full stress
@@ -277,7 +277,7 @@ class SME(BaseModel):
         interp[4] = sum(sp.expand(w_closure[j].rhs.subs(cov)) * sp.legendre(j, 2 * zeta - 1)
                         for j in range(Nu + 2))
         interp[5] = rho * g * h * (1 - zeta)
-        self._interpolate_rows = interp
+        m.interpolate_rows = interp
 
         # 11 — model-derived lateral wall BC: mirror u(ζ) → −u(ζ) flips EVERY
         # moment of EVERY direction; h, b extrapolate.
@@ -286,18 +286,18 @@ class SME(BaseModel):
                 m.register_group("boundary:wall", qh(i, t, *horiz), -qh(i, t, *horiz))
 
         # 12 — WB reconstruction: limit η = b+h and the modal velocities q_d/h.
-        self._reconstruction_rows = {h: b + h}
+        m.reconstruction_rows = {h: b + h}
         for qh in q_heads:
-            self._reconstruction_rows.update(
+            m.reconstruction_rows.update(
                 {qh(i, t, *horiz): qh(i, t, *horiz) / h for i in range(Nu + 1)})
 
         # 13 — project (inverse of interpolate): q_{d,i} = (2i+1)·h·∫₀¹ u_d φ_i dζ,
         # one sampled-profile head P3_<vel> per direction.
         P3 = {f: sp.Symbol(f"P3_{f}", real=True) for f in ("b", "h")}
-        self._project_rows = {b: P3["b"], h: P3["h"]}
+        m.project_rows = {b: P3["b"], h: P3["h"]}
         for xd, qh in zip(horiz, q_heads):
             P3vel = sp.Function(f"P3_{HNAME[xd]}", real=True)(zeta)
-            self._project_rows.update({
+            m.project_rows.update({
                 qh(i, t, *horiz): (2 * i + 1) * P3["h"]
                 * sp.Integral(P3vel * sp.legendre(i, 2 * zeta - 1), (zeta, 0, 1))
                 for i in range(Nu + 1)})
@@ -306,9 +306,7 @@ class SME(BaseModel):
         # balances (k, ε) now, using the conserved moments q_d (= h û_d).
         self._add_turbulence_transport(m, t, horiz, h, q_heads)
 
-        self.derivation = m
-        self._bed = b
-        return None
+        return m
 
     # ── turbulence hooks (no-op on plain SME; KESME overrides) ──────────────
     def _declare_turbulence_fields(self, m, t, horiz):
@@ -329,16 +327,20 @@ class SME(BaseModel):
         ``SystemModel.attach_boundary_conditions`` remains available as the
         hook for attaching/replacing BCs on an existing SystemModel."""
         m = self.derivation
+        dim = int(self.dimension)
+        horiz = (x,) if dim == 2 else (x, y)
         qs = list(m.explicit_state())
         # b evolves via the (trivial) bottom equation ∂_t b = 0, so it is
         # already an explicit unknown; prepend only if absent.
-        if self._bed not in qs:
-            qs = [self._bed, *qs]
+        bed = sp.Function("b", real=True)(t, *horiz)
+        if bed not in qs:
+            qs = [bed, *qs]
         # Manual hydrostatic-pressure tag (one-liner): mark g·h²/2 so the
         # structural extractor routes it to hydrostatic_pressure (well-balanced
-        # reconstruction) instead of the conservative flux.
+        # reconstruction) instead of the conservative flux.  Recomputed from m.
         from zoomy_core.model.derivation.system_extract import HydrostaticPressure
-        pf = self._pressure_flux
+        h = sp.Function("h", positive=True)(t, *horiz)
+        pf = m.parameters.g * h ** 2 / 2
         m.apply({pf: HydrostaticPressure(pf)})
         sm = SystemModel.from_model(m, Q=qs, canonical_source=self)
         m.apply({HydrostaticPressure(pf): pf})   # un-tag: leave derivation clean

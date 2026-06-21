@@ -27,6 +27,19 @@ def clear_derivation_model_cache():
     _DERIVATION_MODEL_CACHE.clear()
 
 
+def _derivation_byproduct(model, on_derivation, legacy_attr):
+    """Fetch a derivation byproduct (interpolate/project/reconstruction rows).
+
+    Cacheable models attach it to the derivation object (``m.<on_derivation>``)
+    so it survives a cache hit; legacy models stash it on ``self.<legacy_attr>``.
+    Prefer the derivation copy, fall back to the legacy stash, else ``None``."""
+    deriv = getattr(model, "derivation", None)
+    val = getattr(deriv, on_derivation, None) if deriv is not None else None
+    if val is None:
+        val = getattr(model, legacy_attr, None)
+    return val
+
+
 def register_sympy_attribute(definition, prefix="q"):
     """Turn int or list field specs into a Zstruct of real sympy Symbols."""
     if isinstance(definition, int):
@@ -963,7 +976,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
         picks the dict up through this method and parses it with the same
         machinery as ``register_group`` — one definition, one parser.
         Production overrides returning a ZArray keep their old meaning."""
-        rows = getattr(self, "_interpolate_rows", None)
+        rows = _derivation_byproduct(self, "interpolate_rows", "_interpolate_rows")
         if rows is not None:
             return rows
         return ZArray.zeros(6)
@@ -972,7 +985,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
         """Profile → state projection (canonical operator); see
         :meth:`interpolate_to_3d` for the stash/dict contract
         ({state_field_or_slot: expr})."""
-        rows = getattr(self, "_project_rows", None)
+        rows = _derivation_byproduct(self, "project_rows", "_project_rows")
         if rows is not None:
             return rows
         return ZArray.zeros(self.n_variables)
@@ -1018,7 +1031,8 @@ class Model(param.Parameterized, SymbolicRegistrar):
         ({state_field_or_slot: expr}) in ``derive_model``; unregistered
         slots default to the identity at extraction time.
         """
-        rows = getattr(self, "_reconstruction_rows", None)
+        rows = _derivation_byproduct(self, "reconstruction_rows",
+                                     "_reconstruction_rows")
         if rows is not None:
             return rows
         return ZArray(self.variables)
