@@ -44,6 +44,7 @@ class VAM(BaseModel):
     ``level`` (= ``N_u``; u, w and the non-hydrostatic p share the basis)."""
 
     _finalize_lazy = True               # declarative path
+    _cacheable_derivation = True        # derive_model returns m, no self._X stash
     level = param.Integer(default=1, bounds=(0, None))
     dimension = param.Integer(default=2, bounds=(2, 3), doc=(
         "Total spatial dimension incl. vertical: 2 → (t,x,z), one horizontal "
@@ -84,9 +85,10 @@ class VAM(BaseModel):
         g, rho = m.parameters.g, m.parameters.rho
         h = sp.Function("h", positive=True)(t, *horiz)
         b = sp.Function("b", real=True)(t, *horiz)
-        # Free-surface hydrostatic pressure flux; tagged explicitly in
-        # ``system_model`` (the extractor no longer auto-detects pressure).
-        self._pressure_flux = g * h ** 2 / 2
+        # Free-surface hydrostatic pressure flux (g·h²/2) is tagged in
+        # ``system_model``; it is recomputed there from ``m`` rather than
+        # stashed on ``self`` (keeps the model surface free of derivation
+        # byproducts — see ``system_model``).
 
         # 1 — full system (hydrostatic pressure pre-absorbed) from blueprints
         m.declare_state(h)
@@ -304,15 +306,17 @@ class VAM(BaseModel):
                         expr = sp.Add(*out)
                 eq.expr = expr
 
-        self.derivation = m
-        self._bed = b
-        self._P_head = m.functions.P.head
-        return None
+        return m
 
     @property
     def system_model(self) -> SystemModel:
         """The square DAE: state ``[b, h, q_k, r_k, P_k]``; the P rows are
-        the divergence constraints (zero mass-matrix rows)."""
+        the divergence constraints (zero mass-matrix rows).
+
+        Reads everything from the derivation ``m`` (cached per spec) — the bed,
+        the pressure head, and the hydrostatic flux are recomputed here rather
+        than stashed on ``self`` in ``derive_model``.  A FRESH SystemModel is
+        built on every access, so callers may safely mutate its ICs/BCs."""
         m = self.derivation
         Nu = int(self.level)
         # Pressure modes carry the SAME horizontal dependence as the rest of the
@@ -321,13 +325,15 @@ class VAM(BaseModel):
         # P(j,t,x,y) atoms, so from_model fails to recognise them as state and
         # the pressure silently drops out of every momentum/vertical row.
         horiz = (x,) if int(self.dimension) == 2 else (x, y)
-        P_modes = [self._P_head(j, t, *horiz) for j in range(Nu + 1)]
+        P_modes = [m.functions.P.head(j, t, *horiz) for j in range(Nu + 1)]
         qs = list(m.explicit_state())
-        if self._bed not in qs:
-            qs = [self._bed, *qs]
+        bed = sp.Function("b", real=True)(t, *horiz)
+        if bed not in qs:
+            qs = [bed, *qs]
         # Manual hydrostatic-pressure tag (one-liner): mark g·h²/2 → pressure.
         from zoomy_core.model.derivation.system_extract import HydrostaticPressure
-        pf = self._pressure_flux
+        h = sp.Function("h", positive=True)(t, *horiz)
+        pf = m.parameters.g * h ** 2 / 2
         m.apply({pf: HydrostaticPressure(pf)})
         sm = SystemModel.from_model(m, Q=[*qs, *P_modes])
         m.apply({HydrostaticPressure(pf): pf})   # un-tag: leave derivation clean

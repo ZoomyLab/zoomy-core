@@ -14,6 +14,18 @@ from zoomy_core.model.basefunction import Function, SymbolicRegistrar
 
 sp.init_printing()
 
+# Spec-keyed cache of the heavy symbolic derivation (task 0018), shared across
+# model instances.  Populated by ``Model._run_derive_model`` for models that opt
+# in via ``_cacheable_derivation``.  Keyed by
+# ``zoomy_core.model.derivation.cache_keys.model_spec_key``.
+_DERIVATION_MODEL_CACHE: dict = {}
+
+
+def clear_derivation_model_cache():
+    """Drop all cached symbolic derivations (e.g. in tests, or after a
+    framework change that the spec key doesn't capture)."""
+    _DERIVATION_MODEL_CACHE.clear()
+
 
 def register_sympy_attribute(definition, prefix="q"):
     """Turn int or list field specs into a Zstruct of real sympy Symbols."""
@@ -145,6 +157,17 @@ class Model(param.Parameterized, SymbolicRegistrar):
     # existing flow for hand-written subclasses (SWE etc.).
     _finalize_lazy = False
 
+    # ── Derivation cache (task 0018) ───────────────────────────────
+    # Models whose ``derive_model`` is a PURE function of their spec —
+    # it RETURNS the derivation object and stashes nothing else on
+    # ``self`` (no ``self._bed`` / ``self._rows`` byproducts) — set
+    # ``_cacheable_derivation = True``.  The heavy symbolic build is then
+    # memoised across instances keyed on the model spec (level, dimension,
+    # closures, parameters, …); the cheap ``system_model`` tail still
+    # rebuilds a FRESH SystemModel per access, so callers may safely mutate
+    # the result's ICs/BCs.  Default ``False`` leaves a model uncached.
+    _cacheable_derivation = False
+
     def __init__(self, init_functions=True, **params):
         super().__init__(**params)
         self.functions, self.call = Zstruct(), Zstruct()
@@ -164,7 +187,7 @@ class Model(param.Parameterized, SymbolicRegistrar):
         # Subclass derivation hook — populates ``self._equations``
         # via ``self.add_equation`` + ``self.apply(Op(...))`` and may
         # extend ``self.variables`` / ``self.parameters``.
-        self.derive_model()
+        self._run_derive_model()
         # After the derivation, every Symbol used in any equation must
         # have a numeric value declared in ``self.parameter_values``.
         self._assert_parameter_values_supplied()
@@ -203,6 +226,30 @@ class Model(param.Parameterized, SymbolicRegistrar):
         to substitute derivation Function calls with Model Symbols
         and to set ``self._variable_map``."""
         return None
+
+    def _run_derive_model(self):
+        """Run (or restore from cache) the symbolic derivation.
+
+        For ``_cacheable_derivation`` models (pure ``derive_model`` that
+        RETURNS the derivation object), the heavy build is memoised across
+        instances keyed on :func:`model_spec_key`.  A cache hit sets
+        ``self.derivation`` and skips the build entirely; the cheap
+        ``system_model`` tail still runs fresh per access.  Non-cacheable
+        models keep the original behaviour (``derive_model`` mutates self).
+        """
+        if not self._cacheable_derivation:
+            self.derive_model()
+            return
+        from zoomy_core.model.derivation.cache_keys import model_spec_key
+        key = model_spec_key(self)
+        cached = _DERIVATION_MODEL_CACHE.get(key)
+        if cached is not None:
+            self.derivation = cached
+            return
+        result = self.derive_model()
+        if result is not None:
+            self.derivation = result
+        _DERIVATION_MODEL_CACHE[key] = self.derivation
 
     # ── derivation hook + minimal Model surface ───────────────────
     #

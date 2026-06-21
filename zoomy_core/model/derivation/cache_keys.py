@@ -187,6 +187,17 @@ def model_spec_key(model, *, include_bc_ic=False) -> str:
             if name in skip:
                 continue
             parts.append(f"{name}=" + _canonical(getattr(model, name)))
+        # ``parameter_values`` (numeric defaults baked into the derivation) is
+        # NOT a param but DOES change the symbolic result — include it so two
+        # models that differ only in numeric values never share a derivation.
+        pv = getattr(model, "parameter_values", None)
+        if pv is not None:
+            if hasattr(pv, "items"):
+                parts.append("parameter_values=" + _canonical(
+                    {str(k): v for k, v in pv.items()}))
+            elif hasattr(pv, "keys"):
+                parts.append("parameter_values=" + _canonical(
+                    {k: getattr(pv, k) for k in pv.keys()}))
         return hashlib.sha256(
             f"{CACHE_VERSION}|spec|{'|'.join(parts)}".encode()).hexdigest()
 
