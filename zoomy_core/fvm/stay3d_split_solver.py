@@ -85,7 +85,8 @@ class Stay3DSplitSolver:
     @staticmethod
     def _closure_kinds(model):
         """Return (has_bulk_viscosity, has_navier_slip, has_stress_free)."""
-        clos = getattr(model, "_closures_resolved", None)
+        clos = getattr(getattr(model, "derivation", None),
+                       "closures_resolved", None)
         if not clos:
             clos = model.closures or []
         kinds = {getattr(c, "closes", None) for c in clos}

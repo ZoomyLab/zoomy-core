@@ -70,10 +70,11 @@ class Stay3DSigma(BaseModel):
     velocity ``U`` exposed as an auxiliary defined by ``U = ∫₀¹ ũ dζ`` (and the
     3-D field ``ũ`` carried as the aux it is integrated from).  The 3-D momentum
     advance becomes SystemModel state once the extractor treats ζ as a flux
-    direction (stashed here as ``self._momentum_sigma_x`` / ``self._omega_def``).
+    direction (attached to the derivation as ``m.momentum_sigma_x`` / ``m.omega_def``).
     """
 
     _finalize_lazy = True
+    _cacheable_derivation = True        # derive_model returns m; byproducts on m
     dimension = param.Integer(default=2, bounds=(2, 3), doc=(
         "Total spatial dimension INCLUDING the vertical: 2 → coords (t,x,z), one "
         "horizontal (U=U_x); 3 → coords (t,x,y,z), two horizontals.  Only dim=2 "
@@ -101,9 +102,8 @@ class Stay3DSigma(BaseModel):
         g, rho, e_x = m.parameters.g, m.parameters.rho, m.parameters.e_x
         h = sp.Function("h", positive=True)(t, x)
         b = sp.Function("b", real=True)(t, x)
-        # Free-surface hydrostatic pressure flux; tagged explicitly in
-        # ``system_model`` (the extractor no longer auto-detects pressure).
-        self._pressure_flux = g * h ** 2 / 2
+        # Free-surface hydrostatic pressure flux (g·h²/2): recomputed in
+        # ``system_model`` from m and tagged there (not stashed on self).
 
         # 1 — general 3-D mass + momentum (full stress tensor), shallow scaling.
         m.declare_state(h)
@@ -134,7 +134,7 @@ class Stay3DSigma(BaseModel):
             Newtonian, NavierSlip, StressFree, apply_stress_closures)
         from zoomy_core.model.models.material import ClosureState
         clos = self.closures or [Newtonian(), NavierSlip(), StressFree()]
-        self._closures_resolved = clos      # for the closure → ζ-face-BC reduction
+        m.closures_resolved = clos          # for the closure → ζ-face-BC reduction
 
         def _cstate(at, *, alias=None, btag=None):
             return ClosureState(m.functions, params=m.parameters, h=h, x=x,
@@ -160,9 +160,12 @@ class Stay3DSigma(BaseModel):
         # 3-D conservative-σ ingredients for the conservative momentum below
         # (verified: σ-momentum(×h) ≡ ∂_t(hu)+∂_x(hu²+gh²/2)+∂_ζ(h u ω)+ghb_x−e_x g h−τ̃_z/ρ).
         zc = b + h * zeta
-        self._omega_def = wt - sp.Derivative(zc, t) - ut * sp.Derivative(zc, x)   # = h·ω
-        self._momentum_sigma_x = sp.expand((h * m.momentum.x.expr).doit())
-        self._heads_3d = {"u": ut.func, "w": wt.func}
+        momentum_sigma_x = sp.expand((h * m.momentum.x.expr).doit())
+        # 3-D conservative-σ ingredients, attached to m for the extractor /
+        # solver (off the model surface; survive the derivation cache).
+        m.omega_def = wt - sp.Derivative(zc, t) - ut * sp.Derivative(zc, x)   # = h·ω
+        m.momentum_sigma_x = momentum_sigma_x
+        m.heads_3d = {"u": ut.func, "w": wt.func}
 
         # 4 — height equation: φ₀-moment of continuity against the two KBCs.
         m.mass.apply(Multiply(h))
@@ -183,7 +186,7 @@ class Stay3DSigma(BaseModel):
         ref = sp.Derivative(h, t).doit() + sp.diff(h * U, x)
         assert sp.simplify((m.mass.expr - ref).doit()) == 0, (
             f"height equation mismatch: {m.mass.expr} != ∂_t h + ∂_x(h U)")
-        self._U_def = vint                                # U = ∫₀¹ ũ dζ
+        m.U_def = vint                                    # U = ∫₀¹ ũ dζ (documented stash)
 
         # 5 — STAY 3-D: the conserved momentum mom = h·ũ and the contravariant
         # vertical velocity ω, both (t, x, ζ).  u = mom/h with RAW 1/h — the KP
@@ -199,7 +202,7 @@ class Stay3DSigma(BaseModel):
         # VERIFY the clean conservative form ≡ the derived σ-momentum (ũ=mom/h,
         # w̃=h·ω+∂_t z+ũ ∂_x z) — a faithful derivation, not a hand-write.
         wt_sub = h * omega + sp.Derivative(zc, t) + (mom / h) * sp.Derivative(zc, x)
-        derived = self._momentum_sigma_x.subs(wt, wt_sub).subs(ut, mom / h)
+        derived = momentum_sigma_x.subs(wt, wt_sub).subs(ut, mom / h)
         assert sp.simplify(sp.expand((cons_mom - derived).doit())) == 0, (
             "stay-3D conservative-σ momentum mismatch vs the derived σ-momentum")
 
@@ -218,9 +221,7 @@ class Stay3DSigma(BaseModel):
         omega_run = (zeta * d.x(h * U) - d.x(h * W_run)) / h
         m.add_equation("omega", sp.Eq(omega, omega_run), group="aux")
 
-        self.derivation = m
-        self._bed = b
-        return None
+        return m
 
     @property
     def system_model(self) -> SystemModel:
@@ -233,11 +234,13 @@ class Stay3DSigma(BaseModel):
         stays raw (regularization is the NumericalSystemModel's job)."""
         m = self.derivation
         qs = list(m.explicit_state())
-        if self._bed not in qs:
-            qs = [self._bed, *qs]
+        bed = sp.Function("b", real=True)(t, x)
+        if bed not in qs:
+            qs = [bed, *qs]
         # Manual hydrostatic-pressure tag (one-liner): route g·h²/2 → pressure.
         from zoomy_core.model.derivation.system_extract import HydrostaticPressure
-        pf = self._pressure_flux
+        h = sp.Function("h", positive=True)(t, x)
+        pf = m.parameters.g * h ** 2 / 2
         m.apply({pf: HydrostaticPressure(pf)})
         sm = SystemModel.from_model(m, Q=qs, canonical_source=self)
         m.apply({HydrostaticPressure(pf): pf})   # un-tag: leave derivation clean
@@ -274,7 +277,7 @@ class Stay3DSigma(BaseModel):
             return []
         hS, momS = sm.state[names.index("h")], sm.state[names.index("mom")]
         nu = sm.parameters.nu
-        clos = getattr(self, "_closures_resolved", [])
+        clos = getattr(self.derivation, "closures_resolved", [])
         out = []
         for c in clos:
             kind = getattr(c, "closes", None)
