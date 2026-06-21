@@ -433,6 +433,23 @@ class EddyViscosity(Closure):
         return s.par.nu
 
 
+class ShallowInPlane(Closure):
+    """Shallow-moment in-plane stress closure: DROP the in-plane deviatoric
+    stress (``τ_xx, τ_xy, τ_yy → 0``).
+
+    The explicit, opt-in form of the old ``moment_scaling`` shallow-scaling step.
+    A full-stress 3-D model (e.g. :class:`~zoomy_core.model.models.sigma3d.Sigma3D`)
+    keeps every deviatoric term in the derivation; adding this horizontal closure
+    reproduces the shallow / SME-type form where only the vertical shear ``τ_xz``
+    survives.  Add it to a model's ``closures=[…]`` to "get the shallow version
+    back"; leave it out for the geometrically-exact full-stress model.
+    """
+    closes = "horizontal"; requires = ()
+
+    def expression(self, s):
+        return sp.S.Zero
+
+
 # ── surface closures ───────────────────────────────────────────────────────
 
 
@@ -560,4 +577,5 @@ __all__ = ["Closure", "ClosureState", "apply_stress_closures",
            "Newtonian", "KEpsilonViscosity", "QRViscosity", "NavierSlip", "RoughWall",
            "WallFunctionBed",
            "StressFree", "InterfaceFlux", "MeanInterface", "UpwindInterface",
-           "ManningFriction", "EddyViscosity", "swe_closure_state"]
+           "ManningFriction", "EddyViscosity", "ShallowInPlane",
+           "swe_closure_state"]

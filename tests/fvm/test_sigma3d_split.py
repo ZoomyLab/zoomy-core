@@ -15,7 +15,7 @@ These are run, not asserted by hand.
 import numpy as np
 
 from zoomy_core.model.models.sigma3d import Sigma3D
-from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
+from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree, ShallowInPlane
 from zoomy_core.model.boundary_conditions import Extrapolation
 from zoomy_core.fvm.sigma3d_split_solver import Sigma3DSplitSolver
 
@@ -27,7 +27,7 @@ def _u(x, z): h = _h(x); return (_A*_B)/np.sin(_B*h)*np.cos(_B*(z - _zb(x)))
 
 
 def _bbsm13_model():
-    m = Sigma3D(closures=[Newtonian(), NavierSlip(), StressFree()],
+    m = Sigma3D(closures=[Newtonian(), NavierSlip(), StressFree(), ShallowInPlane()],
                     parameters={"nu": 0.0, "e_x": 0.0, "g": _G,
                                 "rho": 1.0, "lambda_s": 0.0})
     m.boundary_conditions = [Extrapolation(tag="left"), Extrapolation(tag="right")]
@@ -100,7 +100,7 @@ def test_relaxes_to_steady_state_from_perturbed_ic():
 
 def test_viscous_navierslip_dambreak_stable():
     """Viscous + Navier-slip dam break: stable, mass-conserving, sheared."""
-    model = Sigma3D(closures=[Newtonian(), NavierSlip(), StressFree()],
+    model = Sigma3D(closures=[Newtonian(), NavierSlip(), StressFree(), ShallowInPlane()],
                         parameters={"nu": 1e-2, "e_x": 0.0, "g": 9.81,
                                     "rho": 1.0, "lambda_s": 1.0})
     model.boundary_conditions = [Extrapolation(tag="left"),

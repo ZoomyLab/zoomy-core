@@ -136,3 +136,32 @@ def test_vertical_is_a_flux_direction():
     assert sm.flux[0, 1] != 0                         # the ζ-flux (u·ω) is present
     assert sm.diffusion_matrix[0, 0, 1, 1] != 0       # the ζζ vertical diffusion
     assert m.vertical == zeta                         # derived from the field dep, not a hack
+
+
+def test_full_deviatoric_stress_and_shallow_recovery():
+    """Sigma3D keeps the FULL deviatoric stress by default — the in-plane
+    component τ̃_xx survives as an aux (no baked-in ``moment_scaling`` drop).
+    Adding the ``ShallowInPlane`` closure drops it, recovering the shallow form
+    exactly (full momentum with τ̃_xx → 0)."""
+    from zoomy_core.model.models.sigma3d import Sigma3D
+    from zoomy_core.model.models.closures import (
+        Newtonian, NavierSlip, StressFree, ShallowInPlane)
+    from zoomy_core.model.basemodel import clear_derivation_model_cache
+
+    clear_derivation_model_cache()
+    full = Sigma3D()                       # default closures → full stress
+    mom_full = sp.sympify(full.derivation.momentum.expr)
+    txx = [a for a in mom_full.atoms(sp.Function) if "tau_xx" in str(a.func)]
+    assert txx, "full-stress Sigma3D must retain the in-plane stress τ̃_xx"
+    # honest: τ̃_xx is carried as an aux the user must close (not silently 0)
+    assert any("tau_xx" in str(s) for s in full.system_model.aux_state)
+
+    clear_derivation_model_cache()
+    shallow = Sigma3D(closures=[Newtonian(), NavierSlip(), StressFree(),
+                                ShallowInPlane()])
+    mom_shallow = sp.sympify(shallow.derivation.momentum.expr)
+    assert not [a for a in mom_shallow.atoms(sp.Function)
+                if "tau_xx" in str(a.func)], "ShallowInPlane must drop τ̃_xx"
+    # shallow == full with τ̃_xx → 0
+    drop = {a: 0 for a in mom_full.atoms(sp.Function) if "tau_xx" in str(a.func)}
+    assert sp.simplify(sp.expand((mom_shallow - mom_full.subs(drop)).doit())) == 0

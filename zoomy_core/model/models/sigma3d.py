@@ -95,8 +95,7 @@ class Sigma3D(BaseModel):
         user_vals = getattr(self, "parameter_values", None)
         if user_vals is not None and hasattr(user_vals, "items"):
             values.update({k: float(v) for k, v in user_vals.items()})
-        from zoomy_core.model.models.equations import (
-            Mass, Momentum, moment_scaling)
+        from zoomy_core.model.models.equations import (Mass, Momentum)
 
         m = DModel(coords=(t, x, z), parameters=values)
         g, rho, e_x = m.parameters.g, m.parameters.rho, m.parameters.e_x
@@ -105,12 +104,17 @@ class Sigma3D(BaseModel):
         # Free-surface hydrostatic pressure flux (g·h²/2): recomputed in
         # ``system_model`` from m and tagged there (not stashed on self).
 
-        # 1 — general 3-D mass + momentum (full stress tensor), shallow scaling.
+        # 1 — general 3-D mass + momentum, FULL deviatoric stress tensor.
+        # Unlike the shallow-moment models, Sigma3D does NOT drop the in-plane
+        # stress (no ``moment_scaling``): every deviatoric term survives in the
+        # derivation, and what to do with the in-plane component τ̃_xx is decided
+        # by a HORIZONTAL closure (step 3b').  An SME/hydrostatic-type 3-D run
+        # adds ``ShallowInPlane()`` to drop it (recovering the shallow form);
+        # leaving it out keeps the geometrically-exact full-stress model.
         m.declare_state(h)
         m.add_equation("bottom", d.t(b))                 # ∂_t b = 0
         m.add_equation(Mass(m))                          # mints u, w
         mom = Momentum(m); m.add_equation(mom)           # mints p (+ τ closures)
-        moment_scaling(m, mom)                           # drop in-plane stresses
         uvel, w, p = mom.uvel, mom.w, mom.p
         m.add_equation("kbc_top", KinematicBC(w=w, u=uvel[0], interface=b + h))
         m.add_equation("kbc_bot", KinematicBC(w=w, u=uvel[0], interface=b))
@@ -144,6 +148,23 @@ class Sigma3D(BaseModel):
         apply_stress_closures(clos, m, axes, _cstate, [x])
         m.momentum.x.apply(Simplify())
 
+        # 3b' — HORIZONTAL (in-plane) stress closure.  The full-stress momentum
+        # still carries the deviatoric in-plane component τ̃_xx; a ``horizontal``
+        # closure supplies its constitutive value (``ShallowInPlane`` → 0 drops
+        # it back to the shallow-moment form; a Newtonian in-plane → 2ρν ∂_x ũ).
+        # With NO horizontal closure τ̃_xx stays free — the honest full-stress
+        # model.  We substitute the closure value into the in-plane stress head.
+        horiz_clos = [c for c in clos if getattr(c, "closes", None) == "horizontal"]
+        if horiz_clos:
+            for c in horiz_clos:
+                c.register(m); c.check(m)
+            inplane_val = sum((c.expression(_cstate(at=zeta)) for c in horiz_clos),
+                              sp.S.Zero)
+            for a in list(m.momentum.x.expr.atoms(sp.Function)):
+                if "tau_xx" in str(a.func):
+                    m.momentum.x.apply({a: inplane_val})
+            m.momentum.x.apply(Simplify())
+
         def _head(name):
             pool = m.momentum.x.expr.atoms(sp.Function)
             return next(a.func for a in pool if str(a.func) == name)
@@ -161,6 +182,13 @@ class Sigma3D(BaseModel):
         # (verified: σ-momentum(×h) ≡ ∂_t(hu)+∂_x(hu²+gh²/2)+∂_ζ(h u ω)+ghb_x−e_x g h−τ̃_z/ρ).
         zc = b + h * zeta
         momentum_sigma_x = sp.expand((h * m.momentum.x.expr).doit())
+        # The surviving in-plane deviatoric stress τ̃_xx (None/0 if a horizontal
+        # closure dropped it) — fed into the conservative momentum's in-plane
+        # divergence term below so the verify holds in BOTH the full-stress and
+        # the shallow (τ̃_xx→0) cases.
+        _inplane = [a for a in momentum_sigma_x.atoms(sp.Function)
+                    if "tau_xx" in str(a.func)]
+        tau_xx_t = _inplane[0] if _inplane else sp.S.Zero
         # 3-D conservative-σ ingredients, attached to m for the extractor /
         # solver (off the model surface; survive the derivation cache).
         m.omega_def = wt - sp.Derivative(zc, t) - ut * sp.Derivative(zc, x)   # = h·ω
@@ -197,8 +225,14 @@ class Sigma3D(BaseModel):
         omega = sp.Function("omega", real=True)(t, x, zeta)    # σ vertical velocity
         u = mom / h
         # conservative-σ momentum (raw 1/h; viscous −∂_ζ(ν/h ∂_ζ u) from Newtonian).
+        # The IN-PLANE deviatoric stress enters as the σ-conservative divergence
+        # of τ̃_xx: physical −(h/ρ)∂_x τ_xx maps (via ∂_x|_z = ∂_x|_ζ − (∂_x zc/h)∂_ζ)
+        # to −(1/ρ)[h ∂_x τ̃_xx − ∂_ζ τ̃_xx · ∂_x zc].  τ̃_xx=0 (shallow closure)
+        # ⇒ this term vanishes and we recover the shallow-moment momentum exactly.
+        inplane = -(h * d.x(tau_xx_t) - d.zeta(tau_xx_t) * d.x(zc)) / rho
         cons_mom = (d.t(mom) + d.x(mom * u + g * h**2 / 2) + d.zeta(mom * omega)
-                    + g * h * d.x(b) - e_x * g * h - d.zeta(nu / h * d.zeta(u)))
+                    + g * h * d.x(b) - e_x * g * h - d.zeta(nu / h * d.zeta(u))
+                    + inplane)
         # VERIFY the clean conservative form ≡ the derived σ-momentum (ũ=mom/h,
         # w̃=h·ω+∂_t z+ũ ∂_x z) — a faithful derivation, not a hand-write.
         wt_sub = h * omega + sp.Derivative(zc, t) + (mom / h) * sp.Derivative(zc, x)
