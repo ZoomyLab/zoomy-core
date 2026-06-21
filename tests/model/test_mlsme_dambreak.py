@@ -23,7 +23,7 @@ def test_mlsme_structure():
     # Gram-normalized at extraction (runtime integrates ∂_t Q = RHS)
     assert M == sp.eye(6)
     # same fraction-multiplier G as the level-0 MLSWE (k=0 continuities)
-    G = sp.sympify(list(mod._G_closed.values())[0])
+    G = sp.sympify(list(mod.derivation.G_closed.values())[0])
     rho, l1 = sp.Symbol("rho", positive=True), sp.Symbol("l_1", positive=True)
     t_, x_ = sm.time, sm.space[0]
     q1 = sp.Function("q_1", real=True)(0, t_, x_)

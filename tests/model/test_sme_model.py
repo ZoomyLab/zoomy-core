@@ -140,7 +140,7 @@ def test_canonical_method_and_register_group_conflict_raises():
     from zoomy_core.systemmodel import SystemModel
     model = SME(closures=[Newtonian(), NavierSlip(), StressFree()], level=0)
     m = model.derivation
-    b = model._bed
+    b = list(m.explicit_state())[0]              # the bed (was model._bed)
     m.register_group("interpolate", 0, b)        # collides with the stash
     import pytest as _pytest
     with _pytest.raises(ValueError, match="exactly one definition"):

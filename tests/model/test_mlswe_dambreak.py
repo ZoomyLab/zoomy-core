@@ -27,7 +27,7 @@ def test_mlswe_structure_and_closed_G():
     M = sp.Matrix(sm.mass_matrix.tolist())
     assert M == sp.eye(4)
     # the Hörnschemeyer multiplier, pinned: G_1 = ρ(l_1·∂x(q_1+q_2) − ∂x q_1)
-    G = sp.sympify(list(mod._G_closed.values())[0])
+    G = sp.sympify(list(mod.derivation.G_closed.values())[0])
     rho, l1 = sp.Symbol("rho", positive=True), sp.Symbol("l_1", positive=True)
     t_, x_ = sm.time, sm.space[0]
     q1 = sp.Function("q_1", real=True)(0, t_, x_)
