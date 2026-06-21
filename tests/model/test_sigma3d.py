@@ -65,8 +65,8 @@ def test_full_3d_conservative_sigma_extract():
     (manual); viscous ``−ν/h²`` as the ζζ diffusion of mom with NO spurious
     ``∂_ζ h`` coupling (per-field dims); bed slope ``g·h`` in the NCP; ``e_x·g·h``
     source."""
-    from zoomy_core.model.models.stay3d_sigma import Stay3DSigma
-    mdl = Stay3DSigma(parameters={"nu": 0.7, "e_x": 0.3, "g": 9.81,
+    from zoomy_core.model.models.sigma3d import Sigma3D
+    mdl = Sigma3D(parameters={"nu": 0.7, "e_x": 0.3, "g": 9.81,
                                   "rho": 1.0, "lambda_s": 0.5})
     m = mdl.derivation                               # internal asserts ran in derive
     assert not m.mass.expr.atoms(sp.Integral)        # integral absorbed into U

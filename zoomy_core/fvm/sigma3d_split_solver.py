@@ -2,7 +2,7 @@
 FACE-CONSISTENT vertical velocity ω.
 
 This is the *reference* numerical solver for
-:class:`zoomy_core.model.models.stay3d_sigma.Stay3DSigma`.  It realises the
+:class:`zoomy_core.model.models.sigma3d.Sigma3D`.  It realises the
 dimensional split the model is built for:
 
 * a 2-D (here 1-D-x) BAROTROPIC system for ``h`` driven by the column mass flux,
@@ -50,7 +50,7 @@ from __future__ import annotations
 import numpy as np
 
 
-class Stay3DSplitSolver:
+class Sigma3DSplitSolver:
     """Explicit structured (x, ζ) coupled solver with face-consistent ω.
 
     Parameters

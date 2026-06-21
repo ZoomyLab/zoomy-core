@@ -2,7 +2,7 @@
 
 Handoff spec for redefining how zoomy_core tracks dimensionality and splits a
 model into 2-D and 3-D sub-systems. Motivated by the **stay-3D σ model**
-(`zoomy_core/model/models/stay3d_sigma.py`): general 3-D balance → σ-map →
+(`zoomy_core/model/models/sigma3d.py`): general 3-D balance → σ-map →
 column-integrated height equation, but NO velocity ansatz — the flow stays 3-D
 and the vertical integral is an aux. To solve it we need one system in which
 `h, b` are 2-D fields `(t,x)` and `ũ` is a 3-D field `(t,x,ζ)`, coupled.

@@ -1,4 +1,4 @@
-"""Stay-3D σ reference solver (:class:`Stay3DSplitSolver`) — the face-consistent
+"""Stay-3D σ reference solver (:class:`Sigma3DSplitSolver`) — the face-consistent
 ω makes the inviscid 3-D solver CONVERGENT.
 
 The lagged-ω prototype was non-convergent on the inviscid BBSM13/AHS26
@@ -14,10 +14,10 @@ These are run, not asserted by hand.
 """
 import numpy as np
 
-from zoomy_core.model.models.stay3d_sigma import Stay3DSigma
+from zoomy_core.model.models.sigma3d import Sigma3D
 from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
 from zoomy_core.model.boundary_conditions import Extrapolation
-from zoomy_core.fvm.stay3d_split_solver import Stay3DSplitSolver
+from zoomy_core.fvm.sigma3d_split_solver import Sigma3DSplitSolver
 
 # BBSM13 / AHS26 §3.1: stationary inviscid hydrostatic-Euler solution.
 _A, _B, _ZBAR, _G = 0.1, 1.0, 2.0, 9.81
@@ -27,7 +27,7 @@ def _u(x, z): h = _h(x); return (_A*_B)/np.sin(_B*h)*np.cos(_B*(z - _zb(x)))
 
 
 def _bbsm13_model():
-    m = Stay3DSigma(closures=[Newtonian(), NavierSlip(), StressFree()],
+    m = Sigma3D(closures=[Newtonian(), NavierSlip(), StressFree()],
                     parameters={"nu": 0.0, "e_x": 0.0, "g": _G,
                                 "rho": 1.0, "lambda_s": 0.0})
     m.boundary_conditions = [Extrapolation(tag="left"), Extrapolation(tag="right")]
@@ -40,7 +40,7 @@ def _ic(x, zeta):
 
 
 def _l1_error(NX, NY, t_end):
-    s = Stay3DSplitSolver(NX, NY, domain=(-5., 5., 0., 1.), cfl=0.4, rk=2)
+    s = Sigma3DSplitSolver(NX, NY, domain=(-5., 5., 0., 1.), cfl=0.4, rk=2)
     r = s.solve(_bbsm13_model(), _ic, t_end)
     xc, zc, h, b, uu = r["x"], r["zeta"], r["h"], r["b"], r["u"]
     uref = np.array([[_u(xc[i], _zb(xc[i]) + zc[k]*_h(xc[i]))
@@ -85,8 +85,8 @@ def test_relaxes_to_steady_state_from_perturbed_ic():
         return zb, h, h * _u(x, zb + zeta * h)
 
     NX, NY, dom = 120, 12, (-5., 5., 0., 1.)
-    rp = Stay3DSplitSolver(NX, NY, domain=dom, cfl=0.4, rk=2).solve(model, ic_bump, 3.0)
-    re = Stay3DSplitSolver(NX, NY, domain=dom, cfl=0.4, rk=2).solve(model, _ic, 3.0)
+    rp = Sigma3DSplitSolver(NX, NY, domain=dom, cfl=0.4, rk=2).solve(model, ic_bump, 3.0)
+    re = Sigma3DSplitSolver(NX, NY, domain=dom, cfl=0.4, rk=2).solve(model, _ic, 3.0)
     xc, zc = rp["x"], rp["zeta"]
 
     dEta = float(np.max(np.abs(rp["b"] + rp["h"] - (_zb(xc) + _h(xc)))))
@@ -100,7 +100,7 @@ def test_relaxes_to_steady_state_from_perturbed_ic():
 
 def test_viscous_navierslip_dambreak_stable():
     """Viscous + Navier-slip dam break: stable, mass-conserving, sheared."""
-    model = Stay3DSigma(closures=[Newtonian(), NavierSlip(), StressFree()],
+    model = Sigma3D(closures=[Newtonian(), NavierSlip(), StressFree()],
                         parameters={"nu": 1e-2, "e_x": 0.0, "g": 9.81,
                                     "rho": 1.0, "lambda_s": 1.0})
     model.boundary_conditions = [Extrapolation(tag="left"),
@@ -110,7 +110,7 @@ def test_viscous_navierslip_dambreak_stable():
         return 0.0, (2.0 if x < 5.0 else 1.0), 0.0
 
     NX, NY = 200, 16
-    s = Stay3DSplitSolver(NX, NY, domain=(0., 10., 0., 1.), cfl=0.4, rk=2)
+    s = Sigma3DSplitSolver(NX, NY, domain=(0., 10., 0., 1.), cfl=0.4, rk=2)
     r = s.solve(model, ic, 0.5)
     h, mom, u = r["h"], r["mom"], r["u"]
     dx = 10.0 / NX

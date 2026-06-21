@@ -38,7 +38,7 @@ The aux is introduced with EXISTING machinery — no ``promote_to_aux`` op::
     m.add_equation("U", sp.Eq(U, ∫ũ dζ), group="aux")   # records the definition
     m.mass.apply({∫ũ dζ: U})                            # U auto-lands in Qaux
 
-``Stay3DSigma(...).derive_model()`` builds the declarative model;
+``Sigma3D(...).derive_model()`` builds the declarative model;
 ``.system_model`` returns the height-reduced ``[b, h] + U`` SystemModel (the
 3-D momentum is stashed on ``self`` for the forthcoming 3-D extraction, which
 needs the vertical added to the extractor's ``space``).
@@ -62,7 +62,7 @@ t, x, y, z = C.t, C.x, C.y, C.z
 zeta = sp.Symbol("zeta", real=True)
 
 
-class Stay3DSigma(BaseModel):
+class Sigma3D(BaseModel):
     """3-D mass+momentum → σ-map → column-integrated height equation, keeping the
     velocity profile UNCLOSED as a per-backend vertical integral.
 
@@ -90,7 +90,7 @@ class Stay3DSigma(BaseModel):
     def derive_model(self):
         if int(self.dimension) != 2:
             raise NotImplementedError(
-                "Stay3DSigma: only dimension=2 (t,x,z) is wired today.")
+                "Sigma3D: only dimension=2 (t,x,z) is wired today.")
         values = {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0, "e_x": 0.0}
         user_vals = getattr(self, "parameter_values", None)
         if user_vals is not None and hasattr(user_vals, "items"):
