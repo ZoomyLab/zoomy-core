@@ -98,6 +98,25 @@ class GenericCppBase(CXX11CodePrinter):
         "max_wavespeed": lambda p, *args: p._print_nested_max(
             [f"{p.math_namespace}abs({p.doprint(a)})" for a in args]
         ),
+        # Backend-provided free functions (the C++ printer only emits the
+        # call; the backend supplies the implementation, exactly like
+        # OpenFOAM's ``UserFunctions.H`` — see FoamNumericsPrinter
+        # (``numerics::eigensystem``) and FoamUpdateAuxPrinter
+        # (``numerics::compute_derivative``) in ``to_openfoam.py``).
+        #
+        #   compute_derivative(field_id, dx, dy, dz)
+        #       -> the (dx,dy,dz)-order spatial derivative of the field
+        #          identified by ``field_id``, evaluated on the mesh.
+        #   eigensystem(idx, A...)
+        #       -> the ``idx``-th eigen-quantity of the flattened matrix
+        #          ``A`` (the opaque eigendecomposition a Roe scheme builds
+        #          ``|A| = R|Lambda|L`` from).
+        "compute_derivative": lambda p, *args: (
+            "compute_derivative(" + ", ".join(p.doprint(a) for a in args) + ")"
+        ),
+        "eigensystem": lambda p, *args: (
+            "eigensystem(" + ", ".join(p.doprint(a) for a in args) + ")"
+        ),
     }
 
     def __init__(self, *args, **kwargs):
@@ -715,9 +734,22 @@ class GenericCppModel(GenericCppBase):
         """Initialize the instance."""
         super().__init__(*args, **kwargs)
         self.model = model
-        self.n_dof_q = model.n_variables
-        self.n_dof_qaux = model.n_aux_variables
-        self.n_parameters = model.n_parameters
+        # Declarative models carry their lowered interface (state, params,
+        # BC Piecewise) on the SystemModel, not on the Model itself (e.g.
+        # SME(level=0) has n_variables==1 but the SystemModel state is
+        # [b, h, q_0] with 5 parameters).  Source the emitted interface
+        # from the SystemModel when present — mirrors FoamSystemModelPrinter.
+        # Legacy hand-written Models (no ``system_model``) fall back to the
+        # Model's own counts.
+        self.sm = getattr(model, "system_model", None)
+        if self.sm is not None:
+            self.n_dof_q = self.sm.n_equations
+            self.n_dof_qaux = len(self.sm.aux_state)
+            self.n_parameters = len(list(self.sm.parameters.keys()))
+        else:
+            self.n_dof_q = model.n_variables
+            self.n_dof_qaux = model.n_aux_variables
+            self.n_parameters = model.n_parameters
         self.register_map("Q", model.variables.values())
         self.register_map("Qaux", model.aux_variables.values())
         if hasattr(model, "gradient_variables") and model.gradient_variables.length() > 0:
@@ -740,40 +772,97 @@ class GenericCppModel(GenericCppBase):
         for name, func_obj in self.model.functions.items():
             blocks.extend(self._process_kernel_from_function(func_obj))
 
-        # Shared arguments for BC functions
-        bc_args = self.get_bc_args()
-
-        # 1. Main Boundary Conditions
-        bc_wrapper = self.model._boundary_conditions
-        shape, expr = get_nested_shape(bc_wrapper.definition)
-        body = self.convert_expression_body(expr, shape)
-        blocks.extend(
-            [self.wrap_function_signature("boundary_conditions", bc_args, body, shape)]
-        )
-
-        # 2. Aux Boundary Conditions
-        bc_aux_wrapper = self.model._aux_boundary_conditions
-        shape_aux, expr_aux = get_nested_shape(bc_aux_wrapper.definition)
-        body_aux = self.convert_expression_body(expr_aux, shape_aux)
-        blocks.extend(
-            [
-                self.wrap_function_signature(
-                    "aux_boundary_conditions", bc_args, body_aux, shape_aux
-                )
-            ]
-        )
+        blocks.extend(self._emit_boundary_conditions())
 
         blocks.append(self.get_file_footer())
         return "\n".join(blocks)
 
+    def _emit_boundary_conditions(self):
+        """Lower the model's ``BoundaryConditions`` into the indexed
+        ``boundary_conditions(bc_idx, …)`` / ``aux_boundary_conditions``
+        Piecewise kernels.
+
+        The indexed Piecewise (one branch per boundary tag, dispatched on
+        ``bc_idx``) is owned by the SystemModel — built from the very
+        ``BoundaryConditions`` the Model carries — and its branches
+        reference the SystemModel state / aux / parameter / normal symbols.
+        This mirrors ``FoamSystemModelPrinter._emit_boundary_conditions``;
+        we read ``sm.boundary_conditions`` instead of the stale
+        ``model._boundary_conditions`` that current models no longer expose.
+        """
+        sm = self.sm
+        if sm is None:
+            return []
+        blocks = [
+            self._emit_bc_kernel("boundary_conditions", sm.boundary_conditions)
+        ]
+        aux_bc = getattr(sm, "aux_boundary_conditions", None)
+        if aux_bc is not None:
+            blocks.append(
+                self._emit_bc_kernel("aux_boundary_conditions", aux_bc)
+            )
+        return blocks
+
+    def _emit_bc_kernel(self, func_name, bc_func):
+        """Emit one boundary-condition Piecewise kernel.
+
+        Pushes a temporary symbol map binding the SystemModel state /
+        aux / parameter / normal symbols (and the BC-specific scalar
+        ``bc_idx`` / ``time`` / ``distance`` / position symbols) to their
+        C interface accessors, then prints the Piecewise body.
+        """
+        sm = self.sm
+        smap = {}
+        for i, s in enumerate(sm.state):
+            smap[s] = self.format_accessor("Q", i)
+        for i, s in enumerate(sm.aux_state):
+            smap[s] = self.format_accessor("Qaux", i)
+        for i, s in enumerate(sm.parameters.values()):
+            smap[s] = self.format_accessor("p", i)
+        for i, s in enumerate(sm.normal.values()):
+            smap[s] = self.format_accessor("n", i)
+        args = bc_func.args
+        if args.contains("idx"):
+            smap[args["idx"]] = "bc_idx"
+        if args.contains("time"):
+            smap[args["time"]] = self.ARG_MAPPING.get("time", "time")
+        if args.contains("distance"):
+            smap[args["distance"]] = self.ARG_MAPPING.get("distance", "dX")
+        if args.contains("position"):
+            pos = args["position"]
+            if hasattr(pos, "values"):
+                for i, s in enumerate(pos.values()):
+                    smap[s] = self.format_accessor("X", i)
+        self.symbol_maps.append(smap)
+        try:
+            shape, expr = get_nested_shape(bc_func.definition)
+            body = self.convert_expression_body(expr, shape)
+            return self.wrap_function_signature(
+                func_name, self.get_bc_args(), body, shape
+            )
+        finally:
+            self.symbol_maps.pop()
+
     def get_file_header(self):
         """Get file header."""
-        bc_names = sorted(
-            self.model.boundary_conditions.boundary_conditions_list_dict.keys()
-        )
+        sm = self.sm
+        # Boundary tags and parameter names/defaults describe the emitted
+        # C interface — take them from the SystemModel when present (the
+        # declarative Model's own ``parameters`` may be empty; the lowered
+        # operators and BCs reference the SystemModel parameters).
+        if sm is not None:
+            bc_names = sorted(sm._bc_source.boundary_conditions_list_dict.keys())
+            param_keys = list(sm.parameters.keys())
+            param_vals = list(sm.parameter_values.values())
+            dimension = sm.dimension
+        else:
+            bc_names = sorted(
+                self.model.boundary_conditions.boundary_conditions_list_dict.keys()
+            )
+            param_keys = list(self.model.parameters.keys())
+            param_vals = list(self.model.parameters.values())
+            dimension = self.model.dimension
         bc_str = ", ".join(f'"{item}"' for item in bc_names)
-        param_keys = list(self.model.parameters.keys())
-        param_vals = list(self.model.parameters.values())
         if len(param_keys) != len(param_vals):
             raise ValueError(
                 f"Parameter keys {param_keys} and values values {param_vals} do not match"
@@ -803,8 +892,10 @@ class GenericCppModel(GenericCppBase):
             )
         else:
             lines.append("#define PORTABLE_FN")
-        # Detect whether the model has non-trivial diffusion
-        n_dof_gradQ = self.model.gradient_variables.length()
+        # Detect whether the model has non-trivial diffusion.  Models that
+        # do not expose ``gradient_variables`` (current declarative models)
+        # have no gradQ dof — treat as 0 rather than crashing.
+        n_dof_gradQ = self._n_dof_gradq()
         has_diffusion = self._detect_has_diffusion()
         has_free_surface = self._detect_has_free_surface()
 
@@ -815,7 +906,7 @@ class GenericCppModel(GenericCppBase):
                 f"    static constexpr int n_dof_q    = {self.n_dof_q};",
                 f"    static constexpr int n_dof_qaux = {self.n_dof_qaux};",
                 f"    static constexpr int n_parameters = {self.n_parameters};",
-                f"    static constexpr int dimension  = {self.model.dimension};",
+                f"    static constexpr int dimension  = {dimension};",
                 f"    static constexpr int n_dof_gradQ = {n_dof_gradQ};",
                 f"    static constexpr bool has_diffusion = {'true' if has_diffusion else 'false'};",
                 f"    static constexpr bool has_free_surface = {'true' if has_free_surface else 'false'};",
@@ -848,9 +939,26 @@ class GenericCppModel(GenericCppBase):
             return not all(sp.simplify(e) == 0 for e in sp.flatten(expr))
         return sp.simplify(expr) != 0
 
+    def _n_dof_gradq(self):
+        """Number of gradient-variable dof, or 0 when the model has no
+        ``gradient_variables`` (current declarative models)."""
+        gv = getattr(self.model, "gradient_variables", None)
+        if gv is None:
+            return 0
+        if hasattr(gv, "length"):
+            return gv.length()
+        return len(gv)
+
+    def _state_names(self):
+        """Names of the emitted state slots (SystemModel state when present,
+        else the Model's own conserved variables)."""
+        if self.sm is not None:
+            return [str(s) for s in self.sm.state]
+        return list(self.model.variables.keys())
+
     def _var_index(self, name):
-        """Return the index of a variable by name, or -1 if not found."""
-        keys = list(self.model.variables.keys())
+        """Return the index of a state variable by name, or -1 if not found."""
+        keys = self._state_names()
         return keys.index(name) if name in keys else -1
 
     def _detect_has_free_surface(self):
@@ -860,8 +968,10 @@ class GenericCppModel(GenericCppBase):
         of both 'h' (water depth) and 'b' (bathymetry) in either the
         conserved or auxiliary variable sets.
         """
-        all_vars = set(self.model.variables.keys())
-        if hasattr(self.model, "aux_variables"):
+        all_vars = set(self._state_names())
+        if self.sm is not None:
+            all_vars |= {str(s) for s in self.sm.aux_state}
+        elif hasattr(self.model, "aux_variables"):
             all_vars |= set(self.model.aux_variables.keys())
         return "h" in all_vars and "b" in all_vars
 
@@ -870,8 +980,12 @@ class GenericCppModel(GenericCppBase):
         return "};\n"
 
     def get_bc_args(self):
-        """Hook to define boundary condition arguments."""
-        return "const int bc_idx,\n        const T* Q,\n        const T* Qaux,\n        const T* n,\n        const T* X,\n        const T time,\n        const T dX"
+        """Hook to define boundary condition arguments.
+
+        ``p`` (the model parameter vector) is part of the interface so
+        parameter-dependent boundary conditions lower correctly.
+        """
+        return "const int bc_idx,\n        const T* Q,\n        const T* Qaux,\n        const T* p,\n        const T* n,\n        const T* X,\n        const T time,\n        const T dX"
 
 
 # =========================================================================
