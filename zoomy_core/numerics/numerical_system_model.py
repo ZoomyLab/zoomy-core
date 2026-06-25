@@ -172,6 +172,55 @@ class NumericalSystemModel:
     # right list at setup time and passes it here.
     scaled_q_indices: Optional[list] = None
 
+    # ── SystemModel delegation ────────────────────────────────────
+    # The NSM is a *thin numerical wrapper* around a frozen
+    # SystemModel.  Solvers / codegen reach a fixed set of the
+    # SystemModel's physics slots through the NSM; rather than spell
+    # ``nsm.sm.<x>`` at every site we delegate those — and ONLY those
+    # — to ``self.sm`` via a guarded ``__getattr__``.  The list is an
+    # explicit ALLOWLIST (every entry is a real SystemModel data field
+    # or ``@property``), so a typo such as ``nsm.boudary_conditions``
+    # still raises ``AttributeError`` instead of silently forwarding.
+    #
+    # ⚠ BC kernel/container split: ``boundary_conditions`` here is the
+    # SystemModel's *lambdified BC kernel* (a sympy ``Function``).  The
+    # periodic ``BoundaryConditions`` CONTAINER is deliberately NOT in
+    # the allowlist — it stays reachable only at ``nsm.sm._bc_source``
+    # (IMEX periodic-BC resolution depends on that separation).
+    _DELEGATED_SM_ATTRS = frozenset({
+        # state / aux
+        "state", "aux_state", "aux_registry",
+        # symbolic operators
+        "flux", "source", "source_explicit", "source_jacobian",
+        "quasilinear_matrix", "mass_matrix", "nonconservative_matrix",
+        "hydrostatic_pressure", "diffusion_matrix",
+        "diffusion_matrix_explicit", "eigenvalues",
+        # symbols / metadata
+        "time", "space", "normal", "position",
+        "parameters", "parameter_values",
+        "equilibrium_reconstruction",
+        # BC kernels (Function objects — NOT the containers)
+        "boundary_conditions", "aux_boundary_conditions",
+        "boundary_gradients",
+        # size / shape properties
+        "n_equations", "n_state", "n_dim", "n_variables",
+        "n_aux_variables", "n_parameters", "dimension",
+        "variables", "aux_variables", "eigenvalue_mode",
+    })
+
+    def __getattr__(self, name: str):
+        # ``__getattr__`` only fires when normal attribute lookup
+        # fails, so the dataclass's own fields (``sm``, ``riemann``,
+        # …) never reach here.  Use ``__dict__`` to read ``sm`` so we
+        # never recurse through ``__getattr__`` itself (matters during
+        # copy / unpickle, before ``sm`` is bound).
+        if name in NumericalSystemModel._DELEGATED_SM_ATTRS:
+            sm = self.__dict__.get("sm")
+            if sm is not None:
+                return getattr(sm, name)
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}")
+
     # ── Constructors ──────────────────────────────────────────────
 
     @classmethod
