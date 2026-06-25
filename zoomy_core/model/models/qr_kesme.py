@@ -346,19 +346,38 @@ class QRKESME(SME):
         m.apply(InvertMassMatrix())
 
         # 9b — wall-function bed BCs (weak/penalty) on the q-r variables, pinned
-        # to the channel friction velocity u_*² = g h e_x (the uniform open-channel
-        # bed shear).  φ_i(ζ=0)=P_i(−1)=(−1)^i, so the bed traces are
-        # sk(0)=Σ(SK_i/h)(−1)^i, se(0)=Σ(SE_i/h)(−1)^i.  Drive
+        # to the LIVE rough-wall friction velocity u_*² = C_f·U_p² (REQ-42; see
+        # block below — same bed law as the momentum closure, valid for both
+        # slope- and non-slope-driven flow).  φ_i(ζ=0)=P_i(−1)=(−1)^i, so the bed
+        # traces are sk(0)=Σ(SK_i/h)(−1)^i, se(0)=Σ(SE_i/h)(−1)^i.  Drive
         #   sk(0) → √(u_*²/√C_μ)        (k-wall   k=u_*²/√C_μ, sk=√k)
         #   se(0) → √(u_*³/(κ z_p))     (ε-wall   ε=u_*³/(κ z_p), se=√ε)
         # via τ_p·(−1)^l·(trace − wall) on mode l.  Both wall targets are
-        # POSITIVE (u_*²=g h e_x>0) so no √(negative) — and with sk,se the state,
+        # POSITIVE (u_*²=C_f·U_p²≥0) so no √(negative) — and with sk,se the state,
         # k=sk²≥0 / ε=se²≥0 hold for the whole spin-up (the q-r raison d'être).
         SK_head = m.functions.SK.head
         SE_head = m.functions.SE.head
         kap, z_p = m.parameters.kappa, m.parameters.z_p
         tau_p = m.parameters.eps_wall_penalty
-        ustar2 = g * h * m.parameters.e_x
+        # ── Live rough-wall friction velocity (REQ-42) ───────────────────────
+        # The wall-function friction velocity must be the LIVE bed friction
+        # velocity from the bed law (cf. REQ-12), NOT the slope value g*h*e_x.
+        # g*h*e_x is ZERO for any non-slope-driven flow (dam break, sloshing,
+        # tide, ...), so the wall BC then pins the bed turbulence target to zero
+        # and ACTIVELY SUPPRESSES the turbulence the flow should produce — the
+        # k-buildup never happens.  Replace with u_*^2 = C_f * U_p^2, the same
+        # rough-wall law the momentum bed closure uses:
+        #   C_f = (kappa / ln(z_p/z0))^2,  z0 = k_s/30,  U_p = u(zeta_p).
+        # Recovers the old behaviour in a uniform slope-driven channel (there
+        # C_f*U_p^2 == g h e_x at equilibrium) but now tracks the LOCAL flow.
+        _qh_wall = [getattr(m.functions, qn).head for qn in QNAME]
+        _zeta_p = z_p / h
+        _Cf_wall = (kap / sp.log(z_p / (m.parameters.k_s / 30))) ** 2
+        _Up2 = sum(
+            (sum((qh(i, t, *horiz) / h) * sp.legendre(i, 2 * _zeta_p - 1)
+                 for i in range(Nu + 1))) ** 2
+            for qh in _qh_wall)
+        ustar2 = _Cf_wall * _Up2
         sk_wall = sp.sqrt(ustar2 / sp.sqrt(C_mu))
         se_wall = sp.sqrt(ustar2 ** sp.Rational(3, 2) / (kap * z_p))
         sk0 = sum((SK_head(i, t, *horiz) / h) * (-1) ** i for i in range(Nk + 1))
