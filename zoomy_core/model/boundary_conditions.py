@@ -1,6 +1,7 @@
 """Module `zoomy_core.model.boundary_conditions`."""
 
 import functools
+import re
 import numpy as np
 from time import time as get_time
 import sympy
@@ -663,6 +664,20 @@ class CharacteristicWall(Characteristic):
 
     momentum_field_indices = param.List(default=[[1, 2]])
 
+    def __init__(self, tag=None, on=None, **params):
+        self._mom_indices_explicit = "momentum_field_indices" in params
+        super().__init__(tag=tag, on=on, **params)
+
+    def resolve(self, sm):
+        """Resolve the eigensystem (base) AND bind the mirror's momentum index
+        groups to this model's state layout — same fix as :meth:`Wall.resolve`
+        (default ``[[1, 2]]`` mis-targets the ``[b, h, …]`` state)."""
+        super().resolve(sm)
+        if not self._mom_indices_explicit:
+            self.momentum_field_indices = _state_momentum_groups(
+                [str(s) for s in sm.state])
+        return self
+
     def target_state(self, time, X, dX, Q, Qaux, parameters, normal):
         q = ZArray(Q)
         out = ZArray(Q)
@@ -729,6 +744,27 @@ class Wall(BoundaryCondition):
     blending = param.Number(default=0.0)
     use_gradient = param.Boolean(default=True,
         doc="Use gradient for 2nd-order ghost extrapolation when available")
+
+    def __init__(self, tag=None, on=None, **params):
+        # Record whether the caller pinned momentum_field_indices explicitly
+        # (or whether resolve_per_field set them) — if so, ``resolve`` must NOT
+        # override them with the state-derived default.
+        self._mom_indices_explicit = "momentum_field_indices" in params
+        super().__init__(tag=tag, on=on, **params)
+
+    def resolve(self, sm):
+        """Bind the momentum reflection to THIS model's state layout.
+
+        Without an explicit ``momentum_field_indices``, the default ``[[1, 2]]``
+        wrongly assumes momentum sits at slots 1,2 — but the SW hierarchy state
+        is ``[b, h, <momentum…>]`` (e.g. SWE ``[b, h, hu, hv]`` ⇒ slots 2,3;
+        SME(0) dim=2 ``[b, h, q_0]`` ⇒ slot 2).  Derive the real momentum index
+        groups from the declared state names so the wall reflects the NORMAL
+        momentum and leaves the scalar depth alone (no negative ghost h)."""
+        if not self._mom_indices_explicit:
+            self.momentum_field_indices = _state_momentum_groups(
+                [str(s) for s in sm.state])
+        return self
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
         """Compute boundary condition."""
@@ -1332,6 +1368,25 @@ def _momentum_groups(slots, state_names):
             for l in sorted(by_level)]
 
 
+# Conserved horizontal-momentum variables across the SW hierarchy: SWE depth-
+# momenta ``hu/hv/hw`` and the moment momenta ``q`` / ``q_<lvl>`` /
+# ``q_{x,y,z}_<lvl>`` (SME/VAM/ML).  Scalars (``b``, ``h``) and tracers
+# (``k``, ``ε``, …) deliberately do NOT match.
+_MOMENTUM_NAME_RE = re.compile(r"^(?:h[uvw]|q)(?:_[xyz])?(?:_\d+)?$")
+
+
+def _state_momentum_groups(state_names):
+    """Derive momentum-component index groups DIRECTLY from the declared state
+    names — the model is the source of truth for WHERE momentum lives.  Slots
+    whose name is a horizontal momentum (see :data:`_MOMENTUM_NAME_RE`) are
+    grouped per moment level into ``(x[, y[, z]])`` vectors via
+    :func:`_momentum_groups`, so a :class:`Wall` reflects only the NORMAL
+    component regardless of how many scalars precede momentum in the state."""
+    slots = [i for i, nm in enumerate(state_names)
+             if _MOMENTUM_NAME_RE.match(nm)]
+    return _momentum_groups(slots, state_names)
+
+
 class PerFieldBoundary(BoundaryCondition):
     """Composite BC for one tag: each state slot delegates to the BC assigned to
     its field.  Built by :func:`resolve_per_field`; unclaimed slots fall back to
@@ -1412,6 +1467,7 @@ def resolve_per_field(bc_list, state_names, aliases=None):
                 # Wall decomposes into normal/transverse and reflects only the
                 # NORMAL component — dimension-agnostic (1-D, 2-D, 3-D).
                 bc.momentum_field_indices = _momentum_groups(slots, state_names)
+                bc._mom_indices_explicit = True   # resolve must not broaden it
             for s in slots:
                 if s in slot_bc and slot_bc[s] is not bc:
                     raise ValueError(
