@@ -666,14 +666,15 @@ class CharacteristicWall(Characteristic):
     def target_state(self, time, X, dX, Q, Qaux, parameters, normal):
         q = ZArray(Q)
         out = ZArray(Q)
+        ndim = len(normal)
         for indices in self.momentum_field_indices:
-            dim = len(indices)
-            n_vec = Matrix(normal[:dim])
-            momentum = Matrix([q[k] for k in indices])
+            idx = indices[:ndim]
+            n_vec = Matrix(normal[: len(idx)])
+            momentum = Matrix([q[k] for k in idx])
             normal_momentum = momentum.dot(n_vec)
             mirrored = momentum - 2 * normal_momentum * n_vec
-            for i, idx in enumerate(indices):
-                out[idx] = mirrored[i]
+            for i, k in enumerate(idx):
+                out[k] = mirrored[i]
         return out
 
 
@@ -732,37 +733,37 @@ class Wall(BoundaryCondition):
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
         """Compute boundary condition."""
         q = ZArray(Q)
-        dim = len(self.momentum_field_indices[0])
-        n_vec = Matrix(normal[:dim])
         out = ZArray(Q)
-        momentum_list_wall = []
+        # Project momentum onto the horizontal normal.  The normal lives in the
+        # horizontal space, so its rank IS the number of horizontal directions
+        # (1 for SME dimension=2, 2 for SME dimension=3 / SWE).  Slice the
+        # momentum indices to that rank so the .dot ranks match regardless of
+        # how many components the default index list names.
+        ndim = len(normal)
         for indices in self.momentum_field_indices:
-            momentum = Matrix([q[k] for k in indices])
+            idx = indices[:ndim]
+            n_vec = Matrix(normal[: len(idx)])
+            momentum = Matrix([q[k] for k in idx])
             normal_momentum_coef = momentum.dot(n_vec)
             transverse_momentum = momentum - normal_momentum_coef * n_vec
             momentum_wall = (
                 self.wall_slip * transverse_momentum
                 - (1 - self.permeability) * normal_momentum_coef * n_vec
             )
-            momentum_list_wall.append(momentum_wall)
-        for indices, momentum_wall in zip(
-            self.momentum_field_indices, momentum_list_wall
-        ):
-            for i, idx in enumerate(indices):
-                out[idx] = (1 - self.blending) * momentum_wall[i] + self.blending * q[
-                    idx
-                ]
+            for i, k in enumerate(idx):
+                out[k] = (1 - self.blending) * momentum_wall[i] + self.blending * q[k]
         return out
 
     def face_state(self, Q_face, Qaux_face, normal, parameters):
         """Wall: reflect normal momentum component of the reconstructed face value."""
         Q_wall = Q_face.copy()
+        ndim = len(normal)
         for indices in self.momentum_field_indices:
-            dim = len(indices)
-            n_vec = normal[:dim]
-            mom = np.array([Q_face[k] for k in indices], dtype=float)
+            idx = indices[:ndim]
+            n_vec = np.asarray(normal[: len(idx)], dtype=float)
+            mom = np.array([Q_face[k] for k in idx], dtype=float)
             normal_component = np.dot(mom, n_vec)
-            for i, k in enumerate(indices):
+            for i, k in enumerate(idx):
                 Q_wall[k] = (self.wall_slip * (mom[i] - normal_component * n_vec[i])
                              - (1 - self.permeability) * normal_component * n_vec[i])
         return Q_wall
@@ -776,12 +777,13 @@ class Wall(BoundaryCondition):
         """
         Q_inner = np.asarray(Q_inner, dtype=float)
         Q_wall = Q_inner.copy()
+        ndim = len(normal)
         for indices in self.momentum_field_indices:
-            dim = len(indices)
-            n_vec = np.asarray(normal[:dim], dtype=float)
-            mom = np.array([Q_inner[k] for k in indices], dtype=float)
+            idx = indices[:ndim]
+            n_vec = np.asarray(normal[: len(idx)], dtype=float)
+            mom = np.array([Q_inner[k] for k in idx], dtype=float)
             normal_component = np.dot(mom, n_vec)
-            for i, k in enumerate(indices):
+            for i, k in enumerate(idx):
                 Q_wall[k] = (self.wall_slip * (mom[i] - normal_component * n_vec[i])
                              - (1 - self.permeability) * normal_component * n_vec[i])
         return Q_wall
