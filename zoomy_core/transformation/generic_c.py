@@ -778,6 +778,15 @@ class GenericCppModel(GenericCppBase):
         blocks = [self.get_file_header()]
         if self.sm is not None:
             blocks.extend(self._emit_operator_kernels())
+            # Drop-in kernels the dmplex/C solver calls directly (REQ-44):
+            # stacked all-directions flux / NCP, the source Jacobians, the
+            # per-cell state / aux update + its Jacobian, and the initial
+            # condition.  Each is read off the SystemModel; a None slot is
+            # documented (``_doc_note``) instead of emitting a broken kernel.
+            blocks.extend(self._emit_stacked_operators())
+            blocks.extend(self._emit_source_jacobians())
+            blocks.extend(self._emit_update_kernels())
+            blocks.extend(self._emit_initial_conditions())
             blocks.extend(self._emit_reconstruction_kernels())
             blocks.extend(self._emit_projection_kernels())
         else:
@@ -834,16 +843,42 @@ class GenericCppModel(GenericCppBase):
         """Operator-kernel parameter list from an ordered arg-key list."""
         return ",\n        ".join(self._sm_arg_decl(a) for a in args)
 
-    def _sm_kernel(self, name, expr, shape, args):
-        """Emit one operator kernel from a SystemModel expression, with the
-        SystemModel symbol map pushed for the body."""
-        self.symbol_maps.append(self._sm_symbol_map())
+    def _kernel_with_symbol_map(self, name, expr, shape, args, smap):
+        """Emit one kernel from a symbolic expression with ``smap`` pushed for
+        the body (the shared lowering path; ``_sm_kernel`` uses the SystemModel
+        state/aux/parameter/normal map, the IC kernels a position/parameter
+        map)."""
+        self.symbol_maps.append(smap)
         try:
             body = self.convert_expression_body(expr, shape)
         finally:
             self.symbol_maps.pop()
         return self.wrap_function_signature(
             name, self._sm_signature(args), body, shape
+        )
+
+    def _sm_kernel(self, name, expr, shape, args):
+        """Emit one operator kernel from a SystemModel expression, with the
+        SystemModel symbol map pushed for the body."""
+        return self._kernel_with_symbol_map(
+            name, expr, shape, args, self._sm_symbol_map()
+        )
+
+    def _doc_note(self, name, reason):
+        """A struct-body comment standing in for a kernel the SystemModel does
+        not carry, so the header stays a *documented contract* rather than a
+        broken / zero kernel.  The backend must supply ``name`` solver-side
+        (case directory / settings).  Mirrors the reconstruction skip but
+        leaves a paper trail the dmplex consumer can grep for."""
+        wrapped = textwrap.fill(
+            reason,
+            width=70,
+            initial_indent="    //   ",
+            subsequent_indent="    //   ",
+        )
+        return (
+            f"    // {name}: NOT emitted from the SystemModel "
+            f"(provide solver-side).\n{wrapped}\n"
         )
 
     def _sm_slice(self, tensor, axis_idx, out_shape):
@@ -919,6 +954,166 @@ class GenericCppModel(GenericCppBase):
                 ["Q", "Qaux", "p"],
             )
         return blocks
+
+    def _emit_stacked_operators(self):
+        """Emit the *stacked* all-directions ``flux(Q,Qaux,p)`` and
+        ``nonconservative_matrix(Q,Qaux,p)`` the dmplex solver / ``Numerics.H``
+        call directly — in addition to the per-direction ``*_x`` / ``*_y``
+        accessors ``_emit_operator_kernels`` already emits.
+
+        Layout is the operator tensor flattened row-major (the convention the
+        solver indexes): ``flux[eq, dim]`` → ``SimpleArray<n_eq*dim>`` and
+        ``NCP[eq, state, dim]`` → ``SimpleArray<n_eq*n_state*dim>`` (see
+        ``Model.H``'s ``flux`` / ``nonconservative_matrix`` and ``Numerics.H``'s
+        ``Model<T>::flux`` / ``::nonconservative_matrix`` calls)."""
+        sm = self.sm
+        n_eq, n_state, dim = sm.n_equations, len(sm.state), sm.dimension
+        return [
+            self._sm_kernel(
+                "flux", sm.flux, (n_eq, dim), ["Q", "Qaux", "p"]
+            ),
+            self._sm_kernel(
+                "nonconservative_matrix",
+                sm.nonconservative_matrix,
+                (n_eq, n_state, dim),
+                ["Q", "Qaux", "p"],
+            ),
+        ]
+
+    def _emit_source_jacobians(self):
+        """Emit the symbolic source Jacobians the implicit source step needs:
+
+        * ``source_jacobian_wrt_variables(Q,Qaux,p)`` → ``(n_eq, n_state)`` —
+          ``dS/dQ`` holding aux fixed (the SystemModel's ``source_jacobian``).
+        * ``source_jacobian_wrt_aux_variables(Q,Qaux,p)`` → ``(n_eq, n_aux)`` —
+          ``dS/dQaux``; the solver completes the chain rule
+          ``dS/dQ + dS/dQaux . dQaux/dQ`` (see ``ModularSolver.hpp`` ~l.268).
+
+        Row-major layout matches the solver's ``dS_dQ[i*n_dof+j]`` /
+        ``dS_dAux[i*n_aux+k]`` indexing."""
+        sm = self.sm
+        n_eq, n_state, n_aux = sm.n_equations, len(sm.state), len(sm.aux_state)
+        if sm.source is None:
+            return [self._doc_note(
+                "source_jacobian_wrt_variables / "
+                "source_jacobian_wrt_aux_variables",
+                "the SystemModel carries no source term.")]
+        src = [sp.sympify(e) for e in sp.flatten(sm.source)]
+        blocks = []
+        jq = getattr(sm, "source_jacobian", None)
+        if jq is None:
+            jq = sp.derive_by_array(sp.Array(src), list(sm.state))
+        blocks.append(self._sm_kernel(
+            "source_jacobian_wrt_variables", jq, (n_eq, n_state),
+            ["Q", "Qaux", "p"],
+        ))
+        if n_aux > 0:
+            jaux = sp.Array(
+                [[sp.diff(src[i], sm.aux_state[k]) for k in range(n_aux)]
+                 for i in range(n_eq)]
+            )
+            blocks.append(self._sm_kernel(
+                "source_jacobian_wrt_aux_variables", jaux, (n_eq, n_aux),
+                ["Q", "Qaux", "p"],
+            ))
+        return blocks
+
+    def _emit_update_kernels(self):
+        """Emit the per-cell state / aux update kernels (mirrors the dmplex
+        ``Model::update_variables`` / ``update_aux_variables`` /
+        ``update_aux_variables_jacobian_wrt_variables`` the solver calls in
+        ``TransportStep`` / ``ModularSolver``):
+
+        * ``update_variables(Q,Qaux,p)`` → ``(n_eq,)`` — pointwise state remap.
+        * ``update_aux_variables(Q,Qaux,p)`` → ``(n_aux,)`` — pointwise aux
+          recompute, plus its Jacobian ``(n_aux, n_state)`` (row-major
+          ``dAux_dQ[k*n_dof+j]``).
+
+        These are *pointwise algebraic* updates.  A declarative model whose aux
+        are mesh-derivative (computed by the solver's gradient) or user
+        closures carries ``None`` here — documented, not emitted (it is the
+        ``FoamUpdateAuxPrinter`` ``compute_derivative`` path, which cannot be a
+        pointwise ``Model`` kernel)."""
+        sm = self.sm
+        n_eq, n_state, n_aux = sm.n_equations, len(sm.state), len(sm.aux_state)
+        blocks = []
+
+        uv = getattr(sm, "update_variables", None)
+        if uv is not None and len(sp.flatten(uv)) > 0:
+            blocks.append(self._sm_kernel(
+                "update_variables", uv, (n_eq,), ["Q", "Qaux", "p"],
+            ))
+        else:
+            blocks.append(self._doc_note(
+                "update_variables",
+                "no pointwise state remap on this SystemModel; the solver "
+                "leaves Q unchanged after the transport step."))
+
+        uav = getattr(sm, "update_aux_variables", None)
+        if uav is not None and len(sp.flatten(uav)) > 0:
+            blocks.append(self._sm_kernel(
+                "update_aux_variables", uav, (n_aux,), ["Q", "Qaux", "p"],
+            ))
+            jac = sp.derive_by_array(
+                sp.Array([sp.sympify(e) for e in sp.flatten(uav)]),
+                list(sm.state),
+            )
+            blocks.append(self._sm_kernel(
+                "update_aux_variables_jacobian_wrt_variables",
+                jac, (n_aux, n_state), ["Q", "Qaux", "p"],
+            ))
+        else:
+            blocks.append(self._doc_note(
+                "update_aux_variables / "
+                "update_aux_variables_jacobian_wrt_variables",
+                "aux are mesh-derivative (solver gradient) and/or user "
+                "closures; no pointwise algebraic aux update on this "
+                "SystemModel — compute aux solver-side."))
+        return blocks
+
+    def _emit_initial_conditions(self):
+        """Emit ``initial_condition(X,p)`` / ``initial_aux_condition(X,p)`` from
+        the SystemModel's ``InitialConditions`` (``get_definition`` lowers them
+        to a symbolic vector in the position symbols ``X[i]`` and parameters
+        ``p[i]``, exactly the old MOOD-era header's IC).
+
+        A SystemModel that carries no symbolic IC (IC is case-side, set from
+        the case directory / ``settings.json``) is documented, not stubbed."""
+        sm = self.sm
+        return [
+            self._ic_block(
+                "initial_condition",
+                getattr(sm, "initial_conditions", None),
+                sm.n_equations,
+            ),
+            self._ic_block(
+                "initial_aux_condition",
+                getattr(sm, "aux_initial_conditions", None),
+                len(sm.aux_state),
+            ),
+        ]
+
+    def _ic_block(self, name, ic, n):
+        """One IC kernel, or a doc-note when the SystemModel carries no IC."""
+        sm = self.sm
+        if ic is None or not hasattr(ic, "get_definition"):
+            return self._doc_note(
+                name,
+                "the SystemModel carries no symbolic initial state; IC is "
+                "case-side (case directory / settings.json).")
+        X = sp.Array([sp.Symbol(f"_ICX{i}", real=True) for i in range(3)])
+        params = list(sm.parameters.values())
+        expr = ic.get_definition(X, sp.Array(params), n)
+        if len(sp.flatten(expr)) == 0 or all(e == 0 for e in sp.flatten(expr)):
+            return self._doc_note(
+                name,
+                "the SystemModel's IC is trivial / zero; set it case-side.")
+        smap = {X[i]: self.format_accessor("X", i) for i in range(3)}
+        for i, s in enumerate(params):
+            smap[s] = self.format_accessor("p", i)
+        return self._kernel_with_symbol_map(
+            name, expr, (n,), ["X", "p"], smap,
+        )
 
     def _emit_reconstruction_kernels(self):
         """Emit the MUSCL reconstruction variable change, mirroring
