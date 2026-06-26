@@ -1188,8 +1188,9 @@ class GenericCppModel(GenericCppBase):
           reduce one sampled column back to the 2-D state.  The depth-average
           enters through the ``P3_<field>`` symbols (``profile[i]``); any
           ``Integral(g(ζ), (ζ,0,1))`` row enters through a column-quadrature
-          accumulator ``I[j]`` the backend fills (matching foam's
-          ``project_from_3d_at`` per-profile signature).
+          accumulator ``I[j]`` the backend fills.  This is the ONE shared
+          ``project_from_3d(profile, p[, I])`` structure every backend emits
+          (foam included — no per-backend ``_at`` special case).
 
         Both maps are read off the SystemModel slots filled by
         ``register_group("interpolate"/"project", …)``.  A model with the
@@ -1207,7 +1208,7 @@ class GenericCppModel(GenericCppBase):
                 "interpolate_to_3d", p2, shape, ["Q", "Qaux", "p", "X"],
             ))
 
-        p3 = getattr(sm, "project_from_3d", None)
+        p3 = sm.project_from_3d
         if p3 is not None and len(sp.flatten(p3)) > 0:
             rows = [sp.sympify(e) for e in sp.flatten(p3)]
             shape = (len(rows),)

@@ -558,6 +558,18 @@ class SystemModel:
     # velocity over depth, etc.).  Default ``None`` ⇒ no projection
     # defined; the runtime exposes ``None`` and callers handle absence.
     interpolate_to_3d: Optional[ZArray] = None        # (n_3d_components,)
+    # ``project_from_3d``: the inverse of ``interpolate_to_3d`` — a 3-D
+    # field column (canonical ``[b,h,u,v,w,p]`` profile sampled over the
+    # vertical) → the depth-averaged state.  Each row is a Galerkin
+    # projection ``∫₀¹ g(ζ) dζ`` left OPAQUE as a column-quadrature
+    # accumulator the backend fills (the ``I[j]`` convention emitted by the
+    # code printers), so the symbolic operator carries the basis weights and
+    # the backend supplies the quadrature.  Declared symmetrically with
+    # ``interpolate_to_3d`` and filled by the SAME function-group registry
+    # (``register_group("project", …)`` / the canonical ``project()``
+    # method).  Default ``None`` ⇒ no projection defined (a depth-collapsed
+    # model with no 3-D maps); the runtime exposes ``None``.
+    project_from_3d: Optional[ZArray] = None          # (n_state,)
     # 3D position symbols used by ``interpolate_to_3d`` (and any future
     # 3D-aware operator).  Default ``None`` → SystemModel constructed
     # without a model context; the interpolate_to_3d slot then carries
@@ -601,6 +613,7 @@ class SystemModel:
         self.reconstruction_variables   = _to_zarray(self.reconstruction_variables)
         self.state_from_reconstruction  = _to_zarray(self.state_from_reconstruction)
         self.interpolate_to_3d           = _to_zarray(self.interpolate_to_3d)
+        self.project_from_3d             = _to_zarray(self.project_from_3d)
         self.source_jacobian_wrt_variables = _to_zarray(
             self.source_jacobian_wrt_variables)
         self.source_jacobian_wrt_aux_variables = _to_zarray(
@@ -1366,6 +1379,11 @@ class SystemModel:
                 _to_zarray(model.interpolate_to_3d())
                 if (hasattr(model, "interpolate_to_3d")
                     and callable(model.interpolate_to_3d))
+                else None),
+            project_from_3d=(
+                _to_zarray(model.project_from_3d())
+                if (hasattr(model, "project_from_3d")
+                    and callable(model.project_from_3d))
                 else None),
             position=getattr(model, "position", None),
             vertical=getattr(model, "vertical", None),

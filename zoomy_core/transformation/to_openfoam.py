@@ -102,13 +102,12 @@ _AXIS = ("x", "y", "z")
 # them via fresh ``P3_<field>`` symbols mapped to ``profile[i]``.
 _PROFILE_3D_FIELDS = ("b", "h", "u", "v", "w", "p")
 
-# Column wrappers around the per-position / per-profile coupling kernels.  They
-# make interpolate_to_3d and project_from_3d operate on one full interface
-# COLUMN (the higher-dim solver dictates the column; the lower-dim solver lifts
-# to / reduces from it), and they are inverse: interpolate_to_3d(state) -> a
-# column of canonical [b,h,u,v,w,p] field vectors; project_from_3d(column) ->
-# state.  project_from_3d derives its integration weights from z (cell heights);
-# the average is exact for a flat (SWE) profile.
+# Column wrapper around the per-position interpolate kernel: makes
+# interpolate_to_3d operate on one full interface COLUMN (the higher-dim solver
+# dictates the column z; the lower-dim solver lifts to it).  ``project_from_3d``
+# has NO foam-only wrapper — it is emitted in the generic-C ``I[j]``
+# column-quadrature form (see ``_emit_projection_kernels``): the C++ driver
+# supplies the reduced ``profile`` and the ζ-quadrature accumulators ``I``.
 _INTERPOLATE_COLUMN_WRAPPER = """inline Foam::List<Foam::List<Foam::scalar>> interpolate_to_3d(
     const Foam::List<Foam::scalar>& Q,
     const Foam::List<Foam::scalar>& Qaux,
@@ -118,28 +117,6 @@ _INTERPOLATE_COLUMN_WRAPPER = """inline Foam::List<Foam::List<Foam::scalar>> int
     Foam::List<Foam::List<Foam::scalar>> out(z.size());
     forAll(z, k) out[k] = interpolate_to_3d_at(Q, Qaux, p, z[k]);
     return out;
-}"""
-
-_PROJECT_COLUMN_WRAPPER = """inline Foam::List<Foam::scalar> project_from_3d(
-    const Foam::List<Foam::List<Foam::scalar>>& field,
-    const Foam::List<Foam::scalar>& z,
-    const Foam::List<Foam::scalar>& p)
-{
-    const Foam::label N = field.size();
-    Foam::List<Foam::scalar> profile(6, Foam::scalar(0));   // canonical [b,h,u,v,w,p]
-    Foam::scalar W = 0;
-    forAll(field, k)
-    {
-        const Foam::scalar w =
-            (N == 1)     ? Foam::scalar(1)
-          : (k == 0)     ? Foam::mag(z[1]     - z[0])
-          : (k == N - 1) ? Foam::mag(z[N - 1] - z[N - 2])
-          :                Foam::scalar(0.5)*Foam::mag(z[k + 1] - z[k - 1]);
-        W += w;
-        forAll(profile, c) profile[c] += w*field[k][c];
-    }
-    forAll(profile, c) profile[c] /= W;
-    return project_from_3d_at(profile, p);
 }"""
 
 
@@ -198,7 +175,7 @@ class FoamSystemModelPrinter(GenericCppBase):
         # in its source; for any other sub-system the bare ``dt`` arg wins.
         self.symbol_maps.append({sp.Symbol("dt", positive=True): "dt"})
         if self.project_from_3d is None:
-            self.project_from_3d = getattr(sm, "project_from_3d", None)
+            self.project_from_3d = sm.project_from_3d
 
     def _parameter_symbols(self):
         """Ordered parameter Symbols for the ``p`` interface — the
@@ -494,11 +471,14 @@ class FoamSystemModelPrinter(GenericCppBase):
           canonical 3D field ``[b,h,u,v,w,p]`` evaluated at every z of the
           column.  Loops the per-position kernel ``interpolate_to_3d_at``
           (from ``sm.interpolate_to_3d``; ``sm.position[2]`` → scalar ``z``).
-        * ``Model::project_from_3d(field[N][6], z[N], p) -> Q`` — the inverse:
-          reduce one full column back to the 2D state.  Weighted depth-average
-          (cell heights from ``z``) → the per-profile map ``project_from_3d_at``
-          (``P3_<field>`` → ``profile[i]``, from the ``project_from_3d`` printer
-          option).  Exact for a flat (SWE) profile.
+        * ``Model::project_from_3d(profile[6], p[, I]) -> Q`` — the inverse:
+          reduce one column back to the 2D state.  Emitted in the SAME
+          ``I[j]`` column-quadrature-accumulator form as the generic-C printer
+          (``P3_<field>`` → ``profile[i]``; every ``Integral(g(ζ),(ζ,0,1))`` →
+          an opaque ``I[j]`` the BACKEND fills from the sampled column).  No
+          per-backend special case: the C++ driver supplies ``profile`` (depth
+          reduction) and ``I`` (ζ-quadrature) and calls one kernel, exactly as
+          the generic-C / jax backends do.
 
         interpolate_to_3d and project_from_3d are inverse on a column.  A model
         with neither defined emits nothing (uncoupled cases unchanged).
@@ -563,87 +543,17 @@ class FoamSystemModelPrinter(GenericCppBase):
                        else ["profile", "p"])
             self.symbol_maps.append(prof_map)
             try:
+                # ONE kernel, the generic-C ``I[j]`` convention — no foam-only
+                # ``project_from_3d_at`` + baked column-quadrature wrapper.  The
+                # zoomyFoam C++ driver fills ``profile`` (depth reduction) and
+                # ``I`` (ζ-quadrature accumulators) and calls this directly.
                 blocks.append(self._kernel(
-                    "project_from_3d_at", sp.Matrix(rows), shape, at_args,
+                    "project_from_3d", sp.Matrix(rows), shape, at_args,
                 ))
             finally:
                 self.symbol_maps.pop()
-            if integral_atoms:
-                blocks.append(self._project_column_wrapper_quadrature(
-                    integral_atoms))
-            else:
-                blocks.append(_PROJECT_COLUMN_WRAPPER)        # legacy wrapper
 
         return blocks
-
-    def _project_column_wrapper_quadrature(self, integral_atoms):
-        """The combined ``project_from_3d(field, z, p)`` column wrapper with
-        ζ-quadrature accumulators for the model's registered Integral rows."""
-        zeta_loop = sp.Symbol("_zeta_loop", real=True)
-        lines = []
-        smap = {zeta_loop: "zeta"}
-        integrands = []
-        for j, a in enumerate(integral_atoms):
-            g = a.function
-            var = a.limits[0][0]
-            # sampled-profile heads P3_<f>(ζ) → field[k][slot]
-            for fa in list(g.atoms(sp.Function)):
-                name = fa.func.__name__
-                if name.startswith("P3_"):
-                    fld = name[len("P3_"):]
-                    if fld not in _PROFILE_3D_FIELDS:
-                        raise ValueError(
-                            f"project Integral references {name}(ζ) but "
-                            f"{fld!r} is not a canonical profile field "
-                            f"{_PROFILE_3D_FIELDS}.")
-                    slot = _PROFILE_3D_FIELDS.index(fld)
-                    s = sp.Symbol(f"_P3S_{fld}", real=True)
-                    g = g.xreplace({fa: s})
-                    smap[s] = f"field[k][{slot}]"
-            integrands.append((j, g.xreplace({var: zeta_loop})))
-        self.symbol_maps.append(smap)
-        try:
-            for j, g in integrands:
-                lines.append(f"        I[{j}] += wn * ({self._print(g)});")
-        finally:
-            self.symbol_maps.pop()
-        int_lines = "\n".join(lines)
-        n_int = len(integral_atoms)
-        return f"""inline Foam::List<Foam::scalar> project_from_3d(
-    const Foam::List<Foam::List<Foam::scalar>>& field,
-    const Foam::List<Foam::scalar>& z,     // water-relative zeta in [0,1]
-    const Foam::List<Foam::scalar>& p)
-{{
-    const Foam::label N = field.size();
-    Foam::List<Foam::scalar> profile(6, Foam::scalar(0));   // canonical [b,h,u,v,w,p]
-    Foam::List<Foam::scalar> I({n_int}, Foam::scalar(0));   // zeta-quadrature accumulators
-    Foam::scalar W = 0;
-    forAll(field, k)
-    {{
-        const Foam::scalar w =
-            (N == 1)     ? Foam::scalar(1)
-          : (k == 0)     ? Foam::mag(z[1]     - z[0])
-          : (k == N - 1) ? Foam::mag(z[N - 1] - z[N - 2])
-          :                Foam::scalar(0.5)*Foam::mag(z[k + 1] - z[k - 1]);
-        W += w;
-        forAll(profile, c) profile[c] += w*field[k][c];
-    }}
-    forAll(profile, c) profile[c] /= W;
-    // normalized trapezoid: integral_0^1 g dzeta ~= sum_k (w_k/W) g(zeta_k)
-    forAll(field, k)
-    {{
-        const Foam::scalar zeta = z[k];
-        (void)zeta;
-        const Foam::scalar w =
-            (N == 1)     ? Foam::scalar(1)
-          : (k == 0)     ? Foam::mag(z[1]     - z[0])
-          : (k == N - 1) ? Foam::mag(z[N - 1] - z[N - 2])
-          :                Foam::scalar(0.5)*Foam::mag(z[k + 1] - z[k - 1]);
-        const Foam::scalar wn = w / W;
-{int_lines}
-    }}
-    return project_from_3d_at(profile, p, I);
-}}"""
 
     def _emit_boundary_conditions(self):
         """Emit ``Model::boundary_conditions(bc_idx, time, X, dX, Q,
