@@ -89,12 +89,6 @@ class GenericCppBase(CXX11CodePrinter):
         "Min": lambda p, *args: p._print_min_max("min", args),
         "Max": lambda p, *args: p._print_min_max("max", args),
         "Abs": lambda p, a: f"{p.math_namespace}abs({p.doprint(a)})",
-        "clamp_positive": lambda p, x: f"{p.math_namespace}max({p.doprint(x)}, ({p.real_type})0.0)",
-        "clamp_momentum": lambda p, hu, h, u_max: (
-            f"{p.math_namespace}min({p.math_namespace}max({p.doprint(hu)}, "
-            f"-{p.doprint(h)}*{p.doprint(u_max)}), "
-            f"{p.doprint(h)}*{p.doprint(u_max)})"
-        ),
         "max_wavespeed": lambda p, *args: p._print_nested_max(
             [f"{p.math_namespace}abs({p.doprint(a)})" for a in args]
         ),

@@ -60,12 +60,6 @@ class GenericGlslBase(OutParamCodePrinter):
         "conditional": lambda p, c, t, f: (
             f"(({p.doprint(c)}) ? ({p.doprint(t)}) : ({p.doprint(f)}))"
         ),
-        "clamp_positive": lambda p, x: f"max({p.doprint(x)}, 0.0)",
-        "clamp_momentum": lambda p, hu, h, u_max: (
-            f"clamp({p.doprint(hu)}, "
-            f"-({p.doprint(h)}) * ({p.doprint(u_max)}), "
-            f"({p.doprint(h)}) * ({p.doprint(u_max)}))"
-        ),
         "Min": lambda p, *args: p._print_min_max("min", args),
         "Max": lambda p, *args: p._print_min_max("max", args),
         "Abs": lambda p, a: f"abs({p.doprint(a)})",

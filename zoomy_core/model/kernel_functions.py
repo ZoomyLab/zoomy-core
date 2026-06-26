@@ -15,54 +15,6 @@ import itertools
 from zoomy_core.misc.misc import ZArray
 
 
-class clamp_positive(sp.Function):
-    """
-    clamp_positive(x) = max(x, 0).
-
-    Opaque to SymPy — never simplified, even if x has positive=True.
-    At runtime: np.maximum(x, 0).
-    """
-    nargs = 1
-    is_commutative = True
-
-    @classmethod
-    def eval(cls, x):
-        # Only evaluate for explicit numeric values, never for symbols
-        if x.is_Number:
-            return sp.Max(x, 0)
-        return None  # keep unevaluated
-
-    def _eval_derivative(self, s):
-        x = self.args[0]
-        return conditional(x > 0, x.diff(s), sp.Integer(0))
-
-
-class clamp_momentum(sp.Function):
-    """
-    clamp_momentum(hu, h, u_max) = sign(hu) * min(|hu|, h * u_max).
-
-    Caps momentum so that |u| = |hu/h| <= u_max.
-    Opaque to SymPy. At runtime: np.clip(hu, -h*u_max, h*u_max).
-    """
-    nargs = 3
-    is_commutative = True
-
-    @classmethod
-    def eval(cls, hu, h, u_max):
-        if hu.is_Number and h.is_Number and u_max.is_Number:
-            bound = h * u_max
-            return sp.Min(sp.Max(hu, -bound), bound)
-        return None
-
-    def _eval_derivative(self, s):
-        hu, h, u_max = self.args
-        return conditional(
-            sp.Abs(hu) < h * u_max,
-            hu.diff(s),
-            sp.sign(hu) * (h * u_max).diff(s),
-        )
-
-
 class max_wavespeed(sp.Function):
     """
     max_wavespeed(Q, Qaux, p, n) — maximum absolute wave speed.

@@ -41,12 +41,6 @@ class GenericJsBase(OutParamCodePrinter):
         "conditional": lambda p, c, t, f: (
             f"(({p.doprint(c)}) ? ({p.doprint(t)}) : ({p.doprint(f)}))"
         ),
-        "clamp_positive": lambda p, x: f"Math.max({p.doprint(x)}, 0)",
-        "clamp_momentum": lambda p, hu, h, u_max: (
-            f"Math.max(Math.min({p.doprint(hu)}, "
-            f"{p.doprint(h)} * {p.doprint(u_max)}), "
-            f"-{p.doprint(h)} * {p.doprint(u_max)})"
-        ),
         "Min": lambda p, *args: p._print_min_max("min", args),
         "Max": lambda p, *args: p._print_min_max("max", args),
         "Abs": lambda p, a: f"Math.abs({p.doprint(a)})",

@@ -1,6 +1,6 @@
 """Kernel — SymbolicRegistrar for backend-agnostic helper functions.
 
-The Kernel holds basefunctions (safe_denominator, clamp_positive, etc.)
+The Kernel holds basefunctions (safe_denominator, conditional, etc.)
 that model and numerics expressions reference symbolically.  Each backend
 (numpy, jax, C, UFL) provides concrete implementations during code
 transformation, using the same NumpyRuntimeSymbolic / JaxRuntimeSymbolic
@@ -56,8 +56,6 @@ class Kernel(param.Parameterized, SymbolicRegistrar):
 
         # Kernel function arguments: lightweight symbols, not full Q/Qaux/p
         self._x = sp.Symbol("x", real=True)
-        self._y = sp.Symbol("y", real=True)
-        self._z = sp.Symbol("z_arg", real=True)
         self._c = sp.Symbol("c")  # condition
         self._t = sp.Symbol("t_branch", real=True)  # true branch
         self._f = sp.Symbol("f_branch", real=True)  # false branch
@@ -79,7 +77,7 @@ class Kernel(param.Parameterized, SymbolicRegistrar):
 
     def _initialize_functions(self):
         """Register all kernel functions as basefunctions."""
-        x, y, z = self._x, self._y, self._z
+        x = self._x
         c, t, f = self._c, self._t, self._f
 
         # Each function gets a minimal signature: just the args it needs.
@@ -89,16 +87,6 @@ class Kernel(param.Parameterized, SymbolicRegistrar):
             "safe_denominator",
             self.safe_denominator,
             Zstruct(x=x, eps=self._eps),
-        )
-        self.register_symbolic_function(
-            "clamp_positive",
-            self.clamp_positive,
-            Zstruct(x=x),
-        )
-        self.register_symbolic_function(
-            "clamp_momentum",
-            self.clamp_momentum,
-            Zstruct(hu=x, h=y, u_max=z),
         )
         self.register_symbolic_function(
             "conditional",
@@ -113,15 +101,6 @@ class Kernel(param.Parameterized, SymbolicRegistrar):
     def safe_denominator(self):
         """safe_denominator(x) → x regularized to avoid 1/0."""
         return self._x + self._eps
-
-    def clamp_positive(self):
-        """clamp_positive(x) → max(x, 0)."""
-        return sp.Max(self._x, 0)
-
-    def clamp_momentum(self):
-        """clamp_momentum(hu, h, u_max) → sign(hu) * min(|hu|, h * u_max)."""
-        hu, h, u_max = self._x, self._y, self._z
-        return sp.sign(hu) * sp.Min(sp.Abs(hu), h * u_max)
 
     def conditional(self):
         """conditional(c, t, f) → t if c else f."""

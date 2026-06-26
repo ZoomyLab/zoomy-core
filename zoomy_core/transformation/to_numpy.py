@@ -49,8 +49,6 @@ class NumpyRuntimeModel:
         "array": np.array,
         "squeeze": np.squeeze,
         "conditional": lambda c, t, f: np.where(c, t, f),
-        "clamp_positive": lambda x: np.maximum(x, 0.0),
-        "clamp_momentum": lambda hu, h, u_max: np.clip(hu, -h * u_max, h * u_max),
         "max_wavespeed": None,  # must be provided by the solver before compilation
         # NON-LOCAL spatial derivative aux — solver injects the mesh-bound
         # impl (mesh.compute_derivatives) before the update_aux_variables slot
