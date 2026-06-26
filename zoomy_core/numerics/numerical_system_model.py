@@ -352,6 +352,42 @@ class NumericalSystemModel(SystemModel):
         return NumpyRuntimeModel.from_system_model(self.sm)
 
 
+# ── Canonical coercion (the printers' front door) ───────────────────
+
+
+def to_numerical_system_model(obj) -> "NumericalSystemModel":
+    """Coerce ``obj`` to a :class:`NumericalSystemModel`.
+
+    The single front door every CORE code printer routes its entry
+    through, so a printer accepts a :class:`Model`, a
+    :class:`SystemModel`, OR an already-built NSM and always operates on
+    an NSM:
+
+    - already a :class:`NumericalSystemModel` → returned unchanged;
+    - a :class:`SystemModel` → promoted in place via
+      :meth:`NumericalSystemModel.from_system_model`;
+    - a :class:`zoomy_core.model` ``Model`` (exposes ``.system_model``)
+      → its SystemModel is promoted;
+    - anything else → :class:`TypeError`.
+
+    The NSM-first check matters because ``NumericalSystemModel`` *is* a
+    ``SystemModel`` (subclass) — an NSM must short-circuit before the
+    SystemModel branch so it is never re-promoted.
+    """
+    if isinstance(obj, NumericalSystemModel):
+        return obj
+    if isinstance(obj, SystemModel):
+        return NumericalSystemModel.from_system_model(obj)
+    sm = getattr(obj, "system_model", None)
+    if sm is not None:
+        return NumericalSystemModel.from_system_model(sm)
+    raise TypeError(
+        f"to_numerical_system_model: cannot coerce {type(obj).__name__!r} "
+        "to a NumericalSystemModel — expected a NumericalSystemModel, a "
+        "SystemModel, or a Model exposing `.system_model`."
+    )
+
+
 # ── Helpers ─────────────────────────────────────────────────────────
 
 

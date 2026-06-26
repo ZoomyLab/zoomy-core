@@ -14,6 +14,7 @@ from zoomy_core.numerics.numerical_system_model import (
     NumericalSystemModel,
     ReconstructionSpec,
     RegularizationSpec,
+    to_numerical_system_model,
 )
 
 __all__ = [
@@ -21,4 +22,5 @@ __all__ = [
     "NumericalSystemModel",
     "ReconstructionSpec",
     "RegularizationSpec",
+    "to_numerical_system_model",
 ]

@@ -355,6 +355,11 @@ class NumpyRuntimeModel:
         have a backing Model (e.g. SystemModel constructed from
         scratch).
         """
+        # Normalise the entry: accept a Model, a SystemModel, or an NSM and
+        # always lambdify from an NSM (the canonical front door).
+        from zoomy_core.numerics.numerical_system_model import (
+            to_numerical_system_model)
+        sm = to_numerical_system_model(sm)
         rt = cls.__new__(cls)
         # The SystemModel *is* the symbolic model for this runtime —
         # solvers unwrap it via ``_get_symbolic_model`` to build their

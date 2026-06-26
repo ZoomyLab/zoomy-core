@@ -8,6 +8,7 @@ import itertools
 import textwrap
 from zoomy_core.misc import misc as misc
 from zoomy_core.misc.misc import Zstruct, ZArray
+from zoomy_core.numerics.numerical_system_model import to_numerical_system_model
 
 # =========================================================================
 #  1. HELPER FUNCTIONS
@@ -732,18 +733,15 @@ class GenericCppModel(GenericCppBase):
         # BC Piecewise) on the SystemModel, not on the Model itself (e.g.
         # SME(level=0) has n_variables==1 but the SystemModel state is
         # [b, h, q_0] with 5 parameters).  Source the emitted interface
-        # from the SystemModel when present — mirrors FoamSystemModelPrinter.
-        # Legacy hand-written Models (no ``system_model``) fall back to the
-        # Model's own counts.
-        self.sm = getattr(model, "system_model", None)
-        if self.sm is not None:
-            self.n_dof_q = self.sm.n_equations
-            self.n_dof_qaux = len(self.sm.aux_state)
-            self.n_parameters = len(list(self.sm.parameters.keys()))
-        else:
-            self.n_dof_q = model.n_variables
-            self.n_dof_qaux = model.n_aux_variables
-            self.n_parameters = model.n_parameters
+        # from the SystemModel — mirrors FoamSystemModelPrinter.
+        # Normalise the entry at the front door: a Model, a SystemModel, or an
+        # NSM all become an NSM here, so a raw SystemModel input no longer
+        # crashes (the old ``getattr(SystemModel, "system_model", None)``
+        # yielded a ``Function`` lacking ``boundary_conditions_list_dict``).
+        self.sm = to_numerical_system_model(model)
+        self.n_dof_q = self.sm.n_equations
+        self.n_dof_qaux = len(self.sm.aux_state)
+        self.n_parameters = len(list(self.sm.parameters.keys()))
         self.register_map("Q", model.variables.values())
         self.register_map("Qaux", model.aux_variables.values())
         if hasattr(model, "gradient_variables") and model.gradient_variables.length() > 0:

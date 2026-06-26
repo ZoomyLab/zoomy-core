@@ -12,6 +12,7 @@ import itertools
 
 import sympy as sp
 
+from zoomy_core.numerics.numerical_system_model import to_numerical_system_model
 from zoomy_core.transformation.generic_c import GenericCppBase, GenericCppModel
 
 
@@ -160,7 +161,8 @@ class FoamSystemModelPrinter(GenericCppBase):
 
     def __init__(self, sm, **opts):
         super().__init__()
-        self.sm = sm
+        # Normalise the entry: accept a Model, a SystemModel, or an NSM.
+        self.sm = sm = to_numerical_system_model(sm)
         # Apply printer options first so ``dt_symbol`` is in effect before the
         # parameter symbol map (which may append it) is built.
         for k, v in opts.items():
@@ -690,7 +692,9 @@ class FoamNumericsPrinter(GenericCppBase):
     def __init__(self, numerics, **opts):
         super().__init__()
         self.numerics = numerics
-        sm = numerics.model
+        # Normalise the contained model to an NSM (numerics.model is a
+        # SystemModel; promote it so the printer always operates on an NSM).
+        sm = to_numerical_system_model(numerics.model)
         self.sm = sm
         # State / aux / parameter / normal symbol maps.
         self.register_map("Q", list(sm.state))
@@ -793,7 +797,8 @@ class FoamUpdateAuxPrinter:
 
     def __init__(self, sm, function_name="update_aux_variables",
                  state_index_filter=None):
-        self.sm = sm
+        # Normalise the entry: accept a Model, a SystemModel, or an NSM.
+        self.sm = to_numerical_system_model(sm)
         # The emitted function name — overridable so a Chorin pressure-aux
         # refresh (P_x / P_xx only) can sit beside the predictor's own
         # ``update_aux_variables`` without a symbol clash.
@@ -808,8 +813,8 @@ class FoamUpdateAuxPrinter:
             None if state_index_filter is None
             else {int(i) for i in state_index_filter})
         # aux_state names so we can resolve target_name → index.
-        self._aux_names = [str(s) for s in sm.aux_state]
-        self._state_names = [str(s) for s in sm.state]
+        self._aux_names = [str(s) for s in self.sm.aux_state]
+        self._state_names = [str(s) for s in self.sm.state]
 
     def _resolve_source(self, entry):
         """Return ``(container_str, idx)`` for the source field of an
