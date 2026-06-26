@@ -118,12 +118,20 @@ def _desingularize_positivity(sm, floor):
     for i in range(n):
         new_src[i, 0] = safe(sm.source[i, 0])
     sm.source = ZArray(new_src)
+    # The regularised source invalidates the channeled jacobians — re-derive
+    # both from the new source (the in-place-mutation fallback, mirroring
+    # ``SystemModel.refresh_derived_operators``).
+    aux = list(sm.aux_state)
     J = sp.zeros(n, len(state))
+    Ja = sp.zeros(n, len(aux))
     for i in range(n):
         si = sp.sympify(sm.source[i, 0])
         for j, s in enumerate(state):
             J[i, j] = sp.diff(si, s)
-    sm.source_jacobian = ZArray(J)
+        for k, a in enumerate(aux):
+            Ja[i, k] = sp.diff(si, a)
+    sm.source_jacobian_wrt_variables = ZArray(J)
+    sm.source_jacobian_wrt_aux_variables = ZArray(Ja)
 
 
 # ── The NSM itself ───────────────────────────────────────────────────
@@ -191,7 +199,8 @@ class NumericalSystemModel:
         # state / aux
         "state", "aux_state", "aux_registry",
         # symbolic operators
-        "flux", "source", "source_explicit", "source_jacobian",
+        "flux", "source", "source_explicit",
+        "source_jacobian_wrt_variables", "source_jacobian_wrt_aux_variables",
         "quasilinear_matrix", "mass_matrix", "nonconservative_matrix",
         "hydrostatic_pressure", "diffusion_matrix",
         "diffusion_matrix_explicit", "eigenvalues",

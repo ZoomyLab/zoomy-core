@@ -152,7 +152,7 @@ def plane_wave_dispersion(
         lambda i, j: sp.simplify(qm_sym[i, j, axis].xreplace(sub)),
     )
 
-    src_jac_sym = sm.source_jacobian
+    src_jac_sym = sm.source_jacobian_wrt_variables
     M_0 = sp.Matrix(
         n_eq,
         n_st,

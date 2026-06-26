@@ -371,6 +371,13 @@ def _attach_function_groups(sm, model, canonical_source=None) -> None:
         registry.append(entry)
         registered.add(sym.name)
     sm.aux_registry = registry
+    # Appending the reconstruction gradient aux changed ``aux_state``; resize
+    # source_jacobian_wrt_aux_variables to the full aux vector (these gradient
+    # aux do not enter the source, so the new columns are zero — but the field
+    # must stay shape-consistent for the printers that read it).
+    if new_aux:
+        sm.source_jacobian_wrt_aux_variables = _to_zarray(
+            sm._compute_source_jacobian_wrt_aux_variables())
     if sm.position is None:
         sm.position = Zstruct(X0=x, X1=y_pos, X2=z_pos)
 
@@ -399,12 +406,15 @@ class SystemModel:
     Every operator the system needs is a **stored field**, frozen at
     construction — there are no derived-on-demand methods.  Alongside
     the five primaries (flux, P, NCP, source, mass matrix) the system
-    carries the derived operators ``quasilinear_matrix``,
-    ``source_jacobian`` and ``eigenvalues``, plus the ``normal``
-    symbols and the parameter Zstructs.  ``quasilinear_matrix`` and
-    ``source_jacobian`` are cheap derivatives — ``__post_init__``
-    computes them from the primaries when not supplied, and any
-    in-place operation refreshes them via
+    carries the derived operators ``quasilinear_matrix``, the source
+    jacobians ``source_jacobian_wrt_variables`` /
+    ``source_jacobian_wrt_aux_variables`` and ``eigenvalues``, plus the
+    ``normal`` symbols and the parameter Zstructs.  ``quasilinear_matrix``
+    is a cheap derivative computed lazily on first access.  The source
+    jacobians are CHANNELED from the source Model in :meth:`from_model`
+    (read off the SystemModel, never re-derived by printers); a standalone
+    SystemModel falls back to deriving them once from ``source`` in
+    ``__post_init__``.  Any in-place operation refreshes them via
     :meth:`refresh_derived_operators`.  ``eigenvalues`` is the one
     operator that may be expensive (a symbolic spectral derivation) or
     deliberately skipped — :meth:`from_model` simply carries over
@@ -419,7 +429,8 @@ class SystemModel:
     * ``source``                — ``(n_eq, 1)``
     * ``mass_matrix``           — ``(n_eq, n_state)``
     * ``quasilinear_matrix``    — ``(n_eq, n_state, n_dim)``
-    * ``source_jacobian``       — ``(n_eq, n_state)``
+    * ``source_jacobian_wrt_variables``     — ``(n_eq, n_state)``
+    * ``source_jacobian_wrt_aux_variables`` — ``(n_eq, n_aux)``
     * ``eigenvalues``           — ``(n_eq, 1)`` or ``None`` if skipped
 
     ``parameters`` is a Zstruct mapping parameter name → symbol (the
@@ -446,14 +457,24 @@ class SystemModel:
     nonconservative_matrix: ZArray           # (n_eq, n_state, n_dim)
     source: ZArray                           # (n_eq,)
     mass_matrix: ZArray                      # (n_eq, n_state)
-    # Derived operators.  ``quasilinear_matrix`` (flux Jacobian) and
-    # ``source_jacobian`` (∂S/∂Q) are LAZY: exposed as cached properties that
-    # compute from the primaries on FIRST access (and cache), not eagerly at
-    # construction.  This keeps building / inspecting / flux-only codegen cheap
-    # — the expensive ``∂S/∂Q`` (a big ``sp.diff`` for rational closures) is
-    # paid only when a consumer (implicit IMEX solve, codegen) actually reads it.
+    # Derived operators.  ``quasilinear_matrix`` (flux Jacobian) is LAZY:
+    # exposed as a cached property that computes from the primaries on FIRST
+    # access (and caches), not eagerly at construction.  The source jacobians
+    # are real FIELDS (channeled from the Model — see below).
     # ``eigenvalues`` stays ``None`` when skipped.
     eigenvalues: Optional[ZArray] = None           # (n_eq,)
+    # ∂S/∂Q and ∂S/∂Qaux — CHANNELED from the source Model in
+    # :meth:`from_model` (the Model already derived & cached them — printers
+    # READ them off the SystemModel and never re-derive with ``sp.diff``).  A
+    # SystemModel built WITHOUT a Model (standalone analysis, or the structural
+    # derivation path whose ``derivation.model.Model`` carries no precomputed
+    # jacobian) leaves these ``None``; ``__post_init__`` then derives them once
+    # from ``source`` via ``sp.diff`` as the FALLBACK only.  Canonical
+    # orientation ``(n_eq, n_state)`` / ``(n_eq, n_aux)`` — row = equation,
+    # column = state/aux field (the Model's ``derive_by_array`` output is the
+    # transpose, reoriented at the channel).
+    source_jacobian_wrt_variables: Optional[ZArray] = None      # (n_eq, n_state)
+    source_jacobian_wrt_aux_variables: Optional[ZArray] = None  # (n_eq, n_aux)
     normal: Optional[Zstruct] = None
     parameter_values: Optional[Zstruct] = None   # name -> numeric default
     equation_to_state_index: Optional[List[int]] = None
@@ -558,10 +579,10 @@ class SystemModel:
     history: List[Dict[str, str]] = field(default_factory=list)
 
     def __post_init__(self):
-        # Lazy derived-operator caches — filled on first property access (see
-        # the ``quasilinear_matrix`` / ``source_jacobian`` properties below).
+        # Lazy derived-operator cache — filled on first ``quasilinear_matrix``
+        # access.  The source jacobians are real FIELDS (channeled in
+        # ``from_model``); the fallback below derives them once when absent.
         self._quasilinear_matrix = None
-        self._source_jacobian = None
         # Normalise every operator tensor field to ZArray.  Construction
         # sites that still produce sympy types are wrapped transparently.
         self.flux                   = _to_zarray(self.flux)
@@ -578,6 +599,22 @@ class SystemModel:
         self.reconstruction_variables   = _to_zarray(self.reconstruction_variables)
         self.state_from_reconstruction  = _to_zarray(self.state_from_reconstruction)
         self.interpolate_to_3d           = _to_zarray(self.interpolate_to_3d)
+        self.source_jacobian_wrt_variables = _to_zarray(
+            self.source_jacobian_wrt_variables)
+        self.source_jacobian_wrt_aux_variables = _to_zarray(
+            self.source_jacobian_wrt_aux_variables)
+
+        # FALLBACK only: a SystemModel built without a Model channel (standalone
+        # analysis, or the structural derivation path) arrives here with the
+        # source jacobians unset — derive them once from ``source`` via
+        # ``sp.diff``.  When ``from_model`` channeled the Model's matrices these
+        # are already populated and we leave them untouched.
+        if self.source is not None and self.source_jacobian_wrt_variables is None:
+            self.source_jacobian_wrt_variables = _to_zarray(
+                self._compute_source_jacobian_wrt_variables())
+        if self.source is not None and self.source_jacobian_wrt_aux_variables is None:
+            self.source_jacobian_wrt_aux_variables = _to_zarray(
+                self._compute_source_jacobian_wrt_aux_variables())
 
         if self.equation_to_state_index is None:
             self.equation_to_state_index = list(range(self.n_equations))
@@ -870,20 +907,6 @@ class SystemModel:
     def quasilinear_matrix(self, value):
         self._quasilinear_matrix = _to_zarray(value)
 
-    @property
-    def source_jacobian(self):
-        """``∂S/∂Q`` — LAZY: computed on first access, then cached.  This is the
-        expensive one for rational closures (``ν_t=C_μ sk⁴/se²``): a big
-        ``sp.diff``, deferred so building / inspecting / flux-only codegen never
-        pays it.  Assigning re-seeds the cache."""
-        if self._source_jacobian is None:
-            self._source_jacobian = _to_zarray(self._compute_source_jacobian())
-        return self._source_jacobian
-
-    @source_jacobian.setter
-    def source_jacobian(self, value):
-        self._source_jacobian = _to_zarray(value)
-
     def _compute_quasilinear_matrix(self):
         """``∂F/∂Q + ∂P/∂Q + B`` — shape ``(n_eq, n_state, n_dim)``."""
         n_eq = self.n_equations
@@ -899,14 +922,26 @@ class SystemModel:
                     Q[i, j, k] = djF + djP + self.nonconservative_matrix[i, j, k]
         return Q
 
-    def _compute_source_jacobian(self):
-        """``∂S/∂Q`` — shape ``(n_eq, n_state)``."""
+    def _compute_source_jacobian_wrt_variables(self):
+        """``∂S/∂Q`` — shape ``(n_eq, n_state)``.  Fallback derivation used only
+        when no Model channeled ``source_jacobian_wrt_variables``."""
         n_eq = self.n_equations
         n_st = self.n_state
         out = sp.zeros(n_eq, n_st)
         for i in range(n_eq):
             for j in range(n_st):
                 out[i, j] = sp.diff(self.source[i, 0], self.state[j])
+        return out
+
+    def _compute_source_jacobian_wrt_aux_variables(self):
+        """``∂S/∂Qaux`` — shape ``(n_eq, n_aux)``.  Fallback derivation used only
+        when no Model channeled ``source_jacobian_wrt_aux_variables``."""
+        n_eq = self.n_equations
+        n_aux = len(self.aux_state)
+        out = sp.zeros(n_eq, n_aux)
+        for i in range(n_eq):
+            for k in range(n_aux):
+                out[i, k] = sp.diff(self.source[i, 0], self.aux_state[k])
         return out
 
     def _compute_eigenvalues(self):
@@ -958,14 +993,19 @@ class SystemModel:
                        for idx in range(n + 2 * n * n)])
 
     def refresh_derived_operators(self, *, eigenvalues: bool = False):
-        """Recompute ``quasilinear_matrix`` and ``source_jacobian`` from
+        """Recompute ``quasilinear_matrix`` and the source jacobians from
         the (possibly just-mutated) primary operators, keeping the
-        derived operators consistent.  ``eigenvalues=True`` also
+        derived operators consistent.  After an in-place CoV / xreplace the
+        channeled Model matrices are stale, so the jacobians are re-derived
+        from the current ``source`` here.  ``eigenvalues=True`` also
         re-derives the spectrum — only request it when an operation
         genuinely changes the system's characteristic structure and the
         spectrum was not skipped."""
         self.quasilinear_matrix = self._compute_quasilinear_matrix()
-        self.source_jacobian = self._compute_source_jacobian()
+        self.source_jacobian_wrt_variables = _to_zarray(
+            self._compute_source_jacobian_wrt_variables())
+        self.source_jacobian_wrt_aux_variables = _to_zarray(
+            self._compute_source_jacobian_wrt_aux_variables())
         if eigenvalues and self.eigenvalues is not None:
             self.eigenvalues = self._compute_eigenvalues()
 
@@ -1286,6 +1326,17 @@ class SystemModel:
             aux_initial_conditions=getattr(
                 model, "aux_initial_conditions", None),
             update_variables=_to_matrix(model.update_variables(), n_eq, 1),
+            # CHANNEL the source jacobians off the Model (it already derived &
+            # cached them) instead of re-deriving on the SystemModel.  The
+            # Model's ``derive_by_array`` output is ``(n_state|n_aux, n_eq)``;
+            # transpose to the canonical ``(n_eq, n_state|n_aux)`` the printers
+            # / solvers index.
+            source_jacobian_wrt_variables=_to_matrix(
+                model.source_jacobian_wrt_variables(), n_eq, n_eq).T,
+            source_jacobian_wrt_aux_variables=(
+                _to_matrix(model.source_jacobian_wrt_aux_variables(),
+                           len(aux_state), n_eq).T
+                if aux_state else sp.zeros(n_eq, 0)),
             # Carry the model's per-cell LOCAL aux formula (e.g. hinv) so it
             # reaches the runtime generically.  getattr-guarded: only the
             # basemodel branch reaches here (derivation models dispatch to
@@ -1707,16 +1758,20 @@ class SystemModel:
             self.diffusion_matrix_explicit = (
                 self.diffusion_matrix_explicit.xreplace(sub_dict))
 
+        # The freshly exposed Symbols join the aux vector FIRST, so the
+        # source-jacobian-wrt-aux refresh below sees the full ``aux_state``
+        # (the substituted source now references these new aux Symbols).
+        self.aux_state = list(self.aux_state) + new_syms
+        self.aux_registry = registry
+
         # Keep the derived operators consistent: recompute
-        # quasilinear_matrix / source_jacobian from the substituted
+        # quasilinear_matrix / source jacobians from the substituted
         # primaries, and push the substitution through eigenvalues
         # (cheap — avoids re-paying the spectral derivation).
         self.refresh_derived_operators(eigenvalues=False)
         if self.eigenvalues is not None:
             self.eigenvalues = self.eigenvalues.xreplace(sub_dict)
 
-        self.aux_state = list(self.aux_state) + new_syms
-        self.aux_registry = registry
         self.history.append({
             "name": "expose_aux_atoms",
             "description": (
@@ -1813,12 +1868,14 @@ class SystemModel:
             new_B[idx] = B[idx].xreplace(sub_dict)
         self.nonconservative_matrix = new_B
 
+        # Extend aux_state BEFORE refreshing so source_jacobian_wrt_aux_variables
+        # is sized to the full aux vector (the substituted source references the
+        # new aux Symbols).
+        self.aux_state = list(self.aux_state) + list(name_to_sym.values())
+        self.aux_function_map = aux_function_map
         self.refresh_derived_operators(eigenvalues=False)
         if self.eigenvalues is not None:
             self.eigenvalues = self.eigenvalues.xreplace(sub_dict)
-
-        self.aux_state = list(self.aux_state) + list(name_to_sym.values())
-        self.aux_function_map = aux_function_map
         self.history.append({
             "name": "expose_functions_as_aux",
             "description": (
@@ -1905,14 +1962,15 @@ class SystemModel:
             new_B[idx] = B[idx].xreplace(derivative_subs)
         self.nonconservative_matrix = new_B
 
-        self.refresh_derived_operators(eigenvalues=False)
-        if self.eigenvalues is not None:
-            self.eigenvalues = self.eigenvalues.xreplace(derivative_subs)
-
-        # Extend aux_state with the new derivative Symbols.
+        # Extend aux_state with the new derivative Symbols BEFORE refreshing so
+        # source_jacobian_wrt_aux_variables is sized to the full aux vector.
         self.aux_state = list(self.aux_state) + list(
             derivative_subs.values())
         self.aux_derivative_map = aux_derivative_map
+
+        self.refresh_derived_operators(eigenvalues=False)
+        if self.eigenvalues is not None:
+            self.eigenvalues = self.eigenvalues.xreplace(derivative_subs)
 
         self.history.append({
             "name": "expose_derivatives_as_aux",
@@ -2567,7 +2625,7 @@ class SystemModelDescription:
              sm.diffusion_matrix_explicit, 4),
             ("Quasilinear $A_\\mathrm{ql}$", sm.quasilinear_matrix, 3),
             ("Source Jacobian $\\partial S/\\partial Q$",
-             sm.source_jacobian, 2),
+             sm.source_jacobian_wrt_variables, 2),
             ("Eigenvalues $\\Lambda$", sm.eigenvalues, 1),
             ("State update", sm.state_update, 1),
             ("Update variables", sm.update_variables, 1),

@@ -978,7 +978,7 @@ class GenericCppModel(GenericCppBase):
         """Emit the symbolic source Jacobians the implicit source step needs:
 
         * ``source_jacobian_wrt_variables(Q,Qaux,p)`` → ``(n_eq, n_state)`` —
-          ``dS/dQ`` holding aux fixed (the SystemModel's ``source_jacobian``).
+          ``dS/dQ`` holding aux fixed (``sm.source_jacobian_wrt_variables``).
         * ``source_jacobian_wrt_aux_variables(Q,Qaux,p)`` → ``(n_eq, n_aux)`` —
           ``dS/dQaux``; the solver completes the chain rule
           ``dS/dQ + dS/dQaux . dQaux/dQ`` (see ``ModularSolver.hpp`` ~l.268).
@@ -992,22 +992,19 @@ class GenericCppModel(GenericCppBase):
                 "source_jacobian_wrt_variables / "
                 "source_jacobian_wrt_aux_variables",
                 "the SystemModel carries no source term.")]
-        src = [sp.sympify(e) for e in sp.flatten(sm.source)]
         blocks = []
-        jq = getattr(sm, "source_jacobian", None)
-        if jq is None:
-            jq = sp.derive_by_array(sp.Array(src), list(sm.state))
+        # READ both jacobians off the SystemModel — channeled from the Model in
+        # ``from_model`` (or derived once in ``__post_init__`` for standalone
+        # SMs).  Never re-derive with ``sp.diff`` here.
         blocks.append(self._sm_kernel(
-            "source_jacobian_wrt_variables", jq, (n_eq, n_state),
+            "source_jacobian_wrt_variables",
+            sm.source_jacobian_wrt_variables, (n_eq, n_state),
             ["Q", "Qaux", "p"],
         ))
         if n_aux > 0:
-            jaux = sp.Array(
-                [[sp.diff(src[i], sm.aux_state[k]) for k in range(n_aux)]
-                 for i in range(n_eq)]
-            )
             blocks.append(self._sm_kernel(
-                "source_jacobian_wrt_aux_variables", jaux, (n_eq, n_aux),
+                "source_jacobian_wrt_aux_variables",
+                sm.source_jacobian_wrt_aux_variables, (n_eq, n_aux),
                 ["Q", "Qaux", "p"],
             ))
         return blocks

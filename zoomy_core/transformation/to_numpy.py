@@ -418,7 +418,11 @@ class NumpyRuntimeModel:
         _register("source_explicit",
                   _column_to_rank1(sm.source_explicit), std_sig)
         _register("mass_matrix", sm.mass_matrix, std_sig)
-        _register("source_jacobian", sm.source_jacobian, std_sig)
+        _register("source_jacobian_wrt_variables",
+                  sm.source_jacobian_wrt_variables, std_sig)
+        _register("source_jacobian_wrt_aux_variables",
+                  sm.source_jacobian_wrt_aux_variables if sm.aux_state else None,
+                  std_sig)
         _register("update_variables",
                   _column_to_rank1(sm.update_variables), std_sig)
         # Per-cell aux formula (e.g. KP hinv), lowered exactly like
@@ -433,12 +437,6 @@ class NumpyRuntimeModel:
         # ``len(equation_to_state_index)``: the new values for those
         # state slots.  Same broadcast pattern as ``source``.
         _register("state_update", sm.state_update, std_sig)
-
-        # ``∂S/∂Q`` is exposed under both names — the Model-based
-        # runtime calls it ``source_jacobian_wrt_variables``.
-        if "source_jacobian" in rt.runtime_functions:
-            rt.source_jacobian_wrt_variables = (
-                rt.runtime_functions["source_jacobian"])
 
         # NDimArray operators (NCP, quasilinear) — per-axis slab as a
         # Matrix, each routed through ``_lambdify_function`` (so each
