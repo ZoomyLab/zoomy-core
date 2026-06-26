@@ -249,6 +249,8 @@ class FoamSystemModelPrinter(GenericCppBase):
             '#include "vector.H"',
             '#include "scalar.H"',
             '#include "word.H"',
+            '#include "volFields.H"',
+            '#include "fvMesh.H"',
             "",
             f"namespace {self.namespace_name}",
             "{",
@@ -331,8 +333,69 @@ class FoamSystemModelPrinter(GenericCppBase):
 
         blocks.append(self._emit_boundary_conditions())
 
+        # Mesh-aware aux refresh, folded in from the (deleted) standalone
+        # FoamUpdateAuxPrinter: ``update_aux_variables(Q, Qaux, dt, mesh)`` is a
+        # sequence of ``numerics::compute_derivative(...)`` calls read straight
+        # from ``sm.aux_registry`` (already minimal after the Phase-1 split — no
+        # state_index_filter).  Lives inside the model namespace so its name
+        # qualifies as ``{namespace}::update_aux_variables``.
+        blocks.append(self._emit_update_aux_variables())
+
         blocks.append(f"}} // namespace {self.namespace_name}")
         return "\n".join(blocks)
+
+    def _emit_update_aux_variables(self):
+        """Emit ``update_aux_variables(Q, Qaux, dt, mesh)`` from
+        ``sm.aux_registry`` — one ``numerics::compute_derivative(...)`` per
+        derivative-kind aux (the solver-side helper does the LSQ / Gauss-grad
+        on the OpenFOAM mesh).  Emitted verbatim from the registry, which the
+        Phase-1 split already made minimal (no ``state_index_filter``)."""
+        sm = self.sm
+        aux_names = [str(s) for s in sm.aux_state]
+        state_names = [str(s) for s in sm.state]
+
+        def _resolve_source(entry):
+            name = entry["target_name"]
+            if name in state_names:
+                return "Q", state_names.index(name)
+            if name in aux_names:
+                return "Qaux", aux_names.index(name)
+            raise KeyError(
+                f"aux_registry entry {entry['name']!r} references unknown "
+                f"target {name!r} — not found in state or aux_state."
+            )
+
+        lines = [
+            "inline void update_aux_variables(",
+            "    const Foam::List<Foam::volScalarField*>& Q,",
+            "    const Foam::List<Foam::volScalarField*>& Qaux,",
+            "    const Foam::scalar dt,",
+            "    const Foam::fvMesh& mesh)",
+            "{",
+        ]
+        for entry in sm.aux_registry:
+            row = entry["row"]
+            name = entry["name"]
+            if entry["kind"] in ("derivative", "limited_derivative"):
+                src_container, src_idx = _resolve_source(entry)
+                mi = entry["multi_index"]
+                pad = tuple(mi) + (0,) * (3 - len(mi))
+                lines.append(
+                    f"    // Qaux[{row}] ({name}) = "
+                    f"D^{mi} {src_container}[{src_idx}]"
+                )
+                lines.append(
+                    f"    numerics::compute_derivative"
+                    f"(*Qaux[{row}], *{src_container}[{src_idx}], "
+                    f"{pad[0]}, {pad[1]}, {pad[2]}, mesh);"
+                )
+            elif entry["kind"] == "function":
+                lines.append(
+                    f"    // Qaux[{row}] ({name}) — user-supplied function "
+                    f"loaded by the case directory; no computation."
+                )
+        lines.append("}")
+        return "\n".join(lines)
 
     def _emit_mass_matrix(self):
         """Emit ``mass_matrix(Q, Qaux, p) -> List[n_eq][n_state]``."""
@@ -726,196 +789,48 @@ class FoamNumericsPrinter(GenericCppBase):
         return output_path
 
 
-# ── Aux-variables updater (Phase 3) ─────────────────────────────────────
+# ── Chorin projection split headers (REQ-40) ────────────────────────────
 
 
-class FoamUpdateAuxPrinter:
-    """Emit ``numerics::update_aux_variables(Q, Qaux, dt, mesh)`` from
-    ``sm.aux_registry``.
-
-    The output is a flat sequence of ``numerics::compute_derivative(...)``
-    calls — one ``volScalarField`` assignment per derivative-kind aux.
-    The solver-side ``compute_derivative`` helper does the actual LSQ
-    / Gauss-grad computation on the OpenFOAM mesh.
-    """
-
-    def __init__(self, sm, function_name="update_aux_variables",
-                 state_index_filter=None):
-        # Normalise the entry: accept a Model, a SystemModel, or an NSM.
-        self.sm = to_numerical_system_model(sm)
-        # The emitted function name — overridable so a Chorin pressure-aux
-        # refresh (P_x / P_xx only) can sit beside the predictor's own
-        # ``update_aux_variables`` without a symbol clash.
-        self.function_name = function_name
-        # Optional set of state indices: when given, only derivative-of-state
-        # aux entries whose ``state_index`` is in the set are emitted.  This is
-        # the foam analogue of the JAX ChorinSplit solver's
-        # ``_press_aux_recompute`` filter — the Krylov inner loop only needs to
-        # re-derive ``P_x`` / ``P_xx`` (the rest of the pressure block's aux is
-        # frozen predictor output).
-        self.state_index_filter = (
-            None if state_index_filter is None
-            else {int(i) for i in state_index_filter})
-        # aux_state names so we can resolve target_name → index.
-        self._aux_names = [str(s) for s in self.sm.aux_state]
-        self._state_names = [str(s) for s in self.sm.state]
-
-    def _resolve_source(self, entry):
-        """Return ``(container_str, idx)`` for the source field of an
-        aux-registry entry.  ``container_str`` is ``"Q"`` or ``"Qaux"``."""
-        name = entry["target_name"]
-        if name in self._state_names:
-            return "Q", self._state_names.index(name)
-        if name in self._aux_names:
-            return "Qaux", self._aux_names.index(name)
-        raise KeyError(
-            f"aux_registry entry {entry['name']!r} references unknown "
-            f"target {name!r} — not found in state or aux_state."
-        )
-
-    def create_code(self):
-        lines = [
-            "#pragma once",
-            '#include "List.H"',
-            '#include "volFields.H"',
-            '#include "fvMesh.H"',
-            '#include "Model.H"',
-            "",
-            "namespace numerics",
-            "{",
-            "",
-            f"inline void {self.function_name}(",
-            "    const Foam::List<Foam::volScalarField*>& Q,",
-            "    const Foam::List<Foam::volScalarField*>& Qaux,",
-            "    const Foam::scalar dt,",
-            "    const Foam::fvMesh& mesh)",
-            "{",
-        ]
-        for entry in self.sm.aux_registry:
-            row = entry["row"]
-            name = entry["name"]
-            if entry["kind"] in ("derivative", "limited_derivative"):
-                if (self.state_index_filter is not None
-                        and (entry.get("target_kind") != "state"
-                             or entry.get("state_index")
-                             not in self.state_index_filter)):
-                    continue
-                src_container, src_idx = self._resolve_source(entry)
-                mi = entry["multi_index"]
-                # Pad to 3D so the C++ helper always sees (dx, dy, dz).
-                pad = tuple(mi) + (0,) * (3 - len(mi))
-                lines.append(
-                    f"    // Qaux[{row}] ({name}) = "
-                    f"D^{mi} {src_container}[{src_idx}]"
-                )
-                lines.append(
-                    f"    numerics::compute_derivative"
-                    f"(*Qaux[{row}], *{src_container}[{src_idx}], "
-                    f"{pad[0]}, {pad[1]}, {pad[2]}, mesh);"
-                )
-            elif entry["kind"] == "function":
-                lines.append(
-                    f"    // Qaux[{row}] ({name}) — user-supplied function "
-                    f"loaded by the case directory; no computation."
-                )
-        lines.extend([
-            "}",
-            "",
-            "}  // namespace numerics",
-        ])
-        return "\n".join(lines)
-
-    @classmethod
-    def write_code(cls, sm, output_path, **opts):
-        with open(output_path, "w") as f:
-            f.write(cls(sm, **opts).create_code())
-        return output_path
-
-
-# ── Chorin projection split printer (REQ-40) ────────────────────────────
-
-
-class FoamChorinSplitPrinter:
-    """Emit the foam kernels a C++ Chorin-projection driver needs from a VAM
-    pressure split (``model.chorin_split(dt)`` →
+def write_chorin_split_headers(split, output_dir, dt_symbol, *,
+                               predictor_ns="ChorinPredictor",
+                               pressure_ns="ChorinPressure",
+                               corrector_ns="ChorinCorrector"):
+    """Write the three sub-model headers a C++ Chorin-projection driver needs
+    from a VAM pressure split (``model.chorin_split(dt)`` →
     ``split_for_pressure_structural`` → ``(SM_pred, SM_press, SM_corr)``).
 
-    The pieces are NOT a foam-only fork — each is the existing per-SystemModel
-    printer applied to a sub-system, so the predictor flux/NCP/source, the
-    pressure elliptic source, the corrector ``update_variables``, and the
-    P-derivative aux all flow through the same lowering as the single-system
-    interface.  This printer only routes the three sub-systems into distinct
-    namespaces / files and threads ``dt`` as the trailing parameter:
+    No foam-only fork: this just LOOPS the ordinary
+    :class:`FoamSystemModelPrinter` over the three self-contained sub-systems
+    and writes one full model header each.  The pressure-aux refresh is NOT a
+    separate emission anymore — it rides inside ``SM_press``'s own (already
+    minimal) ``update_aux_variables``, folded into its model header.
 
-    * ``Model.H``        — ``namespace {predictor_ns}`` : predictor ops
+    * ``Model.H``     — ``namespace {predictor_ns}`` : predictor ops
       (pressure-zeroed flux / NCP / source + ``mass_matrix``);
-    * ``Pressure.H``     — ``namespace {pressure_ns}``  : the elliptic
-      ``source(Q, Qaux, p)`` linear in ``(P, P_x, P_xx)`` + the
-      ``equation_to_state_index`` mapping (the pressure-mode slots);
-    * ``Corrector.H``    — ``namespace {corrector_ns}`` : ``update_variables``
-      ``U_k ← U_k − dt/M_kk · T_u[k](P)`` + its ``equation_to_state_index``;
-    * ``PressureAux.H``  — ``numerics::update_pressure_aux_variables`` (full
-      press-block refresh, after the predictor) and
-      ``numerics::update_pressure_iter_aux_variables`` (``P_x`` / ``P_xx``
-      only, the Krylov-inner refresh) via the existing ``compute_derivative``
-      LSQ aux path.
+    * ``Pressure.H``  — ``namespace {pressure_ns}``  : the elliptic
+      ``source(Q, Qaux, p)`` linear in ``(P, P_x, P_xx)`` + the pressure-mode
+      ``equation_to_state_index`` + its minimal ``update_aux_variables``
+      (P-derivative computes only);
+    * ``Corrector.H`` — ``namespace {corrector_ns}`` : ``update_variables``
+      ``U_k ← U_k − dt/M_kk · T_u[k](P)`` + its ``equation_to_state_index``.
+
+    The corrector takes dt as an explicit kernel argument
+    (``update_variables(Q, Qaux, p, dt)``), so dt is NOT baked into its
+    parameter vector — only the pressure block carries ``dt_symbol``.
+
+    Returns the list of written paths.
     """
-
-    def __init__(self, split, dt_symbol, *,
-                 predictor_ns="ChorinPredictor",
-                 pressure_ns="ChorinPressure",
-                 corrector_ns="ChorinCorrector"):
-        self.split = split
-        self.dt_symbol = dt_symbol
-        self.predictor_ns = predictor_ns
-        self.pressure_ns = pressure_ns
-        self.corrector_ns = corrector_ns
-
-    def _press_state_indices(self):
-        return list(self.split.SM_press.equation_to_state_index)
-
-    def headers(self):
-        """Return ``{filename: code}`` for the four emitted headers."""
-        s = self.split
-        pred = FoamSystemModelPrinter(
-            s.SM_pred, namespace_name=self.predictor_ns).create_code()
-        press = FoamSystemModelPrinter(
-            s.SM_press, namespace_name=self.pressure_ns,
-            dt_symbol=self.dt_symbol).create_code()
-        # The corrector takes dt as an explicit kernel argument
-        # (``update_variables(Q, Qaux, p, dt)``), so dt must NOT be baked into
-        # its parameter vector — leave ``dt_symbol`` unset and let the canonical
-        # dt symbol resolve to the bare ``dt`` arg.
-        corr = FoamSystemModelPrinter(
-            s.SM_corr, namespace_name=self.corrector_ns).create_code()
-        aux_full = FoamUpdateAuxPrinter(
-            s.SM_press,
-            function_name="update_pressure_aux_variables").create_code()
-        aux_iter = FoamUpdateAuxPrinter(
-            s.SM_press,
-            function_name="update_pressure_iter_aux_variables",
-            state_index_filter=self._press_state_indices()).create_code()
-        return {
-            "Model.H": pred,
-            "Pressure.H": press,
-            "Corrector.H": corr,
-            "PressureAux.H": aux_full + "\n" + aux_iter,
-        }
-
-    def create_code(self):
-        """All four headers concatenated — convenient for inspection / tests.
-        Production use should prefer :meth:`headers` / :meth:`write_code` so
-        each header lands in its own ``#pragma once`` file."""
-        return "\n\n".join(self.headers().values())
-
-    @classmethod
-    def write_code(cls, split, dt_symbol, output_dir, **opts):
-        import os
-        printer = cls(split, dt_symbol, **opts)
-        paths = []
-        for fname, code in printer.headers().items():
-            path = os.path.join(output_dir, fname)
-            with open(path, "w") as f:
-                f.write(code)
-            paths.append(path)
-        return paths
+    import os
+    specs = [
+        ("Model.H", split.SM_pred, {"namespace_name": predictor_ns}),
+        ("Pressure.H", split.SM_press,
+         {"namespace_name": pressure_ns, "dt_symbol": dt_symbol}),
+        ("Corrector.H", split.SM_corr, {"namespace_name": corrector_ns}),
+    ]
+    paths = []
+    for fname, sub_sm, opts in specs:
+        path = os.path.join(output_dir, fname)
+        FoamSystemModelPrinter.write_code(sub_sm, path, **opts)
+        paths.append(path)
+    return paths
