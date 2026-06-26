@@ -166,18 +166,52 @@ class FoamSystemModelPrinter(GenericCppBase):
     # — the ``project_from_3d=`` kwarg remains as an explicit override.
     # None (no registration, no kwarg) ⇒ not emitted.
     project_from_3d = None
+    # C++ namespace the kernels are emitted into.  The default ``Model``
+    # matches the single-system foam interface; the Chorin split printer
+    # overrides it per sub-system (predictor / pressure / corrector) so the
+    # three sub-systems coexist in one driver.
+    namespace_name = "Model"
+    # REQ-40 Chorin split: a free time-step symbol (e.g. the ``dt`` baked into
+    # the pressure elliptic source and the corrector update by
+    # ``split_for_pressure_structural``).  When set it is appended to the
+    # parameter vector ``p`` as the last slot — the exact convention the JAX
+    # ChorinSplit solver uses (``_params_with_dt`` sets ``p[-1] = dt``) — so a
+    # bare ``dt`` symbol prints as ``p[n_parameters - 1]`` and the C++ driver
+    # writes the current step size into that slot.  ``None`` ⇒ unchanged.
+    dt_symbol = None
 
     def __init__(self, sm, **opts):
         super().__init__()
         self.sm = sm
+        # Apply printer options first so ``dt_symbol`` is in effect before the
+        # parameter symbol map (which may append it) is built.
+        for k, v in opts.items():
+            setattr(self, k, v)
         self.register_map("Q", list(sm.state))
         self.register_map("Qaux", list(sm.aux_state))
         self.register_map("n", list(sm.normal.values()))
-        self.register_map("p", list(sm.parameters.values()))
-        for k, v in opts.items():
-            setattr(self, k, v)
+        self.register_map("p", self._parameter_symbols())
         if self.project_from_3d is None:
             self.project_from_3d = getattr(sm, "project_from_3d", None)
+
+    def _parameter_symbols(self):
+        """Ordered parameter Symbols for the ``p`` interface — the
+        SystemModel's parameters, plus ``dt_symbol`` as a trailing slot when
+        the Chorin split baked a time-step into the operators."""
+        p_syms = list(self.sm.parameters.values())
+        if self.dt_symbol is not None:
+            p_syms = p_syms + [self.dt_symbol]
+        return p_syms
+
+    def _parameter_keys_and_values(self):
+        """(names, default_values) for the emitted ``parameter_names`` /
+        ``default_parameters`` — mirrors :meth:`_parameter_symbols`."""
+        keys = list(self.sm.parameters.keys())
+        vals = list(self.sm.parameter_values.values())
+        if self.dt_symbol is not None:
+            keys = keys + ["dt"]
+            vals = vals + [0.0]
+        return keys, vals
 
     # ── Foam syntax hooks ────────────────────────────────────────────────
 
@@ -260,11 +294,19 @@ class FoamSystemModelPrinter(GenericCppBase):
         from zoomy_core.model.boundary_conditions import Coupled
         sm = self.sm
         n_eq, n_state = sm.n_equations, len(sm.state)
-        bc_dict = sm._bc_source.boundary_conditions_list_dict
+        # ``_bc_source`` is the original BoundaryConditions list — pure tag /
+        # preCICE metadata.  Chorin sub-systems (from the splitter, which is
+        # out of this printer's scope) share the parent's indexed BC *kernel*
+        # — what actually gets emitted — but not this metadata object; fall
+        # back to empty tag/preCICE lists when it is absent.
+        bc_source = getattr(sm, "_bc_source", None)
+        bc_dict = (bc_source.boundary_conditions_list_dict
+                   if bc_source is not None else {})
         bc_tags = sorted(bc_dict.keys())
         bc_str = ", ".join(f'"{t}"' for t in bc_tags)
-        p_names = ", ".join(f'"{k}"' for k in sm.parameters.keys())
-        p_vals = ", ".join(str(v) for v in sm.parameter_values.values())
+        p_keys, p_default = self._parameter_keys_and_values()
+        p_names = ", ".join(f'"{k}"' for k in p_keys)
+        p_vals = ", ".join(str(v) for v in p_default)
         # preCICE-coupled patches (Phase 7): a patch↔mesh-name binding for
         # every Coupled BC.  Empty for models with no coupling.
         precice = [(t, bc_dict[t].mesh_name) for t in bc_tags
@@ -279,11 +321,11 @@ class FoamSystemModelPrinter(GenericCppBase):
             '#include "scalar.H"',
             '#include "word.H"',
             "",
-            "namespace Model",
+            f"namespace {self.namespace_name}",
             "{",
             f"constexpr int n_dof_q    = {n_eq};",
             f"constexpr int n_dof_qaux = {len(sm.aux_state)};",
-            f"constexpr int n_parameters = {len(list(sm.parameters.keys()))};",
+            f"constexpr int n_parameters = {len(p_keys)};",
             f"constexpr int dimension  = {sm.dimension};",
             f"const Foam::List<Foam::word> map_boundary_tag_to_function_index{{ {bc_str} }};",
             f"const Foam::List<Foam::word> parameter_names{{ {p_names} }};",
@@ -292,6 +334,20 @@ class FoamSystemModelPrinter(GenericCppBase):
             f"const Foam::List<Foam::word> precice_patch_names{{ {precice_patch_str} }};",
             f"const Foam::List<Foam::word> precice_mesh_names{{ {precice_mesh_str} }};",
         ]
+
+        # REQ-40: the row→state-slot map.  For a square ``from_model``
+        # extraction this is the identity; for a rectangular Chorin sub-system
+        # (predictor / pressure / corrector) it tells the driver which state
+        # slot each emitted row writes — e.g. the pressure block's
+        # ``equation_to_state_index`` is the pressure-mode indices ``[6, 7]``,
+        # the corrector's is the velocity-mode indices ``[2, 3, 4, 5]``.
+        e2s = sm.equation_to_state_index
+        if e2s is not None:
+            e2s_str = ", ".join(str(int(i)) for i in e2s)
+            blocks.append(
+                "const Foam::List<Foam::label> equation_to_state_index"
+                f"{{ {e2s_str} }};"
+            )
 
         # Every operator takes (Q, Qaux, p, …) — parameters are always in the interface.
         blocks += self._per_direction(
@@ -325,14 +381,45 @@ class FoamSystemModelPrinter(GenericCppBase):
             self._kernel("source", sm.source, (n_eq, 1), ["Q", "Qaux", "p"])
         )
 
+        # REQ-40 (a): the mass matrix ``M(Q, Qaux, p)`` — the predictor
+        # sub-system carries the non-trivial ``μ_k·h`` diagonal the driver
+        # inverts when advancing the moments; pressure/corrector rows are
+        # algebraic (all-zero rows).  Always emitted; for the single-system
+        # interface it is the (often identity) operator matrix.
+        blocks.append(self._emit_mass_matrix())
+
+        # REQ-40 (c): the corrector ``state_update(Q, Qaux, p)`` — the
+        # closed-form projection ``U_k ← U_k − dt/M_kk · T_u[k](P)`` (one entry
+        # per corrector row, scattered to ``equation_to_state_index``).  Only
+        # present on a corrector sub-system; ``None`` elsewhere.
+        if sm.state_update is not None:
+            blocks.append(self._emit_state_update())
+
         blocks.extend(self._emit_reconstruction_kernels())
 
         blocks.extend(self._emit_projection_kernels())
 
         blocks.append(self._emit_boundary_conditions())
 
-        blocks.append("} // namespace Model")
+        blocks.append(f"}} // namespace {self.namespace_name}")
         return "\n".join(blocks)
+
+    def _emit_mass_matrix(self):
+        """Emit ``mass_matrix(Q, Qaux, p) -> List[n_eq][n_state]``."""
+        sm = self.sm
+        return self._kernel(
+            "mass_matrix", sm.mass_matrix,
+            (sm.n_equations, len(sm.state)), ["Q", "Qaux", "p"],
+        )
+
+    def _emit_state_update(self):
+        """Emit the corrector ``state_update(Q, Qaux, p) -> List[n_corr]``
+        from ``sm.state_update`` (one updated value per corrector row, in the
+        order of ``equation_to_state_index``)."""
+        sm = self.sm
+        su = sp.Array(sm.state_update)
+        n = len(sp.flatten(su))
+        return self._kernel("state_update", su, (n,), ["Q", "Qaux", "p"])
 
     def _emit_reconstruction_kernels(self):
         """Emit ``Model::reconstruction_variables(Q, Qaux, p)`` (forward)
@@ -348,6 +435,12 @@ class FoamSystemModelPrinter(GenericCppBase):
         state slot), then pop.
         """
         sm = self.sm
+        # A SystemModel may carry no reconstruction maps (e.g. VAM and the
+        # Chorin sub-systems use the default conservative reconstruction);
+        # emit nothing then, mirroring ``_emit_projection_kernels``' skip.
+        if (sm.reconstruction_variables is None
+                or sm.state_from_reconstruction is None):
+            return []
         n_state = len(sm.state)
         shape = (n_state,)
 
@@ -569,7 +662,11 @@ class FoamSystemModelPrinter(GenericCppBase):
 
         self.symbol_maps.append(extra_map)
         try:
-            shape = (self.sm.n_equations,)
+            # The BC kernel returns the full face state (one entry per state
+            # variable).  For a square ``from_model`` system this equals
+            # ``n_equations``; for a rectangular Chorin sub-system the row
+            # count differs from the state count, so size off the state.
+            shape = (len(self.sm.state),)
             body = self.convert_expression_body(bc.definition, shape)
             sig = ",\n    ".join([
                 "const int bc_idx",
@@ -775,8 +872,22 @@ class FoamUpdateAuxPrinter:
     / Gauss-grad computation on the OpenFOAM mesh.
     """
 
-    def __init__(self, sm):
+    def __init__(self, sm, function_name="update_aux_variables",
+                 state_index_filter=None):
         self.sm = sm
+        # The emitted function name — overridable so a Chorin pressure-aux
+        # refresh (P_x / P_xx only) can sit beside the predictor's own
+        # ``update_aux_variables`` without a symbol clash.
+        self.function_name = function_name
+        # Optional set of state indices: when given, only derivative-of-state
+        # aux entries whose ``state_index`` is in the set are emitted.  This is
+        # the foam analogue of the JAX ChorinSplit solver's
+        # ``_press_aux_recompute`` filter — the Krylov inner loop only needs to
+        # re-derive ``P_x`` / ``P_xx`` (the rest of the pressure block's aux is
+        # frozen predictor output).
+        self.state_index_filter = (
+            None if state_index_filter is None
+            else {int(i) for i in state_index_filter})
         # aux_state names so we can resolve target_name → index.
         self._aux_names = [str(s) for s in sm.aux_state]
         self._state_names = [str(s) for s in sm.state]
@@ -805,7 +916,7 @@ class FoamUpdateAuxPrinter:
             "namespace numerics",
             "{",
             "",
-            "inline void update_aux_variables(",
+            f"inline void {self.function_name}(",
             "    const Foam::List<Foam::volScalarField*>& Q,",
             "    const Foam::List<Foam::volScalarField*>& Qaux,",
             "    const Foam::fvMesh& mesh)",
@@ -815,6 +926,11 @@ class FoamUpdateAuxPrinter:
             row = entry["row"]
             name = entry["name"]
             if entry["kind"] in ("derivative", "limited_derivative"):
+                if (self.state_index_filter is not None
+                        and (entry.get("target_kind") != "state"
+                             or entry.get("state_index")
+                             not in self.state_index_filter)):
+                    continue
                 src_container, src_idx = self._resolve_source(entry)
                 mi = entry["multi_index"]
                 # Pad to 3D so the C++ helper always sees (dx, dy, dz).
@@ -841,7 +957,93 @@ class FoamUpdateAuxPrinter:
         return "\n".join(lines)
 
     @classmethod
-    def write_code(cls, sm, output_path):
+    def write_code(cls, sm, output_path, **opts):
         with open(output_path, "w") as f:
-            f.write(cls(sm).create_code())
+            f.write(cls(sm, **opts).create_code())
         return output_path
+
+
+# ── Chorin projection split printer (REQ-40) ────────────────────────────
+
+
+class FoamChorinSplitPrinter:
+    """Emit the foam kernels a C++ Chorin-projection driver needs from a VAM
+    pressure split (``model.chorin_split(dt)`` →
+    ``split_for_pressure_structural`` → ``(SM_pred, SM_press, SM_corr)``).
+
+    The pieces are NOT a foam-only fork — each is the existing per-SystemModel
+    printer applied to a sub-system, so the predictor flux/NCP/source, the
+    pressure elliptic source, the corrector ``state_update``, and the
+    P-derivative aux all flow through the same lowering as the single-system
+    interface.  This printer only routes the three sub-systems into distinct
+    namespaces / files and threads ``dt`` as the trailing parameter:
+
+    * ``Model.H``        — ``namespace {predictor_ns}`` : predictor ops
+      (pressure-zeroed flux / NCP / source + ``mass_matrix``);
+    * ``Pressure.H``     — ``namespace {pressure_ns}``  : the elliptic
+      ``source(Q, Qaux, p)`` linear in ``(P, P_x, P_xx)`` + the
+      ``equation_to_state_index`` mapping (the pressure-mode slots);
+    * ``Corrector.H``    — ``namespace {corrector_ns}`` : ``state_update``
+      ``U_k ← U_k − dt/M_kk · T_u[k](P)`` + its ``equation_to_state_index``;
+    * ``PressureAux.H``  — ``numerics::update_pressure_aux_variables`` (full
+      press-block refresh, after the predictor) and
+      ``numerics::update_pressure_iter_aux_variables`` (``P_x`` / ``P_xx``
+      only, the Krylov-inner refresh) via the existing ``compute_derivative``
+      LSQ aux path.
+    """
+
+    def __init__(self, split, dt_symbol, *,
+                 predictor_ns="ChorinPredictor",
+                 pressure_ns="ChorinPressure",
+                 corrector_ns="ChorinCorrector"):
+        self.split = split
+        self.dt_symbol = dt_symbol
+        self.predictor_ns = predictor_ns
+        self.pressure_ns = pressure_ns
+        self.corrector_ns = corrector_ns
+
+    def _press_state_indices(self):
+        return list(self.split.SM_press.equation_to_state_index)
+
+    def headers(self):
+        """Return ``{filename: code}`` for the four emitted headers."""
+        s = self.split
+        pred = FoamSystemModelPrinter(
+            s.SM_pred, namespace_name=self.predictor_ns).create_code()
+        press = FoamSystemModelPrinter(
+            s.SM_press, namespace_name=self.pressure_ns,
+            dt_symbol=self.dt_symbol).create_code()
+        corr = FoamSystemModelPrinter(
+            s.SM_corr, namespace_name=self.corrector_ns,
+            dt_symbol=self.dt_symbol).create_code()
+        aux_full = FoamUpdateAuxPrinter(
+            s.SM_press,
+            function_name="update_pressure_aux_variables").create_code()
+        aux_iter = FoamUpdateAuxPrinter(
+            s.SM_press,
+            function_name="update_pressure_iter_aux_variables",
+            state_index_filter=self._press_state_indices()).create_code()
+        return {
+            "Model.H": pred,
+            "Pressure.H": press,
+            "Corrector.H": corr,
+            "PressureAux.H": aux_full + "\n" + aux_iter,
+        }
+
+    def create_code(self):
+        """All four headers concatenated — convenient for inspection / tests.
+        Production use should prefer :meth:`headers` / :meth:`write_code` so
+        each header lands in its own ``#pragma once`` file."""
+        return "\n\n".join(self.headers().values())
+
+    @classmethod
+    def write_code(cls, split, dt_symbol, output_dir, **opts):
+        import os
+        printer = cls(split, dt_symbol, **opts)
+        paths = []
+        for fname, code in printer.headers().items():
+            path = os.path.join(output_dir, fname)
+            with open(path, "w") as f:
+                f.write(code)
+            paths.append(path)
+        return paths
