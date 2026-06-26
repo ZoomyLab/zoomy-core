@@ -55,6 +55,12 @@ def _canonical(value) -> str:
     # primitives
     if isinstance(value, (str, int, float, bool, type(None))):
         return repr(value)
+    # objects that carry their own cache key (nested op / Closure / StateSpace) —
+    # checked BEFORE the callable branch, so a *callable* Operation keys on its
+    # config content, not just its __call__ effect/bytecode (which omits config
+    # like ElderViscosity(friction=...)).
+    if hasattr(value, "_key_content"):
+        return f"{type(value).__name__}({value._key_content()})"
     # callables (lambdas / functions) → symbolic effect on a probe symbol
     if callable(value) and not isinstance(value, sp.Basic):
         try:
@@ -76,9 +82,6 @@ def _canonical(value) -> str:
     # a class type that isn't a basis
     if isinstance(value, type):
         return f"type({value.__module__}.{value.__name__})"
-    # opaque object that carries its own cache key (e.g. nested op / StateSpace)
-    if hasattr(value, "_key_content"):
-        return f"{type(value).__name__}({value._key_content()})"
     # unknown object → its own __dict__ (recurse), so we never silently drop state
     if hasattr(value, "__dict__"):
         return f"{type(value).__name__}(" + _state_repr(vars(value)) + ")"
