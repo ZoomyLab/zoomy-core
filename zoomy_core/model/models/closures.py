@@ -114,6 +114,22 @@ class Closure(Operation):
         super().__init__(name=name or type(self).__name__,
                          description=f"{type(self).__name__} ({self.closes})")
 
+    def _key_content(self):
+        """Result-affecting identity of this closure for the derivation cache.
+
+        Canonicalises the non-cosmetic instance state (so e.g. an
+        ``ElderViscosity(friction=bed)`` keys differently from a standalone
+        ``ElderViscosity()``, and a nested bed closure folds in its own config).
+        Without this a closure is keyed only by its class ``repr`` and two
+        configurations of the same class would share a cached derivation."""
+        from zoomy_core.model.derivation.cache_keys import _state_repr
+        return _state_repr(vars(self))
+
+    def __repr__(self):
+        # The derivation-cache canonicaliser falls back to ``repr`` for callable
+        # Operations, so the repr MUST carry the result-affecting config.
+        return f"{type(self).__name__}({self._key_content()})"
+
     def register(self, model):
         """Register-or-query the parameters this closure needs (override)."""
 
@@ -128,6 +144,15 @@ class Closure(Operation):
     def expression(self, s):
         """Return the symbolic relation for this stress component (override)."""
         raise NotImplementedError
+
+    def friction_velocity(self, s):
+        """Bed friction velocity ``u_⋆`` this closure defines, or ``None``.
+
+        A bottom drag law (RoughWall / Chezy) overrides this to expose its
+        recovered ``u_⋆ = √(C_f)|u_b|`` so a bulk eddy-viscosity closure
+        (:class:`ElderViscosity`) can CONSUME it instead of a free parameter.
+        Closures without a bed drag return ``None``."""
+        return None
 
     def traction(self, s):
         """BOUNDARY traction in the local frame ``{n, t_α}``:
@@ -256,16 +281,32 @@ class ElderViscosity(Closure):
     the classical ALGEBRAIC turbulence closure for free-surface flow:
     ``τ = ρ ν_t ∂_z u``.  Unlike k–ε it is a POLYNOMIAL in ζ, so the Galerkin
     projection closes analytically (no quadrature).  ``u_star`` is the friction
-    velocity (a parameter here; set it from the bed law / RoughWall in practice)."""
+    velocity: a free PARAMETER by default, or — when a bed drag closure is passed
+    as ``friction=`` — the SAME live ``u_⋆ = √(C_f)|u_b|`` that closure recovers
+    (one shared bed instance), e.g.::
+
+        bed = RoughWall()
+        SME(..., closures=[ElderViscosity(friction=bed), bed, StressFree()])
+
+    so the eddy viscosity tracks the computed bed shear per cell instead of a
+    frozen constant.  ``friction=None`` keeps the standalone parameter form."""
     closes = "bulk"; requires = ("u",)
+
+    def __init__(self, name=None, friction=None):
+        super().__init__(name=name)
+        self.friction = friction      # a bottom closure exposing friction_velocity
 
     def register(self, m):
         m.parameter("kappa", 0.41)
         m.parameter("u_star", 0.0)
         m.parameter("nu", 0.0)        # molecular part: ν_eff = ν + ν_t
+        if self.friction is not None:
+            self.friction.register(m)  # ensure the bed law's params (k_s, z_p) exist
 
     def expression(self, s):
-        nu_t = s.par.kappa * s.par.u_star * s.depth * s.zeta * (1 - s.zeta)
+        u_star = (self.friction.friction_velocity(s) if self.friction is not None
+                  else s.par.u_star)
+        nu_t = s.par.kappa * u_star * s.depth * s.zeta * (1 - s.zeta)
         return s.par.rho * (s.par.nu + nu_t) * s.dz(s.u)
 
 
@@ -307,6 +348,15 @@ class RoughWall(Closure):
     def expression(self, s):
         Cf = (s.par.kappa / sp.log(s.par.z_p / (s.par.k_s / 30))) ** 2
         return s.par.rho * Cf * s.u * sp.Abs(s.u)
+
+    def friction_velocity(self, s):
+        """Recovered bed friction velocity ``u_⋆ = √(C_f)·|u_b|`` (Rastogi & Rodi
+        1978), with ``|u_b|`` the horizontal-momentum magnitude of the ζ=0 bed
+        trace.  Consumed by :class:`ElderViscosity` (``friction=``)."""
+        Cf = (s.par.kappa / sp.log(s.par.z_p / (s.par.k_s / 30))) ** 2
+        ub = s.velocity_at(0)                        # bed trace [u, (v,) w]
+        u_b_mag = sp.sqrt(sum(ub[i] ** 2 for i in range(len(ub) - 1)))  # horizontal
+        return sp.sqrt(Cf) * u_b_mag
 
     def traction(self, s):
         """Quadratic bed drag as a VECTOR traction opposing the slip velocity:
