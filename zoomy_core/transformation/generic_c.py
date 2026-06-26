@@ -799,6 +799,12 @@ class GenericCppModel(GenericCppBase):
     # but emit the C++ pointer signatures the dmplex/C backend consumes.
 
     _AXIS = ("x", "y", "z")
+    # Whether this backend can compute non-local spatial-derivative aux
+    # (the ``compute_derivative`` registry walk in ``update_aux_variables``).
+    # True for mesh-aware C++ backends (dmplex / amrex); a backend with no
+    # mesh (a hypothetical out-parameter GPU path) sets this False and the
+    # derivative leg is skipped — the algebraic aux leg still emits.
+    supports_nonlocal_derivatives = True
     # Canonical 3D-field profile the coupling maps exchange (Phase 7):
     # ``interpolate_to_3d`` emits these slots in order; ``project_from_3d``
     # consumes them through fresh ``P3_<field>`` symbols mapped to
@@ -1022,15 +1028,25 @@ class GenericCppModel(GenericCppBase):
         * ``update_variables(Q,Qaux,p,dt)`` → ``(n_eq,)`` — pointwise state
           remap (``dt`` ignored by full models; load-bearing in a Chorin
           corrector sub-system, scattered via ``equation_to_state_index``).
-        * ``update_aux_variables(Q,Qaux,p,dt)`` → ``(n_aux,)`` — pointwise aux
-          recompute, plus its Jacobian ``(n_aux, n_state)`` (row-major
-          ``dAux_dQ[k*n_dof+j]``).
+        * ``update_aux_variables(Q,Qaux,p,dt)`` → ``(n_aux,)`` — the COMPLETE
+          per-cell aux recompute, in ONE kernel, mirroring
+          ``FoamSystemModelPrinter._emit_update_aux_variables``:
 
-        These are *pointwise algebraic* updates.  A declarative model whose aux
-        are mesh-derivative (computed by the solver's gradient) or user
-        closures carries ``None`` here — documented, not emitted (it is the
-        ``FoamUpdateAuxPrinter`` ``compute_derivative`` path, which cannot be a
-        pointwise ``Model`` kernel)."""
+          - the ALGEBRAIC leg from the ``update_aux_variables`` SystemModel
+            field (pointwise closures), and
+          - the SPATIAL-DERIVATIVE leg — one ``compute_derivative(field_id,
+            dx, dy, dz)`` call per derivative-kind aux read straight from
+            ``sm.aux_registry`` (the same source foam walks).  ``field_id`` is
+            the differentiated field's accessor (``Q[i]`` / ``Qaux[i]``); the
+            backend's mesh-aware ``compute_derivative`` UserFunction returns
+            the ``(dx,dy,dz)``-order derivative on its mesh.
+
+          Rows neither algebraic nor in the registry (aux supplied by a parent
+          system — e.g. a Chorin predictor's gradients) pass through unchanged
+          (``res[k] = Qaux[k]``), exactly like foam touching only the registry
+          slots.  The Jacobian ``(n_aux, n_state)`` is emitted only for the
+          algebraic leg (the non-local derivative leg has no pointwise local
+          Jacobian); ``dAux_dQ[k*n_dof+j]``."""
         sm = self.sm
         n_eq, n_state, n_aux = sm.n_equations, len(sm.state), len(sm.aux_state)
         blocks = []
@@ -1047,27 +1063,83 @@ class GenericCppModel(GenericCppBase):
                 "no pointwise state remap on this SystemModel; the solver "
                 "leaves Q unchanged after the transport step."))
 
+        blocks.extend(self._emit_update_aux_variables())
+        return blocks
+
+    def _aux_source_symbol(self, entry):
+        """Resolve a derivative-aux registry entry's differentiated field to
+        its SystemModel state / aux Symbol — so the kernel symbol map lowers it
+        to ``Q[i]`` / ``Qaux[i]`` (mirrors foam's ``_resolve_source``)."""
+        sm = self.sm
+        name = entry["target_name"]
+        state_names = [str(s) for s in sm.state]
+        aux_names = [str(s) for s in sm.aux_state]
+        if name in state_names:
+            return sm.state[state_names.index(name)]
+        if name in aux_names:
+            return sm.aux_state[aux_names.index(name)]
+        raise KeyError(
+            f"aux_registry entry {entry['name']!r} references unknown target "
+            f"{name!r} — not found in state or aux_state.")
+
+    def _emit_update_aux_variables(self):
+        """Emit the COMPLETE ``update_aux_variables(Q,Qaux,p,dt) -> (n_aux,)``
+        kernel (algebraic + spatial-derivative legs) plus the algebraic-leg
+        Jacobian.  Mirrors ``FoamSystemModelPrinter._emit_update_aux_variables``
+        but returns the recomputed aux vector in the C++ pointer-arg style.
+
+        A SystemModel with neither an algebraic field nor any derivative-kind
+        registry entry (no aux to recompute) is documented, not stubbed."""
+        sm = self.sm
+        n_state, n_aux = len(sm.state), len(sm.aux_state)
+        registry = getattr(sm, "aux_registry", None) or []
+        deriv_entries = (
+            [e for e in registry
+             if e["kind"] in ("derivative", "limited_derivative")]
+            if self.supports_nonlocal_derivatives else []
+        )
+
         uav = getattr(sm, "update_aux_variables", None)
-        if uav is not None and len(sp.flatten(uav)) > 0:
-            blocks.append(self._sm_kernel(
-                "update_aux_variables", uav, (n_aux,),
-                ["Q", "Qaux", "p", "dt"],
-            ))
-            jac = sp.derive_by_array(
-                sp.Array([sp.sympify(e) for e in sp.flatten(uav)]),
-                list(sm.state),
+        algebraic = (
+            [sp.sympify(e) for e in sp.flatten(uav)]
+            if uav is not None and len(sp.flatten(uav)) > 0 else None
+        )
+
+        if algebraic is None and not deriv_entries:
+            return [self._doc_note(
+                "update_aux_variables / "
+                "update_aux_variables_jacobian_wrt_variables",
+                "no algebraic aux closure and no derivative-kind aux on this "
+                "SystemModel — nothing to recompute; aux pass through.")]
+
+        # Build the (n_aux,) recompute vector.  Default every row to its own
+        # aux Symbol (identity pass-through, lowered to ``Qaux[k]``); the
+        # algebraic field overrides all rows when present; the derivative
+        # registry overrides its rows with mesh-aware ``compute_derivative``.
+        rows = list(sm.aux_state)
+        if algebraic is not None:
+            for k in range(min(n_aux, len(algebraic))):
+                rows[k] = algebraic[k]
+        for e in deriv_entries:
+            src = self._aux_source_symbol(e)
+            pad = tuple(e["multi_index"]) + (0,) * (3 - len(e["multi_index"]))
+            rows[e["row"]] = sp.Function("compute_derivative")(
+                src, sp.Integer(pad[0]), sp.Integer(pad[1]), sp.Integer(pad[2])
             )
+
+        blocks = [self._sm_kernel(
+            "update_aux_variables", sp.Array(rows), (n_aux,),
+            ["Q", "Qaux", "p", "dt"],
+        )]
+
+        # Jacobian — algebraic leg only (compute_derivative is non-local, so it
+        # carries no pointwise local Jacobian; foam emits none either).
+        if algebraic is not None:
+            jac = sp.derive_by_array(sp.Array(algebraic), list(sm.state))
             blocks.append(self._sm_kernel(
                 "update_aux_variables_jacobian_wrt_variables",
                 jac, (n_aux, n_state), ["Q", "Qaux", "p", "dt"],
             ))
-        else:
-            blocks.append(self._doc_note(
-                "update_aux_variables / "
-                "update_aux_variables_jacobian_wrt_variables",
-                "aux are mesh-derivative (solver gradient) and/or user "
-                "closures; no pointwise algebraic aux update on this "
-                "SystemModel — compute aux solver-side."))
         return blocks
 
     def _emit_initial_conditions(self):
