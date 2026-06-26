@@ -19,65 +19,9 @@ from zoomy_core.transformation.generic_c import GenericCppBase, GenericCppModel
 # ── Legacy printer (unchanged) ───────────────────────────────────────────
 
 
-class FoamModel(GenericCppModel):
-    """Legacy Foam printer — consumes a pre-SystemModel ``Model``."""
-
-    _output_subdir = ".foam_interface"
-    _is_template_class = False
-
-    def __init__(self, model, *args, **kwargs):
-        self.real_type = "Foam::scalar"
-        self.math_namespace = "Foam::"
-        super().__init__(model, *args, **kwargs)
-
-    def get_includes(self):
-        return '#include "List.H"\n#include "vector.H"\n#include "scalar.H" '
-
-    def format_accessor(self, var_name, index):
-        if var_name in ("n", "X") and index < 3:
-            return f"{var_name}.{('x()', 'y()', 'z()')[index]}"
-        return f"{var_name}[{index}]"
-
-    def format_assignment(self, target_name, indices, value, shape):
-        return f"{target_name}{''.join(f'[{i}]' for i in indices)} = {value};"
-
-    def get_variable_declaration(self, v):
-        return {
-            "Q": "const Foam::List<Foam::scalar>& Q",
-            "Qaux": "const Foam::List<Foam::scalar>& Qaux",
-            "n": "const Foam::vector& n",
-            "X": "const Foam::vector& X",
-            "time": "const Foam::scalar& time",
-            "dX": "const Foam::scalar& dX",
-            "bc_idx": "const int bc_idx",
-        }.get(v, "")
-
-    def _get_foam_type(self, dims):
-        if not dims:
-            return "Foam::scalar"
-        return f"Foam::List<{self._get_foam_type(dims[1:])}>"
-
-    def wrap_function_signature(self, name, args_str, body_str, shape):
-        def init(dims):
-            if len(dims) == 1:
-                return f"Foam::List<Foam::scalar>({dims[0]}, 0.0)"
-            return (
-                f"Foam::List<{self._get_foam_type(dims[1:])}>"
-                f"({dims[0]}, {init(dims[1:])})"
-            )
-
-        return (
-            f"\n    static inline {self._get_foam_type(shape)} {name}(\n"
-            f"        {args_str})\n"
-            f"    {{\n"
-            f"        auto res = {init(shape)};\n"
-            f"{body_str}\n"
-            f"        return res;\n"
-            f"    }}\n"
-        )
-
-
 # ── SystemModel printer ──────────────────────────────────────────────────
+# (The legacy ``FoamModel`` Model-path printer was removed — foam codegen goes
+#  through ``FoamSystemModelPrinter`` (SystemModel/NSM-native).)
 
 
 _FOAM_ARG = {
