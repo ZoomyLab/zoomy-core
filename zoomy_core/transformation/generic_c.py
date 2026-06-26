@@ -778,6 +778,7 @@ class GenericCppModel(GenericCppBase):
         blocks = [self.get_file_header()]
         if self.sm is not None:
             blocks.extend(self._emit_operator_kernels())
+            blocks.extend(self._emit_reconstruction_kernels())
         else:
             for name, func_obj in self.model.functions.items():
                 blocks.extend(self._process_kernel_from_function(func_obj))
@@ -912,6 +913,63 @@ class GenericCppModel(GenericCppBase):
                 ["Q", "Qaux", "p"],
             )
         return blocks
+
+    def _emit_reconstruction_kernels(self):
+        """Emit the MUSCL reconstruction variable change, mirroring
+        ``FoamSystemModelPrinter._emit_reconstruction_kernels``:
+
+        * ``reconstruction_variables(Q, Qaux, p) -> W[n_state]`` — forward
+          map from the conservative state to the reconstruction variables
+          (e.g. ``eta = b + h``).  Uses the shared SystemModel symbol scope.
+        * ``state_from_reconstruction(W, Qaux, p) -> Q[n_state]`` — the
+          inverse, parameterised by the fresh ``WB_<state>`` symbols
+          ``invert_reconstruction`` created.  Push a temporary ``WB_* -> W[i]``
+          map so each reads as ``W[i]`` for the matching state slot.
+
+        A SystemModel that carries no reconstruction maps (default
+        conservative reconstruction, e.g. VAM / Chorin sub-systems) emits
+        nothing, exactly like the foam printer's skip.
+        """
+        sm = self.sm
+        if (sm.reconstruction_variables is None
+                or sm.state_from_reconstruction is None):
+            return []
+        shape = (len(sm.state),)
+
+        fwd = self._sm_kernel(
+            "reconstruction_variables",
+            sm.reconstruction_variables,
+            shape,
+            ["Q", "Qaux", "p"],
+        )
+
+        # Inverse map — map the actual ``WB_*`` symbols (assumptions like
+        # real=True mean a freshly-built ``Symbol("WB_b")`` would not match)
+        # to ``W[i]`` of their matching state slot.  Pushed below the
+        # ``_sm_kernel`` symbol map; state symbols never appear in the inverse
+        # expressions, so there is no clash with the Q[i] scope.
+        wb_map = {}
+        free = set()
+        for expr in sp.flatten(sm.state_from_reconstruction):
+            if hasattr(expr, "free_symbols"):
+                free |= expr.free_symbols
+        wb_by_name = {str(s): s for s in free if str(s).startswith("WB_")}
+        for i, state_sym in enumerate(sm.state):
+            wb_name = f"WB_{state_sym}"
+            if wb_name in wb_by_name:
+                wb_map[wb_by_name[wb_name]] = self.format_accessor("W", i)
+        self.symbol_maps.append(wb_map)
+        try:
+            inv = self._sm_kernel(
+                "state_from_reconstruction",
+                sm.state_from_reconstruction,
+                shape,
+                ["W", "Qaux", "p"],
+            )
+        finally:
+            self.symbol_maps.pop()
+
+        return [fwd, inv]
 
     def _emit_boundary_conditions(self):
         """Lower the model's ``BoundaryConditions`` into the indexed
