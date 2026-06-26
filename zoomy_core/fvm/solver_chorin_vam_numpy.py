@@ -688,13 +688,19 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
     # ------------------------------------------------------------------
 
     def _aux_pool_for(self, sm):
-        """Return the (Qaux array, registry) for a given sub-system."""
+        """Return the (Qaux array, registry) for a given sub-system.
+
+        ``registry`` is the FULL aux list (live + frozen inputs) so a
+        ``function``-aux injection (e.g. bathymetry ``b``) finds its row
+        whether it was classified live or input by the splitter."""
+        full = (sm.aux_registry or []) + (
+            getattr(sm, "aux_input_registry", None) or [])
         if sm is self.sm_pred:
-            return self._sim_Qaux, sm.aux_registry or []
+            return self._sim_Qaux, full
         if sm is self.sm_press:
-            return self.Qaux_press, sm.aux_registry or []
+            return self.Qaux_press, full
         if sm is self.sm_corr:
-            return self.Qaux_corr, sm.aux_registry or []
+            return self.Qaux_corr, full
         raise ValueError(f"Unknown sub-system {sm}")
 
     def _compute_boundary_face_state(self):
@@ -751,8 +757,16 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         Q, mesh = self._sim_Q, self._sim_mesh
         self._sim_Qaux = self._walk_derivative_aux(
             self.sm_pred, self._sim_Qaux, Q, mesh, **kw)
+        # SM_press.aux_registry holds only the LIVE pressure derivatives;
+        # its frozen predictor-produced inputs live in aux_input_registry.
+        # The private pressure pool needs both filled (the inputs are
+        # constant across the step's Krylov iterations).
         self.Qaux_press = self._walk_derivative_aux(
-            self.sm_press, self.Qaux_press, Q, mesh, **kw)
+            self.sm_press, self.Qaux_press, Q, mesh,
+            registry=((self.sm_press.aux_registry or [])
+                      + (getattr(self.sm_press, "aux_input_registry", None)
+                         or [])),
+            **kw)
         self.Qaux_corr = self._walk_derivative_aux(
             self.sm_corr, self.Qaux_corr, Q, mesh, **kw)
 

@@ -1805,10 +1805,19 @@ class SystemModel:
     # ── reverse-aux substitution helper (for tests / inspection) ──
 
     def _aux_reverse_map(self):
-        """Return ``{aux_Symbol: original_atom}`` for every entry in
-        ``aux_registry`` so reconstructed residuals can be displayed in
-        their original ``Derivative(…)`` form."""
-        registry = getattr(self, "aux_registry", None) or []
+        """Return ``{aux_Symbol: original_atom}`` for every aux entry so
+        reconstructed residuals can be displayed in their original
+        ``Derivative(…)`` form.
+
+        Covers both ``aux_registry`` (the live, re-derived aux) and
+        ``aux_input_registry`` (frozen inputs a split stage reads but does
+        not re-derive — e.g. the predictor-produced derivatives a Chorin
+        pressure block consumes).  Both appear as aux symbols in the
+        operators, so both must reverse-map; otherwise a pruned input
+        symbol (``q_0_x``) would survive the reconstruction and fail to
+        cancel against its ``Derivative(q_0, x)`` reference."""
+        registry = ((getattr(self, "aux_registry", None) or [])
+                    + (getattr(self, "aux_input_registry", None) or []))
         return {entry["aux_symbol"]: entry["atom"] for entry in registry}
 
     # ── (legacy) expose_functions_as_aux / expose_derivatives_as_aux ─

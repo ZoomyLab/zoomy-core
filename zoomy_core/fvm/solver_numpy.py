@@ -235,7 +235,7 @@ class Solver(param.Parameterized):
     def _walk_derivative_aux(self, sm, Qaux, Q, mesh, *,
                              kinds=("derivative",),
                              limited_aux_fields=None, limiter_fn=None,
-                             copy=True):
+                             copy=True, registry=None):
         """Fill ``aux_registry`` derivative rows of ONE SystemModel by LSQ —
         the single source the canonical :meth:`update_qaux` AND
         ``ChorinSplitVAMSolver.update_aux_variables`` (per sub-system pool)
@@ -250,8 +250,16 @@ class Solver(param.Parameterized):
         function-aux targets read the working aux; boundary faces use
         extrapolation (Neumann-zero).  ``copy=True`` returns a fresh array
         (canonical: don't clobber the caller's Qaux); ``copy=False`` mutates
-        in place (Chorin: refresh the pool array itself)."""
-        registry = getattr(sm, "aux_registry", None) if sm is not None else None
+        in place (Chorin: refresh the pool array itself).
+
+        ``registry`` overrides ``sm.aux_registry`` — the Chorin pressure
+        pool passes ``aux_registry + aux_input_registry`` so its private
+        Qaux pool gets BOTH the live pressure derivatives and the frozen
+        predictor-produced input derivatives filled in one pass (the
+        printer-facing ``aux_registry`` stays minimal)."""
+        if registry is None:
+            registry = (getattr(sm, "aux_registry", None)
+                        if sm is not None else None)
         if not registry:
             return Qaux
         out = np.array(Qaux, copy=True) if copy else Qaux

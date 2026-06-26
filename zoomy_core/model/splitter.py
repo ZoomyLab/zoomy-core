@@ -322,6 +322,60 @@ def _extract_pressure_T(residuals, equation_name, pressure_vars, mu_k):
 # ---------------------------------------------------------------------------
 
 
+def _zero_ndim(*shape):
+    """A zero rank-3 NCP array whose entries are sympy ``Zero`` (not the
+    Python ``int`` 0 ``MutableDenseNDimArray.zeros`` fills with).
+
+    ``from_model`` operators are sympy expressions throughout; the C++ /
+    foam code printers walk them with ``expr.replace(...)``.  A bare
+    Python ``int`` entry (as produced by ``...zeros(...)`` directly) has
+    no ``.replace`` and crashes the printer — so the corrector's all-zero
+    flux/NCP must be sympified to print standalone like any other model."""
+    return sp.MutableDenseNDimArray.zeros(*shape).applyfunc(sp.sympify)
+
+
+def _partition_pressure_aux(sm_press, pressure_vars):
+    """Split ``sm_press.aux_registry`` into LIVE vs INPUT derivative aux.
+
+    A Chorin pressure stage solves an elliptic block for the pressure
+    modes ``P_l``.  During that solve the ONLY aux that changes is the
+    pressure derivatives (``P_l_x``, ``P_l_xx``); every other derivative
+    in the elliptic source (``q_k_x``, ``h_x``, ``h_xx``, ``b_x`` …) is a
+    derivative of the *frozen* predictor state and is therefore a constant
+    INPUT to the pressure solve — re-deriving it inside the Krylov loop is
+    wasted work and, worse, misrepresents the model: a standalone Model
+    printer reading ``aux_registry`` would emit compute-derivative calls
+    for aux this sub-model does not actually re-derive.
+
+    This routine makes ``sm_press`` self-describing:
+
+    * ``aux_registry``        — keeps EXACTLY the pressure-mode derivative
+      entries (``target_name`` is a pressure variable).  This is the
+      minimal "what I re-derive" list a Model printer emits as the natural
+      ``update_aux_variables`` — no ``state_index_filter`` needed.
+    * ``aux_input_registry``  — the frozen predictor-produced derivative /
+      function aux this stage READS but does not re-derive.  ``aux_state``
+      is left whole (both groups remain inputs the kernels reference); a
+      runtime that keeps a private pressure aux-pool fills it once per step
+      from ``aux_registry + aux_input_registry`` (the input group is
+      constant across the Krylov iterations).
+
+    Idempotent and a no-op when there is no live pressure derivative.
+    """
+    registry = list(getattr(sm_press, "aux_registry", None) or [])
+    live_names = {str(p) for p in pressure_vars}
+
+    def _is_pressure_derivative(entry):
+        return (entry.get("kind") in ("derivative", "limited_derivative")
+                and entry.get("target_name") in live_names)
+
+    live = [e for e in registry if _is_pressure_derivative(e)]
+    inputs = [e for e in registry if not _is_pressure_derivative(e)]
+    sm_press.aux_registry = live
+    sm_press.aux_input_registry = inputs
+    return sm_press
+
+
 @dataclass
 class SplitForPressureResult:
     """Three sub-SystemModels produced by :func:`split_for_pressure`.
@@ -507,6 +561,11 @@ def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
         space=coords,
         state=state_syms,
         aux_state=[],
+        # Propagate the 3-D position Zstruct so the sub-system prints
+        # standalone (the C++/foam Model printers read ``model.position``
+        # for the ``X`` register map); without it the field defaults to
+        # None and the printer crashes on ``position.values()``.
+        position=sm_parent.position,
         parameters=sm_parent.parameters,
         parameter_values=sm_parent.parameter_values,
         flux=F,
@@ -539,6 +598,13 @@ def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
     # ``P_l_x`` / ``P_l_x_x``, etc.
     sm.expose_aux_atoms()
     sm.equation_names = list(eq_names)
+    # Share the parent's BC source objects so the sub-system prints
+    # standalone — the C++ Model printer reads ``sm._bc_source`` (tag
+    # dict) for its boundary-id header, and the runtime re-resolves the
+    # indexed kernel from it.  Sub-systems share the parent state layout,
+    # so the same source applies verbatim.
+    sm._bc_source = getattr(sm_parent, "_bc_source", None)
+    sm._aux_bc_source = getattr(sm_parent, "_aux_bc_source", None)
     sm.history.append(history_entry)
     return sm
 
@@ -688,11 +754,12 @@ def split_for_pressure(sm, pressure_vars, dt, *, bottom=None):
         space=list(sm.space),
         state=list(state),
         aux_state=[],
+        position=sm.position,
         parameters=sm.parameters,
         parameter_values=sm.parameter_values,
         flux=sp.zeros(n_eq, n_dim),
         hydrostatic_pressure=sp.zeros(n_eq, n_dim),
-        nonconservative_matrix=sp.MutableDenseNDimArray.zeros(n_eq, n_st, n_dim),
+        nonconservative_matrix=_zero_ndim(n_eq, n_st, n_dim),
         source=sp.zeros(n_eq, 1),
         mass_matrix=sp.zeros(n_eq, n_st),
         equation_to_state_index=list(corr_e2s_index),
@@ -707,6 +774,8 @@ def split_for_pressure(sm, pressure_vars, dt, *, bottom=None):
     )
     SM_corr.equation_names = list(update_names)
     SM_corr.expose_aux_atoms()
+    SM_corr._bc_source = getattr(sm, "_bc_source", None)
+    SM_corr._aux_bc_source = getattr(sm, "_aux_bc_source", None)
     SM_corr.history.append({
         "name": "split_for_pressure[corr]",
         "description": (
@@ -848,6 +917,11 @@ def split_for_pressure_structural(sm, pressure_vars, dt):
             "description": f"pressure: {len(press_names)} elliptic rows "
                            f"determining {[str(p) for p in pressure_vars]}",
         })
+    # Keep only the LIVE pressure-mode derivatives in SM_press.aux_registry;
+    # the frozen predictor-produced aux move to aux_input_registry (still in
+    # aux_state as kernel inputs).  Lets a Model printer emit a minimal,
+    # correct update_aux_variables with no split-awareness.
+    _partition_pressure_aux(SM_press, pressure_vars)
 
     func_to_sym = dict(zip(state_funcs, state))
     update_exprs_sym = [e.xreplace(func_to_sym) for e in update_exprs]
@@ -857,12 +931,12 @@ def split_for_pressure_structural(sm, pressure_vars, dt):
         space=list(sm.space),
         state=list(state),
         aux_state=[],
+        position=sm.position,
         parameters=sm.parameters,
         parameter_values=sm.parameter_values,
         flux=sp.zeros(n_corr, sm.n_dim),
         hydrostatic_pressure=sp.zeros(n_corr, sm.n_dim),
-        nonconservative_matrix=sp.MutableDenseNDimArray.zeros(
-            n_corr, sm.n_state, sm.n_dim),
+        nonconservative_matrix=_zero_ndim(n_corr, sm.n_state, sm.n_dim),
         source=sp.zeros(n_corr, 1),
         mass_matrix=sp.zeros(n_corr, sm.n_state),
         equation_to_state_index=list(corr_e2s),
@@ -877,6 +951,8 @@ def split_for_pressure_structural(sm, pressure_vars, dt):
     )
     SM_corr.equation_names = list(update_names)
     SM_corr.expose_aux_atoms()
+    SM_corr._bc_source = getattr(sm, "_bc_source", None)
+    SM_corr._aux_bc_source = getattr(sm, "_aux_bc_source", None)
     SM_corr.history.append({
         "name": "split_for_pressure_structural[corr]",
         "description": f"corrector: explicit update on "
@@ -1075,6 +1151,9 @@ def split_simple(sm, pressure_vars, dt, *, bottom=None):
             ),
         },
     )
+    # Minimal live aux: only the pressure derivatives stay in aux_registry;
+    # the frozen predictor-produced aux move to aux_input_registry.
+    _partition_pressure_aux(SM_press, pressure_vars)
 
     # ── 3. SM_corr: update_variables = U − (dt/h)·T_u(P) ─────────────
     # Identical pattern to split_for_pressure's SM_corr.
@@ -1118,12 +1197,12 @@ def split_simple(sm, pressure_vars, dt, *, bottom=None):
         space=list(sm.space),
         state=list(state),
         aux_state=[],
+        position=sm.position,
         parameters=sm.parameters,
         parameter_values=sm.parameter_values,
         flux=sp.zeros(n_eq_corr, n_dim),
         hydrostatic_pressure=sp.zeros(n_eq_corr, n_dim),
-        nonconservative_matrix=sp.MutableDenseNDimArray.zeros(
-            n_eq_corr, n_st, n_dim),
+        nonconservative_matrix=_zero_ndim(n_eq_corr, n_st, n_dim),
         source=sp.zeros(n_eq_corr, 1),
         mass_matrix=sp.zeros(n_eq_corr, n_st),
         equation_to_state_index=list(corr_e2s_index),
@@ -1138,6 +1217,8 @@ def split_simple(sm, pressure_vars, dt, *, bottom=None):
     )
     SM_corr.equation_names = list(update_names)
     SM_corr.expose_aux_atoms()
+    SM_corr._bc_source = getattr(sm, "_bc_source", None)
+    SM_corr._aux_bc_source = getattr(sm, "_aux_bc_source", None)
     SM_corr.history.append({
         "name": "split_simple[corr]",
         "description": (
