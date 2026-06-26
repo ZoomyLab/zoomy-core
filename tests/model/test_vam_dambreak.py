@@ -49,7 +49,13 @@ def test_vam_chorin_split_roles(vam_sm):
     assert split.SM_corr.equation_names == [
         "corr_q_0", "corr_q_1", "corr_r_0", "corr_r_1"]
     assert split.SM_press.equation_to_state_index == [6, 7]
-    assert split.SM_corr.state_update is not None
+    # the corrector projection is folded into ``update_variables`` (with dt)
+    assert not hasattr(split.SM_corr, "state_update")
+    assert split.SM_corr.update_variables is not None
+    corr_syms = set().union(*[
+        sp.sympify(e).free_symbols
+        for e in sp.flatten(split.SM_corr.update_variables)])
+    assert sp.Symbol("dt", positive=True) in corr_syms
 
 
 def test_vam_dambreak_over_bump():

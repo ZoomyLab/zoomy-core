@@ -114,7 +114,7 @@ def test_vam1_chorin_split_matches_escalante_projection(vam1, reference):
     split = model.chorin_split()
     dt = sp.Symbol("dt", positive=True)
     # the splitter generated its own dt symbol — locate it
-    dts = [a for a in sp.sympify(split.SM_corr.state_update[0]).atoms(sp.Symbol)
+    dts = [a for a in sp.sympify(split.SM_corr.update_variables[0, 0]).atoms(sp.Symbol)
            if str(a) == "dt"]
     dt = dts[0] if dts else dt
 
@@ -145,7 +145,7 @@ def test_vam1_chorin_split_matches_escalante_projection(vam1, reference):
     sym2fn = {s: Fn(str(s)) for s in split.SM_corr.state}
     for k, nm in enumerate(split.SM_corr.equation_names):
         sname = nm[len("corr_"):]
-        upd = sp.expand(sp.sympify(split.SM_corr.state_update[k])
+        upd = sp.expand(sp.sympify(split.SM_corr.update_variables[k, 0])
                         .xreplace(aux_rev).xreplace(sym2fn).doit())
         exp_upd = sp.expand(corr_map[Fn(sname)].doit())
         diff = sp.simplify(upd - exp_upd)

@@ -236,7 +236,7 @@ class SplittingSolver(IMEXSolver):
         # composing DerivativeAwareSolverMixin to the canonical aux_registry
         # walk (local update_aux_variables prefix + LSQ-gradient rows).
         mesh, model = self._sim_mesh, self._sim_model
-        Qnew = self.update_q(Qnew, Qaux, mesh, model, parameters)
+        Qnew = self.update_q(Qnew, Qaux, mesh, model, parameters, dt)
         Qauxnew = self.update_qaux(
             Qnew, Qaux, Q, Qaux, mesh, model, parameters, time_now + dt, dt)
 

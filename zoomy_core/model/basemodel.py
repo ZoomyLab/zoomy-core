@@ -602,6 +602,10 @@ class Model(param.Parameterized, SymbolicRegistrar):
             p=self.parameters,
         )
         eig_sig = Zstruct(**std_sig.as_dict(), normal=self.normal)
+        # The per-cell update kernels carry an explicit trailing scalar ``dt``
+        # (uniform across backends; full models ignore it, a Chorin corrector's
+        # projection update is load-bearing in it).
+        upd_sig = Zstruct(**std_sig.as_dict(), dt=sp.Symbol("dt", positive=True))
         res_sig = Zstruct(
             time=self.time,
             position=self.position,
@@ -662,8 +666,8 @@ class Model(param.Parameterized, SymbolicRegistrar):
             ("interpolate", self.interpolate, std_sig),
             ("initial_condition", self.initial_condition, ic_sig),
             ("initial_aux_condition", self.initial_aux_condition, ic_sig),
-            ("update_variables", self.update_variables, std_sig),
-            ("update_aux_variables", self.update_aux_variables, std_sig),
+            ("update_variables", self.update_variables, upd_sig),
+            ("update_aux_variables", self.update_aux_variables, upd_sig),
             ("reconstruction_variables",
              self.reconstruction_variables, std_sig),
             ("state_from_reconstruction",
@@ -671,12 +675,12 @@ class Model(param.Parameterized, SymbolicRegistrar):
             (
                 "update_variables_jacobian_wrt_variables",
                 self.update_variables_jacobian_wrt_variables,
-                std_sig,
+                upd_sig,
             ),
             (
                 "update_aux_variables_jacobian_wrt_variables",
                 self.update_aux_variables_jacobian_wrt_variables,
-                std_sig,
+                upd_sig,
             ),
         ]
         for name, method, sig in regs:

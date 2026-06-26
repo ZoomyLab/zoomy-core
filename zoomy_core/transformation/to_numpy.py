@@ -10,6 +10,12 @@ from zoomy_core.model.basefunction import Function
 from zoomy_core.model.basemodel import Model
 
 
+# Canonical time-step symbol — the trailing argument of the per-cell update
+# kernels (``update_variables`` / ``update_aux_variables``).  Same name +
+# assumptions as the splitter / VAM ``chorin_split(dt)`` symbol, so it compares
+# equal under sympy and resolves the corrector's baked ``dt``.
+DT_SYMBOL = sp.Symbol("dt", positive=True)
+
 _EIGENSYSTEM_CACHE = {"key": None, "out": None}
 
 
@@ -390,6 +396,11 @@ class NumpyRuntimeModel:
                           parameters=p_struct)
         eig_sig = Zstruct(variables=Q_struct, aux_variables=Qaux_struct,
                           parameters=p_struct, normal=n_struct)
+        # The per-cell update kernels carry an explicit trailing ``dt`` scalar
+        # (uniform across backends; full models ignore it, the Chorin corrector
+        # ``U_k ← U_k − (dt/h)·T_u_k(P)`` is load-bearing in it).
+        upd_sig = Zstruct(variables=Q_struct, aux_variables=Qaux_struct,
+                          parameters=p_struct, dt=DT_SYMBOL)
 
         rt.runtime_functions = {}
 
@@ -423,20 +434,20 @@ class NumpyRuntimeModel:
         _register("source_jacobian_wrt_aux_variables",
                   sm.source_jacobian_wrt_aux_variables if sm.aux_state else None,
                   std_sig)
+        # ``update_variables(Q, Qaux, p, dt)`` — per-cell state remap.  For a
+        # full model it returns the whole state; for a Chorin corrector
+        # sub-system it returns one value per ``equation_to_state_index`` row
+        # (the closed-form projection, where ``dt`` is load-bearing).  Same
+        # broadcast pattern as ``source``.
         _register("update_variables",
-                  _column_to_rank1(sm.update_variables), std_sig)
+                  _column_to_rank1(sm.update_variables), upd_sig)
         # Per-cell aux formula (e.g. KP hinv), lowered exactly like
-        # ``update_variables``; the solver applies it to Qaux each step.
-        # ``getattr`` (not a formal slot yet) ⇒ None short-circuits in _register.
+        # ``update_variables`` with the trailing ``dt`` scalar; the solver
+        # applies it to Qaux each step.
         _register("update_aux_variables",
                   _column_to_rank1(getattr(sm, "update_aux_variables", None)),
-                  std_sig)
+                  upd_sig)
         _register("eigenvalues", _column_to_rank1(sm.eigenvalues), eig_sig)
-        # ``state_update``: explicit-update operator for split substeps
-        # (e.g. Chorin corrector).  Returns a rank-1 array of length
-        # ``len(equation_to_state_index)``: the new values for those
-        # state slots.  Same broadcast pattern as ``source``.
-        _register("state_update", sm.state_update, std_sig)
 
         # NDimArray operators (NCP, quasilinear) — per-axis slab as a
         # Matrix, each routed through ``_lambdify_function`` (so each

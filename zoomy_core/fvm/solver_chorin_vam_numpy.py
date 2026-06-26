@@ -15,8 +15,8 @@ Consumes the three sub-system models produced by
   ``scipy.optimize.fsolve`` on the lambdified residual (converges in
   1–2 Newton iterations).  Matrix-free GMRES is the next refinement.
 * ``SM_corr``  — closed-form algebraic corrector on the velocity modes
-  via the ``state_update`` field.  Single lambdify call + in-place
-  assignment, no solve.
+  via the ``update_variables(Q, Qaux, p, dt)`` field.  Single lambdify
+  call + in-place assignment, no solve.
 """
 from __future__ import annotations
 
@@ -307,9 +307,10 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
     solver in the codebase — mass-conservative by construction.
 
     The pressure projection and corrector substeps are Chorin-specific
-    and don't duplicate any existing infrastructure (the
-    ``state_update`` field on SystemModel + matrix-free linear solve
-    are the new primitives this class introduces).
+    and don't duplicate any existing infrastructure (the corrector reuses
+    the SystemModel ``update_variables(Q, Qaux, p, dt)`` field scattered
+    via ``equation_to_state_index``; the matrix-free linear solve is the
+    one new primitive this class introduces).
     """
 
     pressure_tol = param.Number(
@@ -584,14 +585,18 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
                                            dt_safe)
             self.sm_corr = _substitute_dt(self.sm_corr, self._dt_symbol,
                                           dt_safe)
-            for sm in (self.sm_press, self.sm_corr):
-                if not sm.parameters.contains("dt"):
-                    new_params = Zstruct(**sm.parameters.as_dict())
-                    new_params["dt"] = dt_safe
-                    sm.parameters = new_params
-                    new_pvals = Zstruct(**sm.parameter_values.as_dict())
-                    new_pvals["dt"] = 0.0
-                    sm.parameter_values = new_pvals
+            # Only the pressure elliptic ``source(Q, Qaux, p)`` bakes dt into
+            # the parameter vector (it has no dt argument).  The corrector's
+            # ``update_variables(Q, Qaux, p, dt)`` takes dt as an explicit
+            # kernel argument, so dt must NOT enter sm_corr's parameters
+            # (that would duplicate the symbol in the lowered signature).
+            if not self.sm_press.parameters.contains("dt"):
+                new_params = Zstruct(**self.sm_press.parameters.as_dict())
+                new_params["dt"] = dt_safe
+                self.sm_press.parameters = new_params
+                new_pvals = Zstruct(**self.sm_press.parameter_values.as_dict())
+                new_pvals["dt"] = 0.0
+                self.sm_press.parameter_values = new_pvals
         else:
             self._dt_symbol_safe = None
 
@@ -773,7 +778,7 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
               proper Rusanov + NCP + indexed-BC; mass-conservative.
             - Pressure: matrix-free GMRES on the lambdified elliptic
               residual (linear in P ⇒ 1–2 iters from warm start).
-            - Corrector: one lambdify call to ``state_update`` +
+            - Corrector: one lambdify call to ``update_variables`` +
               atomic in-place assignment.
 
         ``time_order == 2``: SSPRK2 / Heun wrap on the full cycle.
@@ -944,14 +949,15 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         _refresh_pressure_aux(p_new.reshape(nP, nc), self.Qaux_press)
 
     def _step_corrector(self, dt):
-        """``Q[corr_e2s] ← state_update(Q, Qaux_corr, p, dt)`` in place."""
+        """``Q[corr_e2s] ← update_variables(Q, Qaux_corr, p, dt)`` in place."""
         rt = self.rt_corr
         Q = self._sim_Q
         Qaux = self.Qaux_corr           # SM_corr's own aux pool
-        p_full = self._params_with_dt(self._params_corr_base, dt)
+        p_base = self._params_corr_base    # dt is an explicit kernel arg now
         e2s = self._corr_state_idx
 
-        new_vals = np.asarray(rt.state_update(Q, Qaux, p_full), dtype=float)
+        new_vals = np.asarray(
+            rt.update_variables(Q, Qaux, p_base, dt), dtype=float)
         Q[e2s, :] = new_vals
         self._sim_Q = Q
 
@@ -996,7 +1002,7 @@ def _substitute_dt(sm, old_sym, new_sym):
     sm.nonconservative_matrix = _xrepl(sm.nonconservative_matrix)
     sm.refresh_derived_operators(eigenvalues=False)
     sm.eigenvalues            = _xrepl(sm.eigenvalues)
-    sm.state_update           = _xrepl(sm.state_update)
+    sm.update_variables       = _xrepl(sm.update_variables)
     return sm
 
 

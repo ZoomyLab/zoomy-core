@@ -636,7 +636,7 @@ def split_for_pressure(sm, pressure_vars, dt, *, bottom=None):
     )
 
     # ── SM_corr ──────────────────────────────────────────────────────────
-    # Explicit-update operator: ``Q[corr_idx] ← state_update(Q, Qaux, p, dt)``.
+    # Explicit-update operator: ``Q[corr_idx] ← update_variables(Q, Qaux, p, dt)``.
     # The expression for each updated slot is the closed-form
     # ``coeffs_u[k] - (dt/h)·T_u_k(P)`` (and W analogue) in pure state
     # Functions — no P_new rename, no tilde rename.  The "tilde" /
@@ -675,10 +675,11 @@ def split_for_pressure(sm, pressure_vars, dt, *, bottom=None):
     func_to_sym = dict(zip(state_funcs, state))
     update_exprs_sym = [e.xreplace(func_to_sym) for e in update_exprs]
 
-    # Build SM_corr with zero residual fields + ``state_update`` set.
-    # ``_build_subsystem`` autotags an empty residual list to all-zero
-    # operators; the state_update field then carries the explicit
-    # update.
+    # Build SM_corr with zero residual fields + the corrector formula
+    # carried on ``update_variables``.  ``_build_subsystem`` autotags an
+    # empty residual list to all-zero operators; the per-cell
+    # ``update_variables(Q, Qaux, p, dt)`` field then carries the explicit
+    # projection update (scattered to ``equation_to_state_index``).
     n_eq = len(corr_e2s_index)
     n_dim = sm.n_dim
     n_st = sm.n_state
@@ -695,13 +696,12 @@ def split_for_pressure(sm, pressure_vars, dt, *, bottom=None):
         source=sp.zeros(n_eq, 1),
         mass_matrix=sp.zeros(n_eq, n_st),
         equation_to_state_index=list(corr_e2s_index),
-        state_update=sp.Array(update_exprs_sym),
         boundary_conditions=sm.boundary_conditions,
         aux_boundary_conditions=sm.aux_boundary_conditions,
         boundary_gradients=sm.boundary_gradients,
         initial_conditions=sm.initial_conditions,
         aux_initial_conditions=sm.aux_initial_conditions,
-        update_variables=sm.update_variables,
+        update_variables=sp.Matrix(update_exprs_sym),
         reconstruction_variables=sm.reconstruction_variables,
         state_from_reconstruction=sm.state_from_reconstruction,
     )
@@ -712,7 +712,7 @@ def split_for_pressure(sm, pressure_vars, dt, *, bottom=None):
         "description": (
             f"corrector: explicit update on "
             f"{[state_names[i] for i in corr_e2s_index]} "
-            f"via state_update field"
+            f"via update_variables field"
         ),
     })
 
@@ -750,7 +750,7 @@ def split_for_pressure_structural(sm, pressure_vars, dt):
     ``P^{n+1} + P^n ≈ P_phys`` that diverges at shocks — the historic VAM
     dam-break NaN.)  The elliptic rows are the constraint residuals with
     every corrected velocity substituted; the corrector applies the
-    closed-form update via ``state_update``.
+    closed-form update via ``update_variables``.
 
     Parameters
     ----------
@@ -866,13 +866,12 @@ def split_for_pressure_structural(sm, pressure_vars, dt):
         source=sp.zeros(n_corr, 1),
         mass_matrix=sp.zeros(n_corr, sm.n_state),
         equation_to_state_index=list(corr_e2s),
-        state_update=sp.Array(update_exprs_sym),
         boundary_conditions=sm.boundary_conditions,
         aux_boundary_conditions=sm.aux_boundary_conditions,
         boundary_gradients=sm.boundary_gradients,
         initial_conditions=sm.initial_conditions,
         aux_initial_conditions=sm.aux_initial_conditions,
-        update_variables=sm.update_variables,
+        update_variables=sp.Matrix(update_exprs_sym),
         reconstruction_variables=sm.reconstruction_variables,
         state_from_reconstruction=sm.state_from_reconstruction,
     )
@@ -913,7 +912,7 @@ def split_simple(sm, pressure_vars, dt, *, bottom=None):
        ``(P_0, P_1)`` that the implicit Newton-Krylov solver
        targets.
 
-    4. **SM_corr**: the closed-form ``state_update`` formula
+    4. **SM_corr**: the closed-form ``update_variables`` formula
        ``Q[k] ← Q[k] − (dt/h)·T_u_k(P)`` (also from
        :func:`build_pressure_elliptic_block`).  This is the
        projection-corrector that applies the freshly-solved
@@ -1077,7 +1076,7 @@ def split_simple(sm, pressure_vars, dt, *, bottom=None):
         },
     )
 
-    # ── 3. SM_corr: state_update = U − (dt/h)·T_u(P) ─────────────────
+    # ── 3. SM_corr: update_variables = U − (dt/h)·T_u(P) ─────────────
     # Identical pattern to split_for_pressure's SM_corr.
     t = sm.time
     coords = list(sm.space)
@@ -1128,13 +1127,12 @@ def split_simple(sm, pressure_vars, dt, *, bottom=None):
         source=sp.zeros(n_eq_corr, 1),
         mass_matrix=sp.zeros(n_eq_corr, n_st),
         equation_to_state_index=list(corr_e2s_index),
-        state_update=sp.Array(update_exprs_sym),
         boundary_conditions=sm.boundary_conditions,
         aux_boundary_conditions=sm.aux_boundary_conditions,
         boundary_gradients=sm.boundary_gradients,
         initial_conditions=sm.initial_conditions,
         aux_initial_conditions=sm.aux_initial_conditions,
-        update_variables=sm.update_variables,
+        update_variables=sp.Matrix(update_exprs_sym),
         reconstruction_variables=sm.reconstruction_variables,
         state_from_reconstruction=sm.state_from_reconstruction,
     )
@@ -1144,7 +1142,7 @@ def split_simple(sm, pressure_vars, dt, *, bottom=None):
         "name": "split_simple[corr]",
         "description": (
             f"corrector: explicit update on "
-            f"{[state_names[i] for i in corr_e2s_index]} via state_update"
+            f"{[state_names[i] for i in corr_e2s_index]} via update_variables"
         ),
     })
 

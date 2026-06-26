@@ -913,7 +913,7 @@ class DAESolver(Solver):
         # try/except — the default for those models is "no clamp".
         try:
             Q_new = self.update_q(Q_new, Qaux_old, self._sim_mesh,
-                                  self._sim_model, self._sim_parameters)
+                                  self._sim_model, self._sim_parameters, dt)
         except TypeError:
             pass
         Qaux_new = self.update_qaux(

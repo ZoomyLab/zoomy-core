@@ -84,6 +84,7 @@ _FOAM_ARG = {
     "Qaux": "const Foam::List<Foam::scalar>& Qaux",
     "W": "const Foam::List<Foam::scalar>& W",
     "p": "const Foam::List<Foam::scalar>& p",
+    "dt": "const Foam::scalar dt",
     "n": "const Foam::vector& n",
     "X": "const Foam::vector& X",
     "time": "const Foam::scalar& time",
@@ -191,6 +192,11 @@ class FoamSystemModelPrinter(GenericCppBase):
         self.register_map("Qaux", list(sm.aux_state))
         self.register_map("n", list(sm.normal.values()))
         self.register_map("p", self._parameter_symbols())
+        # The per-cell update kernels carry an explicit scalar ``dt`` argument.
+        # Registered AFTER ``p`` so that a pressure sub-system which bakes dt
+        # into the parameter vector (``dt_symbol``) still resolves dt → p[last]
+        # in its source; for any other sub-system the bare ``dt`` arg wins.
+        self.symbol_maps.append({sp.Symbol("dt", positive=True): "dt"})
         if self.project_from_3d is None:
             self.project_from_3d = getattr(sm, "project_from_3d", None)
 
@@ -388,12 +394,13 @@ class FoamSystemModelPrinter(GenericCppBase):
         # interface it is the (often identity) operator matrix.
         blocks.append(self._emit_mass_matrix())
 
-        # REQ-40 (c): the corrector ``state_update(Q, Qaux, p)`` — the
+        # REQ-40 (c): the per-cell ``update_variables(Q, Qaux, p, dt)`` — for a
+        # full model the state remap (h-clamp); for a corrector sub-system the
         # closed-form projection ``U_k ← U_k − dt/M_kk · T_u[k](P)`` (one entry
-        # per corrector row, scattered to ``equation_to_state_index``).  Only
-        # present on a corrector sub-system; ``None`` elsewhere.
-        if sm.state_update is not None:
-            blocks.append(self._emit_state_update())
+        # per row, scattered to ``equation_to_state_index``).  Emitted whenever
+        # the SystemModel carries a non-trivial update.
+        if sm.update_variables is not None and len(sp.flatten(sm.update_variables)) > 0:
+            blocks.append(self._emit_update_variables())
 
         blocks.extend(self._emit_reconstruction_kernels())
 
@@ -412,14 +419,16 @@ class FoamSystemModelPrinter(GenericCppBase):
             (sm.n_equations, len(sm.state)), ["Q", "Qaux", "p"],
         )
 
-    def _emit_state_update(self):
-        """Emit the corrector ``state_update(Q, Qaux, p) -> List[n_corr]``
-        from ``sm.state_update`` (one updated value per corrector row, in the
-        order of ``equation_to_state_index``)."""
+    def _emit_update_variables(self):
+        """Emit the per-cell ``update_variables(Q, Qaux, p, dt) -> List[n]``
+        from ``sm.update_variables``.  For a full model the values are the
+        whole state remap; for a corrector sub-system one updated value per
+        row, in the order of ``equation_to_state_index``."""
         sm = self.sm
-        su = sp.Array(sm.state_update)
-        n = len(sp.flatten(su))
-        return self._kernel("state_update", su, (n,), ["Q", "Qaux", "p"])
+        uv = sp.Array(sp.flatten(sm.update_variables))
+        n = len(uv)
+        return self._kernel(
+            "update_variables", uv, (n,), ["Q", "Qaux", "p", "dt"])
 
     def _emit_reconstruction_kernels(self):
         """Emit ``Model::reconstruction_variables(Q, Qaux, p)`` (forward)
@@ -863,7 +872,7 @@ class FoamNumericsPrinter(GenericCppBase):
 
 
 class FoamUpdateAuxPrinter:
-    """Emit ``numerics::update_aux_variables(Q, Qaux, mesh)`` from
+    """Emit ``numerics::update_aux_variables(Q, Qaux, dt, mesh)`` from
     ``sm.aux_registry``.
 
     The output is a flat sequence of ``numerics::compute_derivative(...)``
@@ -919,6 +928,7 @@ class FoamUpdateAuxPrinter:
             f"inline void {self.function_name}(",
             "    const Foam::List<Foam::volScalarField*>& Q,",
             "    const Foam::List<Foam::volScalarField*>& Qaux,",
+            "    const Foam::scalar dt,",
             "    const Foam::fvMesh& mesh)",
             "{",
         ]
@@ -973,7 +983,7 @@ class FoamChorinSplitPrinter:
 
     The pieces are NOT a foam-only fork — each is the existing per-SystemModel
     printer applied to a sub-system, so the predictor flux/NCP/source, the
-    pressure elliptic source, the corrector ``state_update``, and the
+    pressure elliptic source, the corrector ``update_variables``, and the
     P-derivative aux all flow through the same lowering as the single-system
     interface.  This printer only routes the three sub-systems into distinct
     namespaces / files and threads ``dt`` as the trailing parameter:
@@ -983,7 +993,7 @@ class FoamChorinSplitPrinter:
     * ``Pressure.H``     — ``namespace {pressure_ns}``  : the elliptic
       ``source(Q, Qaux, p)`` linear in ``(P, P_x, P_xx)`` + the
       ``equation_to_state_index`` mapping (the pressure-mode slots);
-    * ``Corrector.H``    — ``namespace {corrector_ns}`` : ``state_update``
+    * ``Corrector.H``    — ``namespace {corrector_ns}`` : ``update_variables``
       ``U_k ← U_k − dt/M_kk · T_u[k](P)`` + its ``equation_to_state_index``;
     * ``PressureAux.H``  — ``numerics::update_pressure_aux_variables`` (full
       press-block refresh, after the predictor) and
@@ -1013,9 +1023,12 @@ class FoamChorinSplitPrinter:
         press = FoamSystemModelPrinter(
             s.SM_press, namespace_name=self.pressure_ns,
             dt_symbol=self.dt_symbol).create_code()
+        # The corrector takes dt as an explicit kernel argument
+        # (``update_variables(Q, Qaux, p, dt)``), so dt must NOT be baked into
+        # its parameter vector — leave ``dt_symbol`` unset and let the canonical
+        # dt symbol resolve to the bare ``dt`` arg.
         corr = FoamSystemModelPrinter(
-            s.SM_corr, namespace_name=self.corrector_ns,
-            dt_symbol=self.dt_symbol).create_code()
+            s.SM_corr, namespace_name=self.corrector_ns).create_code()
         aux_full = FoamUpdateAuxPrinter(
             s.SM_press,
             function_name="update_pressure_aux_variables").create_code()

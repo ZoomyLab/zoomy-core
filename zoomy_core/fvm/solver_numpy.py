@@ -179,15 +179,16 @@ class Solver(param.Parameterized):
         runtime_model = NumpyRuntimeModel.from_system_model(model)
         return Q, Qaux, parameters, mesh, runtime_model
 
-    def update_q(self, Q, Qaux, mesh, model, parameters):
+    def update_q(self, Q, Qaux, mesh, model, parameters, dt):
         """Apply ``model.update_variables`` (h-clamp, momentum ramp) at
         each cell.
 
         ``update_variables`` is carried through the SystemModel and
-        exposed on the runtime — the identity for models with no
-        per-cell transform.  It is ``None`` only for SystemModels
-        assembled directly without one (e.g. split sub-systems); then
-        this is a genuine no-op, not a legacy fallback."""
+        exposed on the runtime as ``update_variables(Q, Qaux, p, dt)`` —
+        the identity for models with no per-cell transform (``dt`` then
+        ignored).  It is ``None`` only for SystemModels assembled directly
+        without one (e.g. split sub-systems); then this is a genuine no-op,
+        not a legacy fallback."""
         update = getattr(model, "update_variables", None)
         if update is None:
             return Q
@@ -195,7 +196,7 @@ class Solver(param.Parameterized):
         for c in range(Q.shape[1]):
             aux = Qaux[:, c] if Qaux.shape[0] > 0 else _EMPTY_AUX
             Q[:, c] = np.asarray(
-                update(Q[:, c], aux, parameters), dtype=float,
+                update(Q[:, c], aux, parameters, dt), dtype=float,
             ).ravel()[:n_vars]
         return Q
 
@@ -222,7 +223,7 @@ class Solver(param.Parameterized):
             out = np.array(Qaux, copy=True)
             for c in range(Q.shape[1]):
                 vals = np.asarray(
-                    local_fn(Q[:, c], Qaux[:, c], parameters),
+                    local_fn(Q[:, c], Qaux[:, c], parameters, dt),
                     dtype=float).ravel()
                 out[:vals.shape[0], c] = vals
         # (2) DERIVATIVE aux leg — the non-local LSQ-gradient rows the
@@ -1040,8 +1041,10 @@ class HyperbolicSolver(Solver):
         self._sim_flux_operator = self.get_flux_operator(mesh, model)
         self._sim_source_operator = self.get_compute_source(mesh, model)
 
-        # Apply initial variable updates
-        self._sim_Q = self.update_q(self._sim_Q, Qaux, mesh, model, parameters)
+        # Apply initial variable updates (no step taken yet → dt = 0; clamps
+        # are dt-independent, the corrector path is never on the setup leg).
+        self._sim_Q = self.update_q(self._sim_Q, Qaux, mesh, model,
+                                    parameters, 0.0)
 
         # Precompute mesh constant for CFL
         nc = mesh.n_inner_cells
@@ -1103,7 +1106,7 @@ class HyperbolicSolver(Solver):
             Qnew = Q + dt * rhs(time_now, Q)
 
         # Variable updates (clamp, etc.)
-        Qnew = self.update_q(Qnew, Qaux, mesh, model, parameters)
+        Qnew = self.update_q(Qnew, Qaux, mesh, model, parameters, dt)
 
         # Auxiliary variable updates
         Qauxnew = self.update_qaux(Qnew, Qaux, Q, Qaux, mesh, model,

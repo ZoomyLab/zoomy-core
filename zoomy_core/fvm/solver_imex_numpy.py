@@ -210,7 +210,7 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
         Qimp = self._apply_implicit_source(Qexp, Q, Qaux, mesh, model, parameters, time_now, dt)
 
         # Variable + auxiliary updates
-        Qnew = self.update_q(Qimp, Qaux, mesh, model, parameters)
+        Qnew = self.update_q(Qimp, Qaux, mesh, model, parameters, dt)
         Qauxnew = self.update_qaux(
             Qnew, Qaux, Q, Qaux, mesh, model, parameters, time_now + dt, dt,
         )

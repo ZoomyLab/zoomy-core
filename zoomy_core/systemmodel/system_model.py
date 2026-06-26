@@ -521,9 +521,16 @@ class SystemModel:
     #
     # Backends that support only one treatment (e.g. explicit-only FV)
     # may *compound* the two: ``F_total = F_explicit + F_implicit``.
-    update_variables: Optional[ZArray] = None        # (n_eq,)
+    # ``update_variables``: per-cell explicit state remap lowered as
+    # ``update_variables(Q, Qaux, p, dt)``.  For a full model it returns the
+    # whole state (h-clamp, momentum ramp; dt typically unused).  For a Chorin
+    # corrector sub-system it returns one value per ``equation_to_state_index``
+    # row — the closed-form projection ``Q[e2s] ← U_k − (dt/h)·T_u_k(P)`` — so
+    # the dt argument is load-bearing there.  ``None`` ⇒ identity.
+    update_variables: Optional[ZArray] = None        # (n_eq, 1)
     # Per-cell LOCAL aux formula (e.g. KP-desingularized hinv); symmetric to
-    # update_variables but for the aux vector.  ``None`` ⇒ identity.  The
+    # update_variables but for the aux vector, lowered as
+    # ``update_aux_variables(Q, Qaux, p, dt)``.  ``None`` ⇒ identity.  The
     # runtime lowers + applies it (the aux leg of post_step).  Derivative-aux
     # (LSQ gradients) is a SEPARATE, non-local leg (aux_registry) — not this.
     update_aux_variables: Optional[ZArray] = None     # (n_aux_decl, 1)
@@ -541,11 +548,6 @@ class SystemModel:
     # changes (CoV via :meth:`change_state_variables`).
     reconstruction_variables: Optional[ZArray] = None      # (n_state,)
     state_from_reconstruction: Optional[ZArray] = None     # (n_state,) in WB_<name> symbols
-    # ``state_update``: rank-1 ZArray of length ``len(equation_to_state_index)``
-    # encoding an explicit-update operator ``Q[e2s] ← state_update(Q, Qaux, p, dt)``.
-    # When set, the solver dispatches this substep as in-place assignment
-    # rather than residual semantics (mass_matrix is implicitly zero).
-    state_update: Optional[ZArray] = None
     # ``interpolate_to_3d``: depth-averaged → 3D reconstruction.  Vector of
     # 3D physical quantities (typically ``[u, v, w, p, ...]``) evaluated at
     # ``(x, y, z)`` given the cell-mean state.  The symbolic expression
@@ -595,7 +597,7 @@ class SystemModel:
         self.diffusion_matrix           = _to_zarray(self.diffusion_matrix)
         self.diffusion_matrix_explicit  = _to_zarray(self.diffusion_matrix_explicit)
         self.source_explicit            = _to_zarray(self.source_explicit)
-        self.state_update               = _to_zarray(self.state_update)
+        self.update_aux_variables       = _to_zarray(self.update_aux_variables)
         self.reconstruction_variables   = _to_zarray(self.reconstruction_variables)
         self.state_from_reconstruction  = _to_zarray(self.state_from_reconstruction)
         self.interpolate_to_3d           = _to_zarray(self.interpolate_to_3d)
@@ -1543,8 +1545,8 @@ class SystemModel:
         matrices = [self.flux, self.hydrostatic_pressure,
                     self.nonconservative_matrix, self.source,
                     self.mass_matrix]
-        if self.state_update is not None:
-            matrices.append(self.state_update)
+        if self.update_variables is not None:
+            matrices.append(self.update_variables)
         # State-dependent diffusion (e.g. MY-2.5 K_M(ℓ, q, G_H)) can
         # carry ``Derivative(state, x)`` atoms via the Galperin G_H
         # argument; auto-expose them so the rank-4 A tensor lambdifies
@@ -1750,8 +1752,8 @@ class SystemModel:
         self.mass_matrix = self.mass_matrix.xreplace(sub_dict)
         self.nonconservative_matrix = self.nonconservative_matrix.xreplace(
             sub_dict)
-        if self.state_update is not None:
-            self.state_update = self.state_update.xreplace(sub_dict)
+        if self.update_variables is not None:
+            self.update_variables = self.update_variables.xreplace(sub_dict)
         if self.diffusion_matrix is not None:
             self.diffusion_matrix = self.diffusion_matrix.xreplace(sub_dict)
         if self.diffusion_matrix_explicit is not None:
@@ -2013,8 +2015,8 @@ class SystemModel:
           ``reconstruction_variables`` (xreplaced) and
           ``state_from_reconstruction`` (re-inverted against the new
           state slots);
-        * per-cell state remap (``update_variables``) and the
-          explicit Chorin-corrector update (``state_update``);
+        * per-cell state remap / explicit Chorin-corrector update
+          (``update_variables``);
         * **symbolic BC kernels** — ``boundary_conditions``,
           ``aux_boundary_conditions``, ``boundary_gradients`` —
           definitions are xreplaced through ``transform`` and the
@@ -2121,9 +2123,9 @@ class SystemModel:
         self.mass_matrix = new_M
         # Push the transform through the secondary fields too so they
         # reference the new state, not the old: ``update_variables``
-        # (per-cell state remap), ``state_update`` (Chorin corrector's
-        # explicit update), and ``eigenvalues`` (preserved under
-        # invertible change-of-vars — xreplace, don't re-solve).
+        # (per-cell state remap / Chorin corrector explicit update) and
+        # ``eigenvalues`` (preserved under invertible change-of-vars —
+        # xreplace, don't re-solve).
         if self.update_variables is not None:
             # ``update_variables`` is a per-cell state-to-state map.
             # Naively xreplacing the OLD state symbols turns
@@ -2149,8 +2151,6 @@ class SystemModel:
                 self.update_variables = self.update_variables.xreplace(
                     full_transform
                 )
-        if self.state_update is not None:
-            self.state_update = self.state_update.xreplace(full_transform)
         # ``reconstruction_variables`` / ``state_from_reconstruction``:
         # the forward map xreplaces straight through under CoV (it's an
         # expression in state symbols).  The inverse is re-derived from
@@ -2627,7 +2627,6 @@ class SystemModelDescription:
             ("Source Jacobian $\\partial S/\\partial Q$",
              sm.source_jacobian_wrt_variables, 2),
             ("Eigenvalues $\\Lambda$", sm.eigenvalues, 1),
-            ("State update", sm.state_update, 1),
             ("Update variables", sm.update_variables, 1),
             ("Reconstruction variables", sm.reconstruction_variables, 1),
             ("State from reconstruction", sm.state_from_reconstruction, 1),

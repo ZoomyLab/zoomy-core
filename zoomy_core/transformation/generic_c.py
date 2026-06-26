@@ -825,12 +825,18 @@ class GenericCppModel(GenericCppBase):
             smap[s] = self.format_accessor("p", i)
         for i, s in enumerate(sm.normal.values()):
             smap[s] = self.format_accessor("n", i)
+        # The per-cell update kernels carry an explicit trailing scalar ``dt``
+        # (uniform across backends).  Map the canonical time-step symbol to the
+        # bare identifier so it prints as a scalar, not an array accessor.
+        smap[sp.Symbol("dt", positive=True)] = "dt"
         return smap
 
     def _sm_arg_decl(self, key):
         """C++ declaration for one operator-kernel argument (pointer
-        form: ``const T* Q``).  Backends with a different calling
-        convention override this."""
+        form: ``const T* Q``; ``dt`` is the one scalar argument).  Backends
+        with a different calling convention override this."""
+        if key == "dt":
+            return f"const {self.real_type} dt"
         return f"const {self.real_type}* {key}"
 
     def _sm_signature(self, args):
@@ -1015,8 +1021,10 @@ class GenericCppModel(GenericCppBase):
         ``update_aux_variables_jacobian_wrt_variables`` the solver calls in
         ``TransportStep`` / ``ModularSolver``):
 
-        * ``update_variables(Q,Qaux,p)`` → ``(n_eq,)`` — pointwise state remap.
-        * ``update_aux_variables(Q,Qaux,p)`` → ``(n_aux,)`` — pointwise aux
+        * ``update_variables(Q,Qaux,p,dt)`` → ``(n_eq,)`` — pointwise state
+          remap (``dt`` ignored by full models; load-bearing in a Chorin
+          corrector sub-system, scattered via ``equation_to_state_index``).
+        * ``update_aux_variables(Q,Qaux,p,dt)`` → ``(n_aux,)`` — pointwise aux
           recompute, plus its Jacobian ``(n_aux, n_state)`` (row-major
           ``dAux_dQ[k*n_dof+j]``).
 
@@ -1032,7 +1040,8 @@ class GenericCppModel(GenericCppBase):
         uv = getattr(sm, "update_variables", None)
         if uv is not None and len(sp.flatten(uv)) > 0:
             blocks.append(self._sm_kernel(
-                "update_variables", uv, (n_eq,), ["Q", "Qaux", "p"],
+                "update_variables", uv, (len(sp.flatten(uv)),),
+                ["Q", "Qaux", "p", "dt"],
             ))
         else:
             blocks.append(self._doc_note(
@@ -1043,7 +1052,8 @@ class GenericCppModel(GenericCppBase):
         uav = getattr(sm, "update_aux_variables", None)
         if uav is not None and len(sp.flatten(uav)) > 0:
             blocks.append(self._sm_kernel(
-                "update_aux_variables", uav, (n_aux,), ["Q", "Qaux", "p"],
+                "update_aux_variables", uav, (n_aux,),
+                ["Q", "Qaux", "p", "dt"],
             ))
             jac = sp.derive_by_array(
                 sp.Array([sp.sympify(e) for e in sp.flatten(uav)]),
@@ -1051,7 +1061,7 @@ class GenericCppModel(GenericCppBase):
             )
             blocks.append(self._sm_kernel(
                 "update_aux_variables_jacobian_wrt_variables",
-                jac, (n_aux, n_state), ["Q", "Qaux", "p"],
+                jac, (n_aux, n_state), ["Q", "Qaux", "p", "dt"],
             ))
         else:
             blocks.append(self._doc_note(
