@@ -63,9 +63,6 @@ class GenericGlslBase(OutParamCodePrinter):
         "Min": lambda p, *args: p._print_min_max("min", args),
         "Max": lambda p, *args: p._print_min_max("max", args),
         "Abs": lambda p, a: f"abs({p.doprint(a)})",
-        "max_wavespeed": lambda p, *args: p._print_nested_max(
-            [f"abs({p.doprint(a)})" for a in args]
-        ),
     }
 
     # ── CSE temp typing (GLSL is strictly typed) ─────────────────────

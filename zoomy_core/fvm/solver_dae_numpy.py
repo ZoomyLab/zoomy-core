@@ -285,8 +285,11 @@ class DAESolver(Solver):
             sm, scaled_q_indices=[],
             integration_order=self.nc_integration_order,
         )
+        # ``local_max_abs_eigenvalue`` is a real expression — for this
+        # hand-built chain model (no closed-form spectrum) the symbolic
+        # Numerics uses the Gershgorin row-sum bound of the quasilinear
+        # matrix, so the flux lowers with no opaque wave-speed kernel.
         numerics_module = dict(NumpyRuntimeModel.module)
-        numerics_module["max_wavespeed"] = self._make_max_wavespeed()
         self.numerics_rt = NumpyRuntimeSymbolic(
             numerics, module=numerics_module,
         )
@@ -482,43 +485,6 @@ class DAESolver(Solver):
         if self._surface_recon is not None:
             return self._surface_recon.compute_phi(Q, Qaux, bf_Q)
         return self._reconstruct.compute_phi(Q, bf_Q)
-
-    def _make_max_wavespeed(self):
-        """Build the numpy implementation of the ``max_wavespeed``
-        kernel that the printed symbolic numerics calls.
-
-        The symbolic ``Numerics`` emits an *opaque* ``max_wavespeed``
-        placeholder precisely so the implementation is a solver choice
-        (analytical formula vs numerical eigensolve).  This is the
-        analytical Saint-Venant bound ``√((u·n)² + δ²) + √(g·√(h²+δ²))``
-        — a *smooth* surrogate for ``|u·n| + √(g·h)`` so the
-        finite-difference Jacobian stays well-behaved at ``u = 0`` /
-        ``h → 0``.  Signature matches the placeholder's argument order:
-        ``(*Q, *Qaux, *parameters, *normal)`` as flat scalars."""
-        sm = self.sm
-        n_eq = sm.n_equations
-        n_aux = len(sm.aux_state)
-        n_param = sm.parameters.length()
-        dim = sm.n_dim
-        h_in_state = (self._h_loc is not None
-                      and self._h_loc[0] == "state")
-        h_idx = self._h_loc[1] if self._h_loc is not None else 0
-        vel_idx = [i for i, s in enumerate(sm.state)
-                   if str(s) in {"U_0", "V_0", "u", "v"}]
-        g_val = self._g_cached
-        d2 = 1e-12
-
-        def max_wavespeed(*args):
-            Q = args[0:n_eq]
-            Qaux = args[n_eq:n_eq + n_aux]
-            nrm = args[n_eq + n_aux + n_param:
-                       n_eq + n_aux + n_param + dim]
-            h = Q[h_idx] if h_in_state else Qaux[h_idx]
-            un = sum(Q[vi] * nrm[d] for d, vi in enumerate(vel_idx))
-            c = np.sqrt(g_val * np.sqrt(h * h + d2))
-            return np.sqrt(un * un + d2) + c
-
-        return max_wavespeed
 
     # ------------------------------------------------------------------
     # Residual assembly (Rusanov flux + NC fluctuations + source)

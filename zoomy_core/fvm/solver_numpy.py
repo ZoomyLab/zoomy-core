@@ -370,81 +370,10 @@ class HyperbolicSolver(Solver):
     def _get_dry_threshold(self, symbolic_model):
         return _param_value(symbolic_model, "eps_wet", default=1e-3)
 
-    # -- Max wavespeed (for CFL + Rusanov dissipation) -----------------
-
-    def _build_max_wavespeed(self, symbolic_model):
-        eig_mode = getattr(symbolic_model, "eigenvalue_mode", "symbolic")
-        n_vars = symbolic_model.n_variables
-        n_aux = symbolic_model.n_aux_variables
-        n_params = symbolic_model.n_parameters
-        dim = symbolic_model.dimension
-
-        if eig_mode != "numerical":
-            rt = NumpyRuntimeModel.from_system_model(symbolic_model)
-            compiled_eig = rt.eigenvalues
-            def max_ws(*args):
-                Q = np.array(args[:n_vars])
-                Qaux = np.array(args[n_vars:n_vars + n_aux])
-                p = np.array(args[n_vars + n_aux:n_vars + n_aux + n_params])
-                n = np.array(args[n_vars + n_aux + n_params:])
-                evs = np.asarray(compiled_eig(Q, Qaux, p, n), dtype=float).ravel()
-                return float(np.max(np.abs(evs)))
-            return max_ws
-
-        rt = NumpyRuntimeModel.from_system_model(symbolic_model)
-        ql_fn = rt.quasilinear_matrix
-        keys = list(symbolic_model.variables.keys())
-        fi_h = keys.index("h") if "h" in keys else None
-        dry_thr = self._get_dry_threshold(symbolic_model) if fi_h is not None else 0.0
-        eps_reg = self.nsm.regularization.eigenvalue_eps
-        reg_diag = eps_reg * np.eye(n_vars)
-        if fi_h is not None and "b" in keys:
-            reg_diag[keys.index("b"), keys.index("b")] = 0.0
-
-        def max_ws_numerical(*args):
-            # BATCH-AWARE: scalar args → single 4×4 eigvals (legacy);
-            # face-array args (the vectorized Riemann kernels broadcast the
-            # whole flux expression over faces) → ONE stacked eigvals call.
-            a0 = np.asarray(args[0])
-            if a0.ndim == 0:
-                Q = np.array(args[:n_vars])
-                Qaux = np.array(args[n_vars:n_vars + n_aux])
-                p = np.array(args[n_vars + n_aux:n_vars + n_aux + n_params])
-                n_vec = np.array(args[n_vars + n_aux + n_params:])
-                if fi_h is not None and Q[fi_h] < dry_thr:
-                    return 0.0
-                ql = np.asarray(ql_fn(Q, Qaux, p), dtype=float).reshape(
-                    n_vars, n_vars, dim)
-                A_n = sum(ql[:, :, d] * float(n_vec[d]) for d in range(dim))
-                A_n += reg_diag
-                evs = np.real(np.linalg.eigvals(A_n))
-                return float(np.max(np.abs(evs)))
-
-            nf = a0.shape[-1]
-            Q = np.stack([np.broadcast_to(np.asarray(a, dtype=float), (nf,))
-                          for a in args[:n_vars]])
-            Qaux = (np.stack([np.broadcast_to(np.asarray(a, dtype=float), (nf,))
-                              for a in args[n_vars:n_vars + n_aux]])
-                    if n_aux else np.zeros((0, nf)))
-            p = np.array([float(np.asarray(a).ravel()[0]) for a in
-                          args[n_vars + n_aux:n_vars + n_aux + n_params]])
-            n_vec = np.stack([np.broadcast_to(np.asarray(a, dtype=float), (nf,))
-                              for a in args[n_vars + n_aux + n_params:]])
-            ql = np.asarray(ql_fn(Q, Qaux, p), dtype=float)
-            if ql.shape == (n_vars, n_vars, nf, dim):
-                ql = np.transpose(ql, (0, 1, 3, 2))
-            A_n = np.einsum("ijdk,dk->kij", ql, n_vec) + reg_diag[None]
-            evs = np.real(np.linalg.eigvals(A_n))
-            out = np.abs(evs).max(axis=1)
-            if fi_h is not None:
-                out[Q[fi_h] < dry_thr] = 0.0
-            return out
-
-        return max_ws_numerical
+    # -- Max abs eigenvalue (for CFL + Rusanov dissipation) ------------
 
     def get_compute_max_abs_eigenvalue(self, mesh, model):
         symbolic_model = self._get_symbolic_model(model)
-        max_ws = self._build_max_wavespeed(symbolic_model)
         keys = list(symbolic_model.variables.keys())
         fi_h = keys.index("h") if "h" in keys else None
         dry_thr = self._get_dry_threshold(symbolic_model) if fi_h is not None else 0.0
@@ -502,79 +431,48 @@ class HyperbolicSolver(Solver):
                 return max_ev
             return compute_max_eigenvalue
 
-        if eig_mode == "numerical":
-            # BATCHED numerical wave speeds: one vectorized quasilinear
-            # evaluation over all cells + one stacked np.linalg.eigvals over
-            # all face-side matrices.  The per-face Python loop below costs
-            # ~25 ms/step at 200 cells (it dominated the whole time loop);
-            # the batched path is two orders of magnitude cheaper.
-            rt = NumpyRuntimeModel.from_system_model(symbolic_model)
-            ql_fn = rt.quasilinear_matrix
-            n_vars = symbolic_model.n_variables
-            eps_reg = self.nsm.regularization.eigenvalue_eps
-            keys = list(symbolic_model.variables.keys())
-            reg = eps_reg * np.eye(n_vars)
-            if fi_h is not None and "b" in keys:
-                reg[keys.index("b"), keys.index("b")] = 0.0
-            n_int = normals[:, interior_faces]          # (dim, n_if)
-            n_bnd = normals[:, boundary_faces]
-
-            def compute_max_eigenvalue(Q, Qaux, parameters):
-                ql = np.asarray(ql_fn(Q, Qaux, parameters), dtype=float)
-                nc_ = Q.shape[1]
-                if ql.shape == (n_vars, n_vars, nc_, dim):
-                    # vectorize wrapper appends the cell axis before dim
-                    ql = np.transpose(ql, (0, 1, 3, 2))
-                elif ql.shape != (n_vars, n_vars, dim, nc_):
-                    raise ValueError(
-                        f"unexpected quasilinear shape {ql.shape}")
-                # (n, n, dim, nc); A·n per face side → (n_faces_side, n, n)
-                A_A = np.einsum("ijdk,dk->kij", ql[:, :, :, iA_int], n_int)
-                A_B = np.einsum("ijdk,dk->kij", ql[:, :, :, iB_int], n_int)
-                A_I = np.einsum("ijdk,dk->kij", ql[:, :, :, iInner_bnd], n_bnd)
-                A_all = np.concatenate([A_A, A_B, A_I], axis=0) + reg[None]
-                evs = np.real(np.linalg.eigvals(A_all))       # batched LAPACK
-                m = np.abs(evs).max(axis=1)
-                n_if = len(interior_faces)
-                max_ev = np.zeros(mesh.n_faces)
-                max_ev[interior_faces] = np.maximum(m[:n_if], m[n_if:2 * n_if])
-                max_ev[boundary_faces] = m[2 * n_if:]
-                if fi_h is not None:                          # dry-cell skip
-                    both_dry = ((Q[fi_h, iA_int] < dry_thr)
-                                & (Q[fi_h, iB_int] < dry_thr))
-                    max_ev[interior_faces[both_dry]] = 0.0
-                    max_ev[boundary_faces[Q[fi_h, iInner_bnd] < dry_thr]] = 0.0
-                return max_ev
-            return compute_max_eigenvalue
+        # BATCHED numerical wave speeds (model carries no closed-form
+        # spectrum — ``eigenvalues is None``): one vectorized quasilinear
+        # evaluation over all cells + one stacked np.linalg.eigvals over
+        # all face-side matrices, two orders of magnitude cheaper than a
+        # per-face Python loop.  Mirrors the Gershgorin/numerical fallback
+        # the symbolic Numerics uses for the flux dissipation.
+        rt = NumpyRuntimeModel.from_system_model(symbolic_model)
+        ql_fn = rt.quasilinear_matrix
+        n_vars = symbolic_model.n_variables
+        eps_reg = self.nsm.regularization.eigenvalue_eps
+        keys = list(symbolic_model.variables.keys())
+        reg = eps_reg * np.eye(n_vars)
+        if fi_h is not None and "b" in keys:
+            reg[keys.index("b"), keys.index("b")] = 0.0
+        n_int = normals[:, interior_faces]          # (dim, n_if)
+        n_bnd = normals[:, boundary_faces]
 
         def compute_max_eigenvalue(Q, Qaux, parameters):
+            ql = np.asarray(ql_fn(Q, Qaux, parameters), dtype=float)
+            nc_ = Q.shape[1]
+            if ql.shape == (n_vars, n_vars, nc_, dim):
+                # vectorize wrapper appends the cell axis before dim
+                ql = np.transpose(ql, (0, 1, 3, 2))
+            elif ql.shape != (n_vars, n_vars, dim, nc_):
+                raise ValueError(
+                    f"unexpected quasilinear shape {ql.shape}")
+            # (n, n, dim, nc); A·n per face side → (n_faces_side, n, n)
+            A_A = np.einsum("ijdk,dk->kij", ql[:, :, :, iA_int], n_int)
+            A_B = np.einsum("ijdk,dk->kij", ql[:, :, :, iB_int], n_int)
+            A_I = np.einsum("ijdk,dk->kij", ql[:, :, :, iInner_bnd], n_bnd)
+            A_all = np.concatenate([A_A, A_B, A_I], axis=0) + reg[None]
+            evs = np.real(np.linalg.eigvals(A_all))       # batched LAPACK
+            m = np.abs(evs).max(axis=1)
+            n_if = len(interior_faces)
             max_ev = np.zeros(mesh.n_faces)
-
-            # Interior faces: evaluate at both cells
-            for fi in range(len(interior_faces)):
-                f = interior_faces[fi]
-                if fi_h is not None:
-                    if Q[fi_h, iA_int[fi]] < dry_thr and Q[fi_h, iB_int[fi]] < dry_thr:
-                        continue
-                n = normals[:, f]
-                for i_cell in [iA_int[fi], iB_int[fi]]:
-                    q = Q[:, i_cell]
-                    qaux = Qaux[:, i_cell] if has_aux else _EMPTY_AUX
-                    ev = max_ws(*q, *qaux, *parameters, *n)
-                    max_ev[f] = max(max_ev[f], ev)
-
-            # Boundary faces: evaluate at inner cell only
-            for bi in range(len(boundary_faces)):
-                f = boundary_faces[bi]
-                cInner = iInner_bnd[bi]
-                if fi_h is not None and Q[fi_h, cInner] < dry_thr:
-                    continue
-                n = normals[:, f]
-                q = Q[:, cInner]
-                qaux = Qaux[:, cInner] if has_aux else _EMPTY_AUX
-                ev = max_ws(*q, *qaux, *parameters, *n)
-                max_ev[f] = max(max_ev[f], ev)
-
+            max_ev[interior_faces] = np.maximum(m[:n_if], m[n_if:2 * n_if])
+            max_ev[boundary_faces] = m[2 * n_if:]
+            if fi_h is not None:                          # dry-cell skip
+                both_dry = ((Q[fi_h, iA_int] < dry_thr)
+                            & (Q[fi_h, iB_int] < dry_thr))
+                max_ev[interior_faces[both_dry]] = 0.0
+                max_ev[boundary_faces[Q[fi_h, iInner_bnd] < dry_thr]] = 0.0
             return max_ev
         return compute_max_eigenvalue
 
@@ -652,11 +550,13 @@ class HyperbolicSolver(Solver):
 
     def get_flux_operator(self, mesh, model):
         symbolic_model = self._get_symbolic_model(model)
-        max_wavespeed_fn = self._build_max_wavespeed(symbolic_model)
         dim = symbolic_model.dimension
 
         numerics = self._build_numerics(symbolic_model)
-        NumpyRuntimeSymbolic.module["max_wavespeed"] = max_wavespeed_fn
+        # ``local_max_abs_eigenvalue`` is a REAL expression of the model's
+        # normal-projected eigenvalues (Gershgorin row-sum when the model
+        # has no closed-form spectrum), so the numerical flux lowers
+        # directly — no opaque wave-speed kernel to inject.
         # Let the numerics declare any extra backend kernels it needs (e.g.
         # the Roe |A| dissipation), merged in before lambdification.
         extra_kernels = getattr(numerics, "runtime_kernels", None)
@@ -664,9 +564,6 @@ class HyperbolicSolver(Solver):
             for _kname, _kfn in extra_kernels(symbolic_model).items():
                 NumpyRuntimeSymbolic.module[_kname] = _kfn
         runtime_numerics = numerics.to_runtime_numpy()
-        runtime_numerics.local_max_abs_eigenvalue = (
-            lambda Q, Qaux, p, n: max_wavespeed_fn(*Q, *Qaux, *p, *n)
-        )
         use_batched = bool(getattr(numerics, "supports_batched_faces", False))
 
         nc = mesh.n_inner_cells
@@ -857,9 +754,9 @@ class HyperbolicSolver(Solver):
                     for d in range(dim):
                         dQ[:, c] -= B_c[:, :, d] @ grad[:, d, c]
 
-            # 4. BATCHED face Riemann solves: the lambdified kernels (and the
-            # batch-aware max_wavespeed backend) broadcast over a trailing
-            # face axis — one call per kernel instead of one per face.
+            # 4. BATCHED face Riemann solves: the lambdified kernels (whose
+            # eigenvalue-based dissipation broadcasts over a trailing
+            # face axis) — one call per kernel instead of one per face.
             # Scatter with np.add.at (unbuffered) so repeated cell indices
             # accumulate correctly on unstructured meshes.  Numerics classes
             # opt IN via ``supports_batched_faces`` (verified bit-identical

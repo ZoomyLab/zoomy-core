@@ -55,10 +55,9 @@ class NumpyRuntimeModel:
         "array": np.array,
         "squeeze": np.squeeze,
         "conditional": lambda c, t, f: np.where(c, t, f),
-        "max_wavespeed": None,  # must be provided by the solver before compilation
         # NON-LOCAL spatial derivative aux — solver injects the mesh-bound
         # impl (mesh.compute_derivatives) before the update_aux_variables slot
-        # is compiled, mirroring max_wavespeed.
+        # is compiled.
         "compute_derivative": None,
         "eigensystem": _eigensystem_numpy,
     }

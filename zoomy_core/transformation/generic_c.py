@@ -90,9 +90,6 @@ class GenericCppBase(CXX11CodePrinter):
         "Min": lambda p, *args: p._print_min_max("min", args),
         "Max": lambda p, *args: p._print_min_max("max", args),
         "Abs": lambda p, a: f"{p.math_namespace}abs({p.doprint(a)})",
-        "max_wavespeed": lambda p, *args: p._print_nested_max(
-            [f"{p.math_namespace}abs({p.doprint(a)})" for a in args]
-        ),
         # Backend-provided free functions (the C++ printer only emits the
         # call; the backend supplies the implementation, exactly like
         # OpenFOAM's ``UserFunctions.H`` — see FoamNumericsPrinter

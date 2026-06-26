@@ -652,35 +652,9 @@ class FoamNumericsPrinter(GenericCppBase):
     _output_subdir = ".foam_interface"
     real_type = "Foam::scalar"
     math_namespace = "Foam::"
-    # Override the inherited expansion of max_wavespeed (which prints
-    # nested ``max(abs(args))``).  In the Foam backend max_wavespeed
-    # is opaque — the solver provides the C++ implementation in
-    # numerics.H, mirroring numpy/jax (``max_wavespeed: None``).
-    #
-    # The symbolic ``max_wavespeed`` always receives the flattened
-    # (Q, Qaux, p, normal) for a given side.  We detect the side from
-    # the first arg's symbol name and emit a fixed-signature call
-    # ``numerics::max_wavespeed(Q_side, Qaux_side, p, n)`` that the
-    # solver implements once (wrapping ``Model::eigenvalues``).
-    # Named without the ``_print_`` prefix to avoid sympy's
-    # automatic ``_print_<funcname>`` dispatch (which would call this
-    # with the whole Function expr instead of via c_functions).
-    #
-    # The symbolic ``max_wavespeed`` is invoked with the flattened
-    # ``*Q, *Qaux, *p, *n`` for some side (cell-centre, minus, plus, or
-    # an HR-reconstructed mix).  We emit a variadic call
-    # ``numerics::max_wavespeed(args...)``; the C++ helper unpacks the
-    # flat args back into Q/Qaux/p/n using Model::n_dof_q etc., then
-    # forwards to Model::eigenvalues.
-    @staticmethod
-    def _emit_max_wavespeed(printer, *args):
-        return "numerics::max_wavespeed(" + ", ".join(
-            printer.doprint(a) for a in args
-        ) + ")"
-
     # ``eigensystem(idx, *A_flat)`` is the opaque eigendecomposition leaf
-    # the Roe scheme builds ``|A| = R|Lambda|L`` from.  Like max_wavespeed
-    # it is implemented in UserFunctions.H (``numerics::eigensystem``,
+    # the Roe scheme builds ``|A| = R|Lambda|L`` from.  It is
+    # implemented in UserFunctions.H (``numerics::eigensystem``,
     # Eigen-backed); the generated kernels live in ``namespace Numerics``,
     # so the call MUST be namespace-qualified to resolve (unqualified
     # lookup would not reach ``namespace numerics``).
@@ -692,7 +666,6 @@ class FoamNumericsPrinter(GenericCppBase):
 
     c_functions = {
         **GenericCppBase.c_functions,
-        "max_wavespeed": _emit_max_wavespeed.__func__,
         "eigensystem": _emit_eigensystem.__func__,
     }
 

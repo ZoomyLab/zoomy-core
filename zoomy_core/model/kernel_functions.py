@@ -15,26 +15,6 @@ import itertools
 from zoomy_core.misc.misc import ZArray
 
 
-class max_wavespeed(sp.Function):
-    """
-    max_wavespeed(Q, Qaux, p, n) — maximum absolute wave speed.
-
-    Opaque to SymPy. Used in Rusanov dissipation and CFL computation.
-    Backend implementations:
-      - NumPy: provided by NumericalModel (symbolic eigenvalues compiled,
-               or np.linalg.eigvals on quasilinear matrix)
-      - JAX: same
-      - C: compiled from symbolic eigenvalue expressions
-    """
-    is_commutative = True
-    is_real = True
-    is_nonnegative = True
-
-    @classmethod
-    def eval(cls, *args):
-        return None  # always keep unevaluated
-
-
 class eigensystem(sp.Function):
     """eigensystem(idx, *A_flat) — idx-th component of the eigendecomposition of
     the row-major n*n matrix A_flat, laid out as
@@ -55,7 +35,7 @@ class compute_derivative(sp.Function):
     derivative of ``field`` of order ``multi_index`` (e.g.
     ``compute_derivative(h, 1, 0)`` = ∂ₓh, ``compute_derivative(b, 0, 1)`` =
     ∂_yb).  Opaque to SymPy; the numeric impl is **injected by the solver**
-    into the backend module dict (exactly like :class:`max_wavespeed`), bound
+    into the backend module dict (like the ``eigensystem`` kernel), bound
     to that backend's LSQ stencil + mesh — numpy ``mesh.compute_derivatives``,
     jax ``lsq_gradient_per_field``.
 

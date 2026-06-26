@@ -15,7 +15,7 @@ import sympy as sp
 from zoomy_core.misc.misc import ZArray, Zstruct
 from zoomy_core.model.basefunction import SymbolicRegistrar
 from zoomy_core.model.kernel_functions import (
-    conditional, max_wavespeed,
+    conditional,
 )
 from zoomy_core.systemmodel.system_model import SystemModel
 from zoomy_core.transformation.to_numpy import (
@@ -258,23 +258,54 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         )
 
     def local_max_eigenvalue_definition(self):
+        """Spectral radius of the normal-projected system at the numerics'
+        own ``Q/Qaux/p/n`` symbols — the kernel body the code printers emit.
+
+        Computed DIRECTLY from the model spectrum:
+        ``Max(|λ_i|)`` over the SystemModel's normal-projected
+        ``eigenvalues``.  When the model carries no closed-form spectrum
+        (``model.eigenvalues is None`` — hand-built models such as VAM) it
+        falls back to the Gershgorin row-sum upper bound of ``|A_n|`` (the
+        normal-projected quasilinear / flux-Jacobian matrix), a finite
+        bound so Rusanov keeps a finite ``dt``.
         """
-        Returns the opaque max_wavespeed function.
-        The actual implementation is provided by the backend at runtime.
-        """
-        return max_wavespeed(
-            *list(self.variables), *list(self.aux_variables),
-            *list(self.parameters), *list(self.normal),
+        return self.local_max_abs_eigenvalue(
+            self.variables, self.aux_variables,
+            self.parameters, self.normal,
         )
 
     def local_max_abs_eigenvalue(self, Q=None, Qaux=None, p=None, n=None):
-        """
-        Called during symbolic Rusanov construction.
-        Returns opaque max_wavespeed with the given state.
-        """
+        """Spectral radius at the given state ``(Q, Qaux, p, n)`` — the real
+        expression substituted into Rusanov dissipation / CFL.  ``Max(|λ_i|)``
+        from the model's normal-projected ``eigenvalues``, or the Gershgorin
+        row-sum bound when the model has no closed-form spectrum."""
         if Q is None:
             return self.local_max_eigenvalue_definition()
-        return max_wavespeed(*list(Q), *list(Qaux), *list(p), *list(n))
+        if self.model.eigenvalues is not None:
+            eig = list(sp.flatten(
+                self._model_eval("eigenvalues", Q, Qaux, p, n)))
+            return sp.Max(*[sp.Abs(lam) for lam in eig])
+        return self._gershgorin_spectral_radius(Q, Qaux, p, n)
+
+    def _gershgorin_spectral_radius(self, Q, Qaux, p, n):
+        """Gershgorin row-sum upper bound of the spectral radius of the
+        normal-projected quasilinear matrix ``A_n = Σ_d n_d A[:, :, d]``:
+        ``max_i Σ_j |A_n[i, j]|``.  A finite over-estimate of ``max|λ|`` —
+        used when the model has no closed-form ``eigenvalues`` (e.g.
+        hand-built VAM), so Rusanov/LF still get a finite, non-zero wave
+        speed."""
+        A = self._model_eval("quasilinear_matrix", Q, Qaux, p)
+        n_vars = self.n_variables
+        nrm = list(n)
+        dim = len(nrm)
+        row_sums = []
+        for i in range(n_vars):
+            s = sp.Integer(0)
+            for j in range(n_vars):
+                A_n_ij = sum(A[i, j, d] * nrm[d] for d in range(dim))
+                s += sp.Abs(A_n_ij)
+            row_sums.append(s)
+        return sp.Max(*row_sums)
 
     def _model_eval(self, operator_name, Q, Qaux, p, n=None):
         """Evaluate a SystemModel operator at a given state.
