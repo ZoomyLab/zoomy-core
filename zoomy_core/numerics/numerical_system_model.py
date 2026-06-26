@@ -138,15 +138,32 @@ def _desingularize_positivity(sm, floor):
 
 
 @dataclass
-class NumericalSystemModel:
-    """Numerical sibling of :class:`SystemModel`.
+class NumericalSystemModel(SystemModel):
+    """Numerical sibling of :class:`SystemModel` — now a SUBCLASS of it.
 
-    Always constructed via :meth:`from_system_model`.  Direct
-    instantiation is allowed (for tests, manual overrides) but the
-    classmethod is the documented entry point.
+    The NSM IS-A SystemModel: it inherits the entire physics/codegen
+    surface (flux, source, eigenvalues, the source jacobians,
+    reconstruction_variables / state_from_reconstruction,
+    interpolate_to_3d / project_from_3d, update_variables /
+    update_aux_variables, the lambdified BC *kernel*
+    ``boundary_conditions``, state / aux_state / parameters, the
+    shape properties n_equations / n_state / dimension /
+    equation_to_state_index, …) and ADDS the numerical knobs below.
+
+    There is no ``sm`` field anymore — the ``sm`` property returns
+    ``self`` so legacy ``nsm.sm.<x>`` accesses keep resolving, and the
+    BC kernel/container split is preserved: ``nsm.boundary_conditions``
+    is the inherited lambdified BC kernel; the ``BoundaryConditions``
+    container stays at ``nsm._bc_source`` (== ``nsm.sm._bc_source``).
+
+    Always constructed via :meth:`from_system_model`, which PROMOTES a
+    frozen SystemModel instance in place (re-class + attach numerics)
+    so ``nsm is sm`` and the SystemModel's full state is preserved with
+    no copy.  Direct dataclass instantiation is possible (it accepts the
+    full SystemModel field signature followed by the numerics fields)
+    but the classmethod is the documented entry point.
     """
 
-    sm: SystemModel
     riemann: Optional[Type[Any]] = None
     reconstruction: ReconstructionSpec = field(default_factory=ReconstructionSpec)
     diffusion: DiffusionSpec = field(default_factory=DiffusionSpec)
@@ -180,55 +197,21 @@ class NumericalSystemModel:
     # right list at setup time and passes it here.
     scaled_q_indices: Optional[list] = None
 
-    # ── SystemModel delegation ────────────────────────────────────
-    # The NSM is a *thin numerical wrapper* around a frozen
-    # SystemModel.  Solvers / codegen reach a fixed set of the
-    # SystemModel's physics slots through the NSM; rather than spell
-    # ``nsm.sm.<x>`` at every site we delegate those — and ONLY those
-    # — to ``self.sm`` via a guarded ``__getattr__``.  The list is an
-    # explicit ALLOWLIST (every entry is a real SystemModel data field
-    # or ``@property``), so a typo such as ``nsm.boudary_conditions``
-    # still raises ``AttributeError`` instead of silently forwarding.
-    #
-    # ⚠ BC kernel/container split: ``boundary_conditions`` here is the
-    # SystemModel's *lambdified BC kernel* (a sympy ``Function``).  The
-    # periodic ``BoundaryConditions`` CONTAINER is deliberately NOT in
-    # the allowlist — it stays reachable only at ``nsm.sm._bc_source``
-    # (IMEX periodic-BC resolution depends on that separation).
-    _DELEGATED_SM_ATTRS = frozenset({
-        # state / aux
-        "state", "aux_state", "aux_registry",
-        # symbolic operators
-        "flux", "source", "source_explicit",
-        "source_jacobian_wrt_variables", "source_jacobian_wrt_aux_variables",
-        "quasilinear_matrix", "mass_matrix", "nonconservative_matrix",
-        "hydrostatic_pressure", "diffusion_matrix",
-        "diffusion_matrix_explicit", "eigenvalues",
-        # symbols / metadata
-        "time", "space", "normal", "position",
-        "parameters", "parameter_values",
-        "equilibrium_reconstruction",
-        # BC kernels (Function objects — NOT the containers)
-        "boundary_conditions", "aux_boundary_conditions",
-        "boundary_gradients",
-        # size / shape properties
-        "n_equations", "n_state", "n_dim", "n_variables",
-        "n_aux_variables", "n_parameters", "dimension",
-        "variables", "aux_variables", "eigenvalue_mode",
-    })
+    # ── SystemModel identity bridge ───────────────────────────────
+    @property
+    def sm(self) -> "SystemModel":
+        """Return ``self``.
 
-    def __getattr__(self, name: str):
-        # ``__getattr__`` only fires when normal attribute lookup
-        # fails, so the dataclass's own fields (``sm``, ``riemann``,
-        # …) never reach here.  Use ``__dict__`` to read ``sm`` so we
-        # never recurse through ``__getattr__`` itself (matters during
-        # copy / unpickle, before ``sm`` is bound).
-        if name in NumericalSystemModel._DELEGATED_SM_ATTRS:
-            sm = self.__dict__.get("sm")
-            if sm is not None:
-                return getattr(sm, name)
-        raise AttributeError(
-            f"{type(self).__name__!r} object has no attribute {name!r}")
+        The NSM *is* a SystemModel (it subclasses it), so the entire
+        physics/codegen interface is INHERITED — no allowlist, no
+        ``__getattr__`` delegation, and a bogus ``nsm.__typo__`` raises
+        ``AttributeError`` for free.  This property keeps the historical
+        ``nsm.sm.<x>`` indirection resolving and preserves the BC
+        kernel/container split: ``nsm.boundary_conditions`` is the
+        inherited lambdified BC *kernel* (a sympy ``Function``), while
+        the ``BoundaryConditions`` *container* lives at
+        ``nsm._bc_source`` (== ``nsm.sm._bc_source``)."""
+        return self
 
     # ── Constructors ──────────────────────────────────────────────
 
@@ -265,6 +248,7 @@ class NumericalSystemModel:
         source_specs = getattr(sm, "derivative_specs", None)
         if not isinstance(sm, SystemModel):
             sm = SystemModel.from_model(sm)
+            source_specs = getattr(sm, "derivative_specs", source_specs)
         _assert_bc_kernels_match_state(sm)
         for sub in (additional_systems or []):
             if isinstance(sub, SystemModel):
@@ -284,19 +268,36 @@ class NumericalSystemModel:
             regularization = RegularizationSpec()
         if regularization.positivity_floor > 0:
             _desingularize_positivity(sm, regularization.positivity_floor)
-        return cls(
-            sm=sm,
-            riemann=riemann,
-            reconstruction=reconstruction,
-            diffusion=diffusion,
-            regularization=regularization,
-            source_derivative_specs=(
-                list(source_specs) if source_specs else None),
-            additional_systems=list(additional_systems or []),
-            scaled_q_indices=(
-                list(scaled_q_indices) if scaled_q_indices is not None
-                else None),
-        )
+
+        # The NSM IS-A SystemModel, so PROMOTE the frozen ``sm`` instance
+        # in place — re-class it to the NSM and attach the numerics
+        # fields — rather than copy its field values into a separate
+        # object.  Both classes are plain (``__dict__``-backed) dataclasses
+        # so the re-class is layout-compatible, and the promotion keeps the
+        # SystemModel's full state (every dataclass field PLUS the dynamic
+        # attributes ``_bc_source`` / ``_aux_bc_source`` (the
+        # BoundaryConditions CONTAINER — REQ-16, reached as
+        # ``nsm._bc_source``), ``aux_registry`` (LSQ-degree sizing),
+        # ``positive_state``, ``derivative_specs``, the lazy
+        # ``_quasilinear_matrix`` cache, …) intact with NO copy.  Crucially
+        # it preserves object identity: ``nsm is sm`` and ``nsm.sm is nsm``,
+        # so callers that built the SystemModel, then keep mutating it
+        # (e.g. ``sm.initial_conditions = …`` between successive solves)
+        # see those mutations through the NSM — the faithful
+        # ``SystemModel → NumericalSystemModel`` pipeline step, not a
+        # snapshot.
+        sm.__class__ = cls
+        sm.riemann = riemann
+        sm.reconstruction = reconstruction
+        sm.diffusion = diffusion
+        sm.regularization = regularization
+        sm.source_derivative_specs = (
+            list(source_specs) if source_specs else None)
+        sm.additional_systems = list(additional_systems or [])
+        sm.scaled_q_indices = (
+            list(scaled_q_indices) if scaled_q_indices is not None
+            else None)
+        return sm
 
     # ── LSQ-degree resolution ─────────────────────────────────────
 
