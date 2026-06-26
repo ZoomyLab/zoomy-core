@@ -779,6 +779,7 @@ class GenericCppModel(GenericCppBase):
         if self.sm is not None:
             blocks.extend(self._emit_operator_kernels())
             blocks.extend(self._emit_reconstruction_kernels())
+            blocks.extend(self._emit_projection_kernels())
         else:
             for name, func_obj in self.model.functions.items():
                 blocks.extend(self._process_kernel_from_function(func_obj))
@@ -797,6 +798,11 @@ class GenericCppModel(GenericCppBase):
     # but emit the C++ pointer signatures the dmplex/C backend consumes.
 
     _AXIS = ("x", "y", "z")
+    # Canonical 3D-field profile the coupling maps exchange (Phase 7):
+    # ``interpolate_to_3d`` emits these slots in order; ``project_from_3d``
+    # consumes them through fresh ``P3_<field>`` symbols mapped to
+    # ``profile[i]``.  Mirrors ``FoamSystemModelPrinter._PROFILE_3D_FIELDS``.
+    _PROFILE_3D_FIELDS = ("b", "h", "u", "v", "w", "p")
     # Emit the SystemModel's symbolic eigenvalue spectrum (default).  Set
     # False to emit a zero placeholder when the solver computes the
     # spectrum numerically from ``quasilinear_matrix``.
@@ -970,6 +976,84 @@ class GenericCppModel(GenericCppBase):
             self.symbol_maps.pop()
 
         return [fwd, inv]
+
+    def _emit_projection_kernels(self):
+        """Emit the 3-D coupling maps from the SystemModel, mirroring
+        ``FoamSystemModelPrinter._emit_projection_kernels`` but in the C++
+        pointer-arg style (``const T*`` / ``res[...]``):
+
+        * ``interpolate_to_3d(Q, Qaux, p, X) -> field[6]`` — the canonical
+          3-D field ``[b,h,u,v,w,p]`` evaluated at one vertical position;
+          ``sm.position[2]`` → ``X[2]`` via the position map the constructor
+          already registered (the same ``X`` convention every C++ kernel
+          uses, in place of foam's scalar ``z``).  The backend loops the
+          column, calling this once per sample point.
+        * ``project_from_3d(profile, p[, I]) -> Q[n_state]`` — the inverse:
+          reduce one sampled column back to the 2-D state.  The depth-average
+          enters through the ``P3_<field>`` symbols (``profile[i]``); any
+          ``Integral(g(ζ), (ζ,0,1))`` row enters through a column-quadrature
+          accumulator ``I[j]`` the backend fills (matching foam's
+          ``project_from_3d_at`` per-profile signature).
+
+        Both maps are read off the SystemModel slots filled by
+        ``register_group("interpolate"/"project", …)``.  A model with the
+        slot ``None`` / absent (default reconstruction, e.g. VAM / Chorin
+        sub-systems) emits nothing — exactly like the reconstruction skip.
+        """
+        sm = self.sm
+        blocks = []
+
+        p2 = getattr(sm, "interpolate_to_3d", None)
+        # The base model returns zeros(6); only emit a real reconstruction.
+        if p2 is not None and any(e != 0 for e in sp.flatten(p2)):
+            shape = (len(sp.flatten(p2)),)
+            blocks.append(self._sm_kernel(
+                "interpolate_to_3d", p2, shape, ["Q", "Qaux", "p", "X"],
+            ))
+
+        p3 = getattr(sm, "project_from_3d", None)
+        if p3 is not None and len(sp.flatten(p3)) > 0:
+            rows = [sp.sympify(e) for e in sp.flatten(p3)]
+            shape = (len(rows),)
+
+            # ζ-quadrature lowering: every ``Integral(g(ζ), (ζ,0,1))`` becomes
+            # a fresh ``I[j]`` accumulator the backend fills from the sampled
+            # column (the per-profile map only consumes the result).  Rows
+            # without Integrals lower exactly as the depth-averaged
+            # ``profile[]`` reduction.
+            integral_atoms: list = []
+            for e in rows:
+                for a in e.atoms(sp.Integral):
+                    if a not in integral_atoms:
+                        integral_atoms.append(a)
+            int_syms = {a: sp.Symbol(f"_ZINT{j}", real=True)
+                        for j, a in enumerate(integral_atoms)}
+            rows = [e.xreplace(int_syms) for e in rows]
+
+            free = set()
+            for expr in rows:
+                if hasattr(expr, "free_symbols"):
+                    free |= expr.free_symbols
+            by_name = {str(s): s for s in free}
+            prof_map = {}
+            for i, field in enumerate(self._PROFILE_3D_FIELDS):
+                sym = by_name.get(f"P3_{field}")
+                if sym is not None:
+                    prof_map[sym] = self.format_accessor("profile", i)
+            for a, s in int_syms.items():
+                prof_map[s] = self.format_accessor(
+                    "I", int(str(s)[len("_ZINT"):]))
+            at_args = (["profile", "p", "I"] if integral_atoms
+                       else ["profile", "p"])
+            self.symbol_maps.append(prof_map)
+            try:
+                blocks.append(self._sm_kernel(
+                    "project_from_3d", sp.Matrix(rows), shape, at_args,
+                ))
+            finally:
+                self.symbol_maps.pop()
+
+        return blocks
 
     def _emit_boundary_conditions(self):
         """Lower the model's ``BoundaryConditions`` into the indexed
