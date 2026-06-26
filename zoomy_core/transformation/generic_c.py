@@ -767,15 +767,151 @@ class GenericCppModel(GenericCppBase):
         return cls._write_file(code, settings, filename)
 
     def create_code(self):
-        """Create code."""
+        """Create code.
+
+        Declarative models keep their operator matrices (flux, NCP,
+        quasilinear, source, eigenvalues, diffusion) on the SystemModel —
+        emit those when present, mirroring ``FoamSystemModelPrinter``.
+        Legacy hand-written Models (no ``system_model``) fall back to
+        iterating the Model's own ``functions``.
+        """
         blocks = [self.get_file_header()]
-        for name, func_obj in self.model.functions.items():
-            blocks.extend(self._process_kernel_from_function(func_obj))
+        if self.sm is not None:
+            blocks.extend(self._emit_operator_kernels())
+        else:
+            for name, func_obj in self.model.functions.items():
+                blocks.extend(self._process_kernel_from_function(func_obj))
 
         blocks.extend(self._emit_boundary_conditions())
 
         blocks.append(self.get_file_footer())
         return "\n".join(blocks)
+
+    # ── SystemModel operator-kernel emission ─────────────────────────────
+    #
+    # The operator matrices live on the SystemModel and reference its
+    # state / aux / parameter / normal symbols (NOT the declarative
+    # Model's own ``variables``).  These mirror
+    # ``FoamSystemModelPrinter._per_direction`` / ``_slice`` / ``_kernel``
+    # but emit the C++ pointer signatures the dmplex/C backend consumes.
+
+    _AXIS = ("x", "y", "z")
+    # Emit the SystemModel's symbolic eigenvalue spectrum (default).  Set
+    # False to emit a zero placeholder when the solver computes the
+    # spectrum numerically from ``quasilinear_matrix``.
+    analytical_eigenvalues = True
+
+    def _sm_symbol_map(self):
+        """Map the SystemModel state / aux / parameter / normal symbols to
+        their C interface accessors (``Q[i]`` / ``Qaux[i]`` / ``p[i]`` /
+        ``n[i]``).  Shared by the operator and boundary-condition kernels."""
+        sm = self.sm
+        smap = {}
+        for i, s in enumerate(sm.state):
+            smap[s] = self.format_accessor("Q", i)
+        for i, s in enumerate(sm.aux_state):
+            smap[s] = self.format_accessor("Qaux", i)
+        for i, s in enumerate(sm.parameters.values()):
+            smap[s] = self.format_accessor("p", i)
+        for i, s in enumerate(sm.normal.values()):
+            smap[s] = self.format_accessor("n", i)
+        return smap
+
+    def _sm_arg_decl(self, key):
+        """C++ declaration for one operator-kernel argument (pointer
+        form: ``const T* Q``).  Backends with a different calling
+        convention override this."""
+        return f"const {self.real_type}* {key}"
+
+    def _sm_signature(self, args):
+        """Operator-kernel parameter list from an ordered arg-key list."""
+        return ",\n        ".join(self._sm_arg_decl(a) for a in args)
+
+    def _sm_kernel(self, name, expr, shape, args):
+        """Emit one operator kernel from a SystemModel expression, with the
+        SystemModel symbol map pushed for the body."""
+        self.symbol_maps.append(self._sm_symbol_map())
+        try:
+            body = self.convert_expression_body(expr, shape)
+        finally:
+            self.symbol_maps.pop()
+        return self.wrap_function_signature(
+            name, self._sm_signature(args), body, shape
+        )
+
+    def _sm_slice(self, tensor, axis_idx, out_shape):
+        """``tensor[..., axis_idx]`` reshaped to ``out_shape`` — the
+        per-direction slice of a direction-indexed operator tensor.  If
+        ``out_shape`` carries a trailing ``1`` padding (the ``flux_x``
+        column convention) walk one fewer axis when collecting values."""
+        walk = (
+            out_shape[:-1]
+            if (len(out_shape) == len(tensor.shape) and out_shape[-1] == 1)
+            else out_shape
+        )
+        flat = [
+            tensor[(*idx, axis_idx)]
+            for idx in itertools.product(*(range(s) for s in walk))
+        ]
+        return sp.Array(flat).reshape(*out_shape)
+
+    def _sm_per_direction(self, base, tensor, out_shape, args):
+        """Emit ``base_x`` / ``base_y`` / ``base_z`` kernels (one per
+        spatial dimension) from a direction-indexed operator tensor."""
+        return [
+            self._sm_kernel(
+                f"{base}_{self._AXIS[d]}",
+                self._sm_slice(tensor, d, out_shape),
+                out_shape,
+                args,
+            )
+            for d in range(self.sm.dimension)
+        ]
+
+    def _emit_operator_kernels(self):
+        """Emit the SystemModel operator kernels into ``Model.H``:
+        per-direction conservative flux, nonconservative (NCP) matrix,
+        quasilinear matrix, the eigenvalue spectrum, the source term, and
+        diffusion when present.  Mirrors ``FoamSystemModelPrinter``."""
+        sm = self.sm
+        n_eq, n_state = sm.n_equations, len(sm.state)
+        blocks = []
+        blocks += self._sm_per_direction(
+            "flux", sm.flux, (n_eq, 1), ["Q", "Qaux", "p"]
+        )
+        blocks += self._sm_per_direction(
+            "nonconservative_matrix",
+            sm.nonconservative_matrix,
+            (n_eq, n_state),
+            ["Q", "Qaux", "p"],
+        )
+        blocks += self._sm_per_direction(
+            "quasilinear_matrix",
+            sm.quasilinear_matrix,
+            (n_eq, n_state),
+            ["Q", "Qaux", "p"],
+        )
+        eig_expr = (
+            sm.eigenvalues
+            if self.analytical_eigenvalues
+            else sp.Array([[0]] * n_eq)
+        )
+        blocks.append(
+            self._sm_kernel(
+                "eigenvalues", eig_expr, (n_eq, 1), ["Q", "Qaux", "p", "n"]
+            )
+        )
+        blocks.append(
+            self._sm_kernel("source", sm.source, (n_eq, 1), ["Q", "Qaux", "p"])
+        )
+        if self._detect_has_diffusion():
+            blocks += self._sm_per_direction(
+                "diffusion_matrix",
+                sm.diffusion_matrix,
+                (n_eq, n_state),
+                ["Q", "Qaux", "p"],
+            )
+        return blocks
 
     def _emit_boundary_conditions(self):
         """Lower the model's ``BoundaryConditions`` into the indexed
@@ -930,10 +1066,20 @@ class GenericCppModel(GenericCppBase):
         return "\n".join(lines)
 
     def _detect_has_diffusion(self):
-        """Check whether the model's diffusion_matrix is non-trivial (not all zeros)."""
-        if "diffusion_matrix" not in self.model.functions.keys():
-            return False
-        expr = self.model.functions.diffusion_matrix.definition
+        """Check whether the model's diffusion_matrix is non-trivial (not all zeros).
+
+        Declarative models keep ``diffusion_matrix`` on the SystemModel
+        (``None`` when the model has no diffusion); legacy Models expose it
+        as a ``functions`` entry.
+        """
+        if self.sm is not None:
+            expr = getattr(self.sm, "diffusion_matrix", None)
+            if expr is None:
+                return False
+        else:
+            if "diffusion_matrix" not in self.model.functions.keys():
+                return False
+            expr = self.model.functions.diffusion_matrix.definition
         # Flatten the expression and check if every element is zero
         if hasattr(expr, "__iter__"):
             return not all(sp.simplify(e) == 0 for e in sp.flatten(expr))
