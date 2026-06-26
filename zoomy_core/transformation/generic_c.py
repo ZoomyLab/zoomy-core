@@ -894,7 +894,7 @@ class GenericCppModel(GenericCppBase):
         )
         eig_expr = (
             sm.eigenvalues
-            if self.analytical_eigenvalues
+            if self.analytical_eigenvalues and sm.eigenvalues is not None
             else sp.Array([[0]] * n_eq)
         )
         blocks.append(
