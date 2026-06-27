@@ -285,6 +285,20 @@ class PDETransformation(Operation):
                     result = self._apply_one_derivative(result, var)
             return result
         if isinstance(e, sp.Function) and not isinstance(e, sp.Sum):
+            # A known/standard sympy function head (exp, log, sin, …) applied
+            # to a field expression is a COMPOSITE, not a σ-field: recurse into
+            # its argument(s) and PRESERVE the head — do NOT decorate it, strip
+            # its inner ζ, nor fire the boundary-evaluation branch on the
+            # function node itself.  Only genuine field/unknown applications
+            # (sympy ``AppliedUndef``) carry the vertical coordinate and get the
+            # σ-field treatment below.  Example: ``exp(lk(z))`` →
+            # ``exp(l̃k(ζ))`` (head kept, inner field σ-mapped), instead of the
+            # bogus ``\tilde{exp}`` / boundary-eval of ``lk`` at ``ζ``.
+            if not isinstance(e, sp.core.function.AppliedUndef):
+                new_args = tuple(self._rewrite(a) for a in e.args)
+                if any(n is not o for n, o in zip(new_args, e.args)):
+                    return e.func(*new_args)
+                return e
             # A field application.  If it contains z, decorate the head and
             # map z → ζ in the arg list; recurse into each arg.
             if self._z in e.free_symbols:
