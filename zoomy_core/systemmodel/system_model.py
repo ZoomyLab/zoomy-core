@@ -52,6 +52,45 @@ def _to_zarray(obj):
     return ZArray(obj)
 
 
+def _channel_explicit_diffusion(model, canonical_source):
+    """Mirror the basemodel ``from_model`` handling of the EXPLICIT diffusion
+    tensor on the declarative (``_from_derivation_model``) path.
+
+    A case-side SME/VAM model may override ``diffusion_matrix_explicit()`` (the
+    ``∇·(ν_h h ∇u)`` horizontal-eddy-viscosity slot).  The override lives on the
+    user-facing model — the ``canonical_source`` here (the SME/VAM wrapper the
+    case constructs), NOT on the derivation ``model`` whose untagged residuals
+    the structural extractor reads.  Read the override off either object,
+    coerce it to an ``NDimArray`` exactly as the basemodel branch's
+    ``_extract_A`` does, and return it.
+
+    Returns ``None`` when no real (non-zero) override is declared — the
+    basemodel default ``diffusion_matrix_explicit()`` returns an all-zero
+    tensor, so treat that as "no override" and inject NOTHING (a plain SME/VAM
+    keeps ``diffusion_matrix_explicit is None``; the implicit, extractor-derived
+    ``diffusion_matrix`` slot is never touched here)."""
+    def _is_zero(e):
+        z = getattr(e, "is_zero", None)
+        return z if z is not None else (e == 0)
+    for src in (canonical_source, model):
+        fn = getattr(src, "diffusion_matrix_explicit", None)
+        if not callable(fn):
+            continue
+        A_z = fn()
+        if A_z is None:
+            continue
+        if hasattr(A_z, "todense"):
+            A = sp.MutableDenseNDimArray(A_z.todense())
+        elif hasattr(A_z, "tolist"):
+            A = sp.MutableDenseNDimArray(A_z.tolist())
+        else:
+            A = sp.MutableDenseNDimArray(A_z)
+        flat = [A[idx] for idx in _iter_indices(tuple(A.shape))]
+        if any(not _is_zero(e) for e in flat):
+            return A
+    return None
+
+
 def _iter_indices(shape):
     if not shape:
         yield ()
@@ -1122,6 +1161,12 @@ class SystemModel:
             nonconservative_matrix=ops["nonconservative_matrix"],
             source=ops["source"], mass_matrix=ops["mass_matrix"],
             diffusion_matrix=ops.get("diffusion_matrix"),
+            # Channel an EXPLICIT diffusion override (``∇·(ν_h h ∇u)``) off the
+            # user-facing model — exactly as the basemodel ``from_model`` branch
+            # does — instead of dropping it (REQ-49).  ``diffusion_matrix`` (the
+            # extractor-derived implicit slot) is left untouched.
+            diffusion_matrix_explicit=_channel_explicit_diffusion(
+                model, canonical_source),
             eigenvalues=None, normal=normal,
             parameter_values=ops["parameter_values"],
             state_function_map=ops.get("state_function_map"),
