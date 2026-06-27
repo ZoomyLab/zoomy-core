@@ -1223,6 +1223,19 @@ class SystemModel:
         def _to_matrix(z, n_rows, n_cols):
             """Coerce a model ZArray / sp.Matrix / 1-D ZArray into an
             sp.Matrix with the requested shape."""
+            # A ``derive_by_array`` of a COLUMN source ``(n_eq, 1)`` (e.g. SWE's
+            # friction-only source) yields a rank-3 ZArray ``(n_state, n_eq, 1)``
+            # with a trailing singleton axis, whereas a rank-1 source ``(n_eq,)``
+            # (SME/VAM) yields the rank-2 ``(n_state, n_eq)`` that ``tomatrix``
+            # handles directly.  Squeeze any trailing singleton axes so both
+            # shapes channel identically — preserves axis order, so the caller's
+            # ``.T`` to the canonical ``(n_eq, n_state)`` is unchanged.
+            shp = getattr(z, "shape", None)
+            if (shp is not None and len(shp) > 2 and shp[-1] == 1
+                    and hasattr(z, "reshape")):
+                while len(shp) > 2 and shp[-1] == 1:
+                    z = z.reshape(*shp[:-1])
+                    shp = z.shape
             # Try direct tomatrix() first (rank-2 ZArrays).
             if hasattr(z, "tomatrix"):
                 try:
