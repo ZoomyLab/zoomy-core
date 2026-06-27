@@ -420,6 +420,25 @@ class LSQMUSCLReconstruction:
         self._lsq_neighbors = mesh.lsq_neighbors    # (n_cells, max_nbr)
         self._lsq_scale = mesh.lsq_scale_factors    # (n_monomials,)
 
+        # Columns of the monomial coefficient vector that hold the
+        # first-order derivatives ``∂_{x_d}``, axis by axis.  The
+        # monomial order from ``build_monomial_indices`` is
+        # reverse-lexicographic (e.g. 2D degree-1 → ``[(0,1),(1,0)]``),
+        # so the gradient is NOT the leading ``dim`` coefficients — that
+        # slice would swap the axes (∂_y where ∂_x is expected).  Map
+        # ``e_d`` to its column explicitly.
+        from zoomy_core.mesh.lsq_reconstruction import find_derivative_indices
+        mon = mesh.lsq_monomial_multi_index
+        grad_multi = [tuple(1 if k == d else 0 for k in range(dim))
+                      for d in range(dim)]
+        self._lsq_grad_cols = np.asarray(
+            find_derivative_indices(mon, grad_multi), dtype=int)
+        if np.any(self._lsq_grad_cols < 0):
+            raise ValueError(
+                "LSQMUSCLReconstruction: first-order derivative monomials "
+                f"missing from the mesh stencil {list(mon)} — rebuild the "
+                "LSQ mesh at degree >= 1.")
+
         # Boundary-face neighbours for LSQ — when present, ``A_loc`` is
         # sized ``(n_cell_nbr + n_bf_nbr, n_monomials)`` so ``delta_u``
         # must also include the boundary-face values to match.  When
@@ -521,12 +540,20 @@ class LSQMUSCLReconstruction:
                 # use the inner cell value (extrapolation).
                 u_bf_i = (u_bf[np.maximum(bf, 0)] if u_bf is not None
                           else np.full_like(bf, u_i, dtype=float))
-                u_bf_delta = np.where(bf >= 0, u_bf_i - u_i, 0.0)
+                # The virtual boundary neighbour sits at the GHOST-CELL
+                # offset ``2·(face - cell)`` (see
+                # ``least_squares_reconstruction_local``), so its delta
+                # is the ghost delta ``u_ghost - u_cell = 2·(u_face -
+                # u_cell)``.  Using the bare face delta caps the
+                # boundary gradient at 1st order for a linear field.
+                # For extrapolation (``u_bf is None``) ``u_bf_i = u_i``,
+                # so this stays 0 — the Neumann-zero ghost = inner cell.
+                u_bf_delta = np.where(bf >= 0, 2.0 * (u_bf_i - u_i), 0.0)
                 delta_u = np.concatenate([u_cells, u_bf_delta])
             else:
                 delta_u = u_cells
             coeffs = scale * (A_loc.T @ delta_u)  # (n_monomials,)
-            grad[:, i] = coeffs[:dim]
+            grad[:, i] = coeffs[self._lsq_grad_cols]
 
         return grad
 

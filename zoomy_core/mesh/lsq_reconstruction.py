@@ -353,17 +353,21 @@ def _resolve_u_boundary_face(u, u_boundary_face, mesh):
       inner cell value.  Slope between ghost and cell is zero, and by
       symmetry the slope at the midpoint (= boundary face) is zero —
       the exact Neumann-zero discretisation.
-    * ndarray of face values (Dirichlet / Lambda prescribed): ghost =
-      face value directly (the JAX-legacy / OpenFOAM convention for
-      Dirichlet at ghost-cell-centred grids).  The LSQ fit then gives
-      ``u(x_face) ≈ (u_ghost + u_cell)/2`` to leading order — close to
-      ``u_bc`` for smooth fields, exact in the limit ``dx → 0``.
+    * ndarray of face values (Dirichlet / Lambda prescribed): the
+      virtual point sits at the GHOST-CELL offset ``2·(face - cell)``,
+      so the value carried there is the linear extrapolation through
+      the face, ``u_ghost = 2·u_face - u_cell``.  Returning the bare
+      face value would place a face-valued sample at the ghost
+      position — an inconsistency that caps the boundary gradient at
+      1st order for a linear field at any finite ``dx``.  The
+      ``2·u_face - u_cell`` form reproduces ``(b, c)`` exactly for
+      ``u = a + b·x + c·y``.
 
     Passing ``None`` or any other type raises — callers must be
     explicit about the BC interpretation.
     """
     if isinstance(u_boundary_face, np.ndarray):
-        return u_boundary_face
+        return 2.0 * u_boundary_face - u[mesh.boundary_face_cells]
     if isinstance(u_boundary_face, str) and u_boundary_face == _BC_EXTRAPOLATION:
         return u[mesh.boundary_face_cells]
     raise ValueError(
