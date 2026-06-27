@@ -57,7 +57,10 @@ class MalpassetSWE(SWE):
         "g":   (9.81, "positive"),
         "n":   (0.033, "nonnegative"),   # Manning roughness
         "nu":  (1.0, "nonnegative"),     # eddy viscosity
-        "eps": (1e-2, "positive"),       # wet/dry depth threshold
+        # Canonical wet/dry-threshold parameter name (REQ-48): the SAME
+        # symbol the FVM Riemann solvers (riemann_solvers._eps_symbol)
+        # and the jax backend (parameter_values.wet_dry_eps) read.
+        "wet_dry_eps": (1e-2, "positive"),  # wet/dry depth threshold
     }
 
     #: per-cell velocity cap used by :meth:`update_variables` (m/s).
@@ -65,9 +68,13 @@ class MalpassetSWE(SWE):
 
     def __init__(self, *, g=9.81, n=0.033, nu=1.0, eps=1e-2,
                  h_friction_floor=0.5, ev_gate=True, closures=None, **kw):
+        # ``eps`` stays the public constructor knob (the wet/dry depth
+        # threshold value); it is declared on the parameter vector under
+        # the canonical name ``wet_dry_eps`` (REQ-48), so there is exactly
+        # ONE wet/dry parameter (no duplicate ``eps`` entry).
         # Numerical constants that are NOT physical parameters (kept off
         # the parameter vector so the SystemModel parameter set stays
-        # exactly {g, n, nu, eps}).
+        # exactly {g, n, nu, wet_dry_eps}).
         self._h_friction_floor = float(h_friction_floor)
         self._ev_gate = bool(ev_gate)
         # Dissipation is CLOSED by composable closures (closures.py): bed
@@ -91,7 +98,7 @@ class MalpassetSWE(SWE):
                 "g":   (float(g),  "positive"),
                 "n":   (float(n),  "nonnegative"),
                 "nu":  (float(nu), "nonnegative"),
-                "eps": (float(eps), "positive"),
+                "wet_dry_eps": (float(eps), "positive"),
             },
             eigenvalue_mode="symbolic",
             **kw,
@@ -214,7 +221,7 @@ class MalpassetSWE(SWE):
         # is never modified.  ``Max(h − eps, 0)·u_max`` collapses smoothly
         # to zero at ``h = eps`` using Min/Max only (lowers through every
         # backend; no Heaviside/sign).
-        h_wet = sp.Max(h - p.eps, sp.S.Zero)
+        h_wet = sp.Max(h - p.wet_dry_eps, sp.S.Zero)
         max_hu = h_wet * u_max
 
         def cap(c):
@@ -239,7 +246,7 @@ class MalpassetSWE(SWE):
         u = hu * hinv
         w = hv * hinv
         un = u * n.n0 + w * n.n1
-        c = sqrt(p.g * sp.Max(h, p.eps))
+        c = sqrt(p.g * sp.Max(h, p.wet_dry_eps))
         raw_ev = [sp.S.Zero, un, un - c, un + c]
         # Optional wet/dry wave-speed gate.  With the KP-desingularised
         # hinv the dry-cell speeds stay bounded at √(g·eps) WITHOUT the
@@ -250,7 +257,7 @@ class MalpassetSWE(SWE):
         if not self._ev_gate:
             return ZArray(raw_ev)
         cond = sp.Function("conditional")
-        gated = [cond(h > p.eps, e, sp.S.Zero) for e in raw_ev]
+        gated = [cond(h > p.wet_dry_eps, e, sp.S.Zero) for e in raw_ev]
         return ZArray(gated)
 
     def update_aux_variables(self):
@@ -264,6 +271,6 @@ class MalpassetSWE(SWE):
         v = self.variables
         p = self._parameter_symbols
         h = v.h
-        h_floor = sp.Max(h, p.eps)
+        h_floor = sp.Max(h, p.wet_dry_eps)
         denom = sqrt(h ** 4 + h_floor ** 4)
         return ZArray([sqrt(2) * h / denom])

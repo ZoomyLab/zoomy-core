@@ -228,10 +228,16 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         return [i for i in range(self.n_variables) if i not in excluded]
 
     def _eps_symbol(self):
-        """Internal helper `_eps_symbol`."""
-        # Symbolic eps parameter if the model declares one.
-        if self.model.parameters.contains("eps"):
-            return self.model.parameters.eps
+        """The canonical wet/dry threshold ``wet_dry_eps`` (REQ-48).
+
+        Returns the symbolic parameter when the model declares it (e.g.
+        MalpassetSWE → the ``wet_dry_eps`` symbol, so the threshold is
+        run-time tunable through ``parameter_values``); models that do not
+        model wetting/drying carry no such parameter and fall back to the
+        desingularisation-only ``1e-12`` literal floor.
+        """
+        if self.model.parameters.contains("wet_dry_eps"):
+            return self.model.parameters.wet_dry_eps
         return sp.Float(1e-12)
 
     def _initialize_functions(self):
