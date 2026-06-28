@@ -2,8 +2,10 @@
 
 import sympy as sp
 from sympy.printing.cxx import CXX11CodePrinter
+from sympy.printing.c import C99CodePrinter
 import re
 import os
+import types
 import itertools
 import textwrap
 from zoomy_core.misc import misc as misc
@@ -130,6 +132,23 @@ class GenericCppBase(CXX11CodePrinter):
         super().__init__(*args, **kwargs)
         self.symbol_maps = []
         self._std_regex = re.compile(r"std::([A-Za-z_]\w*)")
+        self._route_math_funcs_through_caster()
+
+    def _route_math_funcs_through_caster(self):
+        """Re-point the sympy ``_print_<mathfunc>`` dispatchers (``log`` /
+        ``exp`` / ``sin`` / …, dynamically bound by ``C99CodePrinter`` to its
+        own ``_print_math_func``) at THIS class's ``_print_math_func`` override,
+        which casts bare integer/float literal arguments to ``real_type``
+        (REQ-66 caster).  Without this rebind ``log(30)`` emits the ambiguous
+        ``log(int)`` overload.  ``_print_Abs`` keeps its dedicated override
+        (Foam ``mag``)."""
+        c99_mf = C99CodePrinter._print_math_func
+        for attr in dir(type(self)):
+            if (attr.startswith("_print_") and attr != "_print_Abs"
+                    and getattr(type(self), attr, None) is c99_mf):
+                setattr(self, attr, types.MethodType(
+                    lambda self, expr, *a, **k:
+                    type(self)._print_math_func(self, expr), self))
 
     def register_map(self, name, keys):
         """Register map."""
@@ -200,6 +219,22 @@ class GenericCppBase(CXX11CodePrinter):
         ):
             return f"({self.real_type}){printed}"
         return printed
+
+    def _print_math_func(self, expr, nest=False, known=None):
+        """Print a known C math function (``log`` / ``exp`` / ``sin`` / …) with
+        bare integer/float literal arguments cast to ``real_type`` — the same
+        REQ-66 caster used for ``Min``/``Max``.  Without it ``log(30)`` emits
+        ``Foam::log(30)`` and OpenFOAM rejects the ``log(int)`` overload as
+        ambiguous.  Multi-arg ``nest`` reductions and callable ``known``
+        printers fall back to sympy's emitter unchanged."""
+        if (not self._typed_numeric_literals) or nest:
+            return super()._print_math_func(expr, nest=nest, known=known)
+        if known is None:
+            known = self.known_functions[expr.__class__.__name__]
+        if not isinstance(known, str):
+            return super()._print_math_func(expr, nest=nest, known=known)
+        args = ", ".join(self._min_max_operand(a) for a in expr.args)
+        return f"{self._ns}{known}({args})"
 
     def _print_nested_max(self, str_args):
         """Nest std::max calls for >2 arguments: max(a, max(b, max(c, d)))."""
@@ -521,6 +556,10 @@ struct SimpleArray {
     def _print_Pow(self, expr):
         """Internal helper `_print_Pow`."""
         base, exp = expr.as_base_exp()
+        # Cast a bare numeric-literal BASE to ``real_type`` (REQ-66 caster) so
+        # ``sqrt(2)`` emits ``pow((Foam::scalar)2, …)`` not ``pow(2, …)`` — a
+        # bare-int first arg hits the ambiguous integer overload.
+        b = self._min_max_operand(base)
         if exp.is_Integer:
             n = int(exp)
             if n == 0:
@@ -529,9 +568,9 @@ struct SimpleArray {
                 return self._print(base)
             pow_func = f"{self.math_namespace}pow"
             if n < 0:
-                return f"(1.0 / {pow_func}({self._print(base)}, {abs(n)}))"
-            return f"{pow_func}({self._print(base)}, {n})"
-        return f"{self.math_namespace}pow({self._print(base)}, {self._print(exp)})"
+                return f"(1.0 / {pow_func}({b}, {abs(n)}))"
+            return f"{pow_func}({b}, {n})"
+        return f"{self.math_namespace}pow({b}, {self._print(exp)})"
 
     def doprint(self, expr, **settings):
         """Doprint."""

@@ -38,6 +38,19 @@ __all__ = [
 _DEFAULT_WET_DRY_EPS = 1e-8
 
 
+# Transcendental nodes whose ARGUMENT must never be touched by the
+# ``regularize_pow`` ``1/h -> hinv`` sweep — an ``h`` inside ``log(z/h)`` is
+# not a multiplicative factor of a denominator and must stay ``h``.
+_TRANSCENDENTAL = (
+    sp.log, sp.exp,
+    sp.sin, sp.cos, sp.tan, sp.cot, sp.sec, sp.csc,
+    sp.asin, sp.acos, sp.atan, sp.acot, sp.atan2,
+    sp.sinh, sp.cosh, sp.tanh, sp.coth,
+    sp.asinh, sp.acosh, sp.atanh,
+    sp.erf, sp.erfc,
+)
+
+
 # ── KP-desingularized inverse depth ────────────────────────────────────────
 
 def kp_hinv(h, eps):
@@ -215,12 +228,44 @@ def regularize_pow(field: Union[str, sp.Symbol], aux_name: str):
         hs = _resolve_state_symbol(sm, field)
         aux = _resolve_aux_symbol(sm, aux_name)
 
-        def _is_neg_pow(s):
-            return (isinstance(s, sp.Pow) and s.base == hs
-                    and s.exp.is_number and s.exp.is_negative)
+        def _h_multiplicity(base):
+            """Multiplicity of ``h`` as a genuine MULTIPLICATIVE factor of
+            ``base`` — ``p`` such that ``base / h**p`` is h-free.  Returns 0
+            when ``h`` is not a factor, e.g. it only appears inside a
+            transcendental arg (``log(z/h)``) or in a sum with no common
+            ``h`` (``h + 1``): those must be left untouched.  ``sp.factor``
+            pulls the common ``h`` out of an EXPANDED denominator (the
+            RoughWall ``-h·(…)²`` form) so its multiplicity is readable from
+            ``as_powers_dict``."""
+            base = sp.sympify(base)
+            if not base.has(hs):
+                return 0
+            e = sp.factor(base).as_powers_dict().get(hs, sp.S.Zero)
+            return int(e) if e.is_Integer and e > 0 else 0
 
-        def _to_aux(s):
-            return aux ** (-s.exp)
+        def _rw(e):
+            # Recursive rewrite of ``field**(-n) -> aux**n``, factoring the
+            # maximal multiplicative power of ``h`` out of a negative-power
+            # base (``h**(-n)``, ``(h**p·f)**(-n)`` AND the expanded
+            # ``(Σ h·…)**(-n)`` Add).  Transcendental nodes are returned
+            # WHOLE (never descended), so an ``h`` that lives only inside a
+            # transcendental arg (``log(z/h)``) is never rewritten — only a
+            # genuine multiplicative ``h`` factor becomes ``aux``.
+            if isinstance(e, _TRANSCENDENTAL):
+                return e
+            if (isinstance(e, sp.Pow) and e.exp.is_number
+                    and e.exp.is_negative):
+                p = _h_multiplicity(e.base)
+                if p > 0:
+                    # base = q·h**p (q h-free) ⇒ base**e = q**e·hinv**(-p·e).
+                    # Clean ``h**(-n)`` ⇒ q==1 ⇒ byte-identical to the old
+                    # ``aux**(-exp)`` rewrite.
+                    q = sp.cancel(e.base / hs ** p)
+                    return _rw(q) ** e.exp * aux ** (-p * e.exp)
+                return _rw(e.base) ** e.exp
+            if e.args:
+                return e.func(*[_rw(a) for a in e.args])
+            return e
 
         # 1. Force-materialize the lazy derived operators from the CLEAN
         #    primaries (``quasilinear_matrix`` is a lazy property; touching it
@@ -234,7 +279,8 @@ def regularize_pow(field: Union[str, sp.Symbol], aux_name: str):
         for nm in _PRIMARY_OPERATORS + _DERIVED_OPERATORS:
             M = getattr(sm, nm, None)
             if M is not None:
-                setattr(sm, nm, M.replace(_is_neg_pow, _to_aux))
+                flat = [_rw(sp.sympify(e)) for e in sp.flatten(M)]
+                setattr(sm, nm, type(M)(flat).reshape(*M.shape))
 
     _op.name = "regularize_pow"
     _op.description = f"{field}**(-n) -> {aux_name}**n"

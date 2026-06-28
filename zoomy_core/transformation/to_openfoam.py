@@ -394,6 +394,51 @@ class FoamSystemModelPrinter(GenericCppBase):
                     f"    // Qaux[{row}] ({name}) — user-supplied function "
                     f"loaded by the case directory; no computation."
                 )
+
+        # ── Algebraic auxes (e.g. the KP-desingularized ``hinv``) ──────────
+        # These are POINTWISE closures, not spatial derivatives, so the
+        # mesh-aware ``compute_derivative`` leg above never assigns them — yet
+        # every operator reads them (``Qaux[hinv]·q²`` …), so without this they
+        # stay uninitialised garbage.  Emit each non-derivative
+        # ``update_aux_variables`` row as a field-algebra assignment, AFTER the
+        # derivative auxes (a closure may read one) and before any operator
+        # consumes it.  ``Q[i]`` / ``Qaux[i]`` are ``volScalarField*`` handles
+        # here, so the state/aux symbols lower to the dereferenced ``*Q[i]`` /
+        # ``*Qaux[i]`` (OpenFOAM field algebra), mirroring the per-cell
+        # algebraic leg the numpy/jax emitters write.
+        uav = getattr(sm, "update_aux_variables", None)
+        if uav is not None and len(sp.flatten(uav)) > 0:
+            rows = sp.flatten(uav)
+            deriv_rows = {e["row"] for e in sm.aux_registry
+                          if e["kind"] in ("derivative", "limited_derivative")}
+            state_syms, aux_syms = list(sm.state), list(sm.aux_state)
+            allowed = set(state_syms) | set(aux_syms)
+            deref = [
+                {s: f"*Q[{i}]" for i, s in enumerate(state_syms)},
+                {s: f"*Qaux[{i}]" for i, s in enumerate(aux_syms)},
+            ]
+            saved_maps = self.symbol_maps
+            try:
+                self.symbol_maps = deref
+                for row in range(len(aux_syms)):
+                    if row in deriv_rows or row >= len(rows):
+                        continue
+                    expr = sp.sympify(rows[row])
+                    if expr == aux_syms[row]:
+                        continue                       # identity passthrough
+                    unknown = expr.free_symbols - allowed
+                    if unknown:
+                        raise NotImplementedError(
+                            f"update_aux_variables row {row} ({aux_syms[row]}) "
+                            f"references {unknown}; the foam field-level aux "
+                            "refresh has no parameter vector to resolve them.")
+                    lines.append(
+                        f"    // Qaux[{row}] ({aux_syms[row]}) = {expr}"
+                        "  (algebraic closure)")
+                    lines.append(f"    *Qaux[{row}] = {self.doprint(expr)};")
+            finally:
+                self.symbol_maps = saved_maps
+
         lines.append("}")
         return "\n".join(lines)
 
