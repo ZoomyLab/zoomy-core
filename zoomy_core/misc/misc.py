@@ -256,6 +256,24 @@ class ZArray(MutableDenseNDimArray):
                 new_elements.append(item)
         return ZArray(new_elements, shape=current_shape)
 
+    def replace(self, query, value, **kwargs):
+        """Element-wise ``sympy.Basic.replace`` — pattern-based substitution.
+
+        ``MutableDenseNDimArray`` defines no ``replace``; we apply sympy's
+        per-element ``replace(query, value, …)`` and rebuild, exactly as
+        :meth:`xreplace` / :meth:`subs` do.  ``query`` / ``value`` may be the
+        callable form (``lambda expr: bool`` + ``lambda expr: expr``) so a
+        whole *family* (e.g. every ``h**(-n)``) is rewritten in one pass.
+        """
+        current_shape = self.shape
+        new_elements = []
+        for item in self._array:
+            if hasattr(item, "replace"):
+                new_elements.append(item.replace(query, value, **kwargs))
+            else:
+                new_elements.append(item)
+        return ZArray(new_elements, shape=current_shape)
+
     def doit(self, **kwargs):
         """Element-wise ``.doit()`` — evaluates unevaluated Derivative
         / Integral / Function calls.  Same pattern as ``xreplace``."""
