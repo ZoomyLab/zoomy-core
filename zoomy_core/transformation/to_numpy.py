@@ -473,7 +473,13 @@ class NumpyRuntimeModel:
         # ``dt`` at call time; for the default explicit source it stays False
         # and the call signature is unchanged.
         _src = _column_to_rank1(sm.source)
-        src_needs_dt = _src is not None and DT_SYMBOL in _src.free_symbols
+        dt_in_src = _src is not None and DT_SYMBOL in _src.free_symbols
+        # A Chorin/VAM source threads ``dt`` through its PARAMETERS already; only
+        # the NSM linearized source introduces ``dt`` as a non-parameter symbol.
+        # Add the explicit ``dt`` signature field ONLY in the latter case, else the
+        # parameter ``dt`` collides with it (duplicate lambdify argument).
+        dt_in_params = bool(getattr(p_struct, "contains", lambda *_: False)("dt"))
+        src_needs_dt = dt_in_src and not dt_in_params
         _register("source", _src, upd_sig if src_needs_dt else std_sig)
         rt.source_needs_dt = bool(src_needs_dt)
         _register("source_explicit",
