@@ -884,9 +884,18 @@ class HyperbolicSolver(Solver):
         in the convective step.
         """
         has_explicit = hasattr(model, "source_explicit")
+        # The NSM ``source_treatment="linearized"`` transform bakes ``dt`` into
+        # the lowered source (``S_lin = (I − dt·J)⁻¹ S``); the runtime flags it
+        # via ``source_needs_dt`` and we thread ``dt`` exactly like the Chorin
+        # corrector threads it into ``update_variables``.  Default explicit
+        # source keeps the (Q, Qaux, p) signature unchanged.
+        source_needs_dt = getattr(model, "source_needs_dt", False)
 
         def compute_source(dt, Q, Qaux, parameters, dQ):
-            dQ = model.source(Q[:, :], Qaux[:, :], parameters)
+            if source_needs_dt:
+                dQ = model.source(Q[:, :], Qaux[:, :], parameters, dt)
+            else:
+                dQ = model.source(Q[:, :], Qaux[:, :], parameters)
             if has_explicit:
                 dQ = dQ + model.source_explicit(Q[:, :], Qaux[:, :], parameters)
             return dQ

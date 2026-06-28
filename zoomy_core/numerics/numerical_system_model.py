@@ -134,6 +134,74 @@ def _desingularize_positivity(sm, floor):
     sm.source_jacobian_wrt_aux_variables = ZArray(Ja)
 
 
+def _linearize_source(sm):
+    """Rewrite ``sm.source`` into the point-implicit (linearized) update
+
+        S_lin(Q, dt) = (I − dt·J)⁻¹ · S,
+
+    with the **consistent** source jacobian
+
+        J = ∂S/∂Q + ∂S/∂aux · ∂aux/∂Q
+          = source_jacobian_wrt_variables
+            + source_jacobian_wrt_aux_variables · (∂ update_aux_variables / ∂Q).
+
+    The per-cell linear solve is emitted as one opaque
+    :class:`zoomy_core.model.kernel_functions.solve` call per row (``A = I −
+    dt·J``, ``b = S``); every backend then consumes the transformed ``source``
+    as an ordinary source, the only backend-specific atom being ``solve`` →
+    ``np``/``jnp.linalg.solve`` / Eigen.  ``dt`` is the canonical ``DT_SYMBOL``
+    the solvers already thread into the per-cell update kernels.
+
+    A point-implicit step treats the *local* algebraic source dependence
+    implicitly; spatial-derivative aux (``compute_derivative`` rows, which carry
+    no ``update_aux_variables`` formula) stay explicit — their ∂aux/∂Q is zero
+    here, which is correct (a non-local derivative cannot be inverted per cell).
+
+    Requires a square system (``n_equations == n_state``).  Mutates ``sm`` in
+    place; the now-stale channeled source jacobians are irrelevant downstream
+    (the jacobian is baked into ``S_lin`` and consumed explicitly)."""
+    import sympy as sp
+    from zoomy_core.misc.misc import ZArray
+    from zoomy_core.model.kernel_functions import solve as _solve
+    from zoomy_core.transformation.to_numpy import DT_SYMBOL
+
+    n = sm.n_equations
+    if sm.n_state != n:
+        raise ValueError(
+            "source_treatment='linearized' requires a square system "
+            f"(n_equations == n_state); got n_equations={n}, "
+            f"n_state={sm.n_state}.")
+    if sm.source is None:
+        return
+    state = list(sm.state)
+    aux = list(sm.aux_state)
+
+    Jvar = sp.Matrix(
+        n, n, lambda i, j: sp.sympify(sm.source_jacobian_wrt_variables[i, j]))
+    # ∂aux/∂Q from the local aux-update map; None / no aux ⇒ aux is independent
+    # of Q in the point-implicit step ⇒ the channel contributes nothing.
+    uav = getattr(sm, "update_aux_variables", None)
+    if uav is not None and aux:
+        Jaux = sp.Matrix(
+            n, len(aux),
+            lambda i, j: sp.sympify(sm.source_jacobian_wrt_aux_variables[i, j]))
+        Jauxupd = sp.zeros(len(aux), n)
+        nrows = uav.shape[0]
+        for k in range(min(nrows, len(aux))):
+            fk = sp.sympify(uav[k, 0])
+            for j in range(n):
+                Jauxupd[k, j] = sp.diff(fk, state[j])
+        J = Jvar + Jaux * Jauxupd
+    else:
+        J = Jvar
+
+    A = sp.eye(n) - DT_SYMBOL * J
+    A_flat = [A[i, j] for i in range(n) for j in range(n)]
+    b_flat = [sp.sympify(sm.source[i, 0]) for i in range(n)]
+    rows = [[_solve(sp.Integer(i), *A_flat, *b_flat)] for i in range(n)]
+    sm.source = ZArray(rows)
+
+
 # ── The NSM itself ───────────────────────────────────────────────────
 
 
@@ -196,6 +264,15 @@ class NumericalSystemModel(SystemModel):
     # depth-scaled momenta).  ``ChorinSplitVAMSolverJax`` computes the
     # right list at setup time and passes it here.
     scaled_q_indices: Optional[list] = None
+    # How the NSM supplies the source to every backend solver:
+    #   "explicit"   — raw ``S`` (default, unchanged behaviour);
+    #   "linearized" — the point-implicit update ``S_lin = (I − dt·J)⁻¹ S`` with
+    #                  the consistent ``J = J_var + J_aux · (∂aux/∂Q)``.
+    # The transform happens ONCE at construction (``_linearize_source``); every
+    # backend then consumes ``source`` as an ordinary source, the only new atom
+    # being the per-cell opaque ``solve``.  This is an NSM-level knob, NOT a
+    # per-backend solver mode.
+    source_treatment: str = "explicit"
 
     # ── SystemModel identity bridge ───────────────────────────────
     @property
@@ -226,6 +303,7 @@ class NumericalSystemModel(SystemModel):
         regularization: Optional[RegularizationSpec] = None,
         additional_systems: Optional[list] = None,
         scaled_q_indices: Optional[list] = None,
+        source_treatment: str = "explicit",
     ) -> "NumericalSystemModel":
         """Build an NSM from a :class:`SystemModel` (or a :class:`Model`,
         auto-promoted via :meth:`SystemModel.from_model`).
@@ -268,6 +346,12 @@ class NumericalSystemModel(SystemModel):
             regularization = RegularizationSpec()
         if regularization.positivity_floor > 0:
             _desingularize_positivity(sm, regularization.positivity_floor)
+        if source_treatment not in ("explicit", "linearized"):
+            raise ValueError(
+                "source_treatment must be 'explicit' or 'linearized'; "
+                f"got {source_treatment!r}.")
+        if source_treatment == "linearized":
+            _linearize_source(sm)
 
         # The NSM IS-A SystemModel, so PROMOTE the frozen ``sm`` instance
         # in place — re-class it to the NSM and attach the numerics
@@ -297,6 +381,7 @@ class NumericalSystemModel(SystemModel):
         sm.scaled_q_indices = (
             list(scaled_q_indices) if scaled_q_indices is not None
             else None)
+        sm.source_treatment = source_treatment
         return sm
 
     # ── LSQ-degree resolution ─────────────────────────────────────

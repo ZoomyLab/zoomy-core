@@ -30,6 +30,28 @@ class eigensystem(sp.Function):
         return None  # always keep unevaluated
 
 
+class solve(sp.Function):
+    """``solve(idx, *A_flat, *b_flat)`` — idx-th component of the per-cell
+    linear solve ``A⁻¹ b``.  ``A`` is the row-major ``n*n`` matrix (the first
+    ``n*n`` args after ``idx``) and ``b`` the length-``n`` RHS (the last ``n``
+    args); ``n`` is inferred from the arg count (``n*n + n``).
+
+    Opaque to SymPy; numerical in each backend (``np``/``jnp.linalg.solve`` /
+    Eigen ``A.colPivHouseholderQr().solve(b)``).  The single backend-specific
+    atom of the NSM point-implicit source treatment: the linearized source
+    ``S_lin = (I − dt·J)⁻¹ S`` emits one ``solve(i, A_flat, b_flat)`` per row,
+    with ``A = I − dt·J`` and ``b = S`` — every backend then consumes the
+    transformed ``source`` as an ordinary source, the only new op being this
+    per-cell solve (mirrors the ``eigensystem`` opaque-op pattern)."""
+
+    is_commutative = True
+    is_real = True
+
+    @classmethod
+    def eval(cls, *args):
+        return None  # always keep unevaluated (opaque)
+
+
 class compute_derivative(sp.Function):
     """``compute_derivative(field, *multi_index)`` — the NON-LOCAL spatial
     derivative of ``field`` of order ``multi_index`` (e.g.

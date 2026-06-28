@@ -17,6 +17,40 @@ from zoomy_core.model.basemodel import Model
 DT_SYMBOL = sp.Symbol("dt", positive=True)
 
 _EIGENSYSTEM_CACHE = {"key": None, "out": None}
+_SOLVE_CACHE = {"key": None, "out": None}
+
+
+def _solve_numpy(idx, *args):
+    """Backend impl of the opaque ``solve`` kernel: idx-th component of the
+    per-cell linear solve ``A⁻¹ b``.  ``args`` = row-major ``A`` (n*n) followed
+    by ``b`` (n); ``n`` inferred from the count (``n*n + n``).  Vectorised over
+    the grid — each arg may be a scalar or a ``(n_cells,)`` array — so the NSM
+    point-implicit ``source`` lowers to one batched ``np.linalg.solve`` per
+    step.  The full batched solve is computed once and shared across the ``n``
+    component calls via a 1-slot id-keyed cache (lambdify passes the same array
+    objects to every ``solve(i, …)`` call within one evaluation)."""
+    m = len(args)
+    n = int(round((-1.0 + (1.0 + 4.0 * m) ** 0.5) / 2.0))
+    key = tuple(id(a) for a in args)
+    c = _SOLVE_CACHE
+    if c["key"] != key:
+        arrs = [np.asarray(a, dtype=float) for a in args]
+        ncells = max((a.shape[0] for a in arrs if a.ndim > 0), default=1)
+
+        def _col(a):
+            if a.ndim > 0 and a.shape[0] == ncells:
+                return a
+            return np.full(ncells, float(a))
+
+        cols = [_col(a) for a in arrs]
+        A = np.stack(cols[:n * n], axis=-1).reshape(ncells, n, n)
+        # Column RHS ``(ncells, n, 1)`` — unambiguous batched solve (NumPy 2.0
+        # reads a 2-D ``b`` as a matrix, so the vector RHS must be an explicit
+        # column).
+        b = np.stack(cols[n * n:], axis=-1).reshape(ncells, n, 1)
+        c["key"] = key
+        c["out"] = np.linalg.solve(A, b)[..., 0]   # (ncells, n)
+    return c["out"][:, int(idx)]
 
 
 def _eigensystem_numpy(idx, *a_flat):
@@ -60,6 +94,7 @@ class NumpyRuntimeModel:
         # is compiled.
         "compute_derivative": None,
         "eigensystem": _eigensystem_numpy,
+        "solve": _solve_numpy,
     }
     printer = "numpy"
     
@@ -429,7 +464,18 @@ class NumpyRuntimeModel:
 
         _register("flux", sm.flux, std_sig)
         _register("hydrostatic_pressure", sm.hydrostatic_pressure, std_sig)
-        _register("source", _column_to_rank1(sm.source), std_sig)
+        # ``source`` is normally a function of (Q, Qaux, p) only.  The NSM
+        # point-implicit treatment (``source_treatment="linearized"``) rewrites
+        # it into ``(I − dt·J)⁻¹ S``, so the lowered source then carries the
+        # canonical ``dt`` and is registered with the dt-bearing signature —
+        # exactly how the Chorin corrector threads ``dt`` through
+        # ``update_variables``.  ``source_needs_dt`` tells the solver to pass
+        # ``dt`` at call time; for the default explicit source it stays False
+        # and the call signature is unchanged.
+        _src = _column_to_rank1(sm.source)
+        src_needs_dt = _src is not None and DT_SYMBOL in _src.free_symbols
+        _register("source", _src, upd_sig if src_needs_dt else std_sig)
+        rt.source_needs_dt = bool(src_needs_dt)
         _register("source_explicit",
                   _column_to_rank1(sm.source_explicit), std_sig)
         _register("mass_matrix", sm.mass_matrix, std_sig)

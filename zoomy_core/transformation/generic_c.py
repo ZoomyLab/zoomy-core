@@ -109,6 +109,15 @@ class GenericCppBase(CXX11CodePrinter):
         "eigensystem": lambda p, *args: (
             "eigensystem(" + ", ".join(p.doprint(a) for a in args) + ")"
         ),
+        #   solve(idx, A..., b...)
+        #       -> the ``idx``-th component of the per-cell linear solve
+        #          ``A^{-1} b`` (A row-major n*n, b length n; n = n*n+n).  The
+        #          backend supplies the impl (Eigen
+        #          ``A.colPivHouseholderQr().solve(b)``), like ``eigensystem``.
+        #          Emitted by the NSM point-implicit source treatment.
+        "solve": lambda p, *args: (
+            "solve(" + ", ".join(p.doprint(a) for a in args) + ")"
+        ),
     }
 
     def __init__(self, *args, **kwargs):
