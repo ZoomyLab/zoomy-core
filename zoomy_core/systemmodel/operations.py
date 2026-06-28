@@ -408,6 +408,14 @@ def gate_eigenvalues_dry(eps=None):
     model's ``wet_dry_eps`` parameter when present, else
     :data:`_DEFAULT_WET_DRY_EPS` (pass ``eps=`` to override).
 
+    Also guards every fractional power of ``h`` (e.g. ``sqrt(h**5)`` from the
+    desingularized wave speed) with ``Max(., 0)`` so the wet-branch expression
+    stays finite at a transient ``h < 0`` (roundoff at the wet/dry front).  This
+    matters because a backend ``conditional`` lowered branchless
+    (``mask*a + (1-mask)*b``) computes BOTH arms, and ``NaN*0 = NaN`` would leak
+    a ``sqrt(negative)`` past the ``h > eps`` gate (REQ-74).  ``Max(.,0)`` is a
+    no-op for the physical ``h >= 0`` case, so wet wave speeds are unchanged.
+
     No-op when ``sm.eigenvalues is None`` (the model emits numerical wave
     speeds, gated by the solver instead)."""
     def _op(sm):
@@ -417,9 +425,21 @@ def gate_eigenvalues_dry(eps=None):
         h = _depth_state(sm, "gate_eigenvalues_dry")
         e_eps = _wet_dry_eps(sm, eps)
         cond = sp.Function("conditional")
-        gated = [cond(h > e_eps, sp.sympify(e), sp.S.Zero) for e in ev]
+
+        def _is_frac_pow_of_h(x):
+            # sqrt(h**5), h**(5/2), ... — fractional power whose base can go
+            # negative because it carries the depth ``h``.
+            return (isinstance(x, sp.Pow) and x.exp.is_number
+                    and not x.exp.is_integer and x.base.has(h))
+
+        def _guard(e):
+            return sp.sympify(e).replace(
+                _is_frac_pow_of_h,
+                lambda x: sp.Pow(sp.Max(x.base, sp.S.Zero), x.exp))
+
+        gated = [cond(h > e_eps, _guard(e), sp.S.Zero) for e in ev]
         sm.eigenvalues = ZArray(gated).reshape(*ev.shape)
 
     _op.name = "gate_eigenvalues_dry"
-    _op.description = "gate eigenvalues to 0 for dry cells (h < eps)"
+    _op.description = "gate eigenvalues to 0 for dry cells (h < eps); guard sqrt(h) args"
     return _op
