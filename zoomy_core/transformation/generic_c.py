@@ -1127,11 +1127,26 @@ class GenericCppModel(GenericCppBase):
             f"aux_registry entry {entry['name']!r} references unknown target "
             f"{name!r} — not found in state or aux_state.")
 
+    def _aux_field_type(self):
+        """C++ type of a field container argument (``Q`` / ``Qaux``) for the
+        field-level ``update_aux_variables`` overload — an array of per-field
+        cell-data handles.  Backends override ``aux_field_container_type``."""
+        return self.aux_field_container_type or f"{self.real_type}* const*"
+
+    def _aux_mesh_type(self):
+        """C++ type of the mesh handle for the field-level
+        ``update_aux_variables`` overload.  Backends override
+        ``aux_mesh_handle_type`` with their concrete mesh type."""
+        return self.aux_mesh_handle_type or "const ZoomyMesh&"
+
     def _emit_update_aux_variables(self):
-        """Emit the COMPLETE ``update_aux_variables(Q,Qaux,p,dt) -> (n_aux,)``
-        kernel (algebraic + spatial-derivative legs) plus the algebraic-leg
-        Jacobian.  Mirrors ``FoamSystemModelPrinter._emit_update_aux_variables``
-        but returns the recomputed aux vector in the C++ pointer-arg style.
+        """Emit the aux recompute as TWO overloads of ``update_aux_variables``:
+        the PER-CELL algebraic closure ``(Q,Qaux,p,dt) -> (n_aux,)`` (+ its
+        Jacobian) and the FIELD-LEVEL, mesh-aware derivative refresh
+        ``(Q,Qaux,dt,mesh) -> void`` (REQ-65).  The latter mirrors
+        ``FoamSystemModelPrinter._emit_update_aux_variables`` — a non-local
+        spatial derivative needs the mesh, so it CANNOT be a per-cell scalar
+        call.
 
         A SystemModel with neither an algebraic field nor any derivative-kind
         registry entry (no aux to recompute) is documented, not stubbed."""
@@ -1143,6 +1158,7 @@ class GenericCppModel(GenericCppBase):
              if e["kind"] in ("derivative", "limited_derivative")]
             if self.supports_nonlocal_derivatives else []
         )
+        deriv_rows = {e["row"] for e in deriv_entries}
 
         uav = getattr(sm, "update_aux_variables", None)
         algebraic = (
@@ -1157,35 +1173,84 @@ class GenericCppModel(GenericCppBase):
                 "no algebraic aux closure and no derivative-kind aux on this "
                 "SystemModel — nothing to recompute; aux pass through.")]
 
-        # Build the (n_aux,) recompute vector.  Default every row to its own
-        # aux Symbol (identity pass-through, lowered to ``Qaux[k]``); the
-        # algebraic field overrides all rows when present; the derivative
-        # registry overrides its rows with mesh-aware ``compute_derivative``.
+        blocks = []
+
+        # PER-CELL algebraic leg.  Every row defaults to its own aux Symbol
+        # (identity pass-through, lowered to ``Qaux[k]``); the algebraic field
+        # overrides the POINTWISE rows.  Derivative-kind rows are left as
+        # identity here — they are non-local and refreshed by the field-level
+        # overload, never per-cell (this is the REQ-65 fix: no scalar
+        # ``compute_derivative`` in the per-cell kernel).
         rows = list(sm.aux_state)
         if algebraic is not None:
             for k in range(min(n_aux, len(algebraic))):
-                rows[k] = algebraic[k]
-        for e in deriv_entries:
-            src = self._aux_source_symbol(e)
-            pad = tuple(e["multi_index"]) + (0,) * (3 - len(e["multi_index"]))
-            rows[e["row"]] = sp.Function("compute_derivative")(
-                src, sp.Integer(pad[0]), sp.Integer(pad[1]), sp.Integer(pad[2])
-            )
-
-        blocks = [self._sm_kernel(
-            "update_aux_variables", sp.Array(rows), (n_aux,),
-            ["Q", "Qaux", "p", "dt"],
-        )]
-
-        # Jacobian — algebraic leg only (compute_derivative is non-local, so it
-        # carries no pointwise local Jacobian; foam emits none either).
-        if algebraic is not None:
-            jac = sp.derive_by_array(sp.Array(algebraic), list(sm.state))
+                if k not in deriv_rows:
+                    rows[k] = algebraic[k]
+        has_pointwise_closure = any(
+            rows[k] != sm.aux_state[k] for k in range(n_aux)
+        )
+        if has_pointwise_closure:
+            blocks.append(self._sm_kernel(
+                "update_aux_variables", sp.Array(rows), (n_aux,),
+                ["Q", "Qaux", "p", "dt"],
+            ))
+            # Jacobian — pointwise (algebraic) leg only; the non-local
+            # derivative leg carries no per-cell local Jacobian (foam emits
+            # none either).
+            jac = sp.derive_by_array(sp.Array(rows), list(sm.state))
             blocks.append(self._sm_kernel(
                 "update_aux_variables_jacobian_wrt_variables",
                 jac, (n_aux, n_state), ["Q", "Qaux", "p", "dt"],
             ))
+
+        # FIELD-LEVEL, mesh-aware derivative refresh (REQ-65) — mirrors foam.
+        if deriv_entries:
+            blocks.append(self._emit_field_level_aux_update(deriv_entries))
         return blocks
+
+    def _emit_field_level_aux_update(self, deriv_entries):
+        """Field-level ``update_aux_variables(Q, Qaux, dt, mesh)`` — one
+        ``compute_derivative(Qaux[row], src[idx], dx, dy, dz, mesh)`` per
+        derivative-kind aux, mirroring ``FoamSystemModelPrinter.
+        _emit_update_aux_variables``.  ``Q`` / ``Qaux`` are arrays of per-field
+        cell-data handles (``src[idx]`` is the whole differentiated field); the
+        backend's mesh-aware ``compute_derivative`` reads its LSQ stencil from
+        ``mesh`` and writes the ``(dx,dy,dz)``-order derivative into the output
+        field.  ``src`` is ``Q`` when the differentiated field is a state
+        variable, ``Qaux`` when it is itself an aux (mirrors foam's
+        ``_resolve_source``)."""
+        sm = self.sm
+        state_names = [str(s) for s in sm.state]
+        aux_names = [str(s) for s in sm.aux_state]
+        ftype = self._aux_field_type()
+        lines = [
+            "    static inline void update_aux_variables(",
+            f"        {ftype} Q,",
+            f"        {ftype} Qaux,",
+            f"        const {self.real_type} dt,",
+            f"        {self._aux_mesh_type()} mesh)",
+            "    {",
+        ]
+        for e in deriv_entries:
+            name = e["target_name"]
+            if name in state_names:
+                src, idx = "Q", state_names.index(name)
+            elif name in aux_names:
+                src, idx = "Qaux", aux_names.index(name)
+            else:
+                raise KeyError(
+                    f"aux_registry entry {e['name']!r} references unknown "
+                    f"target {name!r} — not found in state or aux_state.")
+            mi = tuple(e["multi_index"])
+            pad = mi + (0,) * (3 - len(mi))
+            lines.append(
+                f"    // Qaux[{e['row']}] ({e['name']}) = "
+                f"D^{mi} {src}[{idx}]")
+            lines.append(
+                f"    compute_derivative(Qaux[{e['row']}], {src}[{idx}], "
+                f"{pad[0]}, {pad[1]}, {pad[2]}, mesh);")
+        lines.append("    }\n")
+        return "\n".join(lines)
 
     def _emit_initial_conditions(self):
         """Emit ``initial_condition(X,p)`` / ``initial_aux_condition(X,p)`` from
