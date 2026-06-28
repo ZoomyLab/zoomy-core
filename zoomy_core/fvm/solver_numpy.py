@@ -656,6 +656,26 @@ class HyperbolicSolver(Solver):
             bc_indices = remap[bc_indices]
         bc_fn = model.boundary_conditions
         face_centers = mesh.face_centers
+        # LOCAL algebraic aux map (e.g. ``hinv = kp_hinv(h)``).  Used to keep
+        # the GHOST (right) side of a boundary face's aux CONSISTENT with its
+        # ghost STATE: the reconstruction/BC fills the right state ``Q_R`` (the
+        # opposite cell for a periodic wrap, the ghost state for a Dirichlet /
+        # extrapolation BC) but the aux was the inner cell's for both sides.
+        # With a state-dependent aux this desyncs ``aux_R`` from ``Q_R`` so the
+        # Rusanov dissipation stops telescoping across the wrap face (the
+        # periodic mass leak).  Recomputing it from ``Q_R`` via the model's own
+        # ``update_aux_variables`` is generic for every BC type; the non-local
+        # derivative-aux rows are identity-passthrough here and keep the inner
+        # value (best available — a single ghost state has no stencil).
+        local_aux_fn = getattr(model, "update_aux_variables", None)
+
+        def _ghost_aux(q_right, qaux_inner, parameters, dt):
+            """Aux consistent with the ghost state ``q_right``."""
+            if local_aux_fn is None or not has_aux:
+                return qaux_inner
+            return np.asarray(
+                local_aux_fn(q_right, qaux_inner, parameters, dt),
+                dtype=float).reshape(-1)
 
         d_face = np.array([
             np.linalg.norm(
@@ -792,12 +812,22 @@ class HyperbolicSolver(Solver):
                 qA = Q_L[:, boundary_faces]
                 qB = Q_R[:, boundary_faces]
                 qauxI = Qaux[:, iInner_bnd] if has_aux else _EMPTY_AUX2
+                # Right-side aux consistent with the ghost state ``qB``
+                # (recomputed from ``Q_R`` so a wrapped/Dirichlet ghost carries
+                # ``aux_R = update_aux_variables(Q_R)``, not the inner aux).
+                if has_aux and local_aux_fn is not None:
+                    qauxR = np.empty_like(qauxI)
+                    for j in range(qB.shape[1]):
+                        qauxR[:, j] = _ghost_aux(
+                            qB[:, j], qauxI[:, j], parameters, dt)
+                else:
+                    qauxR = qauxI
                 n_f = normals_arr[:, boundary_faces]
                 fluct = np.asarray(runtime_numerics.numerical_fluctuations(
-                    qA, qB, qauxI, qauxI, parameters, n_f), dtype=float
+                    qA, qB, qauxI, qauxR, parameters, n_f), dtype=float
                 ).reshape(2 * n_vars, -1)
                 num_flux = np.asarray(runtime_numerics.numerical_flux(
-                    qA, qB, qauxI, qauxI, parameters, n_f), dtype=float
+                    qA, qB, qauxI, qauxR, parameters, n_f), dtype=float
                 ).reshape(n_vars, -1)
                 Dm = fluct[n_vars:]
                 np.add.at(dQ.T, iInner_bnd,
@@ -835,15 +865,18 @@ class HyperbolicSolver(Solver):
                     qA = Q_L[:, f]
                     qB = Q_R[:, f]
                     qauxA = Qaux[:, iInner_bnd[bi]] if has_aux else _EMPTY_AUX
+                    # Right-side aux consistent with the ghost state qB.
+                    qauxR = (_ghost_aux(qB, qauxA, parameters, dt)
+                             if has_aux else _EMPTY_AUX)
                     n = normals_arr[:, f]
                     fluct = np.asarray(
                         runtime_numerics.numerical_fluctuations(
-                            qA, qB, qauxA, qauxA, parameters, n
+                            qA, qB, qauxA, qauxR, parameters, n
                         ), dtype=float,
                     ).reshape(-1)
                     num_flux = np.asarray(
                         runtime_numerics.numerical_flux(
-                            qA, qB, qauxA, qauxA, parameters, n
+                            qA, qB, qauxA, qauxR, parameters, n
                         ), dtype=float,
                     ).reshape(-1)
                     Dm = fluct[n_vars:]

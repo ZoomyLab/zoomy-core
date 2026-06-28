@@ -962,7 +962,16 @@ class SystemModel:
         self._quasilinear_matrix = _to_zarray(value)
 
     def _compute_quasilinear_matrix(self):
-        """``∂F/∂Q + ∂P/∂Q + B`` — shape ``(n_eq, n_state, n_dim)``."""
+        """``∂F/∂Q + ∂P/∂Q + B`` — shape ``(n_eq, n_state, n_dim)``.
+
+        Computed from the CLEAN primaries (with a bare ``1/h``), so a wet
+        entry reads e.g. ``∂(q²/h)/∂h = −q²/h²``.  The wet/dry
+        desingularization does NOT recompute this from ``q²·hinv`` (which
+        would drop the ``−u²`` term, since ``hinv`` is an independent symbol);
+        instead :func:`zoomy_core.systemmodel.operations.regularize_pow`
+        FREEZES this clean matrix and then substitutes ``1/h**k → hinv**k``
+        into it (``−q²/h² → −q²·hinv²``), keeping the wavespeed exact and the
+        codegen factored — no ``∂kp_hinv/∂h`` Heaviside/Dirac chain term."""
         n_eq = self.n_equations
         n_st = self.n_state
         d = self.n_dim

@@ -66,10 +66,16 @@ def kp_hinv(h, eps):
     return sqrt(2) * Max(h, 0) / sqrt(h ** 4 + Max(h, eps) ** 4)
 
 
-# ── operator slots a system-level substitution must sweep ──────────────────
-# Every symbolic operator array that can carry a state/aux expression.  The
-# derived operators (``quasilinear_matrix`` / source jacobians) are NOT listed:
-# they are recomputed from these primaries by ``refresh_derived_operators``.
+# ── PHYSICAL operator slots a 1/h→hinv substitution must sweep ─────────────
+# The flux/source/diffusion/NCP/pressure/mass operators are where a bare
+# ``1/h`` corrupts the wet/dry front, so those are swept.  ``update_variables``
+# (the per-cell reconstruction / corrector projection map) and the
+# reconstruction maps are DELIBERATELY excluded: they are not wavespeed- or
+# flux-bearing, and rewriting them changes the projection update (and, for a
+# split corrector, would pull ``hinv`` into the dt-bearing update kernel).
+# The derived operators (``quasilinear_matrix`` / source jacobians) are NOT
+# listed either — they are recomputed from these primaries by
+# ``refresh_derived_operators``.
 _PRIMARY_OPERATORS = (
     "flux",
     "hydrostatic_pressure",
@@ -79,7 +85,6 @@ _PRIMARY_OPERATORS = (
     "nonconservative_matrix",
     "diffusion_matrix",
     "diffusion_matrix_explicit",
-    "update_variables",
 )
 
 
@@ -165,19 +170,46 @@ def register_aux(name: str, formula, **assumptions):
 
 # ── regularize_pow ─────────────────────────────────────────────────────────
 
+# Derived operators that carry an exact ``∂(…/h)/∂h`` term and therefore must
+# be FROZEN-THEN-SUBSTITUTED (not recomputed) by ``regularize_pow`` — see its
+# docstring.
+_DERIVED_OPERATORS = (
+    "quasilinear_matrix",
+    "eigenvalues",
+    "source_jacobian_wrt_variables",
+    "source_jacobian_wrt_aux_variables",
+)
+
+
 def regularize_pow(field: Union[str, sp.Symbol], aux_name: str):
     """Operation: replace every ``field**(-n)`` (``n > 0``) by ``aux_name**n``.
 
     The conservative change of variables ``u = q/h`` leaves raw ``h**(-1)`` /
     ``h**(-2)`` in the flux / source / NCP; near a dry front those blow up.
     This sweeps every (negative-integer) power of the state ``field`` in every
-    operator and rewrites it in terms of a desingularized auxiliary ``aux_name``
-    (typically registered via :func:`register_aux`), so e.g. ``q/h`` becomes
-    ``q·hinv``.
+    PHYSICAL operator and rewrites it in terms of a desingularized auxiliary
+    ``aux_name`` (typically registered via :func:`register_aux`), so e.g.
+    ``q/h`` becomes ``q·hinv``.
 
-    The derived operators (jacobians, quasilinear matrix) AND the eigenvalues
-    are refreshed INSIDE the operation, so the caller needs no manual
-    :meth:`SystemModel.refresh_derived_operators`.
+    FREEZE-THEN-SUBSTITUTE — why the derived operators are NOT recomputed.
+    ``aux_name`` (``hinv``) is an INDEPENDENT symbol, so once the flux holds
+    ``q²·hinv`` a fresh ``∂/∂h`` is ``0`` — the ``−u²`` wavespeed term is lost
+    and every flux-Jacobian wavespeed is corrupted (the wet 40% error).  And
+    chain-ruling it back via ``∂hinv/∂h = ∂kp_hinv/∂h`` injects a
+    ``Heaviside``/``DiracDelta`` mess into every Jacobian entry — the opposite
+    of factored codegen.  So instead we:
+
+    1. FORCE-MATERIALIZE the lazy derived operators from the CLEAN
+       (pre-substitution) primaries — ``quasilinear_matrix`` and (when present)
+       ``eigenvalues`` — so they hold the exact ``∂(q²/h)/∂h = −q²/h²``.  The
+       source jacobians are already eager (channeled / refreshed by
+       :func:`register_aux`).
+    2. SUBSTITUTE ``field**(-n) → aux_name**n`` into the physical operators
+       AND those now-frozen derived operators, so ``−q²/h² → −q²·hinv²`` (a few
+       ops, no Heaviside) while ``hinv`` stays symbolic.
+
+    No ``refresh_derived_operators`` is called (that would recompute from the
+    substituted primaries and re-drop the ``−u²`` term).
     """
     def _op(sm):
         hs = _resolve_state_symbol(sm, field)
@@ -190,17 +222,19 @@ def regularize_pow(field: Union[str, sp.Symbol], aux_name: str):
         def _to_aux(s):
             return aux ** (-s.exp)
 
-        for nm in _PRIMARY_OPERATORS:
+        # 1. Force-materialize the lazy derived operators from the CLEAN
+        #    primaries (``quasilinear_matrix`` is a lazy property; touching it
+        #    computes ``−q²/h²`` from the still-``1/h`` flux).  ``eigenvalues``
+        #    and the source jacobians are already materialized.
+        _ = sm.quasilinear_matrix
+
+        # 2. Substitute 1/h**n -> hinv**n in the physical operators AND the
+        #    frozen derived operators (so the exact h-derivative terms become
+        #    hinv-powers instead of being recomputed away).
+        for nm in _PRIMARY_OPERATORS + _DERIVED_OPERATORS:
             M = getattr(sm, nm, None)
             if M is not None:
                 setattr(sm, nm, M.replace(_is_neg_pow, _to_aux))
-
-        # Recompute quasilinear / source jacobians from the substituted
-        # primaries, then push the same substitution through the eigenvalues
-        # (cheap — no spectral re-derivation).
-        sm.refresh_derived_operators(eigenvalues=False)
-        if sm.eigenvalues is not None:
-            sm.eigenvalues = sm.eigenvalues.replace(_is_neg_pow, _to_aux)
 
     _op.name = "regularize_pow"
     _op.description = f"{field}**(-n) -> {aux_name}**n"

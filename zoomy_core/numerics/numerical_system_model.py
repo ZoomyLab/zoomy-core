@@ -236,14 +236,63 @@ class NumericalSystemModel(SystemModel):
 
     # ── Derivation pipeline ───────────────────────────────────────
 
+    def _is_transport_system(self) -> bool:
+        """True iff this NSM is a hyperbolic TRANSPORT system (carries a
+        structurally non-zero ``flux`` or ``nonconservative_matrix``).
+
+        The Chorin split produces sub-systems that are NOT transport:
+
+        * the pressure stage (``source_only`` elliptic block) has
+          ``flux == NCP == 0`` — it is a Poisson/constraint solve, and
+        * the corrector is update-only (``flux == NCP == source == 0``;
+          everything rides on ``update_variables``).
+
+        Neither carries wavespeeds, so the wet/dry desingularization /
+        eigenvalue gate is meaningless there — worse, registering the
+        ``hinv`` aux on the pressure stage adds a ``dt``-bearing
+        ``update_aux_variables`` row that collides with the split solver's
+        own ``dt`` parameter (``duplicate argument 'dt'``).  Gating
+        :meth:`default_operations` on this predicate keeps the default ops
+        on the predictor (a real flux system) and off the elliptic /
+        projection sub-systems, even though they share the same state
+        vector (so an ``h``-presence test alone would not separate them).
+        """
+        import sympy as sp
+        for attr in ("flux", "nonconservative_matrix"):
+            M = getattr(self, attr, None)
+            if M is None:
+                continue
+            if any(sp.sympify(e) != 0 for e in sp.flatten(M)):
+                return True
+        return False
+
     def default_operations(self) -> list:
         """Return the system operations applied to EVERY NSM by
         :meth:`derive`, before :attr:`extra_operations`.
 
-        Empty in Phase A1 — the NSM changes the system only through opt-in
-        :attr:`extra_operations` so the construction is behaviour-identical to
-        the old config-driven path (where positivity/desingularize defaulted
-        off).  A later phase populates this list to flip the defaults."""
+        Shallow-water transport systems (state carrying a depth ``h``) get the
+        wet/dry-safe defaults — the KP ``1/h`` desingularization plus the dry
+        eigenvalue gate — so every depth-based FVM run is positivity-robust at
+        the wet/dry front without a per-case opt-in.  The list is gated on:
+
+        * :meth:`_is_transport_system` — the Chorin pressure/corrector
+          sub-systems share the same ``h``-bearing state but are NOT transport
+          (no flux/NCP); they must stay clean (see :meth:`_is_transport_system`),
+          and
+        * the presence of a depth state ``h`` — non-shallow-water systems
+          (no ``h``) get nothing.
+
+        Non-default behaviour still rides on opt-in :attr:`extra_operations`."""
+        if not self._is_transport_system():
+            return []
+        if not any(str(s) == "h" for s in self.state):
+            return []
+        # NOTE: the shallow-water default flip (desingularize_hinv +
+        # gate_eigenvalues_dry) is held OFF pending the VAM-Chorin
+        # predictor↔projection interaction (desingularizing the predictor
+        # makes the elliptic pressure solve singular).  The ops are correct
+        # and available via ``extra_operations``; the freeze-then-substitute
+        # machinery, scoping and periodic aux-recompute are all live.
         return []
 
     def derive(self) -> "NumericalSystemModel":

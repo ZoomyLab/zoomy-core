@@ -23,6 +23,7 @@ import pytest
 
 from zoomy_core.model.models import SME
 from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
+from zoomy_core.systemmodel.operations import kp_hinv
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
 
 
@@ -72,7 +73,16 @@ def test_hswme_bound_quality_in_hyperbolic_regime(level):
         q[3:3 + level] = h * alph * [(-1) ** (j + 1)
                                      for j in range(1, level + 1)]
         Q = q.reshape(-1, 1)
+        # The NSM default-ops desingularize ``1/h → hinv`` (an INDEPENDENT aux
+        # ``hinv = kp_hinv(h)``), so the quasilinear matrix is expressed in
+        # ``hinv``; evaluating it requires a CONSISTENT aux (the solver fills it
+        # via ``update_aux_variables`` each step).  Fill the ``hinv`` row from
+        # ``h`` here; the derivative-aux rows are 0 (no spatial gradient in this
+        # single-state probe).
         Qaux = np.zeros((len(sm.aux_state), 1))
+        _aux_names = [str(s) for s in sm.aux_state]
+        if "hinv" in _aux_names:
+            Qaux[_aux_names.index("hinv"), 0] = kp_hinv(h, 1e-8)
         p = np.array(list(sm.parameter_values.values()), float)
         A = np.asarray(rt.quasilinear_matrix(Q, Qaux, p),
                        float).reshape(n_v, n_v, -1)[:, :, 0]
