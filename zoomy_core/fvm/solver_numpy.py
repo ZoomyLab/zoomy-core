@@ -319,7 +319,7 @@ class HyperbolicSolver(Solver):
     compute_dt = param.Parameter(default=None, doc="Time-stepping strategy (callable)")
     _diffusion_in_flux = True  # explicit diffusion in flux operator
     # Numerical knobs (``reconstruction.order``, ``reconstruction.limiter``,
-    # ``regularization.eigenvalue_eps``) live on the
+    # ``eigenvalue_eps``) live on the
     # :class:`NumericalSystemModel`; the solver reads ``self.nsm.*`` after
     # ``setup_simulation``.  Constructors no longer accept those kwargs —
     # pass an NSM (or a Model / SystemModel that gets auto-promoted to
@@ -347,7 +347,7 @@ class HyperbolicSolver(Solver):
         """Normalise ``model`` to a (NumericalSystemModel, source-Model)
         pair.  Auto-promotes Model / SystemModel by building an NSM
         with default specs (``ReconstructionSpec(order=1)``,
-        ``RegularizationSpec(eigenvalue_eps=1e-8)``, etc.) — to override
+        ``eigenvalue_eps=1e-8``, etc.) — to override
         defaults, build the NSM explicitly and pass that in.
 
         ``source_model`` is the *original* :class:`Model` when one was
@@ -440,7 +440,7 @@ class HyperbolicSolver(Solver):
         rt = NumpyRuntimeModel.from_system_model(symbolic_model)
         ql_fn = rt.quasilinear_matrix
         n_vars = symbolic_model.n_variables
-        eps_reg = self.nsm.regularization.eigenvalue_eps
+        eps_reg = self.nsm.eigenvalue_eps
         keys = list(symbolic_model.variables.keys())
         reg = eps_reg * np.eye(n_vars)
         if fi_h is not None and "b" in keys:

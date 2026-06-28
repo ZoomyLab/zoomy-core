@@ -30,7 +30,7 @@ Pipeline:  Model → SystemModel → NumericalSystemModel → Solver
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional, Type, Union
+from typing import Any, Optional, Type
 
 from zoomy_core.systemmodel.system_model import SystemModel
 
@@ -64,133 +64,6 @@ class DiffusionSpec:
     enabled: bool = True
     scheme: str = "crank_nicolson"
     nu: Optional[float] = None
-
-
-@dataclass
-class RegularizationSpec:
-    """Numerical regularization knobs.
-
-    ``eigenvalue_eps`` is added to the diagonal of the local
-    quasi-linear matrix before eigenvalue decomposition in the
-    numerical-eigenvalue path; without it, dry/near-dry SWE cells
-    yield ``A·n`` matrices with repeated zero eigenvalues and the
-    LAPACK eigensolve can spike spurious large modes.
-
-    ``positivity_floor`` desingularises every singular dependence of the
-    source on a positivity-constrained state (``sm.positive_state`` — e.g. the
-    k, ε moments of KESME): each ``base**p`` with ``base`` containing such a
-    state and ``p`` negative (denominator) OR non-integer (root) has its base
-    replaced by ``√(base² + floor²)``.  This keeps ν_t=C_μk²/ε finite and the
-    wall-function √k(0) real WITHOUT touching the symbolic derivation — the
-    numerical realizability safeguard lives here, in the NSM.  0 = off.
-
-    ``desingularize`` turns on the Kurganov–Petrova ``1/h`` regularization that
-    keeps dry-bed SWE/SME stable: a named ``hinv`` aux is registered with the KP
-    formula ``√2·h/√(h⁴ + max(h,eps)⁴)`` (``eps`` = the model's REQ-48
-    ``wet_dry_eps`` parameter, or :data:`_DEFAULT_DESINGULARIZE_EPS` when the
-    model carries no wetting/drying threshold), and every ``h**(-n)`` in the
-    operators is rewritten to ``hinv**n`` so the flux/source use the
-    desingularized inverse depth instead of a bare ``1/h``.  Accepts ``True``
-    (alias for ``"kp"``) or the string ``"kp"``; ``False`` / ``None`` = off
-    (default).  This is the reusable core form of the regularization that used
-    to live in the Malpasset SME case.
-    """
-    eigenvalue_eps: float = 1e-8
-    positivity_floor: float = 0.0
-    desingularize: Union[bool, str] = False
-
-
-# Default KP threshold when the model declares no ``wet_dry_eps`` (REQ-48);
-# small enough that ``hinv`` matches ``1/h`` everywhere a model without a
-# wetting/drying threshold would actually run, but non-zero so the desingularised
-# inverse depth never divides by an exactly-dry cell.
-_DEFAULT_DESINGULARIZE_EPS = 1e-8
-
-
-def _desingularize_hinv(sm, mode):
-    """Apply the KP ``1/h`` desingularization to ``sm`` in place (REQ-67).
-
-    Registers a named ``hinv`` aux carrying the Kurganov–Petrova inverse depth
-    and rewrites every ``h**(-n)`` in the operators to ``hinv**n`` — the
-    reusable core form of the per-case ``_register_hinv_aux`` the Malpasset SME
-    model used to hand-roll.  ``mode`` is ``True`` or ``"kp"`` (only the KP
-    variant exists today); anything falsy is a no-op.
-
-    ``h`` is found generically as the state variable named ``"h"``; ``eps`` is
-    the model's ``wet_dry_eps`` parameter when present, else
-    :data:`_DEFAULT_DESINGULARIZE_EPS`.
-    """
-    if not mode:
-        return
-    if isinstance(mode, str) and mode.lower() != "kp":
-        raise ValueError(
-            f"RegularizationSpec.desingularize: unknown mode {mode!r}; "
-            "expected True or 'kp'.")
-    import sympy as sp
-    from zoomy_core.systemmodel.operations import (
-        register_aux, regularize_pow, kp_hinv)
-
-    h = next((s for s in sm.state if str(s) == "h"), None)
-    if h is None:
-        raise ValueError(
-            "RegularizationSpec.desingularize: no depth state 'h' found "
-            f"(state = {[str(s) for s in sm.state]}); cannot desingularize "
-            "1/h.")
-    params = getattr(sm, "parameters", None)
-    if params is not None and params.contains("wet_dry_eps"):
-        eps = params.wet_dry_eps
-    else:
-        eps = sp.Float(_DEFAULT_DESINGULARIZE_EPS)
-
-    if not any(str(s) == "hinv" for s in sm.aux_state):
-        sm.apply(register_aux("hinv", kp_hinv(h, eps), positive=True))
-    sm.apply(regularize_pow(h, "hinv"))
-
-
-def _desingularize_positivity(sm, floor):
-    """Floor the source's singular dependence on positivity-constrained state.
-
-    For each ``base**p`` in a source row where ``base`` involves a symbol in
-    ``sm.positive_state`` and ``p`` is negative (denominator) or non-integer
-    (root), replace ``base`` by ``√(base² + floor²)``.  Recomputes
-    ``source_jacobian`` from the regularised source.  No-op if the model
-    declares no ``positive_state``."""
-    import sympy as sp
-    from zoomy_core.misc.misc import ZArray
-    protected = set(getattr(sm, "positive_state", []) or [])
-    if not protected:
-        return
-    f2 = sp.Float(floor) ** 2
-
-    def safe(expr):
-        e = sp.sympify(expr)
-        repl = {}
-        for p in e.atoms(sp.Pow):
-            if (p.exp.is_number and (p.exp < 0 or not p.exp.is_integer)
-                    and (p.base.free_symbols & protected)):
-                repl[p] = sp.Pow(sp.sqrt(p.base ** 2 + f2), p.exp)
-        return e.xreplace(repl) if repl else e
-
-    n = sm.n_equations
-    state = list(sm.state)
-    new_src = sp.zeros(n, 1)
-    for i in range(n):
-        new_src[i, 0] = safe(sm.source[i, 0])
-    sm.source = ZArray(new_src)
-    # The regularised source invalidates the channeled jacobians — re-derive
-    # both from the new source (the in-place-mutation fallback, mirroring
-    # ``SystemModel.refresh_derived_operators``).
-    aux = list(sm.aux_state)
-    J = sp.zeros(n, len(state))
-    Ja = sp.zeros(n, len(aux))
-    for i in range(n):
-        si = sp.sympify(sm.source[i, 0])
-        for j, s in enumerate(state):
-            J[i, j] = sp.diff(si, s)
-        for k, a in enumerate(aux):
-            Ja[i, k] = sp.diff(si, a)
-    sm.source_jacobian_wrt_variables = ZArray(J)
-    sm.source_jacobian_wrt_aux_variables = ZArray(Ja)
 
 
 def _linearize_source(sm):
@@ -294,7 +167,19 @@ class NumericalSystemModel(SystemModel):
     riemann: Optional[Type[Any]] = None
     reconstruction: ReconstructionSpec = field(default_factory=ReconstructionSpec)
     diffusion: DiffusionSpec = field(default_factory=DiffusionSpec)
-    regularization: RegularizationSpec = field(default_factory=RegularizationSpec)
+    # Numerical eigenvalue regularization — added to the diagonal of the local
+    # quasi-linear matrix before the LAPACK eigensolve in the numerical-wave-
+    # speed path (without it, dry/near-dry SWE cells yield ``A·n`` matrices with
+    # repeated zero eigenvalues and the eigensolve can spike spurious large
+    # modes).  This is solver config, not a system operation, so it lives as a
+    # slim NSM attribute rather than driving a ``.apply`` op.
+    eigenvalue_eps: float = 1e-8
+    # Opt-in system operations run on this NSM by :meth:`derive`, in addition to
+    # :meth:`default_operations`.  Each entry is a reusable ``op(sm)`` callable
+    # from :mod:`zoomy_core.systemmodel.operations` (e.g.
+    # ``desingularize_hinv()``); the old ``desingularize=True`` regularization
+    # opt-in is now ``extra_operations=[desingularize_hinv()]``.
+    extra_operations: list = field(default_factory=list)
     # Captured at promotion time so SDM-style derivative declarations
     # survive Model → SystemModel.  SystemModel itself has no back-
     # reference to its source Model and ``derivative_specs`` is a
@@ -349,6 +234,29 @@ class NumericalSystemModel(SystemModel):
         ``nsm._bc_source`` (== ``nsm.sm._bc_source``)."""
         return self
 
+    # ── Derivation pipeline ───────────────────────────────────────
+
+    def default_operations(self) -> list:
+        """Return the system operations applied to EVERY NSM by
+        :meth:`derive`, before :attr:`extra_operations`.
+
+        Empty in Phase A1 — the NSM changes the system only through opt-in
+        :attr:`extra_operations` so the construction is behaviour-identical to
+        the old config-driven path (where positivity/desingularize defaulted
+        off).  A later phase populates this list to flip the defaults."""
+        return []
+
+    def derive(self) -> "NumericalSystemModel":
+        """Run the operation pipeline on this NSM in place and return ``self``.
+
+        Applies ``self.default_operations() + self.extra_operations``, each a
+        reusable ``op(sm)`` callable, through the inherited
+        :meth:`SystemModel.apply` hook (so every step records its own history
+        entry and owns its derived-operator refresh)."""
+        for op in self.default_operations() + list(self.extra_operations):
+            self.apply(op)
+        return self
+
     # ── Constructors ──────────────────────────────────────────────
 
     @classmethod
@@ -359,7 +267,8 @@ class NumericalSystemModel(SystemModel):
         riemann=None,
         reconstruction: Optional[ReconstructionSpec] = None,
         diffusion: Optional[DiffusionSpec] = None,
-        regularization: Optional[RegularizationSpec] = None,
+        eigenvalue_eps: float = 1e-8,
+        extra_operations: Optional[list] = None,
         additional_systems: Optional[list] = None,
         scaled_q_indices: Optional[list] = None,
         source_treatment: str = "explicit",
@@ -373,7 +282,9 @@ class NumericalSystemModel(SystemModel):
             - ``diffusion`` → enabled if the SystemModel carries a
               non-zero ``diffusion_matrix`` and a positive ``nu``;
               otherwise disabled.
-            - ``regularization`` → ``eigenvalue_eps=1e-8``
+            - ``eigenvalue_eps`` → ``1e-8``
+            - ``extra_operations`` → ``[]`` (opt-in system ops run by
+              :meth:`derive`, e.g. ``[desingularize_hinv()]``)
 
         LSQ polynomial degree is **always** auto-derived (from
         ``sm.aux_registry`` plus any ``additional_systems``) — it is
@@ -401,12 +312,6 @@ class NumericalSystemModel(SystemModel):
             reconstruction = ReconstructionSpec()
         if diffusion is None:
             diffusion = DiffusionSpec(enabled=_diffusion_auto_enabled(sm))
-        if regularization is None:
-            regularization = RegularizationSpec()
-        if regularization.positivity_floor > 0:
-            _desingularize_positivity(sm, regularization.positivity_floor)
-        if regularization.desingularize:
-            _desingularize_hinv(sm, regularization.desingularize)
         if source_treatment not in ("explicit", "linearized"):
             raise ValueError(
                 "source_treatment must be 'explicit' or 'linearized'; "
@@ -435,7 +340,8 @@ class NumericalSystemModel(SystemModel):
         sm.riemann = riemann
         sm.reconstruction = reconstruction
         sm.diffusion = diffusion
-        sm.regularization = regularization
+        sm.eigenvalue_eps = eigenvalue_eps
+        sm.extra_operations = list(extra_operations or [])
         sm.source_derivative_specs = (
             list(source_specs) if source_specs else None)
         sm.additional_systems = list(additional_systems or [])
@@ -443,6 +349,10 @@ class NumericalSystemModel(SystemModel):
             list(scaled_q_indices) if scaled_q_indices is not None
             else None)
         sm.source_treatment = source_treatment
+        # Run the operation pipeline (default_operations() + extra_operations)
+        # on the now-promoted NSM.  Phase A1: default_operations() is empty, so
+        # this is a no-op unless the caller opted in via ``extra_operations``.
+        sm.derive()
         return sm
 
     # ── LSQ-degree resolution ─────────────────────────────────────

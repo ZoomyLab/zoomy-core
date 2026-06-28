@@ -13,7 +13,6 @@ from zoomy_core.numerics.numerical_system_model import (
     DiffusionSpec,
     NumericalSystemModel,
     ReconstructionSpec,
-    RegularizationSpec,
     to_numerical_system_model,
 )
 
@@ -21,6 +20,5 @@ __all__ = [
     "DiffusionSpec",
     "NumericalSystemModel",
     "ReconstructionSpec",
-    "RegularizationSpec",
     "to_numerical_system_model",
 ]

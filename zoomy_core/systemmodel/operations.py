@@ -20,7 +20,22 @@ import sympy as sp
 
 from zoomy_core.misc.misc import ZArray
 
-__all__ = ["register_aux", "regularize_pow", "kp_hinv"]
+__all__ = [
+    "register_aux",
+    "regularize_pow",
+    "kp_hinv",
+    "desingularize_hinv",
+    "desingularize_positivity",
+    "gate_eigenvalues_dry",
+]
+
+
+# Default wet/dry threshold when the model declares no ``wet_dry_eps``
+# parameter (REQ-48).  Small enough that the desingularized ``hinv`` matches
+# ``1/h`` everywhere a model without a wetting/drying threshold would actually
+# run, but non-zero so the desingularized inverse depth (and the dry-cell
+# eigenvalue gate) never divide by / compare against an exactly-dry cell.
+_DEFAULT_WET_DRY_EPS = 1e-8
 
 
 # ── KP-desingularized inverse depth ────────────────────────────────────────
@@ -189,4 +204,142 @@ def regularize_pow(field: Union[str, sp.Symbol], aux_name: str):
 
     _op.name = "regularize_pow"
     _op.description = f"{field}**(-n) -> {aux_name}**n"
+    return _op
+
+
+# ── desingularize_hinv ─────────────────────────────────────────────────────
+
+def _wet_dry_eps(sm, override=None):
+    """Resolve the wet/dry threshold ``eps`` for an operation.
+
+    ``override`` (when not ``None``) wins; otherwise the model's REQ-48
+    ``wet_dry_eps`` parameter is used when present, falling back to
+    :data:`_DEFAULT_WET_DRY_EPS`."""
+    if override is not None:
+        return sp.sympify(override)
+    params = getattr(sm, "parameters", None)
+    if params is not None and params.contains("wet_dry_eps"):
+        return params.wet_dry_eps
+    return sp.Float(_DEFAULT_WET_DRY_EPS)
+
+
+def _depth_state(sm, what):
+    """Return the state Symbol named ``"h"`` or raise a descriptive error."""
+    h = next((s for s in sm.state if str(s) == "h"), None)
+    if h is None:
+        raise ValueError(
+            f"{what}: no depth state 'h' found "
+            f"(state = {[str(s) for s in sm.state]}).")
+    return h
+
+
+def desingularize_hinv(mode="kp"):
+    """Operation: apply the Kurganov–Petrova ``1/h`` desingularization (REQ-67).
+
+    Registers a named ``hinv`` aux carrying the KP inverse depth
+    ``√2·h/√(h⁴ + max(h, eps)⁴)`` and rewrites every ``h**(-n)`` in the
+    operators to ``hinv**n`` so the flux/source use the desingularized inverse
+    depth instead of a bare ``1/h`` — the reusable core form of the per-case
+    ``_register_hinv_aux`` the Malpasset SME model used to hand-roll.
+
+    ``mode`` is ``True`` or ``"kp"`` (only the KP variant exists today);
+    anything falsy makes the op a no-op.  ``h`` is found generically as the
+    state named ``"h"``; ``eps`` is the model's ``wet_dry_eps`` parameter when
+    present, else :data:`_DEFAULT_WET_DRY_EPS`."""
+    def _op(sm):
+        if not mode:
+            return
+        if isinstance(mode, str) and mode.lower() != "kp":
+            raise ValueError(
+                f"desingularize_hinv: unknown mode {mode!r}; "
+                "expected True or 'kp'.")
+        h = _depth_state(sm, "desingularize_hinv")
+        eps = _wet_dry_eps(sm)
+        if not any(str(s) == "hinv" for s in sm.aux_state):
+            sm.apply(register_aux("hinv", kp_hinv(h, eps), positive=True))
+        sm.apply(regularize_pow(h, "hinv"))
+
+    _op.name = "desingularize_hinv"
+    _op.description = f"KP 1/h desingularization (mode={mode!r})"
+    return _op
+
+
+# ── desingularize_positivity ───────────────────────────────────────────────
+
+def desingularize_positivity(floor):
+    """Operation: floor the source's singular dependence on positive state.
+
+    For each ``base**p`` in a source row where ``base`` involves a symbol in
+    ``sm.positive_state`` and ``p`` is negative (denominator) or non-integer
+    (root), replace ``base`` by ``√(base² + floor²)``.  Recomputes the source
+    jacobians from the regularised source.  No-op if the model declares no
+    ``positive_state`` (this keeps ν_t=C_μk²/ε finite and the wall-function
+    √k(0) real WITHOUT touching the symbolic derivation)."""
+    def _op(sm):
+        protected = set(getattr(sm, "positive_state", []) or [])
+        if not protected:
+            return
+        f2 = sp.Float(floor) ** 2
+
+        def safe(expr):
+            e = sp.sympify(expr)
+            repl = {}
+            for p in e.atoms(sp.Pow):
+                if (p.exp.is_number and (p.exp < 0 or not p.exp.is_integer)
+                        and (p.base.free_symbols & protected)):
+                    repl[p] = sp.Pow(sp.sqrt(p.base ** 2 + f2), p.exp)
+            return e.xreplace(repl) if repl else e
+
+        n = sm.n_equations
+        state = list(sm.state)
+        new_src = sp.zeros(n, 1)
+        for i in range(n):
+            new_src[i, 0] = safe(sm.source[i, 0])
+        sm.source = ZArray(new_src)
+        # The regularised source invalidates the channeled jacobians —
+        # re-derive both from the new source (the in-place-mutation fallback,
+        # mirroring ``SystemModel.refresh_derived_operators``).
+        aux = list(sm.aux_state)
+        J = sp.zeros(n, len(state))
+        Ja = sp.zeros(n, len(aux))
+        for i in range(n):
+            si = sp.sympify(sm.source[i, 0])
+            for j, s in enumerate(state):
+                J[i, j] = sp.diff(si, s)
+            for k, a in enumerate(aux):
+                Ja[i, k] = sp.diff(si, a)
+        sm.source_jacobian_wrt_variables = ZArray(J)
+        sm.source_jacobian_wrt_aux_variables = ZArray(Ja)
+
+    _op.name = "desingularize_positivity"
+    _op.description = f"floor positive-state singularities (floor={floor})"
+    return _op
+
+
+# ── gate_eigenvalues_dry ───────────────────────────────────────────────────
+
+def gate_eigenvalues_dry(eps=None):
+    """Operation: gate the symbolic eigenvalues to 0 in dry cells (``h < eps``).
+
+    Wraps every entry ``e`` of ``sm.eigenvalues`` in ``conditional(h > eps, e,
+    0)`` so the wave speeds (and the Rusanov dissipation built from them)
+    vanish at dry cells — the reusable core form of the Malpasset SME
+    ``ev_gate``.  ``h`` is the state named ``"h"``; ``eps`` defaults to the
+    model's ``wet_dry_eps`` parameter when present, else
+    :data:`_DEFAULT_WET_DRY_EPS` (pass ``eps=`` to override).
+
+    No-op when ``sm.eigenvalues is None`` (the model emits numerical wave
+    speeds, gated by the solver instead)."""
+    def _op(sm):
+        ev = sm.eigenvalues
+        if ev is None:
+            return
+        h = _depth_state(sm, "gate_eigenvalues_dry")
+        e_eps = _wet_dry_eps(sm, eps)
+        cond = sp.Function("conditional")
+        gated = [cond(h > e_eps, sp.sympify(e), sp.S.Zero) for e in ev]
+        sm.eigenvalues = ZArray(gated).reshape(*ev.shape)
+
+    _op.name = "gate_eigenvalues_dry"
+    _op.description = "gate eigenvalues to 0 for dry cells (h < eps)"
     return _op
