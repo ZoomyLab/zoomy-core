@@ -161,6 +161,17 @@ class GenericCppBase(CXX11CodePrinter):
         indices = [self._print(i) for i in expr.indices]
         return f"{base}[{']['.join(indices)}]"
 
+    def _print_Max(self, expr):
+        """Route ``sympy.Max`` through ``_print_min_max`` so numeric-literal
+        operands are typed (``std::max((T)0, ...)``).  Overrides the sympy
+        ``_CXXCodePrinterBase._print_Max`` (which emits the bare-literal
+        ``std::max(0, ...)`` that fails to instantiate against ``real_type``)."""
+        return self._print_min_max("max", expr.args)
+
+    def _print_Min(self, expr):
+        """Route ``sympy.Min`` through ``_print_min_max`` (see ``_print_Max``)."""
+        return self._print_min_max("min", expr.args)
+
     def _print_min_max(self, func_name, args):
         """Internal helper `_print_min_max`.
 
@@ -1111,21 +1122,6 @@ class GenericCppModel(GenericCppBase):
         blocks.extend(self._emit_update_aux_variables())
         return blocks
 
-    def _aux_source_symbol(self, entry):
-        """Resolve a derivative-aux registry entry's differentiated field to
-        its SystemModel state / aux Symbol — so the kernel symbol map lowers it
-        to ``Q[i]`` / ``Qaux[i]`` (mirrors foam's ``_resolve_source``)."""
-        sm = self.sm
-        name = entry["target_name"]
-        state_names = [str(s) for s in sm.state]
-        aux_names = [str(s) for s in sm.aux_state]
-        if name in state_names:
-            return sm.state[state_names.index(name)]
-        if name in aux_names:
-            return sm.aux_state[aux_names.index(name)]
-        raise KeyError(
-            f"aux_registry entry {entry['name']!r} references unknown target "
-            f"{name!r} — not found in state or aux_state.")
 
     def _aux_field_type(self):
         """C++ type of a field container argument (``Q`` / ``Qaux``) for the
