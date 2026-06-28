@@ -659,9 +659,12 @@ class PositiveRusanov(Rusanov):
         # ``hL / eps`` instead of leaving it unchanged, which breaks
         # the cell-mean positivity decomposition of Xing & Zhang 2013
         # (J. Sci. Comput. 57(1):19-41, doi:10.1007/s10915-013-9695-y).
-        # The ``hinv`` slot — when present — gets the same FP-scale
-        # regularization for the same reason: velocity ``u = hu · hinv``
-        # would otherwise be artificially compressed in thin-water cells.
+        # NB: the ``hinv`` slot does NOT use this FP-scale floor — it must
+        # be reconstructed with the model's own desingularization (KP form,
+        # ``kp_hinv``) so that ``hinv* → 0`` as ``h* → 0`` at an Audusse
+        # near-dry face.  The naive ``1/(h*+hr_eps)`` gives ``hinv* ≈ 1e14``
+        # there, which detonates the ``hinv²·q²`` quasilinear entries in the
+        # NCP path integral (predictor blow-up).  See below.
         hr_eps = sp.Float(1e-14)
         hL_eff = sp.Max(hL, hr_eps)
         hR_eff = sp.Max(hR, hr_eps)
@@ -676,8 +679,13 @@ class PositiveRusanov(Rusanov):
             qRs[idx] = qR[idx] * hR_star / hR_eff
 
         if self.hinv_field is not None:
-            self.hinv_field.assign(qLs, qauxL, 1 / (hL_star + hr_eps))
-            self.hinv_field.assign(qRs, qauxR, 1 / (hR_star + hr_eps))
+            # Reconstruct the desingularized inverse depth with the model's
+            # KP form at the canonical wet/dry threshold — NOT the naive
+            # reciprocal (which blows up to ~1/hr_eps at a clamped dry face).
+            from zoomy_core.systemmodel.operations import kp_hinv
+            eps = self._eps_symbol()
+            self.hinv_field.assign(qLs, qauxL, kp_hinv(hL_star, eps))
+            self.hinv_field.assign(qRs, qauxR, kp_hinv(hR_star, eps))
 
         return qLs, qRs, qauxL, qauxR
 

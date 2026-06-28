@@ -287,13 +287,9 @@ class NumericalSystemModel(SystemModel):
             return []
         if not any(str(s) == "h" for s in self.state):
             return []
-        # NOTE: the shallow-water default flip (desingularize_hinv +
-        # gate_eigenvalues_dry) is held OFF pending the VAM-Chorin
-        # predictor↔projection interaction (desingularizing the predictor
-        # makes the elliptic pressure solve singular).  The ops are correct
-        # and available via ``extra_operations``; the freeze-then-substitute
-        # machinery, scoping and periodic aux-recompute are all live.
-        return []
+        from zoomy_core.systemmodel.operations import (
+            desingularize_hinv, gate_eigenvalues_dry)
+        return [desingularize_hinv(), gate_eigenvalues_dry()]
 
     def derive(self) -> "NumericalSystemModel":
         """Run the operation pipeline on this NSM in place and return ``self``.
