@@ -5,11 +5,16 @@ from zoomy_core.systemmodel.system_model import (
     SystemModel,
     register_function_slot,
 )
-from zoomy_core.systemmodel.operations import register_aux, regularize_pow
+from zoomy_core.systemmodel.operations import (
+    register_aux,
+    regularize_pow,
+    kp_hinv,
+)
 
 __all__ = [
     "SystemModel",
     "register_function_slot",
     "register_aux",
     "regularize_pow",
+    "kp_hinv",
 ]

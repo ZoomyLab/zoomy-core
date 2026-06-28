@@ -61,6 +61,11 @@ class GenericCppBase(CXX11CodePrinter):
     gpu_enabled = True
     real_type = "double"
     math_namespace = "std::"
+    # Typed-C++ backends cast bare numeric literals in ``Min``/``Max`` to
+    # ``real_type`` (``std::max((T)0, ...)``) so a literal int operand does not
+    # clash with the templated ``real_type`` (``std::max(int, double)`` fails to
+    # instantiate).  Untyped backends (JS) override this to ``False``.
+    _typed_numeric_literals = True
 
     ARG_MAPPING = {
         "variables": "Q",
@@ -157,14 +162,33 @@ class GenericCppBase(CXX11CodePrinter):
         return f"{base}[{']['.join(indices)}]"
 
     def _print_min_max(self, func_name, args):
-        """Internal helper `_print_min_max`."""
+        """Internal helper `_print_min_max`.
+
+        Numeric-literal operands are cast to ``real_type`` on typed C++
+        backends so ``Max(0, h)`` emits ``std::max((T)0, Q[1])`` rather than
+        ``std::max(0, Q[1])`` — the latter is an ``std::max(int, double)``
+        template mismatch that fails to compile.  Untyped backends (JS) keep
+        the bare literal (``Math.max(0, ...)`` is fine)."""
         if len(args) == 1:
-            return self._print(args[0])
+            return self._min_max_operand(args[0])
         if len(args) == 2:
-            return f"{self.math_namespace}{func_name}({self._print(args[0])}, {self._print(args[1])})"
-        arg0 = self._print(args[0])
+            return (f"{self.math_namespace}{func_name}"
+                    f"({self._min_max_operand(args[0])}, "
+                    f"{self._min_max_operand(args[1])})")
+        arg0 = self._min_max_operand(args[0])
         rest = self._print_min_max(func_name, args[1:])
         return f"{self.math_namespace}{func_name}({arg0}, {rest})"
+
+    def _min_max_operand(self, arg):
+        """Print one ``Min``/``Max`` operand, casting a bare numeric literal to
+        ``real_type`` on typed C++ backends (avoids the ``std::max(int,
+        double)`` mismatch); non-literal operands print unchanged."""
+        printed = self._print(arg)
+        if self._typed_numeric_literals and isinstance(
+            arg, (sp.Integer, sp.Float, sp.Rational)
+        ):
+            return f"({self.real_type}){printed}"
+        return printed
 
     def _print_nested_max(self, str_args):
         """Nest std::max calls for >2 arguments: max(a, max(b, max(c, d)))."""
@@ -811,6 +835,16 @@ class GenericCppModel(GenericCppBase):
     # mesh (a hypothetical out-parameter GPU path) sets this False and the
     # derivative leg is skipped — the algebraic aux leg still emits.
     supports_nonlocal_derivatives = True
+    # REQ-65: the FIELD-LEVEL, mesh-aware ``update_aux_variables(Q, Qaux, dt,
+    # mesh)`` overload that refreshes the spatial-derivative aux (the foam
+    # ``FoamSystemModelPrinter._emit_update_aux_variables`` analogue).  ``Q`` /
+    # ``Qaux`` are passed as arrays of per-field cell-data handles (``Q[i]`` is
+    # the i-th field over the whole mesh, NOT a single cell's scalar); ``mesh``
+    # is the backend mesh handle the LSQ ``compute_derivative`` reads its
+    # stencil from.  Backends override these with their concrete container /
+    # handle types (dmplex: a DM/section-backed view; amrex: a MultiFab view).
+    aux_field_container_type = None
+    aux_mesh_handle_type = None
     # Canonical 3D-field profile the coupling maps exchange (Phase 7):
     # ``interpolate_to_3d`` emits these slots in order; ``project_from_3d``
     # consumes them through fresh ``P3_<field>`` symbols mapped to
@@ -1034,25 +1068,30 @@ class GenericCppModel(GenericCppBase):
         * ``update_variables(Q,Qaux,p,dt)`` → ``(n_eq,)`` — pointwise state
           remap (``dt`` ignored by full models; load-bearing in a Chorin
           corrector sub-system, scattered via ``equation_to_state_index``).
-        * ``update_aux_variables(Q,Qaux,p,dt)`` → ``(n_aux,)`` — the COMPLETE
-          per-cell aux recompute, in ONE kernel, mirroring
-          ``FoamSystemModelPrinter._emit_update_aux_variables``:
+        * aux recompute, emitted as TWO overloads of ``update_aux_variables``
+          (REQ-65 — a non-local spatial derivative needs the MESH, so it is
+          NOT a per-cell scalar kernel):
 
-          - the ALGEBRAIC leg from the ``update_aux_variables`` SystemModel
-            field (pointwise closures), and
-          - the SPATIAL-DERIVATIVE leg — one ``compute_derivative(field_id,
-            dx, dy, dz)`` call per derivative-kind aux read straight from
-            ``sm.aux_registry`` (the same source foam walks).  ``field_id`` is
-            the differentiated field's accessor (``Q[i]`` / ``Qaux[i]``); the
-            backend's mesh-aware ``compute_derivative`` UserFunction returns
-            the ``(dx,dy,dz)``-order derivative on its mesh.
+          - PER-CELL ``update_aux_variables(Q,Qaux,p,dt)`` → ``(n_aux,)`` — the
+            ALGEBRAIC leg only, from the ``update_aux_variables`` SystemModel
+            field (pointwise closures, e.g. the KP-``hinv`` desingularization).
+            Derivative-kind aux rows pass through unchanged (``res[k] =
+            Qaux[k]``) — they are refreshed by the field-level overload, never
+            per-cell.  Used at face reconstruction (recompute the local closure
+            at the reconstructed state) and by the implicit-source Newton.
+          - FIELD-LEVEL ``update_aux_variables(Q,Qaux,dt,mesh)`` → ``void`` —
+            the SPATIAL-DERIVATIVE leg, mirroring
+            ``FoamSystemModelPrinter._emit_update_aux_variables``: one
+            ``compute_derivative(Qaux[row], src[idx], dx, dy, dz, mesh)`` call
+            per derivative-kind aux from ``sm.aux_registry``.  ``Q`` / ``Qaux``
+            are arrays of per-field cell-data handles; the backend's mesh-aware
+            ``compute_derivative`` (dmplex LSQ via ``Gradient.hpp``) writes the
+            ``(dx,dy,dz)``-order derivative of field ``src[idx]`` into the
+            output field ``Qaux[row]`` over the whole mesh.
 
-          Rows neither algebraic nor in the registry (aux supplied by a parent
-          system — e.g. a Chorin predictor's gradients) pass through unchanged
-          (``res[k] = Qaux[k]``), exactly like foam touching only the registry
-          slots.  The Jacobian ``(n_aux, n_state)`` is emitted only for the
-          algebraic leg (the non-local derivative leg has no pointwise local
-          Jacobian); ``dAux_dQ[k*n_dof+j]``."""
+          The Jacobian ``(n_aux, n_state)`` is emitted only for the algebraic
+          leg (the non-local derivative leg has no pointwise local Jacobian;
+          foam emits none either); ``dAux_dQ[k*n_dof+j]``."""
         sm = self.sm
         n_eq, n_state, n_aux = sm.n_equations, len(sm.state), len(sm.aux_state)
         blocks = []

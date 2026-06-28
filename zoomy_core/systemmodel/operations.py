@@ -20,7 +20,35 @@ import sympy as sp
 
 from zoomy_core.misc.misc import ZArray
 
-__all__ = ["register_aux", "regularize_pow"]
+__all__ = ["register_aux", "regularize_pow", "kp_hinv"]
+
+
+# ── KP-desingularized inverse depth ────────────────────────────────────────
+
+def kp_hinv(h, eps):
+    """Kurganov–Petrova desingularized inverse depth.
+
+        hinv = √2·h / √(h⁴ + max(h, eps)⁴)
+
+    Equals ``1/h`` for ``h ≥ eps`` but → 0 (not ``1/eps``) as ``h → 0``, so the
+    reconstructed velocity ``u = q·hinv → 0`` at a dry front instead of blowing
+    up.  This is the reusable building block behind the ``hinv`` aux: feed it to
+    :func:`register_aux` and then sweep the operators with
+    :func:`regularize_pow`::
+
+        sm.apply(register_aux("hinv", kp_hinv(h, eps), positive=True))
+        sm.apply(regularize_pow(h, "hinv"))
+
+    Works symbolically (``h`` a sympy expression) or numerically (``h`` a
+    numpy/jax array).  The numerator uses ``Max(h, 0)`` so a transient negative-h
+    cell cannot flip ``hinv`` negative (which would wrong-sign ``u = q·hinv`` and
+    the wet/dry-front wavespeeds).
+    """
+    if isinstance(h, sp.Basic) or isinstance(eps, sp.Basic):
+        Max, sqrt = sp.Max, sp.sqrt
+    else:
+        Max, sqrt = max, (lambda x: x ** 0.5)
+    return sqrt(2) * Max(h, 0) / sqrt(h ** 4 + Max(h, eps) ** 4)
 
 
 # ── operator slots a system-level substitution must sweep ──────────────────

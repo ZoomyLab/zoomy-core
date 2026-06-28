@@ -36,6 +36,8 @@ class GenericJsBase(OutParamCodePrinter):
     """
 
     math_namespace = "Math."
+    # JS is untyped — ``Math.max(0, x)`` is fine; never cast literals.
+    _typed_numeric_literals = False
 
     c_functions = {
         "conditional": lambda p, c, t, f: (
