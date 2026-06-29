@@ -65,9 +65,9 @@ def test_mass_row_is_conservative_and_bed_row_is_inert(level):
 
 def test_model_owns_wb_reconstruction_and_projection():
     """The SME registers its own WB primitive map (η = b+h, u_i = q_i/h;
-    b identity) and the profile→state projection (q_0 = h·⟨u⟩ exact for the
-    depth-averaged column contract; higher moments 0 until the ζ-resolved
-    contract lands).  The inverse map is auto-derived."""
+    b identity) and the profile→state projection (the Integral-free,
+    fixed-node Galerkin reduction q_i = h·α_i of the resolved column).  The
+    inverse map is auto-derived."""
     sm = _sm()
     b, h, q0, q1, q2, _ = _syms(sm)
     R = [_scalar(e) for e in sm.reconstruction_variables]
@@ -76,19 +76,27 @@ def test_model_owns_wb_reconstruction_and_projection():
     assert all(sp.simplify(R[2 + i] - qi/h) == 0
                for i, qi in enumerate((q0, q1, q2)))
     assert sm.state_from_reconstruction is not None
-    # project rows are the EXACT Galerkin reduction over the sampled column:
-    # q_i = (2i+1)·P3_h·∫₀¹ P3_u(ζ) φ_i(ζ) dζ.  Evaluate against a sheared
-    # test profile u(ζ) = U0 + U1·(2ζ−1): the moments come back exactly.
+    # project rows are the Integral-FREE, fixed-node Galerkin reduction of the
+    # sampled column: q_i = h·α_i, plain arithmetic in the P3_<field> samples
+    # (NO Integral).  Feed a sheared profile u(ζ) = U0 + U1·(2ζ−1) sampled at
+    # the model's fixed nodes: q_0 = h·U0 and q_1 = h·U1 come back exactly
+    # (trapezoid is exact for the linear profile), with only an O(N_z^-2)
+    # spurious q_2.
+    from sympy.core.function import AppliedUndef
     P3b, P3h = sp.symbols("P3_b P3_h", real=True)
     P = [sp.sympify(_scalar(e)) for e in sm.project_from_3d]
     assert P[0] == P3b and P[1] == P3h
-    zz = sp.Symbol("zeta", real=True)
-    U0, U1 = sp.symbols("U0 U1", real=True)
-    shear = {sp.Function("P3_u", real=True)(zz): U0 + U1 * (2 * zz - 1)}
-    proj = [sp.simplify(e.subs(shear).doit()) for e in P[2:]]
-    assert sp.simplify(proj[0] - P3h * U0) == 0      # q_0 = h·U0
-    assert sp.simplify(proj[1] - P3h * U1) == 0      # q_1 = h·U1 (exact)
-    assert sp.simplify(proj[2]) == 0                 # no spurious q_2
+    assert not any(e.has(sp.Integral) for e in P)      # Integral-free
+    U0, U1 = 0.7, -1.3
+    def _eval(row):
+        subs = {a: U0 + U1 * (2 * float(a.args[0]) - 1)
+                for a in row.atoms(AppliedUndef) if a.func.__name__ == "P3_u"}
+        subs[P3h] = 1.0                                 # h = 1
+        return float(row.subs(subs))
+    proj = [_eval(e) for e in P[2:]]
+    assert abs(proj[0] - U0) < 1e-9                     # q_0 = h·U0 (exact)
+    assert abs(proj[1] - U1) < 1e-9                     # q_1 = h·U1 (exact)
+    assert abs(proj[2]) < 1e-2                          # no spurious q_2
 
 
 def test_sme_flux_and_hydrostatic_pressure():

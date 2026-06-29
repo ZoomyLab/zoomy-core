@@ -62,6 +62,10 @@ class MLSME(BaseModel):
         default="upwind", objects=["upwind", "mean"],
         doc="DEPRECATED - use closures=[UpwindInterface()/MeanInterface()].  "
             "Shared transfer velocity u* at internal interfaces.")
+    project_nz = param.Integer(default=33, bounds=(2, None), doc=(
+        "FIXED per-layer vertical sample count for the Integral-FREE "
+        "``project_from_3d`` Galerkin reduction (trapezoid, O(N_z^-2)); see "
+        "SME.project_nz.  Each layer reduces its own sub-column to moments."))
 
     def derive_model(self):
         N = int(self.n_layers)
@@ -310,19 +314,31 @@ class MLSME(BaseModel):
         interp[5] = m.parameters.rho * m.parameters.g * ht * (1 - zeta)
         m.interpolate_rows = interp
 
-        # inverse: q_ℓ_k = (2k+1)·h·∫_{c_{ℓ-1}}^{c_ℓ} P3_<vel>(ζ)·P_k(2 ζ_loc−1) dζ
+        # inverse: q_ℓ_k = h·α_ℓ_k — the Integral-FREE, fixed-node trapezoid
+        # Galerkin reduction of each layer's sub-column.  Layer ℓ spans global
+        # ζ ∈ [c0, c1]; sample P3_<vel> at N_z LOCAL nodes t∈[0,1] mapped to the
+        # global position ζ = c0 + l_ℓ·t.  ``projection_rows`` carries the
+        # 1/∫φ_k² normalisation; the physical factor is h·l_ℓ (the dζ = l_ℓ·dt
+        # Jacobian times the layer height h·l_ℓ — matching the old
+        # (2k+1)·h·∫_{c0}^{c1} … dζ form).
+        legendre = Legendre_shifted(level=Nu + 2)
+        N_z = int(self.project_nz)
+        loc = [float(j) / (N_z - 1) for j in range(N_z)]
+        weights = [1.0 / (N_z - 1)] * N_z
+        weights[0] *= 0.5; weights[-1] *= 0.5
         P3 = {f: sp.Symbol(f"P3_{f}", real=True) for f in ("b", "h")}
         proj = {b: P3["b"], ht: P3["h"]}
         for xd in horiz:
-            P3vel = sp.Function(f"P3_{HNAME[xd]}", real=True)(zeta)
+            P3vel = sp.Function(f"P3_{HNAME[xd]}", real=True)
             for ell in range(1, N + 1):
                 lf = l_all[ell - 1].subs(par)
-                c0, c1 = cum[ell - 1].subs(par), cum[ell].subs(par)
+                c0 = cum[ell - 1].subs(par)
+                samples = [P3vel(c0 + lf * t) for t in loc]
+                rows = legendre.projection_rows(
+                    loc, weights, samples,
+                    norm=lambda _k, _lf=lf: P3["h"] * _lf)
                 for k in range(Nu + 1):
-                    proj[q_mod[ell][xd][k]] = (
-                        (2 * k + 1) * P3["h"]
-                        * sp.Integral(P3vel * sp.legendre(k, 2 * (zeta - c0) / lf - 1),
-                                      (zeta, c0, c1)))
+                    proj[q_mod[ell][xd][k]] = rows[k]
         m.project_rows = proj
 
         m.bed = b

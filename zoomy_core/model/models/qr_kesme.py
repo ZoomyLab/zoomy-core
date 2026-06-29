@@ -429,15 +429,23 @@ class QRKESME(SME):
             m.reconstruction_rows.update(
                 {qh(i, t, *horiz): qh(i, t, *horiz) / h for i in range(Nu + 1)})
 
-        # 13 — project rows (inverse of interpolate)
+        # 13 — project rows (inverse of interpolate): Integral-FREE, fixed-node
+        # trapezoid Galerkin reduction q_i = h·α_i of the sampled column (see
+        # SME.derive_model §13).  N_z uniform nodes; ``projection_rows`` carries
+        # the 1/∫φ_i² normalisation, we supply only the physical h.
+        N_z = int(self.project_nz)
+        nodes = [float(j) / (N_z - 1) for j in range(N_z)]
+        weights = [1.0 / (N_z - 1)] * N_z
+        weights[0] *= 0.5; weights[-1] *= 0.5
         P3 = {f: sp.Symbol(f"P3_{f}", real=True) for f in ("b", "h")}
         m.project_rows = {b: P3["b"], h: P3["h"]}
         for xd, qh in zip(horiz, q_heads):
-            P3vel = sp.Function(f"P3_{HNAME[xd]}", real=True)(zeta)
-            m.project_rows.update({
-                qh(i, t, *horiz): (2 * i + 1) * P3["h"]
-                * sp.Integral(P3vel * sp.legendre(i, 2 * zeta - 1), (zeta, 0, 1))
-                for i in range(Nu + 1)})
+            P3vel = sp.Function(f"P3_{HNAME[xd]}", real=True)
+            samples = [P3vel(nd) for nd in nodes]
+            rows = legendre.projection_rows(nodes, weights, samples,
+                                            norm=lambda _k: P3["h"])
+            m.project_rows.update({qh(i, t, *horiz): rows[i]
+                                   for i in range(Nu + 1)})
 
         return m
 

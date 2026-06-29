@@ -38,6 +38,7 @@ _FOAM_ARG = {
     "z": "const Foam::scalar& z",
     "profile": "const Foam::List<Foam::scalar>& profile",
     "I": "const Foam::List<Foam::scalar>& I",
+    "column": "const Foam::List<Foam::List<Foam::scalar>>& column",
 }
 
 _AXIS = ("x", "y", "z")
@@ -525,14 +526,16 @@ class FoamSystemModelPrinter(GenericCppBase):
           canonical 3D field ``[b,h,u,v,w,p]`` evaluated at every z of the
           column.  Loops the per-position kernel ``interpolate_to_3d_at``
           (from ``sm.interpolate_to_3d``; ``sm.position[2]`` → scalar ``z``).
-        * ``Model::project_from_3d(profile[6], p[, I]) -> Q`` — the inverse:
-          reduce one column back to the 2D state.  Emitted in the SAME
-          ``I[j]`` column-quadrature-accumulator form as the generic-C printer
-          (``P3_<field>`` → ``profile[i]``; every ``Integral(g(ζ),(ζ,0,1))`` →
-          an opaque ``I[j]`` the BACKEND fills from the sampled column).  No
-          per-backend special case: the C++ driver supplies ``profile`` (depth
-          reduction) and ``I`` (ζ-quadrature) and calls one kernel, exactly as
-          the generic-C / jax backends do.
+        * ``Model::project_from_3d(column, p) -> Q`` — the inverse: reduce one
+          sampled interface column back to the 2D state.  The project rows are
+          the model's Integral-FREE, fixed-node Galerkin reduction (plain
+          arithmetic in the column samples), so this lowers through the SAME
+          generic kernel path as every other operator — no ``Integral``/``I[]``
+          quadrature accumulator and no foam-only ``project_from_3d_at`` +
+          column-quadrature wrapper.  ``_lower_project_from_3d`` (shared with
+          the generic-C printer) binds each sampled value ``P3_<field>(ζ_j)``
+          to its column slot ``column[j][slot]``; the C++ driver supplies the
+          resolved ``column`` and calls this directly.
 
         interpolate_to_3d and project_from_3d are inverse on a column.  A model
         with neither defined emits nothing (uncoupled cases unchanged).
@@ -557,52 +560,13 @@ class FoamSystemModelPrinter(GenericCppBase):
                 self.symbol_maps.pop()
             blocks.append(_INTERPOLATE_COLUMN_WRAPPER)        # column wrapper
 
-        p3 = self.project_from_3d
-        if p3 is not None and len(sp.flatten(p3)) > 0:
-            rows = [sp.sympify(e) for e in sp.flatten(p3)]
-            shape = (len(rows),)
-
-            # ζ-quadrature lowering (the column contract, both directions in
-            # water-relative ζ ∈ [0,1]): every ``Integral(g(ζ), (ζ, 0, 1))``
-            # in a project row becomes a normalized-trapezoid column sum
-            # ``I[j] = Σ_k (w_k/W)·g(ζ_k)`` with ``ζ_k = z[k]`` and the
-            # sampled-profile heads ``P3_<f>(ζ) → field[k][<slot>]``.  The
-            # integrand is printed AS REGISTERED — basis, weights, everything
-            # stays the model's symbolic definition; the printer only supplies
-            # the quadrature.  Rows without Integrals lower exactly as before
-            # (depth-averaged ``profile[]``), so flat-profile models are
-            # untouched.
-            integral_atoms: list = []
-            for e in rows:
-                for a in e.atoms(sp.Integral):
-                    if a not in integral_atoms:
-                        integral_atoms.append(a)
-            int_syms = {a: sp.Symbol(f"_ZINT{j}", real=True)
-                        for j, a in enumerate(integral_atoms)}
-            rows = [e.xreplace(int_syms) for e in rows]
-
-            free = set()
-            for expr in rows:
-                if hasattr(expr, "free_symbols"):
-                    free |= expr.free_symbols
-            by_name = {str(s): s for s in free}
-            prof_map = {}
-            for i, field in enumerate(_PROFILE_3D_FIELDS):
-                sym = by_name.get(f"P3_{field}")
-                if sym is not None:
-                    prof_map[sym] = f"profile[{i}]"
-            for a, s in int_syms.items():
-                prof_map[s] = f"I[{int(str(s)[len('_ZINT'):])}]"
-            at_args = (["profile", "p", "I"] if integral_atoms
-                       else ["profile", "p"])
+        lowered = self._lower_project_from_3d(self.project_from_3d)
+        if lowered is not None:
+            rows, prof_map, at_args = lowered
             self.symbol_maps.append(prof_map)
             try:
-                # ONE kernel, the generic-C ``I[j]`` convention — no foam-only
-                # ``project_from_3d_at`` + baked column-quadrature wrapper.  The
-                # zoomyFoam C++ driver fills ``profile`` (depth reduction) and
-                # ``I`` (ζ-quadrature accumulators) and calls this directly.
                 blocks.append(self._kernel(
-                    "project_from_3d", sp.Matrix(rows), shape, at_args,
+                    "project_from_3d", sp.Matrix(rows), (len(rows),), at_args,
                 ))
             finally:
                 self.symbol_maps.pop()

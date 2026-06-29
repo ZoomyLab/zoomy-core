@@ -77,6 +77,13 @@ class SME(BaseModel):
         "closures=[KEpsilonViscosity(), RoughWall()].  Each closes one stress "
         "component (bulk / bottom / surface).  An empty list leaves tau_xz "
         "UNCLOSED (modal moments stay free)."))
+    project_nz = param.Integer(default=33, bounds=(2, None), doc=(
+        "FIXED number of vertical samples ``N_z`` for the Integral-FREE "
+        "``project_from_3d`` Galerkin reduction: the resolved (e.g. VOF) "
+        "column is sampled at ``N_z`` uniform nodes on the unit interval and "
+        "reduced to the moments by trapezoid quadrature.  Set this to the VOF "
+        "column height the coupling supplies.  Trapezoid is O(N_z^-2); raise "
+        "``project_nz`` for a tighter inverse."))
 
     def derive_model(self):
         """Build the declarative SME model (stored as ``self.derivation``) and
@@ -291,16 +298,27 @@ class SME(BaseModel):
             m.reconstruction_rows.update(
                 {qh(i, t, *horiz): qh(i, t, *horiz) / h for i in range(Nu + 1)})
 
-        # 13 — project (inverse of interpolate): q_{d,i} = (2i+1)·h·∫₀¹ u_d φ_i dζ,
-        # one sampled-profile head P3_<vel> per direction.
+        # 13 — project (inverse of interpolate): the Integral-FREE, fixed-node
+        # Galerkin reduction q_{d,i} = h·α_i of the sampled column.  N_z uniform
+        # nodes on [0,1] with trapezoid weights; the per-node samples are the
+        # SAME P3_<vel> heads the printer maps for the column, evaluated at the
+        # fixed node.  ``Basisfunction.projection_rows`` builds the plain
+        # arithmetic rows — the 1/∫φ_i² normalisation is in its denominator, so
+        # we supply only the physical h factor (q_i = h·α_i, matching the old
+        # (2i+1)·h·∫₀¹ u_d φ_i dζ).  Integral-free ⇒ every printer lowers it.
+        N_z = int(self.project_nz)
+        nodes = [float(j) / (N_z - 1) for j in range(N_z)]
+        weights = [1.0 / (N_z - 1)] * N_z
+        weights[0] *= 0.5; weights[-1] *= 0.5
         P3 = {f: sp.Symbol(f"P3_{f}", real=True) for f in ("b", "h")}
         m.project_rows = {b: P3["b"], h: P3["h"]}
         for xd, qh in zip(horiz, q_heads):
-            P3vel = sp.Function(f"P3_{HNAME[xd]}", real=True)(zeta)
-            m.project_rows.update({
-                qh(i, t, *horiz): (2 * i + 1) * P3["h"]
-                * sp.Integral(P3vel * sp.legendre(i, 2 * zeta - 1), (zeta, 0, 1))
-                for i in range(Nu + 1)})
+            P3vel = sp.Function(f"P3_{HNAME[xd]}", real=True)
+            samples = [P3vel(nd) for nd in nodes]
+            rows = legendre.projection_rows(nodes, weights, samples,
+                                            norm=lambda _k: P3["h"])
+            m.project_rows.update({qh(i, t, *horiz): rows[i]
+                                   for i in range(Nu + 1)})
 
         # hook: a turbulence subclass (KESME) adds its transported-scalar
         # balances (k, ε) now, using the conserved moments q_d (= h û_d).

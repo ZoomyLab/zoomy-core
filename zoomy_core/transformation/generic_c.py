@@ -533,6 +533,71 @@ struct SimpleArray {
         """Format accessor."""
         return f"{var_name}[{index}]"
 
+    # Canonical 3-D-field profile exchanged across a coupling interface: the
+    # column slot order ``interpolate_to_3d`` emits and ``project_from_3d``
+    # consumes.  Shared by both projection emitters (foam + generic-C).
+    _PROFILE_3D_FIELDS = ("b", "h", "u", "v", "w", "p")
+
+    def _column_accessor(self, j, slot):
+        """C accessor for the resolved column sample at vertical node ``j``,
+        canonical-profile field ``slot`` — the j-th interface column entry the
+        backend supplies to ``project_from_3d`` (``column[j][slot]``; both the
+        foam ``List<List<scalar>>`` and the generic-C ``T**`` index this way)."""
+        return f"column[{j}][{slot}]"
+
+    def _lower_project_from_3d(self, p3):
+        """Lower the model's ``project_from_3d`` rows for emission.
+
+        The model rows are now Integral-FREE, fixed-node Galerkin reductions:
+        plain arithmetic in the sampled-profile heads ``P3_<field>`` — either
+        the depth-constant ``P3_b`` / ``P3_h`` symbols, or the per-node values
+        ``P3_<field>(ζ_j)`` at the fixed quadrature nodes.  Bind each to its
+        column slot so the row lowers through the SAME generic path as any other
+        operator — no ``Integral``/``I[]`` quadrature special case.
+
+        Returns ``(rows, prof_map, at_args)`` (``prof_map`` = sample symbol →
+        column accessor) or ``None`` when there is nothing to emit.  The fixed
+        nodes are recovered from the distinct numeric ``P3_<field>(ζ_j)`` args
+        (sorted ascending = column index ``j``)."""
+        from sympy.core.function import AppliedUndef
+        if p3 is None or len(sp.flatten(p3)) == 0:
+            return None
+        rows = [sp.sympify(e) for e in sp.flatten(p3)]
+        field_slot = {f: i for i, f in enumerate(self._PROFILE_3D_FIELDS)}
+        # 1. per-node sampled values ``P3_<field>(ζ_j)`` → ``column[j][slot]``.
+        applied, node_args = [], set()
+        for e in rows:
+            for a in e.atoms(AppliedUndef):
+                nm = a.func.__name__
+                if nm.startswith("P3_") and len(a.args) == 1:
+                    applied.append(a)
+                    node_args.add(a.args[0])
+        numeric = node_args and all(
+            getattr(a, "is_number", False) for a in node_args)
+        node_index = ({v: j for j, v in enumerate(sorted(node_args, key=float))}
+                      if numeric else {})
+        sub, prof_map = {}, {}
+        for a in applied:
+            slot = field_slot.get(a.func.__name__[len("P3_"):])
+            if slot is None or a.args[0] not in node_index:
+                continue
+            j = node_index[a.args[0]]
+            s = sp.Symbol(f"_P3c_{a.func.__name__}_{j}", real=True)
+            sub[a] = s
+            prof_map[s] = self._column_accessor(j, slot)
+        rows = [e.xreplace(sub) for e in rows]
+        # 2. depth-constant heads ``P3_b`` / ``P3_h`` → the first column sample
+        #    (b, h are constant down the column).
+        free = set()
+        for e in rows:
+            free |= e.free_symbols
+        by_name = {str(s): s for s in free}
+        for field, slot in field_slot.items():
+            s = by_name.get(f"P3_{field}")
+            if s is not None:
+                prof_map[s] = self._column_accessor(0, slot)
+        return rows, prof_map, ["column", "p"]
+
     def format_assignment(self, target_name, indices, value, shape):
         """Format assignment."""
         idx = flatten_index(indices, shape)
@@ -895,11 +960,6 @@ class GenericCppModel(GenericCppBase):
     # handle types (dmplex: a DM/section-backed view; amrex: a MultiFab view).
     aux_field_container_type = None
     aux_mesh_handle_type = None
-    # Canonical 3D-field profile the coupling maps exchange (Phase 7):
-    # ``interpolate_to_3d`` emits these slots in order; ``project_from_3d``
-    # consumes them through fresh ``P3_<field>`` symbols mapped to
-    # ``profile[i]``.  Mirrors ``FoamSystemModelPrinter._PROFILE_3D_FIELDS``.
-    _PROFILE_3D_FIELDS = ("b", "h", "u", "v", "w", "p")
     # Emit the SystemModel's symbolic eigenvalue spectrum (default).  Set
     # False to emit a zero placeholder when the solver computes the
     # spectrum numerically from ``quasilinear_matrix``.
@@ -931,6 +991,10 @@ class GenericCppModel(GenericCppBase):
         with a different calling convention override this."""
         if key == "dt":
             return f"const {self.real_type} dt"
+        if key == "column":
+            # the resolved interface column ``column[N_z][n_fields]`` the
+            # depth→moment projection reduces (2-D sampled profile).
+            return f"const {self.real_type}* const* {key}"
         return f"const {self.real_type}* {key}"
 
     def _sm_signature(self, args):
@@ -1399,13 +1463,14 @@ class GenericCppModel(GenericCppBase):
           already registered (the same ``X`` convention every C++ kernel
           uses, in place of foam's scalar ``z``).  The backend loops the
           column, calling this once per sample point.
-        * ``project_from_3d(profile, p[, I]) -> Q[n_state]`` — the inverse:
-          reduce one sampled column back to the 2-D state.  The depth-average
-          enters through the ``P3_<field>`` symbols (``profile[i]``); any
-          ``Integral(g(ζ), (ζ,0,1))`` row enters through a column-quadrature
-          accumulator ``I[j]`` the backend fills.  This is the ONE shared
-          ``project_from_3d(profile, p[, I])`` structure every backend emits
-          (foam included — no per-backend ``_at`` special case).
+        * ``project_from_3d(column, p) -> Q[n_state]`` — the inverse: reduce
+          one sampled interface column back to the 2-D state.  The project rows
+          are the model's Integral-FREE, fixed-node Galerkin reduction (plain
+          arithmetic in the column samples), so this lowers through the SAME
+          generic kernel path as every other operator — no ``Integral``/``I[]``
+          quadrature accumulator.  ``_lower_project_from_3d`` (shared with the
+          foam printer) binds each sampled value ``P3_<field>(ζ_j)`` to its
+          column slot ``column[j][slot]``.
 
         Both maps are read off the SystemModel slots filled by
         ``register_group("interpolate"/"project", …)``.  A model with the
@@ -1423,44 +1488,13 @@ class GenericCppModel(GenericCppBase):
                 "interpolate_to_3d", p2, shape, ["Q", "Qaux", "p", "X"],
             ))
 
-        p3 = sm.project_from_3d
-        if p3 is not None and len(sp.flatten(p3)) > 0:
-            rows = [sp.sympify(e) for e in sp.flatten(p3)]
-            shape = (len(rows),)
-
-            # ζ-quadrature lowering: every ``Integral(g(ζ), (ζ,0,1))`` becomes
-            # a fresh ``I[j]`` accumulator the backend fills from the sampled
-            # column (the per-profile map only consumes the result).  Rows
-            # without Integrals lower exactly as the depth-averaged
-            # ``profile[]`` reduction.
-            integral_atoms: list = []
-            for e in rows:
-                for a in e.atoms(sp.Integral):
-                    if a not in integral_atoms:
-                        integral_atoms.append(a)
-            int_syms = {a: sp.Symbol(f"_ZINT{j}", real=True)
-                        for j, a in enumerate(integral_atoms)}
-            rows = [e.xreplace(int_syms) for e in rows]
-
-            free = set()
-            for expr in rows:
-                if hasattr(expr, "free_symbols"):
-                    free |= expr.free_symbols
-            by_name = {str(s): s for s in free}
-            prof_map = {}
-            for i, field in enumerate(self._PROFILE_3D_FIELDS):
-                sym = by_name.get(f"P3_{field}")
-                if sym is not None:
-                    prof_map[sym] = self.format_accessor("profile", i)
-            for a, s in int_syms.items():
-                prof_map[s] = self.format_accessor(
-                    "I", int(str(s)[len("_ZINT"):]))
-            at_args = (["profile", "p", "I"] if integral_atoms
-                       else ["profile", "p"])
+        lowered = self._lower_project_from_3d(sm.project_from_3d)
+        if lowered is not None:
+            rows, prof_map, at_args = lowered
             self.symbol_maps.append(prof_map)
             try:
                 blocks.append(self._sm_kernel(
-                    "project_from_3d", sp.Matrix(rows), shape, at_args,
+                    "project_from_3d", sp.Matrix(rows), (len(rows),), at_args,
                 ))
             finally:
                 self.symbol_maps.pop()
