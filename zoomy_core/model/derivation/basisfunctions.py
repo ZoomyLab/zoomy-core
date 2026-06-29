@@ -394,6 +394,61 @@ class Basisfunction:
             alpha[i] = np.trapz(Y * b(Z) * self.weight_eval(Z), Z)
         return alpha
 
+    def projection_rows(self, nodes, weights, samples, norm=None):
+        """Symbolic fixed-node projection of a sampled profile onto the basis.
+
+        The discrete, hand-rolled inverse of basis evaluation.  Given a column
+        sampled at ``len(nodes)`` FIXED nodes ``ζ_j`` (``nodes``) with quadrature
+        ``weights`` ``w_j`` and the per-sample input symbols ``samples``
+        (the profile values ``field(ζ_j)``), return one symbolic row per basis
+        function ``k``::
+
+            row_k = (Σ_j w_j·ω(ζ_j)·φ_k(ζ_j)·field_j)
+                    / (Σ_j w_j·ω(ζ_j)·φ_k(ζ_j)²)
+
+        i.e. the symbolic, fixed-length form of :meth:`reconstruct_alpha`
+        (``α_k = ∫ Y φ_k ω dζ / ∫ φ_k² ω dζ``), with the integrals replaced by
+        the fixed quadrature ``Σ_j w_j·(·)(ζ_j)``.  The denominator is a numeric
+        constant, so every row is PLAIN ARITHMETIC in ``samples`` — no
+        ``Integral``, no runtime loop — and every code printer lowers it for
+        free (numpy/jax/foam/dmplex alike).  This is the building block behind a
+        model's ``project_from_3d`` rows / a SystemModel set directly; the model
+        supplies its own physical normalisation (e.g. the ``h`` factor in
+        ``q_k = h·α_k``) via ``norm`` or by scaling the returned rows.
+
+        Parameters
+        ----------
+        nodes, weights, samples : equal-length sequences (length ``N_z`` — the
+            fixed column size).  ``nodes`` are the ζ samples, ``weights`` the
+            quadrature weights (e.g. trapezoid over the column, or Gauss for an
+            exact polynomial inverse), ``samples`` the input profile-value
+            symbols.
+        norm : optional per-row scaling — a callable ``norm(k)`` or a sequence
+            indexed by ``k``.  Default: ``1`` (the consistent ``1/∫φ_k²ω``
+            normalisation is already in the denominator).
+
+        Returns
+        -------
+        list of length ``len(self.basis)`` — the symbolic projection rows.
+        """
+        if not (len(nodes) == len(weights) == len(samples)):
+            raise ValueError(
+                "projection_rows: nodes, weights, samples must be equal length "
+                f"(got {len(nodes)}, {len(weights)}, {len(samples)})")
+        n = len(nodes)
+        rows = []
+        for k in range(len(self.basis)):
+            phik = [self.eval(k, nodes[j]) for j in range(n)]          # φ_k(ζ_j)
+            wj = [weights[j] * self.weight(nodes[j]) for j in range(n)]  # w_j·ω
+            num = sum(wj[j] * phik[j] * samples[j] for j in range(n))
+            den = sum(wj[j] * phik[j] * phik[j] for j in range(n))
+            row = num / den
+            if norm is not None:
+                nk = norm(k) if callable(norm) else norm[k]
+                row = nk * row
+            rows.append(sympy.expand(row))
+        return rows
+
     def get_diff_basis(self):
         """Get diff basis."""
         db = [diff(b, z) for i, b in enumerate(self.basis)]
