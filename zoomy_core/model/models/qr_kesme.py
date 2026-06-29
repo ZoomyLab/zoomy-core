@@ -374,19 +374,19 @@ class QRKESME(SME):
         _zeta_p = z_p / h
         _Cf_wall = (kap / sp.log(z_p / (m.parameters.k_s / 30))) ** 2
         _Up2 = sum(
-            (sum((qh(i, t, *horiz) / h) * sp.legendre(i, 2 * _zeta_p - 1)
+            (sum((qh(i, t, *horiz) / h) * legendre.eval(i, _zeta_p)
                  for i in range(Nu + 1))) ** 2
             for qh in _qh_wall)
         ustar2 = _Cf_wall * _Up2
         sk_wall = sp.sqrt(ustar2 / sp.sqrt(C_mu))
         se_wall = sp.sqrt(ustar2 ** sp.Rational(3, 2) / (kap * z_p))
-        sk0 = sum((SK_head(i, t, *horiz) / h) * (-1) ** i for i in range(Nk + 1))
-        se0 = sum((SE_head(i, t, *horiz) / h) * (-1) ** i for i in range(Nk + 1))
+        sk0 = sum((SK_head(i, t, *horiz) / h) * legendre.at0(i) for i in range(Nk + 1))
+        se0 = sum((SE_head(i, t, *horiz) / h) * legendre.at0(i) for i in range(Nk + 1))
         for l in range(Nk + 1):
             m.sk[l].expr = (sp.sympify(m.sk[l].expr)
-                            + tau_p * (-1) ** l * (sk0 - sk_wall))
+                            + tau_p * legendre.at0(l) * (sk0 - sk_wall))
             m.se[l].expr = (sp.sympify(m.se[l].expr)
-                            + tau_p * (-1) ** l * (se0 - se_wall))
+                            + tau_p * legendre.at0(l) * (se0 - se_wall))
 
         # 9c — resolve the deferred ⟨…⟩^N numerical brackets, the VERY LAST step
         # before extraction.  The rational closure integrals rode the whole
@@ -411,9 +411,9 @@ class QRKESME(SME):
                         for j in range(Nu + 1)})
         interp = {0: b, 1: h}
         for vi, qh in enumerate(q_heads):
-            interp[2 + vi] = sum((qh(i, t, *horiz) / h) * sp.legendre(i, 2 * zeta - 1)
+            interp[2 + vi] = sum((qh(i, t, *horiz) / h) * legendre.eval(i, zeta)
                                  for i in range(Nu + 1))
-        interp[4] = sum(sp.expand(w_closure[j].rhs.subs(cov)) * sp.legendre(j, 2 * zeta - 1)
+        interp[4] = sum(sp.expand(w_closure[j].rhs.subs(cov)) * legendre.eval(j, zeta)
                         for j in range(Nu + 2))
         interp[5] = rho * g * h * (1 - zeta)
         m.interpolate_rows = interp

@@ -177,11 +177,14 @@ class VAM(BaseModel):
         # 5b — top w/p mode closures (Escalante eq 6).  2-D: the bottom
         # kinematic is w(0) = Σ_d u_d(0)·∂_d b.
         top = Nu + 1
-        u_at0 = [sum((-1) ** j * coeff_heads[i](j, t, *horiz) for j in range(Nu + 1))
+        # bottom KBC closes the top w-mode; surface BC p(ζ=1)=0 closes the top
+        # p-mode.  Every basis value goes through the basis object: the bed value
+        # φ_j(0) (= (−1)^j for shifted Legendre) and surface value φ_j(1) (= 1).
+        u_at0 = [sum(legendre.at0(j) * coeff_heads[i](j, t, *horiz) for j in range(Nu + 1))
                  for i in range(len(horiz))]
-        w_top = (-1) ** top * (sum(u_at0[i] * DERIV[xd](b) for i, xd in enumerate(horiz))
-                               - sum((-1) ** j * wh(j, t, *horiz) for j in range(top)))
-        p_top = -sum(ph(j, t, *horiz) for j in range(top))
+        w_top = (sum(u_at0[i] * DERIV[xd](b) for i, xd in enumerate(horiz))
+                 - sum(legendre.at0(j) * wh(j, t, *horiz) for j in range(top))) / legendre.at0(top)
+        p_top = -sum(legendre.at1(j) * ph(j, t, *horiz) for j in range(top)) / legendre.at1(top)
         m.apply({wh(top, t, *horiz): w_top})
         m.apply({ph(top, t, *horiz): p_top})
 
@@ -204,18 +207,17 @@ class VAM(BaseModel):
         # ∂_y (the vertical-coupling operator just gains the second-horizontal
         # divergence + the v-advection term); the correction Δ_k is applied to
         # every horizontal momentum (field = u_d_m) and the vertical (w̃_m).
-        phis = [sp.legendre(j, 2 * zeta - 1) for j in range(Nu + 2)]
+        phis = [legendre.eval(j, zeta) for j in range(Nu + 2)]
         mus = [sp.Rational(1, 2 * j + 1) for j in range(Nu + 2)]
-        s_ = sp.Symbol("_s_omega")
         qf = [[getattr(m.functions, qn).head(j, t, *horiz) for j in range(Nu + 1)]
               for qn in QNAME]                       # qf[di][j]
         rf = [m.functions.r.head(j, t, *horiz) for j in range(Nu + 1)]
         uvel_m = [sum(qf[di][j] / h * phis[j] for j in range(Nu + 1))
                   for di in range(len(horiz))]
-        w_top_cons = ((-1) ** (Nu + 1)) * (
-            sum(sum((-1) ** j * qf[di][j] / h for j in range(Nu + 1)) * DERIV[xd](b)
+        w_top_cons = (
+            sum(sum(legendre.at0(j) * qf[di][j] / h for j in range(Nu + 1)) * DERIV[xd](b)
                 for di, xd in enumerate(horiz))
-            - sum((-1) ** j * rf[j] / h for j in range(Nu + 1)))
+            - sum(legendre.at0(j) * rf[j] / h for j in range(Nu + 1))) / legendre.at0(Nu + 1)
         wt_m = (sum(rf[j] / h * phis[j] for j in range(Nu + 1))
                 + w_top_cons * phis[Nu + 1])
         # ∂_t h = −Σ_d ∂_d(q_d_0); advection Σ_d u_d_m(ζ ∂_d h + ∂_d b)
@@ -223,8 +225,7 @@ class VAM(BaseModel):
         omega_def = (wt_m - zeta * dth
                      - sum(uvel_m[di] * (zeta * DERIV[xd](h) + DERIV[xd](b))
                            for di, xd in enumerate(horiz)))
-        omega_closed = -sum(DERIV[xd](qf[di][j])
-                            * sp.integrate(phis[j].subs(zeta, s_), (s_, 0, zeta))
+        omega_closed = -sum(DERIV[xd](qf[di][j]) * legendre.eval_psi(j, zeta)
                             for di, xd in enumerate(horiz) for j in range(1, Nu + 1))
         R_om = sp.expand(omega_closed - omega_def)
         assert sp.simplify(R_om.subs(zeta, 0)) == 0   # vanishes at the bed (KBC)
@@ -251,8 +252,11 @@ class VAM(BaseModel):
         # kept in their own atom (extraction's diffusion-branch caveat).  This
         # reproduces the Escalante flux for any Nu and any dimension.
         Pf = [m.functions.P.head(j, t, *horiz) for j in range(Nu + 1)]
+        # top pressure mode closed by p(ζ=1)=0: P_top = −Σ φ_j(1)·P_j / φ_top(1).
+        p_top_mode = (-sum(legendre.at1(j) * Pf[j] for j in range(Nu + 1))
+                      / legendre.at1(Nu + 1))
         p_zeta = (sum(Pf[j] * phis[j] for j in range(Nu + 1))
-                  - sum(Pf[j] for j in range(Nu + 1)) * phis[Nu + 1])
+                  + p_top_mode * phis[Nu + 1])
         vel_of = {mn: uvel_m[di] for di, mn in enumerate(MOM)}
         vel_of["momentum_z"] = wt_m
         bxs = [sp.Derivative(b, xd) for xd in horiz]

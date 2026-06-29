@@ -243,9 +243,14 @@ class MLSME(BaseModel):
             part = sp.expand(part.subs(sp.Derivative(ht, t), dth_glob))
             G_sol[Gf[a]] = sp.solve(part, Gf[a])[0]
 
+        # inner (per-layer) basis object — interface traces and the piecewise
+        # reconstruction evaluate it at ζ_loc∈{0,1} and at interior nodes, so the
+        # bed/surface values φ_k(0)=(−1)^k / φ_k(1)=1 go through the basis object.
+        inner_basis = Legendre_shifted(level=Nu + 2)
+
         def _trace(ell, side, xd):
             """Modal interface velocity of layer ℓ in direction xd at ζ=side."""
-            sgn = (lambda i: 1) if side == 1 else (lambda i: (-1) ** i)
+            sgn = lambda i: inner_basis.eval(i, side)
             return (sum(sgn(i) * q_mod[ell][xd][i] for i in range(Nu + 1))
                     / (l_all[ell - 1] * ht))
 
@@ -277,7 +282,7 @@ class MLSME(BaseModel):
                     # u* swap in the per-direction TRANSFER trace only
                     for a, side, sgn in ((ell, 1, +1), (ell - 1, 0, -1)):
                         if 1 <= a <= N - 1:
-                            phik = 1 if side == 1 else (-1) ** k
+                            phik = inner_basis.eval(k, side)
                             mom = mom + (sgn * phik
                                          * (_ustar(a, xd) - _trace(ell, side, xd))
                                          * Gf[a] / rho_s)
@@ -301,7 +306,7 @@ class MLSME(BaseModel):
             for ell in range(1, N + 1):
                 lf, c0 = l_all[ell - 1], cum[ell - 1]
                 zloc = (zeta - c0) / lf
-                u_l = sum((q_mod[ell][xd][k] / (lf * ht)) * sp.legendre(k, 2 * zloc - 1)
+                u_l = sum((q_mod[ell][xd][k] / (lf * ht)) * inner_basis.eval(k, zloc)
                           for k in range(Nu + 1))
                 pieces.append((u_l, (zeta <= cum[ell]) if ell < N else True))
             return sp.Piecewise(*pieces)

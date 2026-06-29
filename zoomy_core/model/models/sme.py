@@ -279,9 +279,9 @@ class SME(BaseModel):
                         for j in range(Nu + 1)})
         interp = {0: b, 1: h}
         for vi, qh in enumerate(q_heads):
-            interp[2 + vi] = sum((qh(i, t, *horiz) / h) * sp.legendre(i, 2 * zeta - 1)
+            interp[2 + vi] = sum((qh(i, t, *horiz) / h) * legendre.eval(i, zeta)
                                  for i in range(Nu + 1))
-        interp[4] = sum(sp.expand(w_closure[j].rhs.subs(cov)) * sp.legendre(j, 2 * zeta - 1)
+        interp[4] = sum(sp.expand(w_closure[j].rhs.subs(cov)) * legendre.eval(j, zeta)
                         for j in range(Nu + 2))
         interp[5] = rho * g * h * (1 - zeta)
         m.interpolate_rows = interp

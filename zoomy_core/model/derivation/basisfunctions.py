@@ -320,7 +320,21 @@ class Basisfunction:
     def eval(self, k, _z):
         """Eval."""
         return self.get(k).subs(z, _z)
-    
+
+    def at0(self, k):
+        """Value of basis function ``k`` at the bottom of the layer ``ζ=0``.
+
+        Thin alias for ``eval(k, 0)`` — the basis-agnostic replacement for the
+        hard-coded shifted-Legendre bed value ``(-1)**k``."""
+        return self.eval(k, self.bounds()[0])
+
+    def at1(self, k):
+        """Value of basis function ``k`` at the top / free surface ``ζ=1``.
+
+        Thin alias for ``eval(k, 1)`` — the basis-agnostic replacement for the
+        hard-coded shifted-Legendre surface value ``1``."""
+        return self.eval(k, self.bounds()[1])
+
     def eval_psi(self, k, _z):
         """Eval psi."""
         z = sympy.Symbol('z')

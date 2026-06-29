@@ -112,9 +112,13 @@ class MLVAM(BaseModel):
         lam_s, nu_s = sp.symbols("lambda_s nu", positive=True)
         rho_s = sp.Symbol("rho", positive=True)
 
-        phis = [sp.legendre(j, 2 * zeta - 1) for j in range(top + 1)]
+        # inner (per-layer) basis object: the per-layer modal reconstruction,
+        # top-mode closures and interface traces all go through it, so the
+        # bed/surface values φ_k(0)=(−1)^k / φ_k(1)=1 and the running integral
+        # ∫₀^ζ φ_j are basis primitives rather than hard-coded Legendre forms.
+        inner_basis = Legendre_shifted(level=Nu + 2)
+        phis = [inner_basis.eval(j, zeta) for j in range(top + 1)]
         mus = [sp.Rational(1, 2 * j + 1) for j in range(top + 1)]
-        s_om = sp.Symbol("_s_omega")
 
         def _zint01(e):
             poly = sp.Poly(sp.expand(e.doit()), zeta)
@@ -227,22 +231,24 @@ class MLVAM(BaseModel):
             #   Σ_j (−1)^j ŵ_j = w_bot  →  closes ŵ_top
             # top-pressure trace (downward convention):
             #   Σ_j p̂_j = p_top_trace  →  closes p̂_top
-            u_at0 = [sum((-1) ** j * coeff_heads[i](j, t, *horiz)
+            u_at0 = [sum(inner_basis.at0(j) * coeff_heads[i](j, t, *horiz)
                          for j in range(Nu + 1)) for i in range(len(horiz))]
             w_bot = (sp.Derivative(z_bot, t).doit().subs(sp.Derivative(b, t), 0)
                      + sum(u_at0[i] * DERIV[xd](z_bot)
                            for i, xd in enumerate(horiz))
                      + G_bot / rl)
-            w_top_mode = (-1) ** top * (
-                w_bot - sum((-1) ** j * wh(j, t, *horiz) for j in range(top)))
-            p_top_mode = p_top_trace_full - sum(
-                P_heads[ell - 1](j, t, *horiz) for j in range(top))
+            w_top_mode = (
+                w_bot - sum(inner_basis.at0(j) * wh(j, t, *horiz)
+                            for j in range(top))) / inner_basis.at0(top)
+            p_top_mode = (p_top_trace_full
+                          - sum(inner_basis.at1(j) * P_heads[ell - 1](j, t, *horiz)
+                                for j in range(top))) / inner_basis.at1(top)
             ml.apply({wh(top, t, *horiz): w_top_mode})
             ml.apply({P_heads[ell - 1](top, t, *horiz): p_top_mode})
             p_bot_trace_full = sp.expand(
-                sum((-1) ** j * P_heads[ell - 1](j, t, *horiz)
+                sum(inner_basis.at0(j) * P_heads[ell - 1](j, t, *horiz)
                     for j in range(top))
-                + (-1) ** top * p_top_mode)
+                + inner_basis.at0(top) * p_top_mode)
 
             for i, xd in enumerate(horiz):
                 ml.apply(ChangeOfVariables(shat(xd, ell), qname(xd, ell),
@@ -271,13 +277,14 @@ class MLVAM(BaseModel):
             rfm = [sp.Function(f"r_{ell}", real=True)(j, t, *horiz)
                    for j in range(Nu + 1)]
             dt_hl = sp.sympify(h_eq.rhs)
-            u_at0_c = [sum((-1) ** j * qfm[di][j] for j in range(Nu + 1)) / h_l
+            u_at0_c = [sum(inner_basis.at0(j) * qfm[di][j] for j in range(Nu + 1)) / h_l
                        for di in range(len(horiz))]
             zb_t = sp.Derivative(z_bot, t).doit().subs(sp.Derivative(b, t), 0)
             w_bot_c = (zb_t + sum(u_at0_c[di] * DERIV[xd](z_bot)
                                   for di, xd in enumerate(horiz)) + G_bot / rl)
-            w_top_c = (-1) ** top * (
-                w_bot_c - sum((-1) ** j * rfm[j] for j in range(top)) / h_l)
+            w_top_c = (
+                w_bot_c - sum(inner_basis.at0(j) * rfm[j] for j in range(top)) / h_l
+                ) / inner_basis.at0(top)
             uvel_m = [sum(qfm[di][j] / h_l * phis[j] for j in range(Nu + 1))
                       for di in range(len(horiz))]
             wt_m = (sum(rfm[j] / h_l * phis[j] for j in range(Nu + 1))
@@ -290,8 +297,7 @@ class MLVAM(BaseModel):
                 G_bot / rl
                 - zeta * (dt_hl + sum(DERIV[xd](qfm[di][0])
                                       for di, xd in enumerate(horiz)))
-                - sum(DERIV[xd](qfm[di][j])
-                      * sp.integrate(phis[j].subs(zeta, s_om), (s_om, 0, zeta))
+                - sum(DERIV[xd](qfm[di][j]) * inner_basis.eval_psi(j, zeta)
                       for di, xd in enumerate(horiz) for j in range(1, Nu + 1)))
             R_om = sp.expand(omega_closed - omega_def)
             assert sp.simplify(R_om.subs(zeta, 0)) == 0, (
@@ -366,7 +372,7 @@ class MLVAM(BaseModel):
             G_sol[Gf[a]] = sp.solve(part, Gf[a])[0]
 
         def _trace(ell, side, xd):
-            sgn = (lambda i: 1) if side == 1 else (lambda i: (-1) ** i)
+            sgn = lambda i: inner_basis.eval(i, side)
             return (sum(sgn(i) * q_mod[ell][xd][i] for i in range(Nu + 1))
                     / (l_all[ell - 1] * ht))
 
@@ -394,7 +400,7 @@ class MLVAM(BaseModel):
                     row = sp.expand(row).subs(sp.Derivative(ht, t), dth_glob)
                     for a, side, sgn in ((ell, 1, +1), (ell - 1, 0, -1)):
                         if 1 <= a <= N - 1:
-                            phik = 1 if side == 1 else (-1) ** k
+                            phik = inner_basis.eval(k, side)
                             row = row + (sgn * phik
                                          * (_ustar(a, xd) - _trace(ell, side, xd))
                                          * Gf[a] / rho_s)

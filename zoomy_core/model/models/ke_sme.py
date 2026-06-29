@@ -311,13 +311,13 @@ class KESME(SME):
         ustar2 = g * h * m.parameters.e_x
         k_wall = ustar2 / sp.sqrt(C_mu)
         eps_wall = ustar2 ** sp.Rational(3, 2) / (kap * z_p)
-        k0 = sum((K_head(i, t, *horiz) / h) * (-1) ** i for i in range(Nk + 1))
-        e0 = sum((E_head(i, t, *horiz) / h) * (-1) ** i for i in range(Nk + 1))
+        k0 = sum((K_head(i, t, *horiz) / h) * legendre.at0(i) for i in range(Nk + 1))
+        e0 = sum((E_head(i, t, *horiz) / h) * legendre.at0(i) for i in range(Nk + 1))
         for l in range(Nk + 1):
             m.k[l].expr = (sp.sympify(m.k[l].expr)
-                           + tau_p * (-1) ** l * (k0 - k_wall))
+                           + tau_p * legendre.at0(l) * (k0 - k_wall))
             m.varepsilon[l].expr = (sp.sympify(m.varepsilon[l].expr)
-                                    + tau_p * (-1) ** l * (e0 - eps_wall))
+                                    + tau_p * legendre.at0(l) * (e0 - eps_wall))
 
         # 10 — vertical reconstruction → interpolate
         q_heads = [getattr(m.functions, qn).head for qn in QNAME]
@@ -327,9 +327,9 @@ class KESME(SME):
                         for j in range(Nu + 1)})
         interp = {0: b, 1: h}
         for vi, qh in enumerate(q_heads):
-            interp[2 + vi] = sum((qh(i, t, *horiz) / h) * sp.legendre(i, 2 * zeta - 1)
+            interp[2 + vi] = sum((qh(i, t, *horiz) / h) * legendre.eval(i, zeta)
                                  for i in range(Nu + 1))
-        interp[4] = sum(sp.expand(w_closure[j].rhs.subs(cov)) * sp.legendre(j, 2 * zeta - 1)
+        interp[4] = sum(sp.expand(w_closure[j].rhs.subs(cov)) * legendre.eval(j, zeta)
                         for j in range(Nu + 2))
         interp[5] = rho * g * h * (1 - zeta)
         m.interpolate_rows = interp
