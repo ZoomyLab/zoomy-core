@@ -208,7 +208,9 @@ class VAM(BaseModel):
         # divergence + the v-advection term); the correction Δ_k is applied to
         # every horizontal momentum (field = u_d_m) and the vertical (w̃_m).
         phis = [legendre.eval(j, zeta) for j in range(Nu + 2)]
-        mus = [sp.Rational(1, 2 * j + 1) for j in range(Nu + 2)]
+        # μ_j = ⟨φ_j, φ_j⟩, the basis Gram-norm (1/(2j+1) for shifted Legendre);
+        # read off the basis, not hardcoded — the projection divides by it.
+        mus = [legendre.gram(j, j) for j in range(Nu + 2)]
         qf = [[getattr(m.functions, qn).head(j, t, *horiz) for j in range(Nu + 1)]
               for qn in QNAME]                       # qf[di][j]
         rf = [m.functions.r.head(j, t, *horiz) for j in range(Nu + 1)]
@@ -272,7 +274,8 @@ class VAM(BaseModel):
                     press = (p_zeta / rho if (fam in MOM and MOM[e] == fam)
                              else sp.S.Zero)
                     integrand = vel_row * uvel_m[e] + press
-                    Fk = sp.expand((2 * kk + 1) * h * _zint01(phis[kk] * integrand))
+                    Fk = sp.expand(h / legendre.gram(kk, kk)
+                                   * _zint01(phis[kk] * integrand))
                     F_bx = sum((tm for tm in sp.Add.make_args(Fk)
                                 if any(tm.has(bxd) for bxd in bxs)), sp.S.Zero)
                     for F in (Fk - F_bx, F_bx):      # bed-free, then bed-slope

@@ -118,7 +118,9 @@ class MLVAM(BaseModel):
         # ∫₀^ζ φ_j are basis primitives rather than hard-coded Legendre forms.
         inner_basis = Legendre_shifted(level=Nu + 2)
         phis = [inner_basis.eval(j, zeta) for j in range(top + 1)]
-        mus = [sp.Rational(1, 2 * j + 1) for j in range(top + 1)]
+        # μ_j = ⟨φ_j, φ_j⟩, the basis Gram-norm (1/(2j+1) for shifted Legendre);
+        # read off the basis, not hardcoded — the projection divides by it.
+        mus = [inner_basis.gram(j, j) for j in range(top + 1)]
 
         def _zint01(e):
             poly = sp.Poly(sp.expand(e.doit()), zeta)
@@ -328,10 +330,12 @@ class MLVAM(BaseModel):
                         if di == e:
                             integ = integ + p_zeta / rl
                         flux_F[(f"momentum_{CN[xd]}", k2, xe)] = (
-                            (2 * k2 + 1) * h_l * _zint01(phis[k2] * integ))
+                            h_l / inner_basis.gram(k2, k2)
+                            * _zint01(phis[k2] * integ))
                 for e, xe in enumerate(horiz):
                     flux_F[("momentum_z", k2, xe)] = (
-                        (2 * k2 + 1) * h_l * _zint01(phis[k2] * (w_bulk * uvel_m[e])))
+                        h_l / inner_basis.gram(k2, k2)
+                        * _zint01(phis[k2] * (w_bulk * uvel_m[e])))
 
             cont = sp.expand(ml.mass[0].expr)
             constraints = [sp.expand(ml.mass[k].expr) for k in range(1, Nu + 2)]

@@ -317,6 +317,28 @@ class Basisfunction:
         """Get."""
         return self.basis[k]
 
+    def gram(self, i, j):
+        """Galerkin mass-matrix entry ``⟨φ_i, φ_j⟩ = ∫_bounds ω·φ_i·φ_j d(ζ)``.
+
+        The basis-derived projection norm: a modal Galerkin coefficient is
+        ``a_k = ⟨φ_k, f⟩ / gram(k, k)`` for an orthogonal basis and
+        ``a = Gram⁻¹·⟨φ, f⟩`` (off-diagonal entries from this same method) for a
+        dense-Gram one — so a derivation reads its normalisation off THIS basis
+        instead of hardcoding the shifted-Legendre ``1/(2k+1)``.
+
+        Resolved through the SAME path the framework uses everywhere: the
+        orthogonality closed form (:meth:`closed_form_bracket`, ``Gram(i,j) →
+        δ_{ij}/(2j+1)`` for shifted Legendre) when the basis supplies one, else
+        the generic quadrature of :meth:`evaluate_bracket` against the basis
+        weight.  For shifted Legendre this evaluates to ``1/(2k+1)`` on the
+        diagonal."""
+        cf = self.closed_form_bracket("Gram", (i, j))
+        if cf is not None:
+            return sympy.sympify(cf)
+        return self.evaluate_bracket(
+            self.weight(z) * self.phi_fn(i, z) * self.phi_fn(j, z),
+            z, *self.bounds())
+
     def eval(self, k, _z):
         """Eval."""
         return self.get(k).subs(z, _z)
