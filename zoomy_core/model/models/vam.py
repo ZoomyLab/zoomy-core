@@ -203,6 +203,19 @@ class VAM(BaseModel):
             m.mass[kk].apply(Consolidate())
         m.apply(InvertMassMatrix())
 
+        # 6a — constraint-row sign.  The Galerkin mass projection onto φ_k (k≥1),
+        # after the conservative change of variables, yields the divergence
+        # constraint Iₖ with an overall −1 relative to Escalante's published form
+        # (eq 6).  For the algebraic row itself (=0) the sign is immaterial, but
+        # it sets the sign of the pressure-Poisson DIAGONAL in the Chorin split:
+        # with −Iₖ the projection is anti-dissipative — the elliptic operator's
+        # eigenvalues flip to NEGATIVE real part and the pressure GMRES diverges
+        # (the historic VAM(1,2) blow-up at t≈1.1).  Negate so the constraints
+        # read +Iₖ and the pressure operator matches the stable hand-rolled split
+        # (Fourier symbol verified: +H·dt·k²/ρ diagonal, eigenvalues +0.65±0.51i).
+        for kk in range(1, Nu + 2):
+            m.mass[kk].expr = -sp.sympify(m.mass[kk].expr)
+
         # 6b — σ-mass-flux ω̃ correction (Escalante).  2-D: ω̃ couples ∂_x AND
         # ∂_y (the vertical-coupling operator just gains the second-horizontal
         # divergence + the v-advection term); the correction Δ_k is applied to
