@@ -28,6 +28,7 @@ from sympy.core.function import AppliedUndef
 from zoomy_core.model.models.sme import SME
 from zoomy_core.model.models.ml_sme import MLSME
 from zoomy_core.model.models.vam import VAM
+from zoomy_core.model.models.ml_vam import MLVAM
 
 _PROFILE = ("b", "h", "u", "v", "w", "p")
 
@@ -61,7 +62,11 @@ def _roundtrip_worst(model, hval=1.7, bval=0.3, layer_split=0.43):
               for a in sp.sympify(proj[q]).atoms(AppliedUndef)
               if a.func.__name__.startswith("P3_") and len(a.args) == 1}
     slot = {n: i for i, n in enumerate(_PROFILE)}
-    fld = {n: sp.lambdify(zeta, interp[slot[n]].subs(state), "numpy")
+    # ``.doit()`` collapses any constant spatial derivative the substitution
+    # leaves behind — VAM's w-profile carries ∂_x b in its (orthogonal) top
+    # mode, so a flat-bed sample column makes it 0 (the projected r_k is
+    # unaffected: the top mode is ⊥ to every φ_{k≤Nu}).
+    fld = {n: sp.lambdify(zeta, interp[slot[n]].subs(state).doit(), "numpy")
            for n in needed}
 
     P3b, P3h = sp.Symbol("P3_b", real=True), sp.Symbol("P3_h", real=True)
@@ -88,6 +93,8 @@ def _roundtrip_worst(model, hval=1.7, bval=0.3, layer_split=0.43):
     (SME(level=2, dimension=2), "SME(2)"),
     (SME(level=1, dimension=3), "SME(1) 3-D"),
     (MLSME(n_layers=2, level=2, dimension=2), "MLSME(2,2)"),
+    (VAM(level=1, dimension=2), "VAM(1)"),
+    (MLVAM(n_layers=2, level=1, dimension=2), "MLVAM(2,1)"),
 ])
 def test_project_inverts_interpolate(model, label):
     """``project_from_3d ∘ interpolate_to_3d`` recovers every conserved moment
@@ -114,16 +121,19 @@ def test_momentum_row_carries_h_factor():
     assert q0 != pytest.approx(U, abs=1e-6)
 
 
-def test_vam_has_no_projection_pair():
-    """VAM defines neither ``interpolate_to_3d`` nor ``project_from_3d`` (it is
-    a DAE / Chorin-split model, not driven through a column-coupling interface),
-    so there is no inverse pair to round-trip — documented, not skipped under
-    the rug.  If VAM ever grows a projection it must join the round-trip test
-    above."""
-    sm = VAM(level=1, dimension=2).system_model
-
-    def _empty(op):
-        return op is None or all(e == 0 for e in sp.flatten(op))
-
-    assert _empty(sm.interpolate_to_3d)
-    assert _empty(sm.project_from_3d)
+def test_vam_pressure_split_in_interpolate():
+    """VAM's reconstructed pressure (slot 5) is the TOTAL pressure: the
+    hydrostatic ρ g h (1−ζ) split plus the non-hydrostatic modal part, which
+    vanishes at the free surface ζ=1 (the p(ζ=1)=0 closure), and the bottom-KBC
+    vertical velocity (slot 4) satisfies w(0)=u(0)·∂_x b."""
+    from zoomy_core import coords as C
+    zeta = sp.Symbol("zeta", real=True)
+    interp = VAM(level=1, dimension=2).interpolate_to_3d()
+    g, rho = sp.Symbol("g"), sp.Symbol("rho")
+    h = sp.Function("h", positive=True)(C.t, C.x)
+    b = sp.Function("b", real=True)(C.t, C.x)
+    nonhyd = sp.expand(interp[5] - g * rho * h * (1 - zeta))
+    assert sp.simplify(nonhyd.subs(zeta, 1)) == 0
+    w0 = sp.simplify(interp[4].subs(zeta, 0))
+    u0 = sp.simplify(interp[2].subs(zeta, 0))
+    assert sp.simplify(w0 - u0 * sp.Derivative(b, C.x)) == 0

@@ -338,7 +338,15 @@ class MLVAM(BaseModel):
             momd = {xd: [sp.expand(getattr(ml, f"momentum_{CN[xd]}")[k].expr)
                          for k in range(Nu + 1)] for xd in horiz}
             momz = [sp.expand(ml.momentum_z[k].expr) for k in range(Nu + 1)]
-            return cont, constraints, momd, momz, flux_F, p_bot_trace_full
+            # per-layer vertical reconstruction profiles (LOCAL ζ), in the
+            # conserved layer state (qfm=q_ℓ, rfm=r_ℓ, P_ℓ) + h_l + G_bot — the
+            # SAME modal columns the §6c flux uses: ``uvel_m`` horizontal
+            # velocity, ``wt_m`` the full w with the bottom-KBC top mode,
+            # ``p_zeta`` the non-hydrostatic pressure with the cascaded top mode.
+            # Assembled into the global piecewise reconstruction below (frac /
+            # ω̃ / par substitutions applied there, exactly as the flux).
+            return (cont, constraints, momd, momz, flux_F,
+                    list(uvel_m), wt_m, p_zeta, p_bot_trace_full)
 
         # layers derived TOP-DOWN so the pressure-trace cascade resolves
         layer_eqs = {}
@@ -393,7 +401,8 @@ class MLVAM(BaseModel):
         m.add_equation("bottom", d.t(b))
         m.add_equation("continuity", sp.expand(glob_c.subs(par)))
         for ell in range(1, N + 1):
-            _, constraints, momd, momz, _flux_F = layer_eqs[ell]
+            constraints, momd, momz = (layer_eqs[ell][1], layer_eqs[ell][2],
+                                       layer_eqs[ell][3])
             for xd in horiz:
                 for k in range(Nu + 1):
                     row = momd[xd][k].subs(frac).doit()
@@ -472,6 +481,84 @@ class MLVAM(BaseModel):
                         dF = sp.Derivative(sp.expand(F_d), e_dir)
                         e = sp.expand(e - sp.expand(dF.doit())) + dF
                 eq.expr = e
+
+        # ── interpolate_to_3d + project_from_3d, PIECEWISE over the moving
+        # layers (same canonical operators as VAM / ML-SME).  Layer ℓ spans the
+        # global ζ ∈ [c_{ℓ-1}, c_ℓ] (c_ℓ = Σ_{j≤ℓ} l_j); within it the LOCAL
+        # column ζ_loc = (ζ − c_{ℓ-1})/l_ℓ carries the per-layer modal profiles
+        # returned by ``derive_layer``.  Each profile gets the SAME assembly
+        # substitutions the §6c flux did (frac h_ℓ=l_ℓ·h, ∂_t h → global mass,
+        # interface fluxes G, parameters).  Field order [b, h, u(, v), w, p];
+        # slot 5 is the TOTAL pressure ρ g h (1−ζ) + the non-hydrostatic part
+        # (Escalante split uses the GLOBAL free surface η = b + H).
+        cum = [sp.S.Zero]
+        for lf in l_all:
+            cum.append(cum[-1] + lf)
+
+        def _xform(prof, ell):
+            """Local-ζ layer profile → global-ζ, with the assembly subs."""
+            lf, c0 = l_all[ell - 1], cum[ell - 1]
+            e = sp.sympify(prof).subs(zeta, (zeta - c0) / lf)
+            e = sp.expand(e.subs(frac).doit())
+            e = e.subs(sp.Derivative(ht, t), dth_glob).subs(G_sol)
+            return e
+
+        def _piece(prof_of_ell):
+            pieces = []
+            for ell in range(1, N + 1):
+                val = _xform(prof_of_ell(ell), ell)
+                cond = (zeta <= cum[ell]) if ell < N else True
+                pieces.append((val, cond))
+            return sp.Piecewise(*pieces).subs(par)
+
+        interp = {0: b, 1: ht}
+        for di, xd in enumerate(horiz):
+            interp[2 + di] = _piece(lambda ell, di=di: layer_eqs[ell][5][di])
+        interp[4] = _piece(lambda ell: layer_eqs[ell][6])
+        interp[5] = (m.parameters.rho * m.parameters.g * ht * (1 - zeta)
+                     + _piece(lambda ell: layer_eqs[ell][7]))
+        m.interpolate_rows = interp
+
+        # inverse: per-layer Integral-FREE fixed-node Galerkin reduction (see
+        # ML-SME).  Layer ℓ samples its profile at N_z LOCAL nodes t∈[0,1] mapped
+        # to the global ζ = c0 + l_ℓ·t.  Conserved moments q_ℓ, r_ℓ carry the
+        # physical layer-height factor h·l_ℓ; the pressure modes P_ℓ are plain
+        # modal coefficients of the NON-hydrostatic column (norm 1, total-pressure
+        # sample with its hydrostatic ρ g h (1−ζ) removed).
+        proj_legendre = Legendre_shifted(level=Nu + 2)
+        N_z = 33
+        loc = [float(j) / (N_z - 1) for j in range(N_z)]
+        wq = [1.0 / (N_z - 1)] * N_z
+        wq[0] *= 0.5; wq[-1] *= 0.5
+        P3 = {f: sp.Symbol(f"P3_{f}", real=True) for f in ("b", "h")}
+        rho_p, g_p = m.parameters.rho, m.parameters.g
+        proj = {b: P3["b"], ht: P3["h"]}
+        for xd in horiz:
+            P3vel = sp.Function(f"P3_{HNAME[xd]}", real=True)
+            for ell in range(1, N + 1):
+                lf = l_all[ell - 1].subs(par); c0 = cum[ell - 1].subs(par)
+                samples = [P3vel(c0 + lf * tt) for tt in loc]
+                rows = proj_legendre.projection_rows(
+                    loc, wq, samples, norm=lambda _k, _lf=lf: P3["h"] * _lf)
+                for k in range(Nu + 1):
+                    proj[q_mod[ell][xd][k]] = rows[k]
+        P3w = sp.Function("P3_w", real=True)
+        for ell in range(1, N + 1):
+            lf = l_all[ell - 1].subs(par); c0 = cum[ell - 1].subs(par)
+            samples = [P3w(c0 + lf * tt) for tt in loc]
+            rows = proj_legendre.projection_rows(
+                loc, wq, samples, norm=lambda _k, _lf=lf: P3["h"] * _lf)
+            for k in range(Nu + 1):
+                proj[r_mod[ell - 1][k]] = rows[k]
+        P3p = sp.Function("P3_p", real=True)
+        for ell in range(1, N + 1):
+            lf = l_all[ell - 1].subs(par); c0 = cum[ell - 1].subs(par)
+            samples = [P3p(c0 + lf * tt) - rho_p * g_p * P3["h"] * (1 - (c0 + lf * tt))
+                       for tt in loc]
+            rows = proj_legendre.projection_rows(loc, wq, samples, norm=None)
+            for k in range(Nu + 1):
+                proj[P_mod[ell - 1][k]] = rows[k]
+        m.project_rows = proj
 
         m.bed = b
         m.ht = ht

@@ -310,6 +310,57 @@ class VAM(BaseModel):
                         expr = sp.Add(*out)
                 eq.expr = expr
 
+        # 7 — vertical reconstruction → interpolate (field order [b,h,u,v,w,p];
+        # v at index 3 only in dim=3).  The modal profiles assembled in §6b/§6c
+        # ARE the reconstruction: ``uvel_m[di]`` = Σ_{i≤Nu}(q_{di,i}/h)·φ_i is the
+        # horizontal velocity; ``wt_m`` = Σ_{j≤Nu}(r_j/h)·φ_j + ŵ_top·φ_{Nu+1}
+        # the vertical velocity with the bottom-KBC top mode (so w(0)=u(0)·∂_x b);
+        # ``p_zeta`` = Σ_{k≤Nu} P_k·φ_k + P_top·φ_{Nu+1} the NON-hydrostatic
+        # pressure with the surface p(ζ=1)=0 top mode.  Slot 5 is the TOTAL
+        # pressure: the split hydrostatic part ρ g h (1−ζ) plus that modal part.
+        HNAME = {x: "u", y: "v"}
+        interp = {0: b, 1: h}
+        for vi in range(len(horiz)):
+            interp[2 + vi] = uvel_m[vi]
+        interp[4] = wt_m
+        interp[5] = rho * g * h * (1 - zeta) + p_zeta
+        m.interpolate_rows = interp
+
+        # 8 — project (inverse of interpolate): the Integral-FREE fixed-node
+        # Galerkin reduction (see SME §13).  N_z uniform nodes, trapezoid
+        # weights; ``projection_rows`` carries the 1/∫φ_k² normalisation, so we
+        # supply only the physical factor.  Horizontal momenta q and the vertical
+        # r are CONSERVED moments q_k = h·α_k (norm h, sampling P3_u/P3_v / P3_w);
+        # the pressure modes P_k are PLAIN modal coefficients of the
+        # non-hydrostatic column (norm 1), so the sampled total-pressure column
+        # P3_p has its hydrostatic part ρ g h (1−ζ_j) removed before projection.
+        # The closed top modes (ŵ_{Nu+1}, P_{Nu+1}) are NOT state — no row.
+        N_z = 33
+        nodes = [float(j) / (N_z - 1) for j in range(N_z)]
+        weights = [1.0 / (N_z - 1)] * N_z
+        weights[0] *= 0.5; weights[-1] *= 0.5
+        P3 = {f: sp.Symbol(f"P3_{f}", real=True) for f in ("b", "h")}
+        m.project_rows = {b: P3["b"], h: P3["h"]}
+        for xd, qn in zip(horiz, QNAME):
+            P3vel = sp.Function(f"P3_{HNAME[xd]}", real=True)
+            samples = [P3vel(nd) for nd in nodes]
+            rows = legendre.projection_rows(nodes, weights, samples,
+                                            norm=lambda _k: P3["h"])
+            qh = getattr(m.functions, qn).head
+            m.project_rows.update({qh(i, t, *horiz): rows[i] for i in range(Nu + 1)})
+        # vertical r_k = h·⟨φ_k, w⟩
+        P3w = sp.Function("P3_w", real=True)
+        rows_w = legendre.projection_rows(nodes, weights, [P3w(nd) for nd in nodes],
+                                          norm=lambda _k: P3["h"])
+        m.project_rows.update({m.functions.r.head(i, t, *horiz): rows_w[i]
+                               for i in range(Nu + 1)})
+        # pressure P_k = ⟨φ_k, p − ρ g h (1−ζ)⟩ (modal, no h factor)
+        P3p = sp.Function("P3_p", real=True)
+        samples_p = [P3p(nd) - rho * g * P3["h"] * (1 - nd) for nd in nodes]
+        rows_p = legendre.projection_rows(nodes, weights, samples_p, norm=None)
+        m.project_rows.update({m.functions.P.head(i, t, *horiz): rows_p[i]
+                               for i in range(Nu + 1)})
+
         return m
 
     @property
