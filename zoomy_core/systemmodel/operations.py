@@ -38,6 +38,17 @@ __all__ = [
 _DEFAULT_WET_DRY_EPS = 1e-8
 
 
+# Plain floating-point floor used for the ``1/h`` of the EIGENVALUE / wave-speed
+# velocity (REQ-82).  The wave speed must NOT use the KP-desingularized ``hinv``:
+# when ``h* < eps`` the ``max(h*, eps)⁴`` term in ``hinv`` suppresses the
+# advective (and gravity) speed by ``(h*/eps)²``, starving the Rusanov
+# dissipation at a steep wet/dry front so the centred Audusse mass flux drains a
+# dry cell (``h<0``).  Instead the eigenvalue velocity uses the same classical
+# floor ``max(1e-14, h)`` the flux velocity already uses, so ``λ = |u·n| +
+# √(g·h*)·|n|`` with the TRUE velocity ``u = q/max(1e-14, h)``.
+_WAVESPEED_H_FLOOR = 1e-14
+
+
 # Transcendental nodes whose ARGUMENT must never be touched by the
 # ``regularize_pow`` ``1/h -> hinv`` sweep — an ``h`` inside ``log(z/h)`` is
 # not a multiplicative factor of a denominator and must stay ``h``.
@@ -243,28 +254,32 @@ def regularize_pow(field: Union[str, sp.Symbol], aux_name: str):
             e = sp.factor(base).as_powers_dict().get(hs, sp.S.Zero)
             return int(e) if e.is_Integer and e > 0 else 0
 
-        def _rw(e):
-            # Recursive rewrite of ``field**(-n) -> aux**n``, factoring the
+        def _rw(e, inv):
+            # Recursive rewrite of ``field**(-n) -> inv**n``, factoring the
             # maximal multiplicative power of ``h`` out of a negative-power
             # base (``h**(-n)``, ``(h**p·f)**(-n)`` AND the expanded
-            # ``(Σ h·…)**(-n)`` Add).  Transcendental nodes are returned
-            # WHOLE (never descended), so an ``h`` that lives only inside a
-            # transcendental arg (``log(z/h)``) is never rewritten — only a
-            # genuine multiplicative ``h`` factor becomes ``aux``.
+            # ``(Σ h·…)**(-n)`` Add).  ``inv`` is the replacement for ``1/h``:
+            # the desingularized ``aux`` (``hinv``) for the flux/source/NCP
+            # operators, but the plain floored inverse ``1/Max(1e-14, h)`` for
+            # the EIGENVALUE / wave-speed (REQ-82 — see ``_WAVESPEED_H_FLOOR``).
+            # Transcendental nodes are returned WHOLE (never descended), so an
+            # ``h`` that lives only inside a transcendental arg (``log(z/h)``)
+            # is never rewritten — only a genuine multiplicative ``h`` factor
+            # becomes ``inv``.
             if isinstance(e, _TRANSCENDENTAL):
                 return e
             if (isinstance(e, sp.Pow) and e.exp.is_number
                     and e.exp.is_negative):
                 p = _h_multiplicity(e.base)
                 if p > 0:
-                    # base = q·h**p (q h-free) ⇒ base**e = q**e·hinv**(-p·e).
+                    # base = q·h**p (q h-free) ⇒ base**e = q**e·inv**(-p·e).
                     # Clean ``h**(-n)`` ⇒ q==1 ⇒ byte-identical to the old
-                    # ``aux**(-exp)`` rewrite.
+                    # ``inv**(-exp)`` rewrite.
                     q = sp.cancel(e.base / hs ** p)
-                    return _rw(q) ** e.exp * aux ** (-p * e.exp)
-                return _rw(e.base) ** e.exp
+                    return _rw(q, inv) ** e.exp * inv ** (-p * e.exp)
+                return _rw(e.base, inv) ** e.exp
             if e.args:
-                return e.func(*[_rw(a) for a in e.args])
+                return e.func(*[_rw(a, inv) for a in e.args])
             return e
 
         # 1. Force-materialize the lazy derived operators from the CLEAN
@@ -275,11 +290,18 @@ def regularize_pow(field: Union[str, sp.Symbol], aux_name: str):
 
         # 2. Substitute 1/h**n -> hinv**n in the physical operators AND the
         #    frozen derived operators (so the exact h-derivative terms become
-        #    hinv-powers instead of being recomputed away).
+        #    hinv-powers instead of being recomputed away).  EXCEPTION: the
+        #    ``eigenvalues`` (the wave-speed / Rusanov-dissipation source) get
+        #    the plain ``1/Max(1e-14, h)`` floor, NOT ``hinv`` — the KP
+        #    regulariser suppresses the speed by ``(h*/eps)²`` at a wet/dry
+        #    front and starves the dissipation, draining the cell negative
+        #    (REQ-82).  The flux velocity already uses this same FP floor.
+        inv_floor = sp.S.One / sp.Max(sp.Float(_WAVESPEED_H_FLOOR), hs)
         for nm in _PRIMARY_OPERATORS + _DERIVED_OPERATORS:
             M = getattr(sm, nm, None)
             if M is not None:
-                flat = [_rw(sp.sympify(e)) for e in sp.flatten(M)]
+                inv = inv_floor if nm == "eigenvalues" else aux
+                flat = [_rw(sp.sympify(e), inv) for e in sp.flatten(M)]
                 setattr(sm, nm, type(M)(flat).reshape(*M.shape))
 
     _op.name = "regularize_pow"
