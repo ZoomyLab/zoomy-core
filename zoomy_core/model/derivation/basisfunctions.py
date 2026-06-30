@@ -421,14 +421,23 @@ class Basisfunction:
                     / (Σ_j w_j·ω(ζ_j)·φ_k(ζ_j)²)
 
         i.e. the symbolic, fixed-length form of :meth:`reconstruct_alpha`
-        (``α_k = ∫ Y φ_k ω dζ / ∫ φ_k² ω dζ``), with the integrals replaced by
-        the fixed quadrature ``Σ_j w_j·(·)(ζ_j)``.  The denominator is a numeric
-        constant, so every row is PLAIN ARITHMETIC in ``samples`` — no
-        ``Integral``, no runtime loop — and every code printer lowers it for
-        free (numpy/jax/foam/dmplex alike).  This is the building block behind a
-        model's ``project_from_3d`` rows / a SystemModel set directly; the model
-        supplies its own physical normalisation (e.g. the ``h`` factor in
-        ``q_k = h·α_k``) via ``norm`` or by scaling the returned rows.
+        (``α = G⁻¹·Σ_j w_j ω(ζ_j) φ(ζ_j) Y_j``) — the EXACT discrete
+        (least-squares) inverse of basis evaluation, with the discrete Gram
+        matrix ``G[k,i] = Σ_j w_j ω(ζ_j) φ_k(ζ_j) φ_i(ζ_j)``.  Using the FULL
+        ``G⁻¹`` (not just its diagonal ``1/Σ_j w_j ω φ_k²``) is what makes
+        ``project_from_3d`` an EXACT inverse of ``interpolate_to_3d`` to
+        round-off for ANY profile in the basis span on ANY nodes: on nodes that
+        make the basis discretely orthogonal (e.g. Gauss) ``G`` is diagonal and
+        this collapses to the plain ``num/den`` form, but on the uniform column
+        nodes the coupling stripped by the diagonal-only formula is exactly the
+        ``O(N_z^-2)`` round-trip error it leaves behind.  Each returned row is
+        still PLAIN ARITHMETIC in ``samples`` (the ``G⁻¹`` and quadrature are
+        precomputed numeric constants) — no ``Integral``, no runtime loop — so
+        every code printer lowers it for free (numpy/jax/foam/dmplex alike).
+        This is the building block behind a model's ``project_from_3d`` rows /
+        a SystemModel set directly; the model supplies its own physical
+        normalisation (e.g. the ``h`` factor in ``q_k = h·α_k``) via ``norm``
+        or by scaling the returned rows.
 
         Parameters
         ----------
@@ -450,13 +459,25 @@ class Basisfunction:
                 "projection_rows: nodes, weights, samples must be equal length "
                 f"(got {len(nodes)}, {len(weights)}, {len(samples)})")
         n = len(nodes)
+        nb = len(self.basis)
+        wj = [weights[j] * self.weight(nodes[j]) for j in range(n)]      # w_j·ω
+        phi = [[self.eval(k, nodes[j]) for j in range(n)]               # φ_k(ζ_j)
+               for k in range(nb)]
+        # Discrete Gram G[k,i] = Σ_j w_j·ω(ζ_j)·φ_k(ζ_j)·φ_i(ζ_j); its inverse
+        # is the EXACT least-squares inverse of basis evaluation.  Numeric
+        # (nodes/weights are concrete) — cond is tiny for the column sizes used,
+        # and the rows it produces stay plain arithmetic in ``samples``.
+        Gnum = np.array(
+            [[float(sum(wj[j] * phi[k][j] * phi[i][j] for j in range(n)))
+              for i in range(nb)] for k in range(nb)])
+        Ginv = np.linalg.inv(Gnum)
         rows = []
-        for k in range(len(self.basis)):
-            phik = [self.eval(k, nodes[j]) for j in range(n)]          # φ_k(ζ_j)
-            wj = [weights[j] * self.weight(nodes[j]) for j in range(n)]  # w_j·ω
-            num = sum(wj[j] * phik[j] * samples[j] for j in range(n))
-            den = sum(wj[j] * phik[j] * phik[j] for j in range(n))
-            row = num / den
+        for k in range(nb):
+            # row_k = Σ_i G⁻¹[k,i]·(Σ_j w_j·φ_i(ζ_j)·sample_j)
+            #       = Σ_j (Σ_i G⁻¹[k,i]·φ_i(ζ_j))·w_j·sample_j
+            coeff = [wj[j] * sum(float(Ginv[k, i]) * phi[i][j]
+                                 for i in range(nb)) for j in range(n)]
+            row = sum(coeff[j] * samples[j] for j in range(n))
             if norm is not None:
                 nk = norm(k) if callable(norm) else norm[k]
                 row = nk * row
