@@ -398,13 +398,57 @@ def _classify_term(term, *, state_funcs, gravity_param, t, coords):
     return "flux"
 
 
-def auto_solver_tag(expr_or_leaf, *, state_funcs, t, coords, gravity_param=None):
+def _is_self_diffusion_compound(term, own_func, coords):
+    """True iff ``term`` is a compound second-order ``coeff·∂_{x_d}(A·∂_{x_e}(·))``
+    whose INNER spatial derivative carries the row's OWN evolved state Function
+    (genuine viscous self-diffusion ``Fᵈ = A ∂_x(own)``).
+
+    Mirrors :func:`system_extract._is_self_diffusion`: the decision is made on
+    the WHOLE compound (before any ``.doit()`` change-of-variable expansion), so
+    the CoV cross piece ``∂_x h`` that ``∂_x(q/h)`` expands into still counts as
+    the row's own self-diffusion.
+
+    Returns ``False`` for an OFF-DIAGONAL ``∂_{x_d}(A(Q)·∂_{x_e}(field))`` whose
+    inner derivative is of a FOREIGN field — the canonical case being the VAM
+    bed-slope vertical-momentum flux ``∂_x(A·∂_x b)`` from the bottom KBC
+    ``w|_bed=u·∂_x b``.  That is a CONSERVATIVE flux carrying a gradient-aux, not
+    viscosity, and must NOT be doit-expanded into a bed-curvature source
+    (``b_x_x``) here (REQ-80, the split re-tagger's mirror of 9f7f52e)."""
+    if own_func is None:
+        return False
+    _coeff, deriv = _split_coeff_and_derivative(term)
+    if deriv is None:
+        return False
+    # Outer must be a single first-order spatial derivative ``∂_{x_d}(arg)``.
+    if len(deriv.variables) != 1 or deriv.variables[0] not in coords:
+        return False
+    inner = deriv.args[0]
+    for dd in inner.atoms(sp.Derivative):
+        if (any(v in coords for v in dd.variables)
+                and dd.args[0].has(own_func)):
+            return True
+    return False
+
+
+def auto_solver_tag(expr_or_leaf, *, state_funcs, t, coords, gravity_param=None,
+                    own_func=None):
     """Walk additive terms and auto-tag with canonical solver tags.
 
     ``coords`` is the full spatial coordinate list (``[x]`` / ``[x, y]``);
     a first-order derivative w.r.t. ANY of them is eligible for the flux /
     NCP slots, so cross-direction conservative fluxes are not lost into the
     source (task 0009).
+
+    ``own_func`` (optional) is the row's OWN evolved state Function.  When given,
+    a compound second-order ``∂_x(A·∂_x own)`` is recognised as genuine viscous
+    self-diffusion and routed to the central-difference SOURCE in its
+    ``.doit()``-expanded ``∂²_x`` form (a split sub-system has no
+    ``diffusion_matrix`` slot, and the predictor solver has no diffusion path —
+    the runtime freezes the second derivative to a ``_x_x`` aux).  An OFF-DIAGONAL
+    ``∂_x(A·∂_x field)`` of a FOREIGN field (the bed ``∂_x b``) is left COMPOUND
+    and falls through to ``_classify_term`` → conservative ``flux`` with the
+    inner ``∂_x field`` frozen to a gradient-aux, matching
+    ``system_extract._classify_row`` (REQ-80, mirror of 9f7f52e).
 
     Returns a :class:`SolverTagged` carrying the grouped solver tags so
     :func:`collect_solver_tag` can extract operator matrices from it.
@@ -414,12 +458,31 @@ def auto_solver_tag(expr_or_leaf, *, state_funcs, t, coords, gravity_param=None)
     else:
         raw, name = sp.sympify(expr_or_leaf), ""
     groups: dict[str, sp.Expr] = {}
-    for term in sp.Add.make_args(sp.expand(raw)):
-        if term == sp.S.Zero:
-            continue
+    # ``canon`` accumulates the residual in the SAME form that was routed into
+    # the groups (self-diffusion compounds replaced by their ``.doit()`` ∂²_x
+    # expansion), so ``untagged_remainder`` stays exactly zero under the strict
+    # policy.  For every non-viscous residual ``canon`` is just ``expand(raw)``.
+    canon_terms: list = []
+
+    def _route(term):
         tag = _classify_term(
             term, state_funcs=state_funcs, gravity_param=gravity_param,
             t=t, coords=coords,
         )
         groups[tag] = groups.get(tag, sp.S.Zero) + term
-    return SolverTagged(raw, name).solver_tag(**groups)
+        canon_terms.append(term)
+
+    for term in sp.Add.make_args(sp.expand(raw)):
+        if term == sp.S.Zero:
+            continue
+        if _is_self_diffusion_compound(term, own_func, coords):
+            # Expand the diffusive flux ``∂_x(A·∂_x own)`` to its ∂²_x source
+            # form and route the pieces (all carry the row's own gradients →
+            # source); foreign-field compounds are NOT taken down this path.
+            for piece in sp.Add.make_args(sp.expand(term.doit())):
+                if piece != sp.S.Zero:
+                    _route(piece)
+            continue
+        _route(term)
+    canon = sp.Add(*canon_terms)
+    return SolverTagged(canon, name).solver_tag(**groups)

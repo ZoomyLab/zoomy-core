@@ -441,13 +441,20 @@ def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
     # carrier keyed under ``name`` in ``tagged`` — the carrier's own ``.name``
     # is unused downstream (collect_solver_tag keys off the dict).
     tagged: dict = {}
-    for name, res in zip(eq_names, eq_residuals):
+    for idx, (name, res) in enumerate(zip(eq_names, eq_residuals)):
         res_func = sp.sympify(res).xreplace(sym_to_func)
+        # The row's OWN evolved state Function — lets the re-tagger tell a
+        # genuine viscous self-diffusion ``∂_x(ν·∂_x own)`` (→ central-stencil
+        # source) apart from an off-diagonal ``∂_x(A·∂_x field)`` of a FOREIGN
+        # field such as the bed ``∂_x b`` (→ conservative flux).  Mirrors
+        # ``system_extract._classify_row``'s ``_is_self_diffusion`` (REQ-80).
+        own_func = state_funcs[equation_to_state_index[idx]]
         tagged[name] = auto_solver_tag(
             res_func,
             state_funcs=state_funcs,
             gravity_param=g_param,
             t=t, coords=coords,
+            own_func=own_func,
         )
 
     class _Holder:
@@ -893,10 +900,36 @@ def split_for_pressure_structural(sm, pressure_vars, dt):
                  for i in constraint_rows]
 
     # ── predictor: the evolution rows, PRESSURE-FREE (hydrostatic part) ──
+    # A blanket ``.doit()`` here is WRONG: the reconstructed residual carries the
+    # conservative fluxes as COMPOUND outer derivatives ``∂_x(F)``, and for the
+    # VAM r_k vertical-momentum rows ``F`` holds the bed-slope integrand
+    # ``A·∂_x b`` (A=(2q₀q₁−2q₁²)/(5h), from the bottom KBC ``w|_bed=u·∂_x b``).
+    # ``.doit()`` product-rule-expands that outer ``∂_x`` into a bed-CURVATURE
+    # source ``A·∂²_x b`` (``b_x_x``) plus cross terms, which then blow up on the
+    # bump near x=0.  Keeping the ``∂_x`` compound lets ``_build_subsystem``'s
+    # re-tagger route ``∂_x(A·∂_x b)`` to the conservative FLUX (inner ``∂_x b``
+    # frozen to a gradient-aux), matching ``system_extract._classify_row``
+    # (9f7f52e / REQ-80).
+    #
+    # But the blanket ``.doit()`` ALSO collapsed benign NON-horizontal derivative
+    # artifacts left by the vertical (ζ) moment derivation — e.g. ``∂_ζ(ζ) → 1``
+    # in the source — which the runtime code-printer cannot lower.  So doit
+    # ONLY the derivatives that touch no horizontal coord (the trivial vertical /
+    # time ones), via ``xreplace`` so it reaches inside the surviving ``∂_x``
+    # compounds without expanding them.  ``.subs`` zeroes the pressure modes
+    # inside the unevaluated derivatives too, so no horizontal doit is needed.
+    coords_set = set(coords)
+
+    def _collapse_nonhorizontal(e):
+        e = sp.sympify(e)
+        repl = {d: d.doit() for d in e.atoms(sp.Derivative)
+                if not any(v in coords_set for v in d.variables)}
+        return e.xreplace(repl) if repl else e
+
     pred_names = [f"pred_{state_names[e2s[i]]}" for i in evolution_rows]
-    pred_res = [sp.expand(sp.sympify(residuals[i])
-                          .subs({p: sp.S.Zero for p in pressure_funcs})
-                          .doit())
+    pred_res = [sp.expand(_collapse_nonhorizontal(
+                    sp.sympify(residuals[i])
+                    .subs({p: sp.S.Zero for p in pressure_funcs})))
                 for i in evolution_rows]
     pred_e2s = [e2s[i] for i in evolution_rows]
 
