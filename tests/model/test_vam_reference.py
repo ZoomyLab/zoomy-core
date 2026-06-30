@@ -179,7 +179,15 @@ def test_vam1_predictor_is_pressure_zeroed_full_rows(vam1, reference):
 def test_vam1_advective_divergences_routed_as_flux(vam1):
     """The conservative parts of the k=1 rows must sit in the FLUX slot
     (compound ∂_x atoms), not be smeared into NCP — flux vs NCP routing
-    is O(1) at shocks (path-dependence of nonconservative products)."""
+    is O(1) at shocks (path-dependence of nonconservative products).
+
+    The r_1 row additionally carries the bed-slope vertical-momentum flux
+    ``∂_x(A·∂_x b)`` (from the bottom KBC ``w|_bed = u·∂_x b``); it is a
+    CONSERVATIVE flux carrying the gradient-aux ``b_x`` (frozen by
+    ``expose_aux_atoms``), NOT an off-diagonal diffusion entry — pinning
+    REQ-80: routing it to ``diffusion_matrix`` dropped it at runtime
+    (numpy raises on off-diagonal A; jax-Chorin has no diffusion path) and
+    blew up the Escalante bump at the transcritical front (t≈1.0s)."""
     _, sm = vam1
     names = [str(s) for s in sm.state]
     i_q1 = names.index("q_1")
@@ -189,8 +197,14 @@ def test_vam1_advective_divergences_routed_as_flux(vam1):
     by_name = {str(s): s for s in sm.state}
     q0, q1, r0, r1, P1, h = (by_name[n] for n in
                              ("q_0", "q_1", "r_0", "r_1", "P_1", "h"))
+    b_x = sp.Symbol("b_x", real=True)
     rho = sm.parameters.rho
+    bed = sp.Rational(2, 5) * b_x * q0 * q1 / h - sp.Rational(2, 5) * b_x * q1**2 / h
     assert sp.simplify(Fq1 - (2*q0*q1/h + h*P1/rho)) == 0, f"q_1 flux: {Fq1}"
     assert sp.simplify(
-        Fr1 - (q0*r1/h + q1*r0/h - sp.Rational(2, 5)*q1*(r0 - r1)/h)) == 0, \
+        Fr1 - (q0*r1/h + q1*r0/h - sp.Rational(2, 5)*q1*(r0 - r1)/h + bed)) == 0, \
         f"r_1 flux: {Fr1}"
+    # the bed-slope flux must NOT have leaked into diffusion_matrix
+    assert sm.diffusion_matrix is None or all(
+        sm.diffusion_matrix[i_r1, j, 0, 0] == 0
+        for j in range(len(names))), "bed slope leaked into diffusion_matrix"

@@ -346,13 +346,39 @@ def _classify_row(residual, i, state, state_funcs, t, space, gravity_param,
 
         coeff, deriv = _split_coeff_and_derivative(term)
 
-        # 2. Second-order diffusion ``∂_{x_d}(coeff · ∂_{x_e} Q_j)`` →
-        # diffusion_matrix.  Checked BEFORE the flux / NCP branches: the outer
-        # ``∂_{x_d}`` is first-order but its argument carries an inner spatial
-        # derivative (the diffusive flux ``Fᵈ = A ∇Q``), so it must NOT be
-        # mistyped as an advective flux.
-        if deriv is not None and _second_order_dirs(deriv, space) is not None:
-            _route_diffusion(term, i, deriv, coeff, state_funcs, space, A)
+        # 2. Second-order ``∂_{x_d}( A · ∂_{x_e}(·) )`` — split by WHAT is being
+        # differentiated inside:
+        #
+        #   (a) GENUINE viscous self-diffusion — the inner derivative carries the
+        #       row's OWN conserved variable (the diffusive flux ``Fᵈ = A ∂_x u``
+        #       of this row's momentum, incl. the CoV cross piece ``∂_x h`` that
+        #       ``∂_x(q/h)`` expands into) → ``diffusion_matrix`` (checked before
+        #       flux/NCP: the outer ``∂_{x_d}`` is first-order but its argument is
+        #       itself a gradient, so it must NOT be mistyped as advective flux).
+        #
+        #   (b) OFF-DIAGONAL ``∂_{x_d}( A(Q) · ∂_{x_e}(field) )`` whose inner
+        #       derivative is of a FOREIGN field (``field`` ≠ this row's own
+        #       state var) — NOT a viscous flux.  It is a CONSERVATIVE flux that
+        #       merely carries a foreign-field gradient: the canonical case is the
+        #       bed-slope vertical-momentum flux ``∂_x(A·∂_x b)`` arising from the
+        #       bottom KBC ``w|_bed = u·∂_x b`` (VAM r_k rows).  Route it to the
+        #       FLUX column ``d`` with the inner ``∂_{x_e}(field)`` left intact —
+        #       ``expose_aux_atoms`` then freezes it to a gradient-aux (``b_x``),
+        #       exactly as the hand-rolled VAM treats ``b_x`` as a derivative-aux
+        #       and the bed-slope term as a flux integrand.  ``diffusion_matrix``
+        #       is RESERVED for the genuine ν self-diffusion of case (a); an
+        #       off-diagonal A[v, b] entry is dropped at runtime (numpy raises on
+        #       off-diagonal A; jax-Chorin has no diffusion path), which silently
+        #       killed the bed-slope coupling (REQ-80).
+        dirs2 = (_second_order_dirs(deriv, space)
+                 if deriv is not None else None)
+        if dirs2 is not None:
+            own = state_funcs[i]
+            if _is_self_diffusion(deriv, own, space):
+                _route_diffusion(term, i, deriv, coeff, state_funcs, space, A)
+            else:
+                d_out = dirs2[0]
+                F[i, d_out] = F[i, d_out] + coeff * deriv.args[0]
             continue
 
         # 3. No first-order spatial derivative → source (sign-flipped: S = −LHS).
@@ -427,6 +453,35 @@ def _second_order_dirs(deriv, space):
             if len(dd.variables) == 1 and dd.variables[0] in space:
                 return d, space.index(dd.variables[0])
     return None
+
+
+def _is_self_diffusion(deriv, own_func, space):
+    """True iff a second-order term is GENUINE viscous self-diffusion of the
+    row's own variable — the inner spatial derivative differentiates a quantity
+    that carries ``own_func`` (the row's own state Function, e.g. the momentum
+    ``mom`` or its velocity ``q/h``).  This keeps the diffusive flux
+    ``Fᵈ = A ∂_x(own)`` — together with the change-of-variable cross piece
+    ``∂_x h`` that ``∂_x(q/h)`` expands into — in ``diffusion_matrix``.
+
+    Returns ``False`` for an OFF-DIAGONAL ``∂_{x_d}(A · ∂_{x_e}(field))`` whose
+    inner derivative is of a FOREIGN field (the bed ``∂_x b`` from the bottom
+    KBC) — that is a conservative flux carrying a gradient-aux, not viscosity.
+
+    The decision is made on the WHOLE compound (before any ``.doit()`` CoV
+    expansion), so the genuine viscous term's ``∂_x h`` cross piece is NOT
+    mistaken for a foreign-field gradient and split off into the flux."""
+    v = deriv.variables
+    # Bare ``∂_{x_d}∂_{x_e} Q_j``: self iff the differentiated arg is the own var.
+    if len(v) == 2 and v[0] in space and v[1] in space:
+        return deriv.args[0].has(own_func)
+    # Compound ``∂_{x_d}( A · ∂_{x_e}(arg) )``: self iff an inner spatial
+    # derivative differentiates a quantity carrying the own var.
+    inner = deriv.args[0]
+    for dd in inner.atoms(sp.Derivative):
+        if (any(var in space for var in dd.variables)
+                and dd.args[0].has(own_func)):
+            return True
+    return False
 
 
 def _route_diffusion(term, i, deriv, coeff, state_funcs, space, A):
