@@ -1,28 +1,35 @@
-"""Predictor / pressure / corrector splitter for chain-DAE SystemModels.
+"""Predictor / pressure / corrector splitter for non-hydrostatic SystemModels.
 
-Mechanises the substitution rule from
-``tutorials/vam/escalante2024_poisson_generic.py`` (the verified
-hand-coded reference).
+=========================================================================
+CANONICAL SPLITTER:  ``split_for_pressure_structural``
+=========================================================================
+This is the ONE generic, supported pressure splitter — use it for every
+non-hydrostatic model (VAM, ML-VAM, …).  It is what ``model.chorin_split(dt)``
+calls (see ``VAM.chorin_split`` / ``MLVAM.chorin_split``).  It is "structural":
+it discovers the row roles purely from the OPERATORS — the divergence
+constraints are exactly the rows with an identically-zero mass-matrix row, the
+rest are evolution rows — so it needs NO ``equation_names`` convention and works
+for any level / dimension / basis straight out of a declarative derivation.
 
-The splitter consumes a :class:`SystemModel` whose ``equation_names``
-follow the chain-DAE convention:
+    >>> split = VAM(level=1).chorin_split(dt)      # (SM_pred, SM_press, SM_corr)
+    >>> split = split_for_pressure_structural(sm, P_syms, dt)   # explicit form
 
-  * ``mass``                              — mass evolution row
-  * ``xmom_j0``, ``xmom_j1``, …           — x-momentum projections
-  * ``zmom_j0``, ``zmom_j1``, …           — z-momentum projections
-  * ``cont_j1``, ``cont_j2``, …           — pressure-projection
-                                            (algebraic) constraint rows
+DEPRECATED — do NOT use for new work (each raises a ``DeprecationWarning``):
+  * :func:`split_for_pressure` — old chain-DAE splitter; dispatches rows by the
+    fragile ``equation_names`` convention (``mass`` / ``xmom_j*`` / ``zmom_j*`` /
+    ``cont_j*``).  A declarative SystemModel carries no such names.
+  * :func:`split_simple` — minimal hand-rolled splitter; used only by the
+    hand-built ``escalante_vam_bump/run.py`` oracle (also name-based).
+  * :func:`build_pressure_elliptic_block` — internal helper for the two
+    deprecated splitters; the structural splitter does NOT use it.
 
-The splitter exposes two entry points:
-
-  * :func:`build_pressure_elliptic_block` — the irreducible algebraic
-    core (extracts ``T_u[k]``, ``T_w[k]``, builds the elliptic rows).
-  * :func:`split_for_pressure` — wraps the core into three rectangular
-    sub-SystemModels (predictor / pressure / corrector) sharing the
-    same state vector.
+The deprecated three are kept only so the legacy hand-built reference cases keep
+running; new models and agents must go through ``chorin_split`` /
+``split_for_pressure_structural``.
 """
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -617,10 +624,20 @@ def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
 
 
 def split_for_pressure(sm, pressure_vars, dt, *, bottom=None):
-    """Split a chain-DAE SystemModel into three :class:`SystemModel`
-    sub-systems ``(SM_pred, SM_press, SM_corr)`` sharing the same
-    state vector ``Q``.
+    """DEPRECATED — use :func:`split_for_pressure_structural` (via
+    ``model.chorin_split(dt)``).
+
+    Old chain-DAE splitter that dispatches rows by the ``equation_names``
+    convention (``mass`` / ``xmom_j*`` / ``zmom_j*`` / ``cont_j*``); a
+    declarative SystemModel carries no such names.  The structural splitter
+    discovers the same roles from the operators (zero mass-matrix rows ⇒
+    constraints) and is the only supported path for new models.
     """
+    warnings.warn(
+        "split_for_pressure is deprecated; use split_for_pressure_structural "
+        "(model.chorin_split(dt)) — it discovers row roles from the operators "
+        "and needs no equation_names convention.",
+        DeprecationWarning, stacklevel=2)
     block = build_pressure_elliptic_block(sm, pressure_vars, dt,
                                           bottom=bottom)
     residuals = _residuals_by_name(sm)
@@ -997,8 +1014,16 @@ def split_for_pressure_structural(sm, pressure_vars, dt):
 
 
 def split_simple(sm, pressure_vars, dt, *, bottom=None):
-    """Minimal manual splitter — copies the SystemModel, then deletes
-    rows and terms.
+    """DEPRECATED — use :func:`split_for_pressure_structural` (via
+    ``model.chorin_split(dt)``).
+
+    Minimal hand-rolled splitter retained ONLY for the hand-built
+    ``escalante_vam_bump/run.py`` reference oracle; it dispatches rows by the
+    ``equation_names`` convention (``cont_j*`` ⇒ constraint).  New models /
+    agents must use the structural splitter, which discovers the same roles
+    from the operators (zero mass-matrix rows ⇒ constraints).
+
+    Copies the SystemModel, then deletes rows and terms.
 
     Algorithm:
 
@@ -1044,6 +1069,11 @@ def split_simple(sm, pressure_vars, dt, *, bottom=None):
     -------
     :class:`SplitForPressureResult`
     """
+    warnings.warn(
+        "split_simple is deprecated; use split_for_pressure_structural "
+        "(model.chorin_split(dt)).  split_simple is kept only for the "
+        "hand-built escalante_vam_bump reference oracle.",
+        DeprecationWarning, stacklevel=2)
     # ── 0. preliminaries
     state = list(sm.state)
     state_names = [str(s) for s in state]
