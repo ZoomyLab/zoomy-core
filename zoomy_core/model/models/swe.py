@@ -28,6 +28,7 @@ import param
 import sympy as sp
 
 from zoomy_core.misc.misc import ZArray
+from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
 from zoomy_core.model.derivative_workflow import StructuredDerivativeModel
 from zoomy_core.systemmodel.system_model import SystemModel
 
@@ -129,13 +130,25 @@ class SWE(StructuredDerivativeModel):
         zeta = sp.Symbol("zeta", real=True)
         P3b = sp.Symbol("P3_b", real=True)
         P3h = sp.Symbol("P3_h", real=True)
-        P3u = sp.Function("P3_u", real=True)(zeta)
 
         # flat-profile lift to canonical [b, h, u, v, w, p](ζ)
         interp = {0: b, 1: h, 2: hu / h, 5: g * h * (1 - zeta)}
-        # depth-average of the sampled column (exact for flat profiles)
+        # depth-average of the sampled column as the Integral-FREE, fixed-node
+        # Galerkin reduction q = h·⟨φ_0, u⟩ over a level-0 (constant) basis —
+        # the SAME ``Basisfunction.projection_rows`` machinery every moment
+        # model uses (SME/ML/VAM), never a raw ``sp.Integral`` (which the C
+        # printers cannot lower, and which must never be ``.doit()``-ed).  Two
+        # trapezoid nodes are exact for the flat profile; the ``P3_u(ζ_j)``
+        # samples bind to the column slots the printer maps.  Round-trips a
+        # constant column to q = h·U exactly.
+        legendre = Legendre_shifted(level=0)
+        nodes = [0.0, 1.0]
+        weights = [0.5, 0.5]
+        P3u = sp.Function("P3_u", real=True)
         project = {b: P3b, h: P3h,
-                   hu: P3h * sp.Integral(P3u, (zeta, 0, 1))}
+                   hu: legendre.projection_rows(
+                       nodes, weights, [P3u(nd) for nd in nodes],
+                       norm=lambda _k: P3h)[0]}
         # WB primitive map: limit η = b+h and the velocities
         recon = {h: b + h, hu: hu / h}
         groups = {
@@ -148,9 +161,11 @@ class SWE(StructuredDerivativeModel):
         }
         if self.dimension == 2:
             hv = self.Q.hv
-            P3v = sp.Function("P3_v", real=True)(zeta)
             interp[3] = hv / h
-            project[hv] = P3h * sp.Integral(P3v, (zeta, 0, 1))
+            P3v = sp.Function("P3_v", real=True)
+            project[hv] = legendre.projection_rows(
+                nodes, weights, [P3v(nd) for nd in nodes],
+                norm=lambda _k: P3h)[0]
             recon[hv] = hv / h
             groups["boundary:wall_y"] = {hv: -hv}
             groups["boundary:inflow"][hv] = sp.S.Zero

@@ -330,7 +330,10 @@ class GenericCppBase(CXX11CodePrinter):
 
         new_exprs = []
         for e in expr_list:
-            new_e = e.replace(
+            # A component may be a raw Python numeric (e.g. a ``Constant`` IC
+            # vector ``[1.0, 0.0, …]``); ``.replace`` needs a sympy node, so
+            # normalise the leaf before walking it.
+            new_e = sp.sympify(e).replace(
                 lambda x: isinstance(x, (sp.Indexed, sp.Function)), replace_logic
             )
             new_exprs.append(new_e)
