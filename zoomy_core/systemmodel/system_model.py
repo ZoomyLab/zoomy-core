@@ -1479,6 +1479,30 @@ class SystemModel:
         # structured registry entry.  Solvers walk ``sm.aux_registry``
         # to compute aux values per step.
         sm.expose_aux_atoms()
+
+        # ── raw-Model promotion: function groups + coupling/boundary conditions
+        # (REQ-87).  Production models (SWE and subclasses) declare their WB
+        # reconstruction / interpolate-project / ``boundary:<name>`` specs as
+        # ``_function_groups`` and POP the constructor ``boundary_conditions=``
+        # into ``_coupling_bcs`` — both were only wired in the ``.system_model``
+        # PROPERTY.  Backend adapters and the FVM solvers call ``from_model``
+        # DIRECTLY, so do that wiring HERE: without it the promoted system has an
+        # EMPTY BC kernel (walls don't reflect — the malpasset "16 m/s eruption")
+        # and no model-declared reconstruction.  The declarative branch attaches
+        # its own function groups (see ``_from_derivation_model``); this covers
+        # the production ``Model`` branch only.
+        if getattr(model, "_function_groups", None):
+            _attach_function_groups(sm, model, canonical_source=canonical_source)
+        coupling = getattr(model, "_coupling_bcs", None)
+        has_coupling = coupling is not None and (
+            (list(coupling) if isinstance(coupling, list)
+             else getattr(coupling, "boundary_conditions_list", None)))
+        if has_coupling:
+            from zoomy_core.model.boundary_conditions import resolve_and_attach
+            # ``boundary:<name>`` specs now live on ``sm.boundary_specs`` (from
+            # the function groups above), so ``FromModel`` BCs resolve; aux BCs
+            # default to per-tag extrapolation (mirrors the old property).
+            resolve_and_attach(sm, coupling)
         return sm
 
     # ── reconstruct_residuals ─────────────────────────────────────────

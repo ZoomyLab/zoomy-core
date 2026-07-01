@@ -29,8 +29,7 @@ import sympy as sp
 
 from zoomy_core.misc.misc import ZArray
 from zoomy_core.model.derivative_workflow import StructuredDerivativeModel
-from zoomy_core.systemmodel.system_model import (
-    SystemModel, _attach_function_groups)
+from zoomy_core.systemmodel.system_model import SystemModel
 
 __all__ = ["SWE"]
 
@@ -160,11 +159,8 @@ class SWE(StructuredDerivativeModel):
     # ── runtime form ──────────────────────────────────────────────────
     @property
     def system_model(self) -> SystemModel:
-        sm = SystemModel.from_model(self)
-        # the production from_model branch does not parse function groups —
-        # attach the canonical operators + boundary specs explicitly (the
-        # same parser the declarative branch uses)
-        _attach_function_groups(sm, self)
-        if self._coupling_bcs is not None:
-            sm.attach_boundary_conditions(self._coupling_bcs)
-        return sm
+        # ``SystemModel.from_model`` now parses the model's function groups AND
+        # attaches its ``_coupling_bcs`` on raw promotion (REQ-87) — the same
+        # wiring this property used to do inline — so every backend adapter /
+        # FVM solver that calls ``from_model`` directly inherits it.
+        return SystemModel.from_model(self)
