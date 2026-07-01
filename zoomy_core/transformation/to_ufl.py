@@ -235,6 +235,55 @@ class UFLRuntimeModel(NumpyRuntimeModel):
             definition=new_def,
         )
 
+    # -----------------------------------------------------------------
+    # SystemModel/NSM-driven operator lowering (Firedrake runs new-style
+    # BaseModel models / NumericalSystemModels)
+    # -----------------------------------------------------------------
+    #
+    # The scalar/vector operators (flux / hydrostatic_pressure / source /
+    # eigenvalues / mass_matrix / update_variables / update_aux_variables /
+    # the BC kernels) are lowered by the inherited
+    # ``NumpyRuntimeModel.from_system_model`` verbatim — it routes each
+    # through ``rt._lambdify_function`` (this class's UFL override), so they
+    # already emit ``ufl`` forms.  Only the rank-3 (NCP / quasilinear) and
+    # rank-4 (diffusion) operators need a UFL-specific lowering: the numpy
+    # hook stacks per-axis slabs with ``np.stack`` (invalid on symbolic
+    # UFL), whereas UFL emits the WHOLE array as one lambdified function.
+    # ``_array_to_matrix`` (called inside ``_vectorize_expression``)
+    # reshapes the ``(n_eq, n_cols, n_dim)`` / ``(n_eq, n_st, n_dim, n_dim)``
+    # array to a 2-D ``ufl.as_tensor`` — the EXACT shape convention the
+    # legacy raw-Model UFL path (``UFLRuntimeModel(model)``) already emits
+    # (NCP → ``(n_eq·n_cols, n_dim)``, diffusion → ``(n_eq·n_st·n_dim,
+    # n_dim)``), so the Firedrake form assembly consumes NSM-driven
+    # operators identically to the legacy Model-driven ones.
+
+    def _lower_ndarray_operator(self, name, arr, n_cols, n_eq, n_dim,
+                                std_sig, modules):
+        """UFL override: emit the full rank-3 operator as ONE lambdified
+        function → ``ufl.as_tensor``.  See the class comment above."""
+        from zoomy_core.model.basefunction import Function
+        fn = Function(name=name, args=std_sig, definition=arr)
+        return self._lambdify_function(fn, modules)
+
+    def _lower_rank4_operator(self, name, A_arr, n_eq, n_st, n_dim,
+                              std_sig, modules):
+        """UFL override: emit the full rank-4 diffusion tensor as ONE
+        lambdified function → ``ufl.as_tensor``.  See the class comment
+        above."""
+        from zoomy_core.model.basefunction import Function
+        fn = Function(name=name, args=std_sig, definition=A_arr)
+        return self._lambdify_function(fn, modules)
+
+    @classmethod
+    def from_nsm(cls, nsm, *, module=None, printer=None):
+        """Build a UFL runtime from a :class:`NumericalSystemModel`.
+
+        Thin front door mirroring ``JaxRuntime.from_nsm``: the operator set
+        lives on ``nsm.sm`` (a :class:`SystemModel`), so this just delegates
+        to :meth:`from_system_model`, which normalises any Model /
+        SystemModel / NSM through ``to_numerical_system_model``."""
+        return cls.from_system_model(nsm, module=module, printer=printer)
+
     module = {
         'ones_like': lambda x: 0*x + 1,
         'zeros_like': lambda x:  0*x,

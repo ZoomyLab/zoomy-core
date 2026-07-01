@@ -301,6 +301,60 @@ class NumpyRuntimeModel:
                 flat.append(item)
         return sp.Array(flat, arr.shape)
 
+    def _lower_ndarray_operator(self, name, arr, n_cols, n_eq, n_dim,
+                                std_sig, modules):
+        """Lower a rank-3 operator ``arr(Q, Qaux, p)`` of shape
+        ``(n_eq, n_cols, n_dim)`` (NCP / quasilinear) to a runtime callable.
+
+        Backend hook consumed by :meth:`from_system_model`.  The numpy
+        lowering emits one ``(n_eq, n_cols)`` matrix per spatial axis
+        (each routed through ``_lambdify_function`` so each slab is
+        vectorised), then ``np.stack``\\ s them along the last axis to
+        rebuild the grid-broadcast ``(n_eq, n_cols, n_dim)`` array.  The
+        UFL backend overrides this to emit a single ``ufl.as_tensor``."""
+        slab_fns = []
+        for d in range(n_dim):
+            slab = sp.Matrix(n_eq, n_cols, lambda i, j, _d=d: arr[i, j, _d])
+            fn = Function(name=f"{name}__d{d}", args=std_sig, definition=slab)
+            slab_fns.append(self._lambdify_function(fn, modules))
+
+        def _runtime(Q, Qaux, p, _slab_fns=slab_fns):
+            slabs = [np.asarray(f(Q, Qaux, p), dtype=float)
+                     for f in _slab_fns]
+            return np.stack(slabs, axis=-1)
+        return _runtime
+
+    def _lower_rank4_operator(self, name, A_arr, n_eq, n_st, n_dim,
+                              std_sig, modules):
+        """Lower a rank-4 constitutive tensor ``A(Q, Qaux, p)`` of shape
+        ``(n_eq, n_state, n_dim, n_dim)`` (the ``div(A : grad Q)``
+        diffusion tensor) to a runtime callable.
+
+        Backend hook consumed by :meth:`from_system_model`.  The numpy
+        lowering emits one ``(n_eq, n_state)`` matrix per ``(d_flux,
+        d_grad)`` pair, stacks along the trailing axis, and reshapes back
+        to rank-4.  The UFL backend overrides this to emit a single
+        ``ufl.as_tensor``."""
+        slab_fns_4d = []
+        for d in range(n_dim):
+            for e in range(n_dim):
+                slab = sp.Matrix(
+                    n_eq, n_st,
+                    lambda i, j, _d=d, _e=e: A_arr[i, j, _d, _e],
+                )
+                fn = Function(name=f"{name}__d{d}_e{e}", args=std_sig,
+                              definition=slab)
+                slab_fns_4d.append(self._lambdify_function(fn, modules))
+
+        def _runtime_A(Q, Qaux, p, _fns=slab_fns_4d,
+                       _n_dim=n_dim, _n_eq=n_eq, _n_st=n_st):
+            slabs = [np.asarray(f(Q, Qaux, p), dtype=float)
+                     for f in _fns]
+            stacked = np.stack(slabs, axis=-1)
+            new_shape = stacked.shape[:-1] + (_n_dim, _n_dim)
+            return stacked.reshape(new_shape)
+        return _runtime_A
+
     @staticmethod
     def _extract_component(value, index, key):
         """Internal helper `_extract_component`."""
@@ -513,22 +567,10 @@ class NumpyRuntimeModel:
         n_st = sm.n_state
 
         def _register_ndarray(name, arr, n_cols):
-            slab_fns = []
-            for d in range(n_dim):
-                slab = sp.Matrix(
-                    n_eq, n_cols,
-                    lambda i, j, _d=d: arr[i, j, _d],
-                )
-                fn = Function(name=f"{name}__d{d}", args=std_sig,
-                              definition=slab)
-                slab_fns.append(rt._lambdify_function(fn, modules))
-
-            def _runtime(Q, Qaux, p, _slab_fns=slab_fns):
-                slabs = [np.asarray(f(Q, Qaux, p), dtype=float)
-                         for f in _slab_fns]
-                return np.stack(slabs, axis=-1)
-            rt.runtime_functions[name] = _runtime
-            setattr(rt, name, _runtime)
+            fn = rt._lower_ndarray_operator(
+                name, arr, n_cols, n_eq, n_dim, std_sig, modules)
+            rt.runtime_functions[name] = fn
+            setattr(rt, name, fn)
 
         _register_ndarray("nonconservative_matrix",
                           sm.nonconservative_matrix, n_eq)
@@ -543,26 +585,10 @@ class NumpyRuntimeModel:
         def _register_rank4(name, A_arr):
             if A_arr is None:
                 return
-            slab_fns_4d = []
-            for d in range(n_dim):
-                for e in range(n_dim):
-                    slab = sp.Matrix(
-                        n_eq, n_st,
-                        lambda i, j, _d=d, _e=e: A_arr[i, j, _d, _e],
-                    )
-                    fn = Function(name=f"{name}__d{d}_e{e}",
-                                  args=std_sig, definition=slab)
-                    slab_fns_4d.append(rt._lambdify_function(fn, modules))
-
-            def _runtime_A(Q, Qaux, p, _fns=slab_fns_4d,
-                           _n_dim=n_dim, _n_eq=n_eq, _n_st=n_st):
-                slabs = [np.asarray(f(Q, Qaux, p), dtype=float)
-                         for f in _fns]
-                stacked = np.stack(slabs, axis=-1)
-                new_shape = stacked.shape[:-1] + (_n_dim, _n_dim)
-                return stacked.reshape(new_shape)
-            rt.runtime_functions[name] = _runtime_A
-            setattr(rt, name, _runtime_A)
+            fn = rt._lower_rank4_operator(
+                name, A_arr, n_eq, n_st, n_dim, std_sig, modules)
+            rt.runtime_functions[name] = fn
+            setattr(rt, name, fn)
 
         _register_rank4("diffusion_matrix", sm.diffusion_matrix)
         _register_rank4("diffusion_matrix_explicit", sm.diffusion_matrix_explicit)
