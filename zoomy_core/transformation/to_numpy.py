@@ -373,6 +373,22 @@ class NumpyRuntimeModel:
         kernel=None,
     ):
         """Initialize the instance."""
+        # Dispatch on model style.  A legacy ``Model`` carries the
+        # ``.functions`` registry that the body below lambdifies.  A new-style
+        # BaseModel (e.g. the thesis ``MalpassetSME``) exposes ``.system_model``
+        # but NO ``.functions``/``.name``/``.variables`` — and a bare
+        # ``SystemModel`` / ``NumericalSystemModel`` likewise.  For any of those,
+        # build through the SystemModel/NSM path so ``RuntimeModel(model)`` (the
+        # entry point every backend/solver already calls — e.g. Firedrake's
+        # ``UFLRuntimeModel(model)``) works for every model style without each
+        # caller choosing a factory.  ``type(self).from_system_model`` keeps the
+        # backend-specific operator lowering (UFL emission for UFLRuntimeModel).
+        # (REQ-90)
+        if not hasattr(model, "functions"):
+            built = type(self).from_system_model(
+                model, module=module, printer=printer)
+            self.__dict__.update(built.__dict__)
+            return
         self.model = model
         self.name = model.name
         self.dimension = model.dimension
