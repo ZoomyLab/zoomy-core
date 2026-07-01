@@ -459,7 +459,16 @@ def gate_eigenvalues_dry(eps=None):
                 _is_frac_pow_of_h,
                 lambda x: sp.Pow(sp.Max(x.base, sp.S.Zero), x.exp))
 
-        gated = [cond(h > e_eps, _guard(e), sp.S.Zero) for e in ev]
+        # Gate SCALAR entries. A ``(n, 1)`` eigenvalue column iterates
+        # row-wise into 1-element sub-arrays, which would lower each gated
+        # entry to ``conditional(cond, array([e]), 0)`` — the constant
+        # (``[0]`` → shape ``(1,)``) vs array-valued (``[e(h)]`` → shape
+        # ``(1, n)``) branches then broadcast to DIFFERENT ranks in the numpy
+        # backend, so ``np.array([...])`` over the entries is inhomogeneous
+        # and raises.  ``sp.flatten`` yields scalars for both the ZArray and
+        # the sympy-Matrix forms ``sm.eigenvalues`` can take (the WB/audusse
+        # path stores a Matrix); gate each, then restore the shape.
+        gated = [cond(h > e_eps, _guard(e), sp.S.Zero) for e in sp.flatten(ev)]
         sm.eigenvalues = ZArray(gated).reshape(*ev.shape)
 
     _op.name = "gate_eigenvalues_dry"
