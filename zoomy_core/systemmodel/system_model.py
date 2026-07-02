@@ -1180,6 +1180,21 @@ class SystemModel:
             parameter_values=ops["parameter_values"],
             state_function_map=ops.get("state_function_map"),
             vertical=getattr(model, "vertical", None),
+            # Carry the initial conditions onto the built SystemModel, exactly
+            # as the basemodel ``from_model`` branch does — otherwise a
+            # declarative model's ``initial_conditions`` (e.g. a dam-break IC set
+            # on ``SME(...)``) is silently dropped and adapters can't run the
+            # model-card default without re-attaching IC by hand (REQ-103).  The
+            # IC lives on the USER-FACING model, passed here as
+            # ``canonical_source`` (the ``model`` arg is the bare derivation
+            # model, which has no IC); fall back to ``model`` when no canonical
+            # source was supplied.
+            initial_conditions=getattr(
+                canonical_source if canonical_source is not None else model,
+                "initial_conditions", None),
+            aux_initial_conditions=getattr(
+                canonical_source if canonical_source is not None else model,
+                "aux_initial_conditions", None),
         )
         sm.history.append({
             "name": "from_model",
