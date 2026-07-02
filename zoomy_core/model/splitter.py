@@ -384,6 +384,228 @@ def _partition_pressure_aux(sm_press, pressure_vars):
 
 
 @dataclass
+class PressureLinearOperator:
+    """Explicit coefficient fields of the affine pressure operator.
+
+    ``SM_press.source`` is AFFINE in the pressure modes and their spatial
+    derivatives (that is why the matrix-free probe path works):
+
+    .. math::
+
+        \\mathrm{source}_k(P)
+          = \\sum_l \\Big[ A0_{kl}\\,P_l
+              + \\sum_a Ad^{(a)}_{kl}\\,\\partial_{x_a} P_l
+              + \\sum_{a\\le b} Add^{(ab)}_{kl}\\,\\partial_{x_a x_b} P_l \\Big]
+            - \\mathrm{RHS}_k .
+
+    This carrier exposes those coefficients as printable sympy expressions in
+    the SAME symbol universe as ``SM_press.source`` (frozen predictor state,
+    params, and the input-aux derivative symbols), so the existing code
+    printers emit them unchanged.  It is produced lazily by
+    :meth:`SystemModel.pressure_operator` (attached to ``SM_press`` by the
+    splitter) — it does NOT re-derive the model: it symbolically
+    differentiates the already-split ``source``.
+
+    Fields
+    ------
+    P_modes : list[Symbol]
+        The ``NP`` pressure state symbols in ``SM_press.equation_to_state_index``
+        order (the code's canonical pressure-mode ordering, ``e2s_press``).
+    A0 : list[list]                 (NP×NP)   ``d source_k / d P_l``.
+    first_derivative : dict[int, list[list]]
+        ``axis → (NP×NP)`` coefficient of ``∂_{x_axis} P_l``.
+    second_derivative : dict[tuple[int,int], list[list]]
+        ``(a, b) with a ≤ b → (NP×NP)`` coefficient of ``∂_{x_a x_b} P_l``.
+    RHS : list                      (length NP)   ``-source_k |_{P=0, dP=0}``.
+
+    Convenience named accessors (``None`` when the axis is absent for the
+    model's dimension): ``Ax``/``Ay``/``Az`` (first) and
+    ``Axx``/``Ayy``/``Azz``/``Axy``/``Axz``/``Ayz`` (second).
+    """
+    P_modes: list
+    A0: list
+    first_derivative: dict
+    second_derivative: dict
+    RHS: list
+
+    def _first(self, axis):
+        return self.first_derivative.get(axis)
+
+    def _second(self, a, b):
+        return self.second_derivative.get((min(a, b), max(a, b)))
+
+    @property
+    def Ax(self):
+        return self._first(0)
+
+    @property
+    def Ay(self):
+        return self._first(1)
+
+    @property
+    def Az(self):
+        return self._first(2)
+
+    @property
+    def Axx(self):
+        return self._second(0, 0)
+
+    @property
+    def Ayy(self):
+        return self._second(1, 1)
+
+    @property
+    def Azz(self):
+        return self._second(2, 2)
+
+    @property
+    def Axy(self):
+        return self._second(0, 1)
+
+    @property
+    def Axz(self):
+        return self._second(0, 2)
+
+    @property
+    def Ayz(self):
+        return self._second(1, 2)
+
+
+def build_pressure_linear_operator(sm_press):
+    """Extract the explicit affine pressure operator from a Chorin
+    ``SM_press`` (see :class:`PressureLinearOperator`).
+
+    Mechanical — no re-derivation.  ``SM_press.source`` is differentiated
+    w.r.t. the bare pressure symbols (→ ``A0``) and w.r.t. the
+    pressure-derivative aux symbols, which the existing aux metadata
+    (``aux_registry`` / ``aux_input_registry`` entries whose ``state_index``
+    is a pressure slot) sorts into first / second-derivative coefficient
+    matrices by their ``multi_index``.  Asserts ``source`` is affine in
+    ``P`` and its pressure derivatives (raises clearly otherwise).
+
+    General over any chorin-split model (VAM any level, ML_VAM), any number
+    of pressure modes ``NP``, and any dimension (2-D / 3-D).
+    """
+    state = list(sm_press.state)
+    e2s = list(getattr(sm_press, "equation_to_state_index", None) or [])
+    if not e2s:
+        raise ValueError(
+            "build_pressure_linear_operator: SM_press carries no "
+            "equation_to_state_index — cannot locate the pressure modes.")
+    P_modes = [state[i] for i in e2s]
+    NP = len(P_modes)
+    pmode_col = {si: l for l, si in enumerate(e2s)}  # state slot → P column l
+    pmode_set = set(P_modes)
+
+    n_dim = len(sm_press.space)
+
+    # ── pressure-derivative aux: aux_symbol → (P column l, multi_index) ──
+    # The canonical source of this metadata is the aux registry.  Live
+    # pressure derivatives sit in ``aux_registry`` (kept by
+    # ``_partition_pressure_aux``); scan ``aux_input_registry`` too so the
+    # extractor is robust to an un-partitioned SM_press.
+    registry = list(getattr(sm_press, "aux_registry", None) or [])
+    registry += list(getattr(sm_press, "aux_input_registry", None) or [])
+    deriv_aux = {}
+    for e in registry:
+        if e.get("kind") not in ("derivative", "limited_derivative"):
+            continue
+        si = e.get("state_index")
+        if si not in pmode_col:
+            continue
+        deriv_aux[e["aux_symbol"]] = (pmode_col[si], tuple(e["multi_index"]))
+    deriv_aux_syms = set(deriv_aux)
+
+    def _row_scalar(i):
+        src = sm_press.source
+        try:
+            return sp.sympify(src[i, 0])
+        except (TypeError, IndexError):
+            return sp.sympify(src[i])
+
+    # Anything a coefficient must NOT still depend on (else non-affine).
+    forbidden = pmode_set | deriv_aux_syms
+
+    A0 = [[sp.S.Zero] * NP for _ in range(NP)]
+    first = {}          # axis → NP×NP
+    second = {}         # (a,b) a<=b → NP×NP
+    RHS = [sp.S.Zero] * NP
+
+    zero_p = {p: sp.S.Zero for p in P_modes}
+    zero_p.update({s: sp.S.Zero for s in deriv_aux_syms})
+
+    def _check_affine(coeff, k, what):
+        bad = forbidden & coeff.free_symbols
+        if bad:
+            raise AssertionError(
+                f"build_pressure_linear_operator: source_{k} is NOT affine "
+                f"in the pressure — coefficient of {what} still depends on "
+                f"pressure atoms {sorted(map(str, bad))}.")
+
+    for k in range(NP):
+        src_k = sp.expand(_row_scalar(k))
+
+        # A0: coefficient of the bare pressure symbol.
+        for l, Pl in enumerate(P_modes):
+            c = sp.diff(src_k, Pl)
+            if c != 0:
+                _check_affine(c, k, str(Pl))
+            A0[k][l] = c
+
+        # First / second-derivative coefficients.
+        for s, (l, mi) in deriv_aux.items():
+            c = sp.diff(src_k, s)
+            if c == 0:
+                continue
+            _check_affine(c, k, str(s))
+            deg = sum(mi)
+            axes = [a for a in range(n_dim) for _ in range(mi[a])]
+            if deg == 1:
+                a = axes[0]
+                first.setdefault(a, [[sp.S.Zero] * NP for _ in range(NP)])
+                first[a][k][l] += c
+            elif deg == 2:
+                a, b = axes[0], axes[1]
+                key = (min(a, b), max(a, b))
+                second.setdefault(key, [[sp.S.Zero] * NP for _ in range(NP)])
+                second[key][k][l] += c
+            else:
+                raise AssertionError(
+                    f"build_pressure_linear_operator: source_{k} carries a "
+                    f"pressure derivative of order {deg} (aux {s}); only "
+                    "first / second derivatives are supported.")
+
+        # RHS = -source|_{P=0, dP=0}.  Everything left must be P-free.
+        const_k = sp.expand(src_k.xreplace(zero_p))
+        _check_affine(const_k, k, "the P-independent part")
+        RHS[k] = sp.expand(-const_k)
+
+    return PressureLinearOperator(
+        P_modes=P_modes,
+        A0=A0,
+        first_derivative=first,
+        second_derivative=second,
+        RHS=RHS,
+    )
+
+
+def _attach_pressure_operator(sm_press):
+    """Attach the lazy, cached ``pressure_operator()`` method to an
+    ``SM_press`` instance (non-breaking; ``source`` is untouched)."""
+    import types
+
+    def _pressure_operator(self):
+        cached = getattr(self, "_pressure_operator_cache", None)
+        if cached is None:
+            cached = build_pressure_linear_operator(self)
+            self._pressure_operator_cache = cached
+        return cached
+
+    sm_press.pressure_operator = types.MethodType(_pressure_operator, sm_press)
+    return sm_press
+
+
+@dataclass
 class SplitForPressureResult:
     """Three sub-SystemModels produced by :func:`split_for_pressure`.
 
@@ -972,6 +1194,10 @@ def split_for_pressure_structural(sm, pressure_vars, dt):
     # aux_state as kernel inputs).  Lets a Model printer emit a minimal,
     # correct update_aux_variables with no split-awareness.
     _partition_pressure_aux(SM_press, pressure_vars)
+    # Opt-in explicit affine pressure operator (coefficient fields for
+    # MG/MLABecLaplacian backends).  Lazy + cached — extracted by symbolic
+    # differentiation of the (unchanged) ``SM_press.source`` on first call.
+    _attach_pressure_operator(SM_press)
 
     func_to_sym = dict(zip(state_funcs, state))
     update_exprs_sym = [e.xreplace(func_to_sym) for e in update_exprs]
@@ -1217,6 +1443,7 @@ def split_simple(sm, pressure_vars, dt, *, bottom=None):
     # Minimal live aux: only the pressure derivatives stay in aux_registry;
     # the frozen predictor-produced aux move to aux_input_registry.
     _partition_pressure_aux(SM_press, pressure_vars)
+    _attach_pressure_operator(SM_press)
 
     # ── 3. SM_corr: update_variables = U − (dt/h)·T_u(P) ─────────────
     # Identical pattern to split_for_pressure's SM_corr.
@@ -1299,6 +1526,8 @@ def split_simple(sm, pressure_vars, dt, *, bottom=None):
 
 __all__ = [
     "build_pressure_elliptic_block",
+    "build_pressure_linear_operator",
+    "PressureLinearOperator",
     "verify_p_linearity",
     "split_for_pressure",
     "split_simple",
