@@ -220,8 +220,19 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
         self._sim_Qaux = Qauxnew
 
     def _apply_implicit_diffusion(self, Qexp, Qaux, dt, time_now):
-        """Apply implicit diffusion with boundary face gradients."""
-        if not hasattr(self, '_diffusion_ops') or self._diffusion_ops is None:
+        """Apply implicit diffusion with boundary face gradients.
+
+        Two paths (built in ``_build_diffusion_operators``):
+
+        * dense / state-dependent ``diffusion_matrix`` → the single
+          :class:`DenseDiffusionOperator` on ``self._dense_diffusion`` solves the
+          cross-variable ``∇·(A:∇Q)`` implicitly (Newton when ``A`` is
+          state-dependent), evaluating the model's runtime ``diffusion_matrix``;
+        * scalar-``ν`` diagonal → the per-variable ``self._diffusion_ops`` loop.
+        """
+        dense = getattr(self, "_dense_diffusion", None)
+        scalar_ops = getattr(self, "_diffusion_ops", None)
+        if dense is None and not scalar_ops:
             return Qexp
 
         # Compute boundary face gradients from BC objects
@@ -230,22 +241,6 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
         has_aux = Qaux.shape[0] > 0
         normals_arr = self._sim_mesh.face_normals[:self._sim_mesh.dimension, :]
 
-        # Compute face values via the indexed BC kernel for face_gradient
-        bc_fn = self._bc_fn
-        bc_indices = self._bc_indices
-        face_centers = self._sim_mesh.face_centers
-        bf_values = np.zeros((n_vars, self._n_bf))
-        for i_bf in range(self._n_bf):
-            q_inner = Qexp[:, self._bf_cells[i_bf]]
-            qaux_inner = Qaux[:, self._bf_cells[i_bf]] if has_aux else np.array([])
-            fidx = self._bf_fidx[i_bf]
-            normal = normals_arr[:, fidx]
-            position = face_centers[fidx, :]
-            bf_values[:, i_bf] = bc_fn(
-                bc_indices[i_bf], time_now, position, self._d_face[i_bf],
-                q_inner, qaux_inner, self._sim_parameters, normal,
-            )
-
         bf_grads = _compute_bf_face_gradients(
             Qexp, Qaux, self._bc_indices, self._bc_grad_fn,
             self._bf_cells, self._bf_fidx, self._d_face, normals_arr,
@@ -253,7 +248,26 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
             n_vars, has_aux, time_now, self._sim_parameters,
         )
 
-        for v, diff_op in self._diffusion_ops.items():
+        if dense is not None:
+            # Model's own rank-4 diffusion_matrix, lambdified on the runtime as
+            # ``diffusion_matrix(Q, Qaux, p)`` (full-grid).  Qaux/p are held
+            # fixed across the implicit (Newton) iterations; only Q varies.
+            A_fn = self._sim_model.diffusion_matrix
+            p = self._sim_parameters
+
+            def _A(Qs, _Qaux=Qaux, _p=p, _fn=A_fn):
+                return _fn(Qs, _Qaux, _p)
+
+            bf_grad_arr = np.stack([bf_grads[v] for v in range(n_vars)], axis=0)
+            Qexp[:, :] = dense.implicit_solve(
+                Qexp, dt, _A, bf_grad_arr,
+                tol=self.gmres_tol, maxiter=self.gmres_maxiter,
+                newton_maxiter=self.implicit_maxiter,
+                newton_tol=self.implicit_tol, fd_eps=self.fd_eps,
+            )
+            return Qexp
+
+        for v, diff_op in scalar_ops.items():
             Qexp[v, :] = diff_op.implicit_solve_with_bc(Qexp[v, :], dt, bf_grads[v])
         return Qexp
 

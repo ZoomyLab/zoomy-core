@@ -497,38 +497,49 @@ class HyperbolicSolver(Solver):
         ``diffusion_matrix`` ``A(Q, Qaux, p)`` (shape ``(n_eq, n_state,
         n_dim, n_dim)``) — the constitutive tensor in ``div(A : grad Q)``.
 
-        For each DIAGONAL entry ``A[v, v, d, d]`` the per-cell diffusivity is the
-        STATE-DEPENDENT field ``−A[v, v, d, d]`` (e.g. stay-3D's ``ν/h²``),
-        lambdified here and evaluated each step (``self._diffusivity_fns``) — NOT
-        a constant ``ν``.  Only those variables diffuse (``b``/``h`` no longer get
-        a spurious Laplacian).  Cross-variable / cross-derivative entries raise
-        (not wired in the numpy backend).  Returns ``None`` when ``A`` is empty
-        or ``ν ≤ 0`` (so SME's source-viscosity and VAM's inviscid runs are
-        untouched)."""
+        Two paths, selected by the STRUCTURE of ``A`` (:meth:`_classify_diffusion`):
+
+        * **Scalar path** (constant DIAGONAL ``A[v, v, d, d]``): the per-variable
+          :class:`DiffusionOperatorV2` (``ν × L``), returned as a ``{v: op}`` dict
+          and consumed by the existing per-variable implicit/explicit loops.
+          Gated on ``ν > 0`` (SME source-viscosity / VAM inviscid runs untouched).
+        * **Dense path** (any off-diagonal ``A[i, j]`` ``i≠j``, cross-derivative
+          ``d≠e``, OR state-dependent entry): a single
+          :class:`DenseDiffusionOperator` stored on ``self._dense_diffusion``.
+          It assembles + solves the GENERAL ``∇·(A:∇Q)`` (cross-variable, evaluated
+          at ``Q^{n+1}`` — Newton when ``A`` depends on the state), which the IMEX
+          solver drives in ``_apply_implicit_diffusion``.  No ``ν`` gate (the
+          diffusivity lives in the tensor, e.g. μ(I) ν-moments carried as aux).
+
+        Returns the scalar ``{v: op}`` dict (or ``None``); the dense operator, when
+        built, is on ``self._dense_diffusion`` (else ``None``)."""
+        self._dense_diffusion = None
         sym_A = getattr(symbolic_model, 'diffusion_matrix', None)
         if sym_A is None:
             return None
         if all(sp.simplify(e) == 0 for e in sp.flatten(sym_A)):
             return None
+
+        needs_dense, state_dependent, diagonal = self._classify_diffusion(
+            sym_A, symbolic_model)
+
+        if needs_dense or state_dependent:
+            # GENERAL dense / state-dependent diffusion — the model's own
+            # diffusion_matrix, assembled + solved implicitly (no scalar-ν
+            # reduction, no parabolic CFL).  Consumed only by the IMEX
+            # implicit-diffusion step; the runtime ``diffusion_matrix``
+            # callable is fetched at apply time from ``self._sim_model``.
+            from zoomy_core.fvm.reconstruction import DenseDiffusionOperator
+            self._dense_diffusion = DenseDiffusionOperator(
+                mesh, dim, n_vars, state_dependent=state_dependent)
+            return None
+
+        # Scalar-ν diagonal path (unchanged, bit-for-bit reference).
         nu_val = _param_value(symbolic_model, "nu", default=0.0)
         if nu_val <= 0:
             return None
         from zoomy_core.fvm.reconstruction import DiffusionOperatorV2
-        import itertools
-        n_eq, n_st, n_d = sym_A.shape[0], sym_A.shape[1], sym_A.shape[2]
-        diffusivity = {}                       # variable row → diffusivity expr (= −A[v,v,d,d])
-        for i, j, d, e in itertools.product(range(n_eq), range(n_st),
-                                            range(n_d), range(n_d)):
-            a = sp.sympify(sym_A[i, j, d, e])
-            if a == 0:
-                continue
-            if i == j and d == e:
-                diffusivity[i] = sp.sympify(diffusivity.get(i, 0)) - a
-            else:
-                raise NotImplementedError(
-                    f"diffusion_matrix A[{i},{j},{d},{e}]={a}: cross-variable / "
-                    "cross-derivative state-dependent diffusion is not wired in "
-                    "the numpy backend (only diagonal A[v,v,d,d]).")
+        diffusivity = {v: sp.sympify(-diagonal[v]) for v in diagonal}
         state = list(symbolic_model.variables.get_list())
         aux = list(symbolic_model.aux_variables.get_list())
         par = list(symbolic_model.parameters.get_list())
@@ -536,6 +547,39 @@ class HyperbolicSolver(Solver):
             v: sp.lambdify(state + aux + par, expr, "numpy")
             for v, expr in diffusivity.items()}
         return {v: DiffusionOperatorV2(mesh, dim, nu=nu_val) for v in diffusivity}
+
+    @staticmethod
+    def _classify_diffusion(sym_A, symbolic_model):
+        """Classify a rank-4 ``diffusion_matrix`` for path selection.
+
+        Returns ``(needs_dense, state_dependent, diagonal)``:
+
+        * ``needs_dense`` — any non-zero off-diagonal (``i≠j``) or
+          cross-derivative (``d≠e``) entry (the scalar operator only sums
+          ``A[v,v,d,d]``).
+        * ``state_dependent`` — any entry depends on a state or aux symbol
+          (⇒ the implicit solve is nonlinear ⇒ Newton).
+        * ``diagonal`` — ``{v: Σ_d A[v,v,d,d]}`` (the scalar-path diffusivity
+          source, only meaningful when neither flag is set)."""
+        import itertools
+        n_eq, n_st, n_d = sym_A.shape[0], sym_A.shape[1], sym_A.shape[2]
+        state_syms = set(symbolic_model.variables.get_list()) | set(
+            symbolic_model.aux_variables.get_list())
+        needs_dense = False
+        state_dependent = False
+        diagonal = {}
+        for i, j, d, e in itertools.product(range(n_eq), range(n_st),
+                                            range(n_d), range(n_d)):
+            a = sp.sympify(sym_A[i, j, d, e])
+            if a == 0:
+                continue
+            if a.free_symbols & state_syms:
+                state_dependent = True
+            if i == j and d == e:
+                diagonal[i] = sp.sympify(diagonal.get(i, 0)) + a
+            else:
+                needs_dense = True
+        return needs_dense, state_dependent, diagonal
 
     def _build_reconstruction(self, mesh, symbolic_model):
         """Build ghost-cell-free face reconstruction."""

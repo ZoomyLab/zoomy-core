@@ -1310,6 +1310,240 @@ class DiffusionOperatorV2:
         return sol
 
 
+class DenseDiffusionOperator:
+    r"""Dense, state-dependent implicit diffusion: ``div(A : grad Q)``.
+
+    Assembles the two-point (normal-gradient) FVM divergence of the model's
+    GENERAL diffusive flux ``F_diff[i,d] = Σ_{j,e} A[i,j,d,e] ∂_e Q[j]`` from
+    the rank-4 ``diffusion_matrix`` ``A(Q, Qaux, p)`` (shape
+    ``(n_eq, n_state, n_dim, n_dim)``).  Unlike :class:`DiffusionOperatorV2`
+    (scalar ``ν`` × constant Laplacian, per-variable diagonal) this couples
+    variables (dense ``A[i,j]``, ``i≠j``) and lets ``A`` depend on the state.
+
+    Discretisation.  At each face the full gradient is approximated by its
+    face-NORMAL two-point difference (TPFA), ``grad Q_j ≈ (∂Q_j/∂n)·n`` with
+    the unit face normal ``n``.  Contracting the tensor against ``n`` on both
+    the flux and the gradient index collapses ``A`` to a scalar variable
+    coupling ::
+
+        T[i,j] = Σ_{d,e} A[i,j,d,e] · n_d · n_e
+
+    (face-averaged, ``Ā = ½(A_a + A_b)``), so the interior face-normal flux for
+    equation ``i`` is ``Σ_j T[i,j]·(Q_{j,b}−Q_{j,a})/(n·Δx)·|f|``.  The
+    geometry factors (``g = |f|/dist/|n·ê|`` interior, ``|f|/|n·ê|/V`` boundary)
+    are IDENTICAL to :class:`DiffusionOperatorV2`, so a constant diagonal
+    ``A = ν·I·δ_de`` reduces to ``ν·L`` bit-for-bit (unit normals ⇒
+    ``T = ν·δ_ij``).  This is the choice the jax mirror must match.
+
+    Time discretisation is Crank–Nicolson (θ=½): unconditionally stable, so no
+    parabolic CFL.  ``state_dependent=False`` ⇒ ``A`` is constant ⇒ a SINGLE
+    linear GMRES solve; ``state_dependent=True`` ⇒ ``A`` is evaluated at the
+    unknown ``Q^{n+1}`` ⇒ the implicit half is NONLINEAR and is solved by
+    Newton with a matrix-free (finite-difference JVP) GMRES inner solve.
+    """
+
+    def __init__(self, mesh, dim, n_vars, state_dependent=False):
+        self.mesh = mesh
+        self.dim = dim
+        self.n_vars = int(n_vars)
+        self.state_dependent = bool(state_dependent)
+        nc = mesh.n_inner_cells
+        iA = mesh.face_cells[0]
+        iB = mesh.face_cells[1]
+        centers = mesh.cell_centers[:dim, :]
+        normals = mesh.face_normals[:dim, :]
+        face_vol = mesh.face_volumes
+        cell_vol = mesh.cell_volumes
+        self.nc = nc
+
+        # Interior-face geometry (nu-free) + unit normal per face — the SAME
+        # per-face factors DiffusionOperatorV2 bakes into ``L``.
+        ia, ib, gA, gB, n_int = [], [], [], [], []
+        for f in range(mesh.n_faces):
+            a, b = iA[f], iB[f]
+            if not (a < nc and b < nc):
+                continue
+            dx = centers[:, b] - centers[:, a]
+            dist = np.linalg.norm(dx)
+            if dist < 1e-30:
+                continue
+            n = normals[:, f]
+            n_dot_e = np.dot(n, dx / dist)
+            n_dot_e = max(abs(n_dot_e), 0.1) * np.sign(n_dot_e + 1e-30)
+            g = face_vol[f] / dist / abs(n_dot_e)
+            ia.append(a); ib.append(b)
+            gA.append(g / cell_vol[a]); gB.append(g / cell_vol[b])
+            n_int.append(n.copy())
+        self._ia = np.asarray(ia, dtype=int)
+        self._ib = np.asarray(ib, dtype=int)
+        self._gA = np.asarray(gA, dtype=float)
+        self._gB = np.asarray(gB, dtype=float)
+        # (dim, n_int) unit normals for the T = Σ A n_d n_e contraction.
+        self._n_int = (np.asarray(n_int, dtype=float).T
+                       if n_int else np.zeros((dim, 0)))
+
+        # Boundary-face geometry + unit normal (inner-cell tensor, per V2).
+        bf_inner, bf_g, n_bf = [], [], []
+        for i_bf in range(mesh.n_boundary_faces):
+            fidx = mesh.boundary_face_face_indices[i_bf]
+            inner = mesh.boundary_face_cells[i_bf]
+            a, b = iA[fidx], iB[fidx]
+            dx = centers[:, b] - centers[:, a]
+            dist = np.linalg.norm(dx)
+            if dist < 1e-30:
+                bf_inner.append(inner); bf_g.append(0.0)
+                n_bf.append(normals[:, fidx].copy())
+                continue
+            n = normals[:, fidx]
+            n_dot_e = np.dot(n, dx / dist)
+            n_dot_e = max(abs(n_dot_e), 0.1) * np.sign(n_dot_e + 1e-30)
+            g = face_vol[fidx] / abs(n_dot_e) / cell_vol[inner]
+            bf_inner.append(inner); bf_g.append(g)
+            n_bf.append(n.copy())
+        self._bf_inner = np.asarray(bf_inner, dtype=int)
+        self._bf_g = np.asarray(bf_g, dtype=float)
+        self._n_bf = (np.asarray(n_bf, dtype=float).T
+                      if n_bf else np.zeros((dim, 0)))
+
+    # -- tensor normalisation ------------------------------------------
+
+    def _as_cell_tensor(self, A):
+        """Broadcast a lambdified ``diffusion_matrix`` return to the per-cell
+        rank-4 layout ``(n_eq, n_state, nc, n_dim, n_dim)``.
+
+        The numpy runtime stacks along a trailing axis, so a full-grid call
+        yields ``(n_eq, n_state, nc, dim, dim)`` while a purely-constant tensor
+        collapses to ``(n_eq, n_state, dim, dim)`` — both handled here."""
+        A = np.asarray(A, dtype=float)
+        d = self.dim
+        if A.ndim == 5:
+            return A
+        if A.ndim == 4:  # (n_eq, n_st, dim, dim) — constant, no cell axis
+            return np.broadcast_to(
+                A[:, :, None, :, :],
+                (A.shape[0], A.shape[1], self.nc, d, d))
+        raise ValueError(
+            f"diffusion_matrix returned ndim={A.ndim}; expected 4 or 5.")
+
+    # -- discrete divergence  D[i] = (∇·F_diff)[i] ---------------------
+
+    def _divergence(self, Q, A_cells, bf_grads=None):
+        """Discrete ``∇·F_diff`` for state ``Q`` and per-cell tensor
+        ``A_cells`` (``(n_eq, n_st, nc, dim, dim)``).
+
+        When ``bf_grads`` (``(n_vars, n_bf)`` face-normal gradients from the BC
+        kernel) is given the boundary diffusive flux is added; ``None`` returns
+        the interior-only operator (used inside the implicit matvec / JVP)."""
+        n_eq = A_cells.shape[0]
+        D = np.zeros((n_eq, self.nc), dtype=float)
+        if self._ia.size:
+            A_a = A_cells[:, :, self._ia]           # (n_eq,n_st,nf,d,d)
+            A_b = A_cells[:, :, self._ib]
+            Aface = 0.5 * (A_a + A_b)
+            # T[i,j,f] = Σ_{d,e} Ā[i,j,f,d,e] n_d n_e
+            T = np.einsum('ijfde,df,ef->ijf', Aface,
+                          self._n_int, self._n_int)
+            dQ = Q[:, self._ib] - Q[:, self._ia]    # (n_st,nf)
+            flux = np.einsum('ijf,jf->if', T, dQ)   # (n_eq,nf)
+            np.add.at(D, (slice(None), self._ia),  flux * self._gA)
+            np.add.at(D, (slice(None), self._ib), -flux * self._gB)
+        if bf_grads is not None and self._bf_inner.size:
+            A_in = A_cells[:, :, self._bf_inner]    # (n_eq,n_st,nbf,d,d)
+            T_bf = np.einsum('ijbde,db,eb->ijb', A_in,
+                             self._n_bf, self._n_bf)
+            fluxb = np.einsum('ijb,jb->ib', T_bf,
+                              np.asarray(bf_grads, dtype=float))
+            np.add.at(D, (slice(None), self._bf_inner), fluxb * self._bf_g)
+        return D
+
+    # -- Crank–Nicolson implicit solve ---------------------------------
+
+    def implicit_solve(self, Q_star, dt, A_fn, bf_grads,
+                       tol=1e-8, maxiter=100, newton_maxiter=8,
+                       newton_tol=1e-8, fd_eps=1e-7):
+        r"""One implicit-diffusion sub-step.
+
+        Solves the Crank–Nicolson update of ``∂_t Q = ∇·F_diff(Q)``::
+
+            (Q^{n+1} − Q*)/dt = ½ [ 𝒟_impl(Q^{n+1}) + 𝒟_expl ],
+
+        with ``𝒟_impl`` the interior divergence (``A`` at the current iterate)
+        and ``𝒟_expl = interior(Q*) + boundary(Q*)`` the frozen explicit half
+        (boundary treated explicitly from ``bf_grads``, exactly as
+        :meth:`DiffusionOperatorV2.implicit_solve_with_bc`).
+
+        ``A_fn(Q) -> diffusion_matrix`` closes over ``Qaux``/``p``.  For a
+        state-independent operator this is a single linear GMRES solve; for a
+        state-dependent one a Newton loop with a matrix-free (FD-JVP) GMRES
+        inner solve."""
+        Q_star = np.asarray(Q_star, dtype=float)
+        n_vars, nc = Q_star.shape
+        shape = Q_star.shape
+
+        A_star = self._as_cell_tensor(A_fn(Q_star))
+        # Explicit half (constant): interior(Q*) + boundary(Q*).
+        D_expl = self._divergence(Q_star, A_star, bf_grads=bf_grads)
+
+        if not self.state_dependent:
+            # Linear CN: (I − dt/2 D_int) Q = Q* + dt/2 (D_int Q* + bf).
+            rhs = (Q_star + 0.5 * dt * D_expl).reshape(-1)
+
+            def matvec(x_flat):
+                X = x_flat.reshape(shape)
+                DX = self._divergence(X, A_star, bf_grads=None)
+                return (X - 0.5 * dt * DX).reshape(-1)
+
+            LinOp = LinearOperator((Q_star.size, Q_star.size),
+                                   matvec=matvec, dtype=float)
+            sol, _ = gmres(LinOp, rhs, x0=Q_star.reshape(-1),
+                           atol=0.0, rtol=tol, maxiter=maxiter)
+            return sol.reshape(shape)
+
+        # State-dependent: Newton on R(Q) = Q − Q* − dt/2 (D_impl(Q) + D_expl).
+        def residual(Q):
+            D_impl = self._divergence(Q, self._as_cell_tensor(A_fn(Q)),
+                                      bf_grads=None)
+            return Q - Q_star - 0.5 * dt * (D_impl + D_expl)
+
+        Q = np.array(Q_star, copy=True)
+        for _ in range(newton_maxiter):
+            R = residual(Q)
+            if float(np.linalg.norm(R)) < newton_tol:
+                break
+
+            def jvp(v_flat, _Q=Q, _R=R):
+                V = v_flat.reshape(shape)
+                Rp = residual(_Q + fd_eps * V)
+                return ((Rp - _R) / fd_eps).reshape(-1)
+
+            J = LinearOperator((Q.size, Q.size), matvec=jvp, dtype=float)
+            # Use the GMRES iterate even when it stops on maxiter (info>0):
+            # the diffusion Jacobian ``I − dt/2 ∂𝒟`` is well-conditioned, so a
+            # non-"converged" iterate is still a good Newton step — the outer
+            # Newton loop absorbs the residual.  (Replacing it with ``−R`` would
+            # be a catastrophic step.)
+            delta, _info = gmres(J, (-R).reshape(-1), atol=0.0,
+                                 rtol=tol, maxiter=maxiter)
+            Q = Q + delta.reshape(shape)
+        return Q
+
+    def residual_norm(self, Q_np1, Q_star, dt, A_fn, bf_grads):
+        r"""Norm of the Crank–Nicolson residual the Newton solve drives to zero::
+
+            R = Q^{n+1} − Q* − dt/2 ( 𝒟_int(Q^{n+1}) + 𝒟_int(Q*) + bf ).
+
+        This is the θ=½ analogue of the task's backward-Euler target
+        ``(Q^{n+1}−Q*)/dt = ∇·F_diff(Q^{n+1})`` (θ=1); CN is used so the
+        constant-diagonal case reduces to :class:`DiffusionOperatorV2`
+        bit-for-bit.  ``→0`` ⇔ the implicit diffusion update is satisfied."""
+        D_expl = self._divergence(
+            Q_star, self._as_cell_tensor(A_fn(Q_star)), bf_grads=bf_grads)
+        D_impl = self._divergence(
+            Q_np1, self._as_cell_tensor(A_fn(Q_np1)), bf_grads=None)
+        R = Q_np1 - Q_star - 0.5 * dt * (D_impl + D_expl)
+        return float(np.linalg.norm(R))
+
+
 class PrimitiveReconstruction:
     """Wraps a base ghost-cell-free reconstruction with pre/post
     transforms to the model's primitive well-balanced variables.
