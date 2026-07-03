@@ -137,3 +137,25 @@ def test_vam_pressure_split_in_interpolate():
     w0 = sp.simplify(interp[4].subs(zeta, 0))
     u0 = sp.simplify(interp[2].subs(zeta, 0))
     assert sp.simplify(w0 - u0 * sp.Derivative(b, C.x)) == 0
+
+
+def test_sme_projection_on_cell_center_exchange_nodes():
+    """REQ-108: the SME projection is baked on VOF-style CELL-CENTRE nodes
+    ``(j+1/2)/N_z`` (uniform weights) — NOT endpoint-inclusive ``j/(N-1)`` +
+    trapezoidal — so it coincides with the coupling exchange grid (the preCICE
+    map is the identity) and the ``project∘interpolate`` round-trip is exact on a
+    column sampled at ``(j+1/2)/N_z``.  Endpoint nodes mismatched the exchange
+    grid and tipped a dam-break transmission into a reflecting solution.  The
+    round-trip exactness itself is covered by ``test_project_inverts_interpolate``
+    (which samples each row at exactly the nodes it references); this pins the
+    node CONVENTION so it cannot silently regress to endpoints."""
+    model = SME(level=1, dimension=2)
+    N_z = int(model.project_nz)
+    P = [sp.sympify(e) for e in sp.flatten(model.system_model.project_from_3d)]
+    nodes = sorted({float(a.args[0])
+                    for e in P for a in e.atoms(AppliedUndef)
+                    if a.func.__name__ == "P3_u"})
+    expected = [(j + 0.5) / N_z for j in range(N_z)]
+    assert nodes == pytest.approx(expected, abs=1e-12)
+    # the old j/(N-1) convention sampled the endpoints ζ=0 and ζ=1
+    assert 0.0 not in nodes and 1.0 not in nodes

@@ -307,9 +307,15 @@ class SME(BaseModel):
         # we supply only the physical h factor (q_i = h·α_i, matching the old
         # (2i+1)·h·∫₀¹ u_d φ_i dζ).  Integral-free ⇒ every printer lowers it.
         N_z = int(self.project_nz)
-        nodes = [float(j) / (N_z - 1) for j in range(N_z)]
-        weights = [1.0 / (N_z - 1)] * N_z
-        weights[0] *= 0.5; weights[-1] *= 0.5
+        # CELL-CENTER nodes (j+1/2)/N_z with midpoint (uniform) weights: the
+        # coupling exchange lives on the VOF's cell centres, so baking the
+        # projection on the SAME grid makes the preCICE map the IDENTITY and the
+        # project∘interpolate round-trip exact (no interpolation between grids).
+        # (was endpoint-inclusive j/(N-1) + trapezoidal, which mismatched the
+        # exchange grid and broke the round-trip → the SME↔VOF bore-arrival
+        # drift; REQ-108, coupling steward's fix/sme-vof-desing-coupling@8a62aac.)
+        nodes = [(float(j) + 0.5) / N_z for j in range(N_z)]
+        weights = [1.0 / N_z] * N_z
         P3 = {f: sp.Symbol(f"P3_{f}", real=True) for f in ("b", "h")}
         m.project_rows = {b: P3["b"], h: P3["h"]}
         for xd, qh in zip(horiz, q_heads):
