@@ -393,7 +393,7 @@ class VAM(BaseModel):
         h = sp.Function("h", positive=True)(t, *horiz)
         pf = m.parameters.g * h ** 2 / 2
         m.apply({pf: HydrostaticPressure(pf)})
-        sm = SystemModel.from_model(m, Q=[*qs, *P_modes])
+        sm = SystemModel.from_model(m, Q=[*qs, *P_modes], canonical_source=self)
         m.apply({HydrostaticPressure(pf): pf})   # un-tag: leave derivation clean
         from zoomy_core.model.boundary_conditions import resolve_and_attach
         resolve_and_attach(sm, self.boundary_conditions,

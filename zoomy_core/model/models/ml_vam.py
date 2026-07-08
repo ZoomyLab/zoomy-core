@@ -578,7 +578,8 @@ class MLVAM(BaseModel):
     def system_model(self) -> SystemModel:
         m = self.derivation
         sm = SystemModel.from_model(
-            m, Q=[m.bed, m.ht, *m.q_flat, *m.r_flat, *m.P_flat])
+            m, Q=[m.bed, m.ht, *m.q_flat, *m.r_flat, *m.P_flat],
+            canonical_source=self)
         from zoomy_core.model.boundary_conditions import resolve_and_attach
         resolve_and_attach(sm, self.boundary_conditions,
                            aux_bcs=self.aux_boundary_conditions)

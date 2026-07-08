@@ -792,6 +792,48 @@ def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
     S_mat = _to_sym(S_mat)
     M_mat = _to_sym(M_mat)
 
+    # ── diffusion tensors (REQ-111) ──────────────────────────────────────
+    # The horizontal-eddy-viscosity slot ``diffusion_matrix_explicit`` (and
+    # the implicit ``diffusion_matrix``) has shape (n_eq, n_state, n_dim,
+    # n_dim); the REQ-50 jax flux operator reads it off the PREDICTOR runtime.
+    # Sub-systems SHARE the parent's state/coord layout (``state=state`` →
+    # same n_state, n_dim, and the COLUMNS reference the shared state), but
+    # carry a REDUCED equation set (the predictor keeps only the evolution
+    # rows).  So the parent's ROW axis must be remapped, not forwarded whole:
+    # row ``i`` of the sub-system evolves state slot ``e2s[i]``; copy the
+    # parent's diffusion row that evolves that SAME slot.  Rows with no parent
+    # diffusion (pressure/constraint rows, bed) stay zero; an all-zero result
+    # collapses to None so plain models keep ``diffusion_matrix_explicit is
+    # None`` and the corrector/pressure stages carry no spurious tensor.
+    def _remap_diffusion(A_parent):
+        if A_parent is None:
+            return None
+        if hasattr(A_parent, "todense"):
+            Ap = sp.MutableDenseNDimArray(A_parent.todense())
+        elif hasattr(A_parent, "tolist"):
+            Ap = sp.MutableDenseNDimArray(A_parent.tolist())
+        else:
+            Ap = sp.MutableDenseNDimArray(A_parent)
+        parent_e2s = list(sm_parent.equation_to_state_index)
+        slot_to_prow = {parent_e2s[p]: p for p in range(len(parent_e2s))}
+        out = sp.MutableDenseNDimArray.zeros(n_eq, n_state, n_dim, n_dim)
+        any_nonzero = False
+        for i in range(n_eq):
+            p = slot_to_prow.get(equation_to_state_index[i])
+            if p is None:
+                continue
+            for a in range(n_state):
+                for b in range(n_dim):
+                    for c in range(n_dim):
+                        val = Ap[p, a, b, c]
+                        out[i, a, b, c] = val
+                        if val != 0:
+                            any_nonzero = True
+        return out if any_nonzero else None
+
+    diff_impl = _remap_diffusion(sm_parent.diffusion_matrix)
+    diff_expl = _remap_diffusion(sm_parent.diffusion_matrix_explicit)
+
     sm = SystemModel(
         time=t,
         space=coords,
@@ -809,6 +851,10 @@ def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
         nonconservative_matrix=B,
         source=S_mat,
         mass_matrix=M_mat,
+        # Row-remapped from the parent (REQ-111): reaches the predictor's
+        # REQ-50 jax flux runtime, which reads ``runtime.diffusion_matrix_*``.
+        diffusion_matrix=diff_impl,
+        diffusion_matrix_explicit=diff_expl,
         equation_to_state_index=list(equation_to_state_index),
         # Indexed BC kernels carry across unchanged — the sub-system
         # shares the parent's state Symbols, so the parent's
