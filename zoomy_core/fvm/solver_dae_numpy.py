@@ -171,12 +171,19 @@ class DAESolver(Solver):
     def setup_simulation(self, mesh, model, *, write_output=False):
         """Build operators + state once, including BC plumbing,
         output infrastructure, and the registry-driven Qaux walker."""
+        # Normalise the input to a SystemModel — accepts a Model (structural
+        # extraction), a pre-built SystemModel (used as-is, e.g. a hand-built /
+        # ``dae=True`` index-1 DAE model whose non-diagonal M(Q) is inverted
+        # numerically here), or an NSM.  Same canonical helper the base
+        # ``Solver.initialize`` uses, so the DAE path is no longer the odd one
+        # out that only accepted a Model.
+        from zoomy_core.fvm.solver_numpy import _coerce_to_system_model
+        model = _coerce_to_system_model(model)
         mesh = ensure_lsq_mesh(mesh, model)
         self._sim_mesh = mesh
         self._sim_model = model
 
-        # SystemModel — auto-scan happens inside from_model.
-        sm = SystemModel.from_model(model)
+        sm = model
         self.sm = sm
         # Expose the SystemModel on the model too so
         # ``Solver._sm_from_solver_or_model`` and any user-provided

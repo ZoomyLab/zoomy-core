@@ -219,7 +219,12 @@ class Solver(param.Parameterized):
         # (1) LOCAL aux formula leg — per-cell (only present when the model
         # declares a real, non-identity update_aux_variables).
         local_fn = getattr(model, "update_aux_variables", None)
-        if local_fn is not None and Qaux.shape[0] > 0:
+        # ``callable`` (not merely ``is not None``): when ``model`` is a
+        # SystemModel used directly (DAE path), its ``update_aux_variables``
+        # slot is a symbolic ZArray coerced from ``None`` — non-callable and
+        # NOT a real per-cell formula.  Only a lowered callable is a genuine
+        # local-aux leg; the ZArray placeholder is skipped.
+        if callable(local_fn) and Qaux.shape[0] > 0:
             out = np.array(Qaux, copy=True)
             for c in range(Q.shape[1]):
                 vals = np.asarray(

@@ -1137,7 +1137,8 @@ class SystemModel:
 
     @classmethod
     def _from_derivation_model(cls, model, Q=None, Qaux=None,
-                               canonical_source=None) -> "SystemModel":
+                               canonical_source=None,
+                               dae=False) -> "SystemModel":
         """Build a SystemModel from a declarative
         :class:`zoomy_core.model.derivation.model.Model` by structurally extracting
         the operators from its untagged residuals (see
@@ -1155,7 +1156,7 @@ class SystemModel:
                 raise TypeError(
                     "SystemModel.from_model: could not derive Q from the model "
                     "(no ∂_t evolution rows found); pass Q= explicitly.")
-        ops = extract_system_operators(model, Q, Qaux)
+        ops = extract_system_operators(model, Q, Qaux, dae=dae)
         # One normal component per horizontal direction — ``space`` length is
         # ``n_dim`` (1 for the usual SME, 2 for the dimension-agnostic
         # ``dimension=3`` map-view model).
@@ -1235,7 +1236,7 @@ class SystemModel:
 
     @classmethod
     def from_model(cls, model, Q=None, Qaux=None,
-                   canonical_source=None) -> "SystemModel":
+                   canonical_source=None, dae=False) -> "SystemModel":
         """Build a SystemModel from a Model.
 
         Two input kinds are dispatched on the *Model class*:
@@ -1256,7 +1257,8 @@ class SystemModel:
         from zoomy_core.model.derivation.model import Model as _DerivationModel
         if isinstance(model, _DerivationModel):
             return cls._from_derivation_model(
-                model, Q=Q, Qaux=Qaux, canonical_source=canonical_source)
+                model, Q=Q, Qaux=Qaux, canonical_source=canonical_source,
+                dae=dae)
 
         if hasattr(model, "_finalize_for_systemmodel") \
                 and not getattr(model, "_finalized", True):

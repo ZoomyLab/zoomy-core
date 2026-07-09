@@ -102,7 +102,7 @@ def _collect_fields(expr, param_names):
     return out
 
 
-def extract_system_operators(model, Q, Qaux=None):
+def extract_system_operators(model, Q, Qaux=None, dae=False):
     """Structurally extract operator matrices from a declarative ``Model``.
 
     Parameters
@@ -114,6 +114,15 @@ def extract_system_operators(model, Q, Qaux=None):
     Qaux : list of applied field Functions, optional
         The auxiliary fields.  ``None`` ⇒ auto-populate with every field not in
         ``Q``.
+    dae : bool, optional
+        When ``False`` (default) the mass matrix must be diagonal with unit
+        diagonal (``InvertMassMatrix`` was applied) — a non-unit / off-diagonal
+        entry raises, exactly as before.  When ``True`` the model is a genuine
+        **index-1 DAE**: the non-diagonal / singular ``M(Q)`` is RETAINED (entries
+        only ``cancel``-normalised, no raise), for a DAE-aware time-stepper
+        (:class:`~zoomy_core.fvm.solver_dae_numpy.DAESolver`) to invert numerically
+        per cell.  Diagonal-mass consumers still guard with
+        :meth:`SystemModel.assert_diagonal_mass_matrix`.
 
     Returns
     -------
@@ -255,29 +264,38 @@ def extract_system_operators(model, Q, Qaux=None):
     # rows arrive with unit ∂_t coefficient.  The extraction only CHECKS:
     # a non-unit (or non-constant / off-diagonal) mass entry raises — no
     # silent rescaling, no silently-wrong (2k+1)× dynamics.
-    for i in range(n_eq):
-        offdiag = [sp.simplify(M[i, j]) for j in range(n_state)
-                   if j != i and sp.simplify(M[i, j]) != 0]
-        if offdiag:
-            raise ValueError(
-                f"row {i}: off-diagonal mass-matrix entries {offdiag} — "
-                "the runtime cannot integrate this; apply InvertMassMatrix "
-                "(or an explicit inversion) in the derivation.")
-        m_ii = sp.cancel(sp.sympify(M[i, i])) if i < n_state else sp.S.Zero
-        M[i, i] = m_ii
-        if m_ii not in (sp.S.Zero, sp.S.One):
-            raise ValueError(
-                f"row {i}: mass-matrix diagonal {m_ii} != 1 — the runtime "
-                "integrates ∂_t Q = RHS, so this row would evolve "
-                f"{sp.nsimplify(1/m_ii)}× too fast.  Apply "
-                "InvertMassMatrix() in the derivation (after the "
-                "conservative change of variables).")
-
+    #
+    # DAE opt-in: a genuine index-1 DAE (VAM pressure, curvilinear
+    # double-moment) legitimately carries a non-diagonal / singular M(Q) that
+    # the DAESolver inverts numerically per cell.  ``dae=True`` retains it
+    # verbatim (cancel-normalised) and skips the diagonal contract.
     parameters = Zstruct(**{k: model.parameters[k]
                             for k in model.parameters.keys()})
     parameters._symbolic_name = "p"
     parameter_values = Zstruct(**{k: getattr(model.parameter_values, k, 0.0)
                                   for k in model.parameters.keys()})
+
+    if dae:
+        M = sp.Matrix(n_eq, n_state,
+                      lambda i, j: sp.cancel(sp.sympify(M[i, j])))
+    else:
+        for i in range(n_eq):
+            offdiag = [sp.simplify(M[i, j]) for j in range(n_state)
+                       if j != i and sp.simplify(M[i, j]) != 0]
+            if offdiag:
+                raise ValueError(
+                    f"row {i}: off-diagonal mass-matrix entries {offdiag} — "
+                    "the runtime cannot integrate this; apply InvertMassMatrix "
+                    "(or an explicit inversion) in the derivation.")
+            m_ii = sp.cancel(sp.sympify(M[i, i])) if i < n_state else sp.S.Zero
+            M[i, i] = m_ii
+            if m_ii not in (sp.S.Zero, sp.S.One):
+                raise ValueError(
+                    f"row {i}: mass-matrix diagonal {m_ii} != 1 — the runtime "
+                    "integrates ∂_t Q = RHS, so this row would evolve "
+                    f"{sp.nsimplify(1/m_ii)}× too fast.  Apply "
+                    "InvertMassMatrix() in the derivation (after the "
+                    "conservative change of variables).")
 
     return dict(
         time=t, space=space, state=state, aux_state=aux_state,
