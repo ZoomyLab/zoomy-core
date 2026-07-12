@@ -239,7 +239,7 @@ class Solver(param.Parameterized):
 
     def _walk_derivative_aux(self, sm, Qaux, Q, mesh, *,
                              kinds=("derivative",),
-                             limited_aux_fields=None, limiter_fn=None,
+                             limiter_fn=None,
                              copy=True, registry=None):
         """Fill ``aux_registry`` derivative rows of ONE SystemModel by LSQ —
         the single source the canonical :meth:`update_qaux` AND
@@ -250,8 +250,8 @@ class Solver(param.Parameterized):
         canonical post-step walks plain spatial ``derivative`` rows with no
         limiter (defaults → byte-identical to the old inline leg); the Chorin
         pools also walk ``limited_derivative`` rows and apply a TVD limiter
-        (``limiter_fn`` resolved from ``entry['limiter_scheme']`` or
-        ``limited_aux_fields[name]``).  State-derivative targets read ``Q``;
+        (``limiter_fn`` resolved from the model-declared
+        ``entry['limiter_scheme']``).  State-derivative targets read ``Q``;
         function-aux targets read the working aux; boundary faces use
         extrapolation (Neumann-zero).  ``copy=True`` returns a fresh array
         (canonical: don't clobber the caller's Qaux); ``copy=False`` mutates
@@ -289,10 +289,8 @@ class Solver(param.Parameterized):
                 u_full, degree=max(mi), derivatives_multi_index=[mi],
                 u_boundary_face="extrapolation",
             )[:nc, 0]
-            if limiter_fn is not None:
-                scheme = (entry.get("limiter_scheme")
-                          if entry["kind"] == "limited_derivative"
-                          else (limited_aux_fields or {}).get(entry["name"]))
+            if limiter_fn is not None and entry["kind"] == "limited_derivative":
+                scheme = entry.get("limiter_scheme")
                 if scheme is not None:
                     grad = limiter_fn(u_full[:nc], grad, mi, scheme, mesh)
             out[row, :] = grad

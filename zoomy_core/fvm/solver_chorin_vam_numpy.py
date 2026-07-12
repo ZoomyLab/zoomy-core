@@ -358,20 +358,6 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
              "the path-integral fluctuation supplies the bed-slope "
              "force.  Both routes operate on the same SystemModel API; "
              "only the face-flux machinery changes."))
-    limited_aux_fields = param.Dict(
-        default={},
-        doc=("Per-aux-derivative TVD limiter map ``{aux_name: scheme}``.  "
-             "Applied at runtime to LSQ-computed gradients before they "
-             "enter the source / elliptic block.  Schemes: ``'minmod'``, "
-             "``'venkatakrishnan'``, ``'barth_jespersen'``.  Use to "
-             "stabilise pressure-projection at shocks / dam-break "
-             "interfaces where the un-limited LSQ gradient overshoots "
-             "(e.g. ``{'h_x': 'minmod', 'q_U0_x': 'minmod'}`` for a "
-             "VAM dam-break-over-bump test).  Sister mechanism to the "
-             "symbolic ``limit(Derivative, scheme)`` wrapper from "
-             "``zoomy_core.model.numerics`` — that path tags aux "
-             "entries as ``limited_derivative`` directly in the "
-             "operator-form pipeline."))
 
     def __init__(self, sm_pred, sm_press, sm_corr, *,
                  reconstruction=None, **kwargs):
@@ -648,8 +634,7 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
                     or entry.get("state_index") not in self._press_state_idx_set):
                 continue
             scheme = (entry.get("limiter_scheme")
-                      if entry["kind"] == "limited_derivative"
-                      else self.limited_aux_fields.get(entry["name"]))
+                      if entry["kind"] == "limited_derivative" else None)
             self._press_aux_recompute.append({
                 "row":         entry["row"],
                 "state_index": entry["state_index"],
@@ -746,13 +731,13 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         Each sub-system has its own ``aux_state`` ordering, so each registry is
         walked against its own pool.  Function-aux rows (``b`` topography, set
         once via :meth:`set_function_aux`) are left untouched.
-        ``limited_derivative`` rows (and ad-hoc ``limited_aux_fields``) get the
-        TVD limiter via :func:`_apply_cell_limiter`.  Boundary faces use
-        extrapolation (Neumann-zero) — matching the previous chain behaviour;
+        ``limited_derivative`` rows (model-declared via
+        ``zoomy_core.model.numerics.limit``) get the TVD limiter via
+        :func:`_apply_cell_limiter`.  Boundary faces use extrapolation
+        (Neumann-zero) — matching the previous chain behaviour;
         prescribed-Dirichlet inflow is handled in the predictor flux only.
         ``copy=False`` refreshes each pool array in place (no stale refs)."""
         kw = dict(kinds=("derivative", "limited_derivative"),
-                  limited_aux_fields=self.limited_aux_fields,
                   limiter_fn=_apply_cell_limiter, copy=False)
         Q, mesh = self._sim_Q, self._sim_mesh
         self._sim_Qaux = self._walk_derivative_aux(
