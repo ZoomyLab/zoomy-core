@@ -34,6 +34,90 @@ from typing import Any, Optional, Type
 
 from zoomy_core.systemmodel.system_model import SystemModel
 
+# Operator arrays a code printer lowers — the complete set of symbolic-PDE
+# operators carried on a (Numerical)SystemModel.  ``quasilinear_matrix`` is a
+# lazy cached property derived from ``flux``/``nonconservative_matrix``; it is
+# guarded (read) but never assigned back to.
+_OPERATOR_ATTRS = (
+    "flux", "hydrostatic_pressure", "nonconservative_matrix", "source",
+    "source_explicit", "mass_matrix", "eigenvalues",
+    "source_jacobian_wrt_variables", "source_jacobian_wrt_aux_variables",
+    "diffusion_matrix", "update_variables", "update_aux_variables",
+    "state_update",
+)
+
+
+def _op_flat(arr):
+    """Flat list of scalar entries of an operator array (ZArray / MatrixBase /
+    nested list), or ``[]`` for non-array operands."""
+    import sympy as sp
+    if arr is None:
+        return []
+    if hasattr(arr, "_array"):                 # ZArray — flat backing store
+        return list(arr._array)
+    if isinstance(arr, sp.Basic):
+        try:
+            return list(sp.flatten(arr))
+        except Exception:
+            return [arr]
+    if isinstance(arr, (list, tuple)):
+        return list(sp.flatten(arr))
+    return []
+
+
+def _resolve_boundary_traces(nsm) -> None:
+    """REQ-130 — collapse every bed/surface-trace ``Subs(f(ζ), ζ, 0|1)`` node
+    that survived symbolic lowering into its concrete ``Σ αₖ φₖ(0|1)`` value on
+    ALL operator arrays, then GUARD that none remain.
+
+    A boundary trace (bottom KBC ``w(0)=u(0)·∂ₓb``, bed traction, …) is a
+    ``Subs`` of a basis-expanded vertical profile at ζ∈{0,1}; ``.doit()`` turns
+    it into a plain ``Σ αₖ φₖ(0|1)`` with no residual ζ.  ``sp.lambdify``
+    evaluates ``Subs`` transparently, so the NumPy path never noticed a leftover
+    node — but every symbolic-tree printer (generic_c / amrex / ufl) emits
+    ``Subs``/``zeta`` into code that will not compile.  Resolving here — the
+    single ``SystemModel → NumericalSystemModel`` lowering seam every printer
+    routes through — makes this backend-agnostic rather than a per-printer
+    workaround, and the guard mirrors the unresolved-Galerkin-integral raise in
+    ``system_extract`` (``model/derivation/system_extract.py``): a lazy node
+    that cannot be lowered must fail LOUD here, never leak to a printer."""
+    import sympy as sp
+    is_subs = lambda n: isinstance(n, sp.Subs)
+    resolve = lambda n: n.doit()
+
+    for attr in _OPERATOR_ATTRS:
+        arr = getattr(nsm, attr, None)
+        if arr is None or not hasattr(arr, "replace"):
+            continue
+        if any(sp.sympify(e).has(sp.Subs) for e in _op_flat(arr)):
+            setattr(nsm, attr, arr.replace(is_subs, resolve))
+
+    # Guard (defense-in-depth, mirrors system_extract's unresolved-integral
+    # raise): after the resolve NO ``Subs`` atom and NO free vertical ζ symbol
+    # may remain in ANY lowered operator (including the derived
+    # ``quasilinear_matrix``).  A leftover means a boundary trace was genuinely
+    # unresolvable (e.g. free ζ after ``.doit()``) — no symbolic-tree printer
+    # can lower it, so fail here rather than emit uncompilable code.
+    for attr in _OPERATOR_ATTRS + ("quasilinear_matrix",):
+        arr = getattr(nsm, attr, None)
+        for e in _op_flat(arr):
+            e = sp.sympify(e)
+            if e.atoms(sp.Subs):
+                raise ValueError(
+                    f"REQ-130: unresolved Subs boundary trace survives in "
+                    f"operator {attr!r}: {e} — a bed/surface trace could not be "
+                    "collapsed by .doit() (free-ζ profile?).  A symbolic-tree "
+                    "printer (generic_c / amrex / ufl) cannot lower Subs; fix "
+                    "the trace at its birthplace in the model derivation.")
+            stray_zeta = {s for s in e.free_symbols
+                          if getattr(s, "name", None) == "zeta"}
+            if stray_zeta:
+                raise ValueError(
+                    f"REQ-130: free vertical symbol {stray_zeta} survives in "
+                    f"operator {attr!r}: {e} — the σ-reference coordinate ζ must "
+                    "not reach the lowered operators (it is an integration / "
+                    "evaluation dummy).  Fix at the model-derivation birthplace.")
+
 
 # ── Slot dataclasses ────────────────────────────────────────────────
 
@@ -398,6 +482,11 @@ class NumericalSystemModel(SystemModel):
         # on the now-promoted NSM.  Phase A1: default_operations() is empty, so
         # this is a no-op unless the caller opted in via ``extra_operations``.
         sm.derive()
+        # REQ-130: collapse any surviving bed/surface-trace ``Subs(f(ζ),ζ,0|1)``
+        # nodes on every operator array — the single backend-agnostic lowering
+        # seam — and GUARD that none (nor a free ζ) remain, so no symbolic-tree
+        # printer ever receives a node it cannot compile.
+        _resolve_boundary_traces(sm)
         return sm
 
     # ── LSQ-degree resolution ─────────────────────────────────────
