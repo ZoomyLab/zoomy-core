@@ -385,9 +385,13 @@ def plot_topo_field(ax, store, topo, field, time_step=0, hide_below=None,
     if contours is not None:
         out["contours"] = _topo_contours(ax, store, _vertex_values(store, b),
                                          contours)
+    # The field ScalarMappable is always exposed (independent of ``colorbar``)
+    # so overlay helpers — e.g. ``overlays.inset_wedge_colorbar`` — can attach
+    # a colorbar even when the default right-side one is suppressed.
+    sm = mpl.cm.ScalarMappable(cmap=fcmap, norm=fnorm)
+    sm.set_array([])
+    out["mappable"] = sm
     if colorbar:
-        sm = mpl.cm.ScalarMappable(cmap=fcmap, norm=fnorm)
-        sm.set_array([])
         out["colorbar"] = ax.figure.colorbar(
             sm, ax=ax, shrink=style.CONFIG.colorbar_shrink,
             pad=style.CONFIG.colorbar_pad, label=str(field))
