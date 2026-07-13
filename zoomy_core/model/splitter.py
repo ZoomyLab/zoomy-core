@@ -329,6 +329,31 @@ def _extract_pressure_T(residuals, equation_name, pressure_vars, mu_k):
 # ---------------------------------------------------------------------------
 
 
+def _resolve_subs(arr):
+    """Collapse every bed/surface-trace ``Subs(f(ζ), ζ, 0|1)`` node in a
+    sub-system operator array into its concrete ``Σ αₖ φₖ(0|1)`` value.
+
+    Same discipline as REQ-130's ``_resolve_boundary_traces`` at the NSM
+    lowering seam, but applied HERE at chorin-split construction so the
+    SM_pred / SM_press / SM_corr sub-SystemModels are Subs-free for ALL
+    consumers — the amrex Chorin header generator reads their operators
+    directly (``write_chorin_headers`` → ``AmrexSystemModelPrinter``), never
+    through ``NumericalSystemModel.from_system_model``, so the central resolve
+    never reaches them and a leftover ``Subs`` prints as an undeclared C++
+    symbol.  Only ``sp.Subs`` nodes are ``.doit()``-ed (never opaque Galerkin
+    bracket integrals), matching REQ-130."""
+    if arr is None or not hasattr(arr, "applyfunc"):
+        return arr
+    is_subs = lambda n: isinstance(n, sp.Subs)
+    resolve = lambda n: n.doit()
+
+    def _fix(e):
+        e = sp.sympify(e)
+        return e.replace(is_subs, resolve) if e.has(sp.Subs) else e
+
+    return arr.applyfunc(_fix)
+
+
 def _zero_ndim(*shape):
     """A zero rank-3 NCP array whose entries are sympy ``Zero`` (not the
     Python ``int`` 0 ``MutableDenseNDimArray.zeros`` fills with).
@@ -792,6 +817,17 @@ def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
     S_mat = _to_sym(S_mat)
     M_mat = _to_sym(M_mat)
 
+    # Resolve any bed/surface-trace Subs(f(ζ),ζ,0|1) node the moment expansion
+    # left in the residual (e.g. the VAM r_k bottom-KBC trace
+    # ``Subs(2·q_1/h, ζ, 0)``) BEFORE this sub-SystemModel reaches any printer.
+    # SM_pred / SM_press are consumed directly by the amrex Chorin header
+    # generator, which bypasses from_system_model's REQ-130 resolve.
+    F = _resolve_subs(F)
+    P = _resolve_subs(P)
+    B = _resolve_subs(B)
+    S_mat = _resolve_subs(S_mat)
+    M_mat = _resolve_subs(M_mat)
+
     # ── diffusion tensors (REQ-111) ──────────────────────────────────────
     # The horizontal-eddy-viscosity slot ``diffusion_matrix_explicit`` (and
     # the implicit ``diffusion_matrix``) has shape (n_eq, n_state, n_dim,
@@ -1247,6 +1283,8 @@ def split_for_pressure_structural(sm, pressure_vars, dt):
 
     func_to_sym = dict(zip(state_funcs, state))
     update_exprs_sym = [e.xreplace(func_to_sym) for e in update_exprs]
+    update_variables = _resolve_subs(sp.Matrix(update_exprs_sym)) \
+        if update_exprs_sym else sp.Matrix(update_exprs_sym)
     n_corr = len(corr_e2s)
     SM_corr = SystemModel(
         time=sm.time,
@@ -1267,7 +1305,7 @@ def split_for_pressure_structural(sm, pressure_vars, dt):
         boundary_gradients=sm.boundary_gradients,
         initial_conditions=sm.initial_conditions,
         aux_initial_conditions=sm.aux_initial_conditions,
-        update_variables=sp.Matrix(update_exprs_sym),
+        update_variables=update_variables,
         reconstruction_variables=sm.reconstruction_variables,
         state_from_reconstruction=sm.state_from_reconstruction,
     )

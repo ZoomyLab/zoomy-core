@@ -88,18 +88,28 @@ def _verify(model, seed=0):
 
     aux_of = _deriv_aux_map(smp, e2s)
 
-    # ── (1) symbolic residual == 0, every row ──
-    for k in range(NP):
-        rec = _reconstruct(op, smp, aux_of, ndim, k)
-        assert sp.simplify(_row_scalar(smp, k) - rec) == 0, \
-            f"symbolic residual != 0 on row {k}"
-
-    # ── (2) A0 == matrix-free probe at a random concrete cell ──
     rng = random.Random(seed)
     p_syms = set(op.P_modes)
     d_syms = set(aux_of.values())
     all_syms = set().union(*[_row_scalar(smp, k).free_symbols
                              for k in range(NP)])
+
+    # ── (1) reconstruction == source, every row ──
+    # Evaluated at a random concrete cell (pressure modes + derivative aux
+    # given random NON-zero values too, so the whole affine operator — RHS,
+    # A0, first/second-derivative fields — is exercised).  ``sp.simplify(...)
+    # == 0`` is NOT a decision procedure and is hash-order dependent for the
+    # larger ML_VAM residuals (see check (2) below), so certify the true-zero
+    # numerically instead — deterministic and cache-independent.
+    probe_all = {s: sp.Rational(rng.randint(2, 9), rng.randint(1, 5))
+                 for s in all_syms}
+    for k in range(NP):
+        rec = _reconstruct(op, smp, aux_of, ndim, k)
+        diff = sp.N(sp.expand(_row_scalar(smp, k) - rec).xreplace(probe_all))
+        assert abs(complex(diff)) < 1e-9, \
+            f"reconstruction residual != 0 on row {k}: {diff}"
+
+    # ── (2) A0 == matrix-free probe at a random concrete cell ──
     frozen = [s for s in all_syms if s not in p_syms and s not in d_syms]
     subs0 = {s: sp.Rational(rng.randint(2, 9), rng.randint(1, 5))
              for s in frozen}
