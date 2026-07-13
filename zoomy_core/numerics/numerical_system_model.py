@@ -389,6 +389,23 @@ class NumericalSystemModel(SystemModel):
     # ── Constructors ──────────────────────────────────────────────
 
     @classmethod
+    def from_model(cls, model, **kwargs) -> "NumericalSystemModel":
+        """Shortcut: build an NSM straight from a :class:`Model`.
+
+        Equivalent to
+        ``from_system_model(SystemModel.from_model(model), **kwargs)`` and
+        accepts every keyword :meth:`from_system_model` does.
+
+        This preserves the one-directional hierarchy
+        ``Model → SystemModel → NumericalSystemModel``: the ``Model`` never
+        needs to know that ``SystemModel`` exists — the convenience of going
+        straight from a Model lives here, on the NSM, not on the Model.  Build
+        the intermediate ``SystemModel`` explicitly (via
+        :meth:`SystemModel.from_model`) when you need it standalone.
+        """
+        return cls.from_system_model(SystemModel.from_model(model), **kwargs)
+
+    @classmethod
     def from_system_model(
         cls,
         sm,
