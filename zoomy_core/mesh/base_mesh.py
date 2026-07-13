@@ -257,6 +257,14 @@ class BaseMesh(param.Parameterized):
     # Optional
     z_ordering = param.Array(default=np.array([-1]))
 
+    # Mesh-carried field data (gmsh $NodeData / $ElementData), keyed by field
+    # name.  ``node_data[field]`` has shape ``(n_vertices, ...)`` and is aligned
+    # to ``vertex_coordinates`` columns; ``cell_data[field]`` has shape
+    # ``(n_inner_cells, ...)``.  Populated by ``from_msh``; consumed by
+    # ``zoomy_core.mesh.mesh_ic.initial_conditions_from_mesh``.
+    node_data = param.Dict(default={})
+    cell_data = param.Dict(default={})
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         # Guarantee: face_cells[0] is always the inner cell at boundary faces.
@@ -630,15 +638,27 @@ class BaseMesh(param.Parameterized):
         dim = 0
         primary_block = None
         primary_type = None
-        for cb in mio.cells:
+        primary_block_index = -1
+        for i_block, cb in enumerate(mio.cells):
             mtype = _MESHIO_TO_ZOOMY.get(cb.type)
             if mtype and _DIM_OF_TYPE.get(mtype, 0) > dim:
                 dim = _DIM_OF_TYPE[mtype]
                 primary_block = cb
                 primary_type = mtype
+                primary_block_index = i_block
 
         if primary_block is None:
             raise ValueError("No supported cell type found in mesh")
+
+        # gmsh $NodeData / $ElementData carried in the mesh (aligned to the
+        # vertex / primary-cell ordering).  Kept so a backend-agnostic reader
+        # can lift them into an initial condition (see mesh_ic).
+        node_field_data = {k: np.asarray(v) for k, v in mio.point_data.items()}
+        cell_field_data = {
+            k: np.asarray(v[primary_block_index])
+            for k, v in mio.cell_data.items()
+            if k != "gmsh:physical" and primary_block_index < len(v)
+        }
 
         mesh_type = primary_type
         n_faces_per_cell = _FACES_PER_CELL[mesh_type]
@@ -737,6 +757,8 @@ class BaseMesh(param.Parameterized):
             boundary_face_face_indices=boundary_face_face_indices_arr,
             boundary_conditions_sorted_physical_tags=sorted_tags,
             boundary_conditions_sorted_names=sorted_names,
+            node_data=node_field_data,
+            cell_data=cell_field_data,
         )
 
     @classmethod

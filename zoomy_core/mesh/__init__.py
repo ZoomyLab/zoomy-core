@@ -3,6 +3,10 @@
 from zoomy_core.mesh.base_mesh import BaseMesh
 from zoomy_core.mesh.fvm_mesh import FVMMesh
 from zoomy_core.mesh.lsq_mesh import LSQMesh
+from zoomy_core.mesh.mesh_ic import (
+    initial_conditions_from_mesh,
+    interpolate_node_data_to_cells,
+)
 
 
 def ensure_lsq_mesh(mesh, model) -> LSQMesh:
