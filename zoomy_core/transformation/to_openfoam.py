@@ -342,6 +342,13 @@ class FoamSystemModelPrinter(GenericCppBase):
         # qualifies as ``{namespace}::update_aux_variables``.
         blocks.append(self._emit_update_aux_variables())
 
+        # Companion for a split sub-model: fill the FROZEN predictor-forcing auxes
+        # (aux_input_registry) that update_aux_variables does NOT re-derive — the
+        # Poisson RHS driver.  Empty for a plain model (REQ-147).
+        aux_inputs = self._emit_update_aux_input_variables()
+        if aux_inputs:
+            blocks.append(aux_inputs)
+
         blocks.append(f"}} // namespace {self.namespace_name}")
         return "\n".join(blocks)
 
@@ -352,20 +359,6 @@ class FoamSystemModelPrinter(GenericCppBase):
         on the OpenFOAM mesh).  Emitted verbatim from the registry, which the
         Phase-1 split already made minimal (no ``state_index_filter``)."""
         sm = self.sm
-        aux_names = [str(s) for s in sm.aux_state]
-        state_names = [str(s) for s in sm.state]
-
-        def _resolve_source(entry):
-            name = entry["target_name"]
-            if name in state_names:
-                return "Q", state_names.index(name)
-            if name in aux_names:
-                return "Qaux", aux_names.index(name)
-            raise KeyError(
-                f"aux_registry entry {entry['name']!r} references unknown "
-                f"target {name!r} — not found in state or aux_state."
-            )
-
         lines = [
             "inline void update_aux_variables(",
             "    const Foam::List<Foam::volScalarField*>& Q,",
@@ -374,27 +367,7 @@ class FoamSystemModelPrinter(GenericCppBase):
             "    const Foam::fvMesh& mesh)",
             "{",
         ]
-        for entry in sm.aux_registry:
-            row = entry["row"]
-            name = entry["name"]
-            if entry["kind"] in ("derivative", "limited_derivative"):
-                src_container, src_idx = _resolve_source(entry)
-                mi = entry["multi_index"]
-                pad = tuple(mi) + (0,) * (3 - len(mi))
-                lines.append(
-                    f"    // Qaux[{row}] ({name}) = "
-                    f"D^{mi} {src_container}[{src_idx}]"
-                )
-                lines.append(
-                    f"    numerics::compute_derivative"
-                    f"(*Qaux[{row}], *{src_container}[{src_idx}], "
-                    f"{pad[0]}, {pad[1]}, {pad[2]}, mesh);"
-                )
-            elif entry["kind"] == "function":
-                lines.append(
-                    f"    // Qaux[{row}] ({name}) — user-supplied function "
-                    f"loaded by the case directory; no computation."
-                )
+        lines += self._emit_deriv_aux_lines(sm.aux_registry)
 
         # ── Algebraic auxes (e.g. the KP-desingularized ``hinv``) ──────────
         # These are POINTWISE closures, not spatial derivatives, so the
@@ -440,6 +413,70 @@ class FoamSystemModelPrinter(GenericCppBase):
             finally:
                 self.symbol_maps = saved_maps
 
+        lines.append("}")
+        return "\n".join(lines)
+
+    def _emit_deriv_aux_lines(self, registry):
+        """``compute_derivative`` (+ function-comment) lines for a derivative-kind
+        aux registry — shared by ``update_aux_variables`` (live) and
+        ``update_aux_input_variables`` (frozen predictor forcing).  ``row`` indexes
+        the FULL ``aux_state`` (both registries share it) so the slots line up."""
+        sm = self.sm
+        aux_names = [str(s) for s in sm.aux_state]
+        state_names = [str(s) for s in sm.state]
+
+        def _resolve_source(entry):
+            name = entry["target_name"]
+            if name in state_names:
+                return "Q", state_names.index(name)
+            if name in aux_names:
+                return "Qaux", aux_names.index(name)
+            raise KeyError(
+                f"aux registry entry {entry['name']!r} references unknown "
+                f"target {name!r} — not found in state or aux_state."
+            )
+
+        out = []
+        for entry in registry:
+            row = entry["row"]
+            name = entry["name"]
+            if entry["kind"] in ("derivative", "limited_derivative"):
+                src_container, src_idx = _resolve_source(entry)
+                mi = entry["multi_index"]
+                pad = tuple(mi) + (0,) * (3 - len(mi))
+                out.append(f"    // Qaux[{row}] ({name}) = D^{mi} {src_container}[{src_idx}]")
+                out.append(
+                    f"    numerics::compute_derivative"
+                    f"(*Qaux[{row}], *{src_container}[{src_idx}], "
+                    f"{pad[0]}, {pad[1]}, {pad[2]}, mesh);")
+            elif entry["kind"] == "function":
+                out.append(
+                    f"    // Qaux[{row}] ({name}) — user-supplied function "
+                    f"loaded by the case directory; no computation.")
+        return out
+
+    def _emit_update_aux_input_variables(self):
+        """Emit ``update_aux_input_variables(Q, Qaux, mesh)`` — fills the FROZEN
+        predictor-forcing auxes (``sm.aux_input_registry``, e.g. the Chorin
+        pressure's q/h/b derivatives that drive the Poisson RHS) via
+        ``compute_derivative``.  These slots are declared in ``n_dof_qaux`` but
+        NOT re-derived by ``update_aux_variables`` (which only owns the live
+        pressure derivatives), so without this they stay 0 and the pressure
+        residual/RHS is identically 0 → P≡0 (REQ-147).  The driver calls this ONCE
+        per step (inputs constant across the Krylov iterations) before the solve.
+        Empty output for a plain model with no input registry (non-split path
+        unchanged)."""
+        reg = getattr(self.sm, "aux_input_registry", None) or []
+        if not reg:
+            return ""
+        lines = [
+            "inline void update_aux_input_variables(",
+            "    const Foam::List<Foam::volScalarField*>& Q,",
+            "    const Foam::List<Foam::volScalarField*>& Qaux,",
+            "    const Foam::fvMesh& mesh)",
+            "{",
+        ]
+        lines += self._emit_deriv_aux_lines(reg)
         lines.append("}")
         return "\n".join(lines)
 
