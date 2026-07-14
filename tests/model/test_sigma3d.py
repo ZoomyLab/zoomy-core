@@ -70,7 +70,7 @@ def test_full_3d_conservative_sigma_extract():
                                   "rho": 1.0, "lambda_s": 0.5})
     m = mdl.derivation                               # internal asserts ran in derive
     assert not m.mass.expr.atoms(sp.Integral)        # integral absorbed into U
-    sm = mdl.system_model
+    sm = SystemModel.from_model(mdl)
     names = [str(s) for s in sm.state]
     assert names[:3] == ["b", "h", "mom"]
     assert sm.space == [x, zeta]                      # ζ IS a genuine flux direction
@@ -154,7 +154,7 @@ def test_full_deviatoric_stress_and_shallow_recovery():
     txx = [a for a in mom_full.atoms(sp.Function) if "tau_xx" in str(a.func)]
     assert txx, "full-stress Sigma3D must retain the in-plane stress τ̃_xx"
     # honest: τ̃_xx is carried as an aux the user must close (not silently 0)
-    assert any("tau_xx" in str(s) for s in full.system_model.aux_state)
+    assert any("tau_xx" in str(s) for s in SystemModel.from_model(full).aux_state)
 
     clear_derivation_model_cache()
     shallow = Sigma3D(closures=[Newtonian(), NavierSlip(), StressFree(),

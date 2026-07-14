@@ -11,6 +11,7 @@ from zoomy_core.model.derivation.derivation_cache import (
     derivation_cache, clear_derivation_cache, cache_size,
 )
 from zoomy_core.model.models.vam import VAM
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 def test_second_call_is_hit_body_not_rerun():
@@ -108,7 +109,7 @@ def test_real_vam_build_cached_no_recompute():
     @derivation_cache
     def derive_vam(level, dimension):
         builds["n"] += 1
-        return VAM(level=level, dimension=dimension).system_model
+        return SystemModel.from_model(VAM(level=level, dimension=dimension))
 
     sm1 = derive_vam(1, 3)
     assert builds["n"] == 1
@@ -116,5 +117,5 @@ def test_real_vam_build_cached_no_recompute():
     assert builds["n"] == 1, "2nd build must hit cache (no ResolveModes re-run)"
     assert sm1 is sm2
     # srepr-identity of the operator content vs a fresh uncached build
-    fresh = VAM(level=1, dimension=3).system_model
+    fresh = SystemModel.from_model(VAM(level=1, dimension=3))
     assert sp.srepr(sp.Matrix(sm1.flux)) == sp.srepr(sp.Matrix(fresh.flux))

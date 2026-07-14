@@ -17,11 +17,12 @@ import pytest
 
 from zoomy_core.model.models import SME
 from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 def _sme(dim):
-    return SME(level=1, dimension=dim,
-               closures=[Newtonian(), NavierSlip(), StressFree()]).system_model
+    return SystemModel.from_model(SME(level=1, dimension=dim,
+               closures=[Newtonian(), NavierSlip(), StressFree()]))
 
 
 def test_w_slot_has_no_raw_derivative_atoms_2d():

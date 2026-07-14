@@ -59,6 +59,7 @@ from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
 from zoomy_core.model.operations import Multiply, ProductRule, KinematicBC
 from zoomy_core.model.operations import Integrate as IntegrateZ
 from zoomy_core.model.models.sme import SME
+from zoomy_core.systemmodel.system_model import SystemModel
 from zoomy_core.model.models.closures import (
     QRViscosity, RoughWall, StressFree)
 
@@ -128,8 +129,8 @@ class QRKESME(SME):
         g, rho = m.parameters.g, m.parameters.rho
         h = sp.Function("h", positive=True)(t, *horiz)
         b = sp.Function("b", real=True)(t, *horiz)
-        # hydrostatic pressure flux (g·h²/2): recomputed in the inherited
-        # SME.system_model from m, not stashed on self.
+        # hydrostatic pressure flux (g·h²/2): recomputed by the SME builder
+        # (``model_builders.build_sme``) from m, not stashed on self.
 
         # 1 — full system from blueprints (mass, momentum, moment_scaling)
         m.declare_state(h)
@@ -449,17 +450,11 @@ class QRKESME(SME):
 
         return m
 
-    @property
-    def system_model(self):
-        """SME.system_model + flag the sk, se moments as positivity-constrained
-        so ``NumericalSystemModel(regularization.positivity_floor>0)`` floors the
-        remaining singular source dependence (ν_t=C_μ sk⁴/se², the 1/sk, 1/se,
-        1/sk² source prefactors).  k=sk²≥0, ε=se²≥0 hold by construction; the floor
-        only guards the divisions when se (=√ε) passes near zero."""
-        sm = super().system_model
-        sm.positive_state = [s for s in sm.state
-                             if str(s).startswith(("SK_", "SE_"))]
-        return sm
+    # Built via ``SystemModel.from_model(QRKESME(...))`` (REQ-143): the SME
+    # build, then the sk, se moments flagged positivity-constrained so the floor
+    # guards the 1/sk, 1/se, 1/sk² source prefactors as se (=√ε) nears zero.
+    # See ``zoomy_core.systemmodel.model_builders.build_qrkesme``.
+    _system_model_kind = "qrkesme"
 
     def _register_hswme_spectrum(self, sm):
         """HSWME spectrum EXCLUDING sk, se (advective, in-cone — they never set
@@ -467,9 +462,9 @@ class QRKESME(SME):
         the b, h, q block and pad the sk, se slots with ``n·u_m`` (avoids the flaky
         symbolic eigensolve on the rational ν_t entries)."""
         n_eq = sm.n_equations
-        twin = SME(level=int(self.level), dimension=int(self.dimension),
+        twin = SystemModel.from_model(SME(level=int(self.level), dimension=int(self.dimension),
                    small_slope=bool(self.small_slope),
-                   parameters=dict(self.parameter_values.items())).system_model
+                   parameters=dict(self.parameter_values.items())))
         if twin.eigenvalues is None:
             sm.eigenvalues = None
             return

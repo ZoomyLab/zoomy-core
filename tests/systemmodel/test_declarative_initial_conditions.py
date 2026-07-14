@@ -13,6 +13,7 @@ import pytest
 
 from zoomy_core.model.models import SME, MLSME
 from zoomy_core.numerics.numerical_system_model import to_numerical_system_model
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 @pytest.mark.parametrize("factory", [
@@ -21,7 +22,7 @@ from zoomy_core.numerics.numerical_system_model import to_numerical_system_model
 ])
 def test_declarative_system_model_carries_initial_conditions(factory):
     model = factory()
-    sm = model.system_model
+    sm = SystemModel.from_model(model)
     assert sm.initial_conditions is not None, \
         "declarative .system_model dropped initial_conditions (REQ-103)"
     # identity: it is the model's own IC instance, not a fresh default

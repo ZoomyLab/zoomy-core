@@ -172,10 +172,6 @@ class SWE(StructuredDerivativeModel):
         return groups
 
     # ── runtime form ──────────────────────────────────────────────────
-    @property
-    def system_model(self) -> SystemModel:
-        # ``SystemModel.from_model`` now parses the model's function groups AND
-        # attaches its ``_coupling_bcs`` on raw promotion (REQ-87) — the same
-        # wiring this property used to do inline — so every backend adapter /
-        # FVM solver that calls ``from_model`` directly inherits it.
-        return SystemModel.from_model(self)
+    # Build via ``SystemModel.from_model(SWE(...))`` (REQ-143); the builder in
+    # ``zoomy_core.systemmodel.model_builders`` runs the low-level path.
+    _system_model_kind = "swe"

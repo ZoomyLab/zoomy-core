@@ -11,7 +11,8 @@ Two turbulence closures on top of the dimension-agnostic :class:`SME`:
   PLUS depth-averaged transported turbulent kinetic energy ``k`` and dissipation
   ``ε``, coupled through the eddy viscosity ``ν_t = C_μ k²/ε``.
 
-Both are real ``Model`` classes: ``ElderSME(level=2, dimension=3).system_model``.
+Both are real ``Model`` classes:
+``SystemModel.from_model(ElderSME(level=2, dimension=3))``.
 """
 from __future__ import annotations
 

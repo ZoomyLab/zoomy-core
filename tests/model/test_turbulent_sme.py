@@ -5,6 +5,7 @@ import pytest
 
 from zoomy_core.model.models import SME, ElderSME, KESME
 from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 def _closes(sm):
@@ -15,7 +16,7 @@ def _closes(sm):
 def test_plain_sme_unaffected_by_turbulence_hooks():
     """Plain SME carries NO turbulence state and still closes — the hooks
     added for KESME are inert here."""
-    sm = SME(level=2, closures=[Newtonian(), NavierSlip(), StressFree()]).system_model
+    sm = SystemModel.from_model(SME(level=2, closures=[Newtonian(), NavierSlip(), StressFree()]))
     st = [str(s) for s in sm.state]
     assert st == ["b", "h", "q_0", "q_1", "q_2"]
     assert not any(x in st for x in ("k", "varepsilon"))
@@ -25,8 +26,8 @@ def test_plain_sme_unaffected_by_turbulence_hooks():
 @pytest.mark.parametrize("dim", [2, 3])
 def test_elder_sme(dim):
     lvl = 2 if dim == 2 else 1
-    sm = ElderSME(level=lvl, dimension=dim,
-                  parameters={"u_star": 0.3, "kappa": 0.41, "k_s": 0.01}).system_model
+    sm = SystemModel.from_model(ElderSME(level=lvl, dimension=dim,
+                  parameters={"u_star": 0.3, "kappa": 0.41, "k_s": 0.01}))
     assert sm.n_dim == (1 if dim == 2 else 2)
     assert _closes(sm), "Elder ν_t(ζ) is polynomial → closes analytically"
     # no extra turbulence state (algebraic closure)
@@ -36,7 +37,7 @@ def test_elder_sme(dim):
 @pytest.mark.parametrize("dim", [2, 3])
 def test_ke_sme(dim):
     lvl = 2 if dim == 2 else 1
-    sm = KESME(level=lvl, dimension=dim, parameters={"k_s": 0.01}).system_model
+    sm = SystemModel.from_model(KESME(level=lvl, dimension=dim, parameters={"k_s": 0.01}))
     assert sm.n_dim == (1 if dim == 2 else 2)
     st = [str(s) for s in sm.state]
     assert "k" in st and "varepsilon" in st          # transported turbulence

@@ -29,6 +29,7 @@ from zoomy_core.fvm import timestepping
 from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
 from zoomy_core.mesh import BaseMesh
 import zoomy_core.model.initial_conditions as IC
+from zoomy_core.systemmodel.system_model import SystemModel
 
 NC, XMAX, T_END, CFL = 100, 20.0, 1.5, 0.9
 PAR = {"lambda_s": 0.5, "nu": 1e-3}
@@ -54,7 +55,7 @@ def test_vam1_matches_sme1_in_long_wave_limit():
     mesh = BaseMesh.create_1d(domain=(0.0, XMAX), n_inner_cells=NC)
 
     sme = SME(closures=[Newtonian(), NavierSlip(), StressFree()], level=1, parameters=dict(PAR), boundary_conditions=_bcs())
-    sm_s = sme.system_model
+    sm_s = SystemModel.from_model(sme)
     sm_s.initial_conditions = IC.UserFunction(function=_ic(len(sm_s.state)))
     sm_s.aux_initial_conditions = IC.Constant(constants=lambda n: np.zeros(n))
     nsm = NumericalSystemModel.from_system_model(
@@ -66,7 +67,7 @@ def test_vam1_matches_sme1_in_long_wave_limit():
     ns = [str(s) for s in sm_s.state]
 
     vam = VAM(closures=[Newtonian(), NavierSlip(), StressFree()], level=1, parameters=dict(PAR), boundary_conditions=_bcs())
-    sm_v = vam.system_model
+    sm_v = SystemModel.from_model(vam)
     sm_v.initial_conditions = IC.UserFunction(function=_ic(len(sm_v.state)))
     sm_v.aux_initial_conditions = IC.Constant(constants=lambda n: np.zeros(n))
     bcs = _bcs()

@@ -85,12 +85,11 @@ class MalpassetSWE(SWE):
         self.closures = (list(closures) if closures is not None else
                          [ManningFriction(h_floor=float(h_friction_floor)),
                           EddyViscosity()])
-        # SWE.__init__ pops boundary_conditions into ``_coupling_bcs`` and
-        # only re-attaches it in the ``.system_model`` PROPERTY.  The
-        # Firedrake solver bypasses that property (it calls
-        # ``SystemModel.from_model(model)`` + ``UFLRuntimeModel(model)``
-        # directly), so we restore ``self.boundary_conditions`` after the
-        # base init or the wall/inflow BCs are silently lost.
+        # SWE.__init__ pops boundary_conditions into ``_coupling_bcs`` and it is
+        # only re-attached when the SystemModel is built via
+        # ``SystemModel.from_model(model)`` (+ ``UFLRuntimeModel(model)``), so we
+        # restore ``self.boundary_conditions`` after the base init or the
+        # wall/inflow BCs are silently lost.
         super().__init__(
             dimension=2,
             aux_variables=["hinv"],

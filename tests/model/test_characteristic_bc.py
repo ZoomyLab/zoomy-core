@@ -13,10 +13,11 @@ from zoomy_core.model.boundary_conditions import (
 import zoomy_core.fvm.timestepping as timestepping
 from zoomy_core.fvm.solver_numpy import HyperbolicSolver
 from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 def _run(bcs, ic, t_end, nc=100):
-    sm = SME(closures=[Newtonian(), NavierSlip(), StressFree()], level=0, boundary_conditions=bcs).system_model
+    sm = SystemModel.from_model(SME(closures=[Newtonian(), NavierSlip(), StressFree()], level=0, boundary_conditions=bcs))
     sm.initial_conditions = IC.UserFunction(function=ic)
     sm.aux_initial_conditions = IC.Constant(constants=lambda n: np.zeros(n))
     mesh = BaseMesh.create_1d(domain=(0.0, 10.0), n_inner_cells=nc)

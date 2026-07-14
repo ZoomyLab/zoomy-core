@@ -24,12 +24,13 @@ import pytest
 
 from zoomy_core.model.models import SME
 from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 @lru_cache(maxsize=None)
 def _sm(level):
-    return SME(level=level, dimension=3, parameters={"nu": 0.1, "lambda_s": 0.5},
-               closures=[Newtonian(), NavierSlip(), StressFree()]).system_model
+    return SystemModel.from_model(SME(level=level, dimension=3, parameters={"nu": 0.1, "lambda_s": 0.5},
+               closures=[Newtonian(), NavierSlip(), StressFree()]))
 
 
 @pytest.mark.parametrize("level", [1, 2])

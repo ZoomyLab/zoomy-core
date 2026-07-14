@@ -29,7 +29,7 @@ x-momentum rows (u-traces are genuinely one-sided).  The w-rows get NO
 swap — the kinematic closures make the w-traces of adjacent layers exactly
 continuous, so a w* transfer correction is identically zero.
 
-``MLVAM(...).system_model`` is the square DAE (state
+``SystemModel.from_model(MLVAM(...))`` is the square DAE (state
 ``[b, h, q_ℓk, r_ℓk, P_ℓj]``; the per-layer divergence constraints are the
 zero-mass-matrix rows); ``MLVAM.chorin_split(dt)`` returns the structural
 predictor / pressure / corrector sub-systems for
@@ -574,21 +574,15 @@ class MLVAM(BaseModel):
         m.layer_eqs_debug = _layer_eqs_debug
         return m
 
-    @property
-    def system_model(self) -> SystemModel:
-        m = self.derivation
-        sm = SystemModel.from_model(
-            m, Q=[m.bed, m.ht, *m.q_flat, *m.r_flat, *m.P_flat],
-            canonical_source=self)
-        from zoomy_core.model.boundary_conditions import resolve_and_attach
-        resolve_and_attach(sm, self.boundary_conditions,
-                           aux_bcs=self.aux_boundary_conditions)
-        return sm
+    # Built via ``SystemModel.from_model(MLVAM(...))`` (REQ-143); see
+    # ``zoomy_core.systemmodel.model_builders.build_mlvam``.
+    _system_model_kind = "mlvam"
 
     def chorin_split(self, dt=None, *, system_model=None):
         """Structural Chorin split (predictor / pressure / corrector)."""
         from zoomy_core.model.splitter import split_for_pressure_structural
-        sm = system_model if system_model is not None else self.system_model
+        sm = system_model if system_model is not None \
+            else SystemModel.from_model(self)
         if dt is None:
             dt = sp.Symbol("dt", positive=True)
         P_syms = [s for s in sm.state if str(s).startswith("P_")]

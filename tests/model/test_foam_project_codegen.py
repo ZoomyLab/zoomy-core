@@ -23,6 +23,7 @@ import pytest
 from zoomy_core.model.models.sme import SME
 from zoomy_core.transformation.generic_c import GenericCppModel
 from zoomy_core.transformation.to_openfoam import FoamSystemModelPrinter
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 def _project_block(code):
@@ -53,7 +54,7 @@ def _moment_row_carries_h(block, row="res[2]"):
 def test_foam_project_moment_row_carries_h_factor(level):
     """Foam ``project_from_3d`` moment row keeps the ``column[·][1]`` (P3_h)
     factor — the conserved moment ``q_0 = h·u_mean``, not the bare ``u_mean``."""
-    sm = SME(level, dimension=2).system_model
+    sm = SystemModel.from_model(SME(level, dimension=2))
     blocks = FoamSystemModelPrinter(sm)._emit_projection_kernels()
     block = next(b for b in blocks
                  if "project_from_3d" in b and "interpolate_to_3d" not in b)

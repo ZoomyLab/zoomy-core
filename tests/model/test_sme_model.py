@@ -22,7 +22,7 @@ def _scalar(row):
 
 
 def _sm():
-    return SME(closures=[Newtonian(), NavierSlip(), StressFree()], level=2).system_model
+    return SystemModel.from_model(SME(closures=[Newtonian(), NavierSlip(), StressFree()], level=2))
 
 
 def _syms(sm):
@@ -54,7 +54,7 @@ def test_mass_row_is_conservative_and_bed_row_is_inert(level):
     a FLUX (``flux[1] = q_0``), never a ``B·∂_x Q`` coupling; and the bed
     row must be exactly ``∂_t b = 0`` (no source decay) for M-unaware
     consumers of the kernels.  Levels 0/1 are what the OF coupling runs."""
-    sm = SME(closures=[Newtonian(), NavierSlip(), StressFree()], level=level).system_model
+    sm = SystemModel.from_model(SME(closures=[Newtonian(), NavierSlip(), StressFree()], level=level))
     assert sp.simplify(_scalar(sm.flux[1]) - sm.state[2]) == 0
     assert all(_scalar(e) == 0 for e in sm.nonconservative_matrix[1])
     assert _scalar(sm.source[0]) == 0

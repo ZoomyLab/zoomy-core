@@ -18,15 +18,16 @@ import zoomy_core.fvm.timestepping as timestepping
 from zoomy_core.fvm.solver_numpy import HyperbolicSolver
 from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
 from zoomy_core.systemmodel import register_aux, regularize_pow
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 def _build_sme(level=1):
-    return SME(
+    return SystemModel.from_model(SME(
         level=level,
         parameters={"nu": 1e-3, "lambda_s": 0.0},
         closures=[Newtonian(), NavierSlip(), StressFree()],
         boundary_conditions=[Extrapolation("left"), Extrapolation("right")],
-    ).system_model
+    ))
 
 
 def _kp_hinv(h, eps):

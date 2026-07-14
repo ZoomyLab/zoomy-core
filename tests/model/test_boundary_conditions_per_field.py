@@ -24,6 +24,7 @@ import zoomy_core.model.initial_conditions as IC
 import zoomy_core.fvm.timestepping as timestepping
 from zoomy_core.fvm.solver_numpy import HyperbolicSolver
 from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
+from zoomy_core.systemmodel.system_model import SystemModel
 
 STATE = ["b", "h", "q_0", "q_1", "q_2"]          # SME(level=2) state
 
@@ -162,11 +163,11 @@ def test_unknown_field_raises():
 
 def test_end_to_end_per_field_wall_dambreak():
     """The flat per-field list flows through to a running numpy solve."""
-    sm = SME(level=2, parameters={"nu": 1e-3},
+    sm = SystemModel.from_model(SME(level=2, parameters={"nu": 1e-3},
              closures=[Newtonian(), NavierSlip(), StressFree()],
              boundary_conditions=[Wall("left", on="momentum"),
                                   Extrapolation("left", on="h"),
-                                  Extrapolation("right")]).system_model
+                                  Extrapolation("right")]))
     nc = 100
     sm.initial_conditions = IC.UserFunction(
         function=lambda xv: np.array([0.0, 1.5 if float(xv[0]) < 5 else 0.75, 0, 0, 0]))

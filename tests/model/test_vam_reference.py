@@ -29,6 +29,7 @@ import sympy as sp
 
 from zoomy_core.model.models import VAM
 from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 # ── shared fixtures ────────────────────────────────────────────────────────
@@ -36,7 +37,7 @@ from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
 @pytest.fixture(scope="module")
 def vam1():
     model = VAM(closures=[Newtonian(), NavierSlip(), StressFree()], level=1)
-    sm = model.system_model
+    sm = SystemModel.from_model(model)
     return model, sm
 
 

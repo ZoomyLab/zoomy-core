@@ -25,15 +25,16 @@ from zoomy_core.fvm.solver_numpy import HyperbolicSolver, FreeSurfaceFlowSolver
 from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
 import zoomy_core.fvm.timestepping as timestepping
 import zoomy_core.model.initial_conditions as IC
+from zoomy_core.systemmodel.system_model import SystemModel
 
 _ETA0, _LEVEL, _NX = 2.0, 2, 100
 def _bed(x): return 0.5 * np.exp(-x ** 2)
 
 
 def _lake_at_rest_model(eqr):
-    sm = SME(level=_LEVEL, equilibrium_reconstruction=eqr,
+    sm = SystemModel.from_model(SME(level=_LEVEL, equilibrium_reconstruction=eqr,
              boundary_conditions=BoundaryConditions(
-                 [Extrapolation(tag="left"), Extrapolation(tag="right")])).system_model
+                 [Extrapolation(tag="left"), Extrapolation(tag="right")])))
     def ic(xv):
         x = float(xv[0]); b = _bed(x)
         return np.array([b, _ETA0 - b] + [0.0] * (_LEVEL + 1))
@@ -66,8 +67,8 @@ def test_bernoulli_reconstruction_roundtrips_and_preserves_discharge():
     """The Bernoulli kernel reconstructs a (single-signed) sheared column to its
     own bed as the identity and preserves the discharge q=h·α_0 exactly."""
     from zoomy_core.fvm.bernoulli_wb import build_bernoulli_config, reconstruct
-    sm = SME(level=2, boundary_conditions=BoundaryConditions(
-        [Extrapolation(tag="left"), Extrapolation(tag="right")])).system_model
+    sm = SystemModel.from_model(SME(level=2, boundary_conditions=BoundaryConditions(
+        [Extrapolation(tag="left"), Extrapolation(tag="right")])))
     cfg = build_bernoulli_config(sm, mode="bernoulli")
     # a sheared but single-signed column: u(σ) = 0.6 + 0.2·P1 (stays > 0)
     h, b = 1.5, 0.3

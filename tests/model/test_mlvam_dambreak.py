@@ -16,6 +16,7 @@ from zoomy_core.mesh import BaseMesh
 import zoomy_core.model.initial_conditions as IC
 from zoomy_core.model.boundary_conditions import BoundaryConditions, Extrapolation
 from zoomy_core.fvm.solver_chorin_vam_numpy import ChorinSplitVAMSolver
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 @pytest.fixture(scope="module")
@@ -24,7 +25,7 @@ def mlvam():
 
 
 def test_mlvam_is_a_square_dae(mlvam):
-    sm = mlvam.system_model
+    sm = SystemModel.from_model(mlvam)
     assert [str(s) for s in sm.state] == [
         "b", "h", "q_1_0", "q_1_1", "q_2_0", "q_2_1",
         "r_1_0", "r_1_1", "r_2_0", "r_2_1",
@@ -41,7 +42,7 @@ def test_mlvam_split_has_all_correctors(mlvam):
     """The downward pressure-trace convention keeps EVERY velocity row
     pressure-coupled — 8 corrector rows (the upward convention loses
     corr_r_1_1 and the elliptic block goes singular)."""
-    split = mlvam.chorin_split(system_model=mlvam.system_model)
+    split = mlvam.chorin_split(system_model=SystemModel.from_model(mlvam))
     assert split.SM_press.equation_to_state_index == [10, 11, 12, 13]
     assert split.SM_corr.equation_names == [
         "corr_q_1_0", "corr_q_1_1", "corr_q_2_0", "corr_q_2_1",
@@ -49,7 +50,7 @@ def test_mlvam_split_has_all_correctors(mlvam):
 
 
 def test_mlvam_dambreak_over_bump(mlvam):
-    sm = mlvam.system_model
+    sm = SystemModel.from_model(mlvam)
 
     def _bump_ic(xv):
         xx = float(xv[0])

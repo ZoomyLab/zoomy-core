@@ -39,7 +39,8 @@ The aux is introduced with EXISTING machinery — no ``promote_to_aux`` op::
     m.mass.apply({∫ũ dζ: U})                            # U auto-lands in Qaux
 
 ``Sigma3D(...).derive_model()`` builds the declarative model;
-``.system_model`` returns the height-reduced ``[b, h] + U`` SystemModel (the
+``SystemModel.from_model(Sigma3D(...))`` returns the height-reduced
+``[b, h] + U`` SystemModel (the
 3-D momentum is stashed on ``self`` for the forthcoming 3-D extraction, which
 needs the vertical added to the extractor's ``space``).
 """
@@ -257,44 +258,12 @@ class Sigma3D(BaseModel):
 
         return m
 
-    @property
-    def system_model(self) -> SystemModel:
-        """Full 3-D conservative-σ operator system over ``(x, ζ)``.
-
-        State ``[b, h, mom]`` (``mom = h·ũ``); ζ is a genuine flux direction.
-        ``U`` (depth-mean) and ``ω`` (σ vertical velocity) are integral
-        auxiliaries supplied per-backend by integrate-over-z.  The free-surface
-        pressure ``g·h²/2`` is tagged hydrostatic (manual, one-liner); ``1/h``
-        stays raw (regularization is the NumericalSystemModel's job)."""
-        m = self.derivation
-        qs = list(m.explicit_state())
-        bed = sp.Function("b", real=True)(t, x)
-        if bed not in qs:
-            qs = [bed, *qs]
-        # Manual hydrostatic-pressure tag (one-liner): route g·h²/2 → pressure.
-        from zoomy_core.model.derivation.system_extract import HydrostaticPressure
-        h = sp.Function("h", positive=True)(t, x)
-        pf = m.parameters.g * h ** 2 / 2
-        m.apply({pf: HydrostaticPressure(pf)})
-        sm = SystemModel.from_model(m, Q=qs, canonical_source=self)
-        m.apply({HydrostaticPressure(pf): pf})   # un-tag: leave derivation clean
-        # CLOSURE → ζ-FACE-BC REDUCTION: the user states the bed/surface
-        # conditions as physical closures; here the reduction emits them as
-        # ordinary solver BCs on the ζ-faces (combined with the user's
-        # horizontal BCs).  ω(0)=ω(1)=0 (no-penetration) is structural in the ω
-        # aux, so only the viscous tractions become BCs.
-        from zoomy_core.model.boundary_conditions import (
-            resolve_and_attach, Extrapolation)
-        user = self.boundary_conditions
-        if user is None:
-            horiz_bcs = [Extrapolation(tag="left"), Extrapolation(tag="right")]
-        elif isinstance(user, list):
-            horiz_bcs = list(user)
-        else:
-            horiz_bcs = list(user.boundary_conditions_list)
-        all_bcs = horiz_bcs + self._vertical_face_bcs(sm)
-        resolve_and_attach(sm, all_bcs, aux_bcs=self.aux_boundary_conditions)
-        return sm
+    # The full 3-D conservative-σ operator system over ``(x, ζ)`` (state
+    # ``[b, h, mom]``; ζ a genuine flux direction) is built via
+    # ``SystemModel.from_model(Sigma3D(...))`` (REQ-143); the builder in
+    # ``zoomy_core.systemmodel.model_builders`` tags the hydrostatic flux and
+    # runs the closure → ζ-face-BC reduction via ``_vertical_face_bcs``.
+    _system_model_kind = "sigma3d"
 
     def _vertical_face_bcs(self, sm):
         """Translate the bed/surface CLOSURES into ζ-face solver BCs (the user

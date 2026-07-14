@@ -40,6 +40,7 @@ from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
 from zoomy_core.model.operations import Multiply, ProductRule, KinematicBC
 from zoomy_core.model.operations import Integrate as IntegrateZ
 from zoomy_core.model.models.sme import SME
+from zoomy_core.systemmodel.system_model import SystemModel
 from zoomy_core.model.models.closures import (
     KEpsilonViscosity, RoughWall, StressFree)
 
@@ -103,10 +104,10 @@ class KESME(SME):
         g, rho = m.parameters.g, m.parameters.rho
         h = sp.Function("h", positive=True)(t, *horiz)
         b = sp.Function("b", real=True)(t, *horiz)
-        # hydrostatic pressure flux, tagged in the inherited SME.system_model
-        # (mirrors SME.derive_model; the extractor routes it to
+        # hydrostatic pressure flux, tagged by the SME builder
+        # (``model_builders.build_sme``; the extractor routes it to
         # hydrostatic_pressure rather than the conservative flux).  Recomputed
-        # in SME.system_model from m — not stashed on self.
+        # there from m — not stashed on self.
 
         # 1 — full system from blueprints (mass, momentum, moment_scaling)
         m.declare_state(h)
@@ -365,15 +366,12 @@ class KESME(SME):
 
         return m
 
-    @property
-    def system_model(self):
-        """SME.system_model + flag the k, ε moments as positivity-constrained
-        so ``NumericalSystemModel(regularization.positivity_floor>0)`` floors
-        their singular source dependence (ν_t=C_μk²/ε, wall √k)."""
-        sm = super().system_model
-        sm.positive_state = [s for s in sm.state
-                             if str(s).startswith(("K_", "E_"))]
-        return sm
+    # Built via ``SystemModel.from_model(KESME(...))`` (REQ-143): the SME build,
+    # then the k, ε moments flagged positivity-constrained so
+    # ``NumericalSystemModel(regularization.positivity_floor>0)`` floors their
+    # singular source dependence (ν_t=C_μk²/ε, wall √k).  See
+    # ``zoomy_core.systemmodel.model_builders.build_kesme``.
+    _system_model_kind = "kesme"
 
     def _register_hswme_spectrum(self, sm):
         """HSWME spectrum EXCLUDING k, ε (they are not critical for the CFL
@@ -384,9 +382,9 @@ class KESME(SME):
         b, h, q block and pad the k, ε slots with ``n·u_m`` — avoiding the flaky
         9×9 symbolic eigensolve on the rational ν_t entries."""
         n_eq = sm.n_equations
-        twin = SME(level=int(self.level), dimension=int(self.dimension),
+        twin = SystemModel.from_model(SME(level=int(self.level), dimension=int(self.dimension),
                    small_slope=bool(self.small_slope),
-                   parameters=dict(self.parameter_values.items())).system_model
+                   parameters=dict(self.parameter_values.items())))
         if twin.eigenvalues is None:
             sm.eigenvalues = None
             return

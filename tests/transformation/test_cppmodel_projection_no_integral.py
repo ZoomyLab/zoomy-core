@@ -21,6 +21,7 @@ import pytest
 from zoomy_core.model.models.swe import SWE
 from zoomy_core.model.models.sme import SME
 from zoomy_core.transformation.generic_c import CppModel
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 @pytest.mark.parametrize("model,label", [
@@ -43,7 +44,7 @@ def test_swe_project_row_carries_h_factor():
     import sympy as sp
 
     rows = [sp.sympify(e) for e in
-            sp.flatten(SWE(dimension=2).system_model.project_from_3d)]
+            sp.flatten(SystemModel.from_model(SWE(dimension=2)).project_from_3d)]
     assert not any(r.has(sp.Integral) for r in rows), "raw Integral in rows"
     # momentum rows (res[2], res[3]) must reference the P3_h head symbol.
     P3h = sp.Symbol("P3_h", real=True)

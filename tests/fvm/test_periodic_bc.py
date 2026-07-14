@@ -22,6 +22,7 @@ from zoomy_core.fvm import timestepping
 from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
 from zoomy_core.mesh import BaseMesh
 import zoomy_core.model.initial_conditions as IC
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 def test_resolve_periodic_bcs_is_idempotent():
@@ -46,8 +47,8 @@ def test_bump_wraps_and_conserves_mass():
         Periodic(tag="left", periodic_to_physical_tag="right"),
         Periodic(tag="right", periodic_to_physical_tag="left"),
     ])
-    sm = SME(level=0, parameters={"nu": 1e-6, "lambda_s": 0.0},
-             boundary_conditions=bcs).system_model
+    sm = SystemModel.from_model(SME(level=0, parameters={"nu": 1e-6, "lambda_s": 0.0},
+             boundary_conditions=bcs))
     n_state = len(sm.state)
 
     def ic(xv):

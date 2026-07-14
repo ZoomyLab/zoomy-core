@@ -1237,9 +1237,17 @@ class SystemModel:
     @classmethod
     def from_model(cls, model, Q=None, Qaux=None,
                    canonical_source=None, dae=False) -> "SystemModel":
-        """Build a SystemModel from a Model.
+        """Build a SystemModel from a Model — the ONE entry point (REQ-143).
 
-        Two input kinds are dispatched on the *Model class*:
+        A production model that carries a plain-string ``_system_model_kind``
+        class attribute (SWE, SME, VAM, MLSWE, MLSME, MLVAM, Sigma3D, KESME,
+        QRKESME) is dispatched to its per-model builder in
+        :mod:`zoomy_core.systemmodel.model_builders` (lazy import to avoid an
+        import cycle) — the builder holds the model-specific Q selection,
+        hydrostatic-pressure tag, spectrum/positivity flags and BC resolution.
+
+        Otherwise the LOW-LEVEL path (:meth:`_from_model_impl`) runs, dispatched
+        on the *Model class*:
 
         * the **declarative** clean-redesign
           :class:`zoomy_core.model.derivation.model.Model` (whose equations are plain
@@ -1254,6 +1262,18 @@ class SystemModel:
           backed by solver-tag extraction) are read once and frozen.  ``Q`` /
           ``Qaux`` are ignored (the state vector is baked into the model).
         """
+        if getattr(model, "_system_model_kind", None) is not None:
+            from zoomy_core.systemmodel.model_builders import build_system_model
+            return build_system_model(model)
+        return cls._from_model_impl(
+            model, Q=Q, Qaux=Qaux, canonical_source=canonical_source, dae=dae)
+
+    @classmethod
+    def _from_model_impl(cls, model, Q=None, Qaux=None,
+                         canonical_source=None, dae=False) -> "SystemModel":
+        """Low-level Model → SystemModel build (declarative model + Q, or a
+        production model whose state vector is baked in).  Unchanged behaviour;
+        see :meth:`from_model` for the dispatch."""
         from zoomy_core.model.derivation.model import Model as _DerivationModel
         if isinstance(model, _DerivationModel):
             return cls._from_derivation_model(

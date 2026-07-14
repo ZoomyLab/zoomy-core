@@ -262,12 +262,6 @@ class MLSWE(BaseModel):
                       for k, v in G_sol.items()}
         return m
 
-    @property
-    def system_model(self) -> SystemModel:
-        m = self.derivation
-        sm = SystemModel.from_model(
-            m, Q=[m.bed, m.ht, *m.q_l])
-        from zoomy_core.model.boundary_conditions import resolve_and_attach
-        resolve_and_attach(sm, self.boundary_conditions,
-                           aux_bcs=self.aux_boundary_conditions)
-        return sm
+    # Built via ``SystemModel.from_model(MLSWE(...))`` (REQ-143); see
+    # ``zoomy_core.systemmodel.model_builders.build_mlswe``.
+    _system_model_kind = "mlswe"

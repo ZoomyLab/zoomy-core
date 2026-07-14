@@ -15,12 +15,13 @@ import pytest
 
 from zoomy_core.model.models import VAM
 from zoomy_core.model.models.closures import NavierSlip, StressFree
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 @pytest.fixture(scope="module")
 def vam2d():
-    return VAM(level=1, dimension=3,
-               closures=[NavierSlip(), StressFree()]).system_model
+    return SystemModel.from_model(VAM(level=1, dimension=3,
+               closures=[NavierSlip(), StressFree()]))
 
 
 def test_vam_2d_state_layout(vam2d):

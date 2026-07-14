@@ -30,6 +30,7 @@ import sympy as sp
 
 from zoomy_core.model.models import MLVAM
 from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
+from zoomy_core.systemmodel.system_model import SystemModel
 
 NU = 1
 TOP = NU + 1
@@ -39,7 +40,7 @@ NL = 2
 @pytest.fixture(scope="module")
 def mlvam21():
     model = MLVAM(closures=[Newtonian(), NavierSlip(), StressFree()], n_layers=NL, level=NU)
-    return model, model.system_model
+    return model, SystemModel.from_model(model)
 
 
 def _reference(sm):

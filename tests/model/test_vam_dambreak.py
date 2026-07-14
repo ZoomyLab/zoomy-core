@@ -19,11 +19,12 @@ from zoomy_core.mesh import BaseMesh
 import zoomy_core.model.initial_conditions as IC
 from zoomy_core.model.boundary_conditions import BoundaryConditions, Extrapolation
 from zoomy_core.fvm.solver_chorin_vam_numpy import ChorinSplitVAMSolver
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 @pytest.fixture(scope="module")
 def vam_sm():
-    return VAM(closures=[Newtonian(), NavierSlip(), StressFree()], level=1).system_model
+    return SystemModel.from_model(VAM(closures=[Newtonian(), NavierSlip(), StressFree()], level=1))
 
 
 def test_vam_is_a_square_dae_with_pressure_constraints(vam_sm):
@@ -63,7 +64,7 @@ def test_vam_dambreak_over_bump():
     conserved, bounded non-hydrostatic pressure."""
     nc = 60
     model = VAM(closures=[Newtonian(), NavierSlip(), StressFree()], level=1)
-    sm = model.system_model
+    sm = SystemModel.from_model(model)
 
     def _bump_ic(xv):
         xx = float(xv[0])

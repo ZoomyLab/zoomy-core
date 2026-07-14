@@ -22,6 +22,7 @@ from zoomy_core.model.models.malpasset import MalpassetSWE
 from zoomy_core.numerics.numerical_system_model import NumericalSystemModel
 from zoomy_core.transformation.to_ufl import UFLRuntimeModel
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 def _uvec(n, base=1.0):
@@ -34,7 +35,7 @@ def _uvec(n, base=1.0):
 
 
 def _sme0_sm():
-    return SME(level=0, dimension=2).system_model
+    return SystemModel.from_model(SME(level=0, dimension=2))
 
 
 # --------------------------------------------------------------------------

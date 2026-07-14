@@ -375,8 +375,9 @@ class NumpyRuntimeModel:
         """Initialize the instance."""
         # Dispatch on model style.  A legacy ``Model`` carries the
         # ``.functions`` registry that the body below lambdifies.  A new-style
-        # BaseModel (e.g. the thesis ``MalpassetSME``) exposes ``.system_model``
-        # but NO ``.functions``/``.name``/``.variables`` — and a bare
+        # BaseModel (e.g. the thesis ``MalpassetSME``) builds via
+        # ``SystemModel.from_model(model)`` but has NO
+        # ``.functions``/``.name``/``.variables`` — and a bare
         # ``SystemModel`` / ``NumericalSystemModel`` likewise.  For any of those,
         # build through the SystemModel/NSM path so ``RuntimeModel(model)`` (the
         # entry point every backend/solver already calls — e.g. Firedrake's

@@ -12,11 +12,12 @@ from zoomy_core.model.boundary_conditions import BoundaryConditions, Extrapolati
 import zoomy_core.fvm.timestepping as timestepping
 from zoomy_core.fvm.solver_numpy import HyperbolicSolver
 from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 def test_mlsme_structure():
     mod = MLSME(closures=[Newtonian(), NavierSlip(), StressFree()], n_layers=2, level=1, interface_velocity="mean")
-    sm = mod.system_model
+    sm = SystemModel.from_model(mod)
     assert [str(s) for s in sm.state] == [
         "b", "h", "q_1_0", "q_1_1", "q_2_0", "q_2_1"]
     M = sp.Matrix(sm.mass_matrix.tolist())
@@ -35,10 +36,10 @@ def test_mlsme_structure():
 @pytest.mark.parametrize("ustar", ["upwind", "mean"])
 def test_mlsme_dambreak_with_shear(ustar):
     nc = 100
-    sm = MLSME(closures=[Newtonian(), NavierSlip(), StressFree()], n_layers=2, level=1, interface_velocity=ustar,
+    sm = SystemModel.from_model(MLSME(closures=[Newtonian(), NavierSlip(), StressFree()], n_layers=2, level=1, interface_velocity=ustar,
                boundary_conditions=BoundaryConditions(
                    [Extrapolation(tag="left"), Extrapolation(tag="right")])
-               ).system_model
+               ))
 
     def _ic(xv):
         htv = 1.5 if float(xv[0]) < 5.0 else 0.9

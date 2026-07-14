@@ -357,12 +357,6 @@ class MLSME(BaseModel):
                       for kk_, v in G_sol.items()}
         return m
 
-    @property
-    def system_model(self) -> SystemModel:
-        m = self.derivation
-        sm = SystemModel.from_model(
-            m, Q=[m.bed, m.ht, *m.q_flat], canonical_source=self)
-        from zoomy_core.model.boundary_conditions import resolve_and_attach
-        resolve_and_attach(sm, self.boundary_conditions,
-                           aux_bcs=self.aux_boundary_conditions)
-        return sm
+    # Built via ``SystemModel.from_model(MLSME(...))`` (REQ-143); see
+    # ``zoomy_core.systemmodel.model_builders.build_mlsme``.
+    _system_model_kind = "mlsme"

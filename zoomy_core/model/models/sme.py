@@ -14,8 +14,9 @@ registered into the ``interpolate`` function group with the ŵ closure inlined
 (``w(ζ) = Σ_j ŵ_j(q, ∂_x q, ∂_x h, ∂_x b) φ_j(ζ)``), so ``interpolate_to_3d`` is
 self-contained.
 
-``SME(level=2).derive_model()`` builds the declarative model; ``.system_model``
-returns the runtime :class:`~zoomy_core.systemmodel.SystemModel`.
+``SME(level=2).derive_model()`` builds the declarative model;
+``SystemModel.from_model(SME(level=2))`` returns the runtime
+:class:`~zoomy_core.systemmodel.SystemModel`.
 """
 from __future__ import annotations
 
@@ -341,39 +342,12 @@ class SME(BaseModel):
         """Add the transported-scalar balances (e.g. the k–ε equations) AFTER
         the moment system is assembled.  No-op on SME."""
 
-    @property
-    def system_model(self) -> SystemModel:
-        """The runtime operator-form system (conservative q-state, `b` prepended).
-
-        Boundary conditions passed to the constructor
-        (``SME(level, boundary_conditions=BoundaryConditions(...))``) are
-        forwarded — the normal interface, exactly as the production models.
-        ``SystemModel.attach_boundary_conditions`` remains available as the
-        hook for attaching/replacing BCs on an existing SystemModel."""
-        m = self.derivation
-        dim = int(self.dimension)
-        horiz = (x,) if dim == 2 else (x, y)
-        qs = list(m.explicit_state())
-        # b evolves via the (trivial) bottom equation ∂_t b = 0, so it is
-        # already an explicit unknown; prepend only if absent.
-        bed = sp.Function("b", real=True)(t, *horiz)
-        if bed not in qs:
-            qs = [bed, *qs]
-        # Manual hydrostatic-pressure tag (one-liner): mark g·h²/2 so the
-        # structural extractor routes it to hydrostatic_pressure (well-balanced
-        # reconstruction) instead of the conservative flux.  Recomputed from m.
-        from zoomy_core.model.derivation.system_extract import HydrostaticPressure
-        h = sp.Function("h", positive=True)(t, *horiz)
-        pf = m.parameters.g * h ** 2 / 2
-        m.apply({pf: HydrostaticPressure(pf)})
-        sm = SystemModel.from_model(m, Q=qs, canonical_source=self)
-        m.apply({HydrostaticPressure(pf): pf})   # un-tag: leave derivation clean
-        self._register_hswme_spectrum(sm)
-        # legacy BoundaryConditions container OR the new flat per-field list
-        from zoomy_core.model.boundary_conditions import resolve_and_attach
-        resolve_and_attach(sm, self.boundary_conditions,
-                           aux_bcs=self.aux_boundary_conditions)
-        return sm
+    # The runtime operator-form system is built via
+    # ``SystemModel.from_model(SME(...))`` (REQ-143); the builder in
+    # ``zoomy_core.systemmodel.model_builders`` holds the conservative q-state
+    # selection, the hydrostatic-pressure tag, the HSWME spectrum and BC
+    # resolution.  Constructor BCs are forwarded there, as before.
+    _system_model_kind = "sme"
 
     def _register_hswme_spectrum(self, sm):
         """Register the β-HSWME spectrum as the SystemModel's symbolic
@@ -442,8 +416,8 @@ class SME(BaseModel):
         per-face eigensolve.  If even the twin has no symbolic spectrum, leave
         ``eigenvalues = None`` → the runtime's opaque numeric eigensystem."""
         n_eq = sm.n_equations
-        twin = SME(level=5, dimension=int(self.dimension),
-                   parameters=dict(self.parameter_values.items())).system_model
+        twin = SystemModel.from_model(SME(level=5, dimension=int(self.dimension),
+                   parameters=dict(self.parameter_values.items())))
         if twin.eigenvalues is None:
             sm.eigenvalues = None
             import warnings

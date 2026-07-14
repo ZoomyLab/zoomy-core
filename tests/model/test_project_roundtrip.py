@@ -29,6 +29,7 @@ from zoomy_core.model.models.sme import SME
 from zoomy_core.model.models.ml_sme import MLSME
 from zoomy_core.model.models.vam import VAM
 from zoomy_core.model.models.ml_vam import MLVAM
+from zoomy_core.systemmodel.system_model import SystemModel
 
 _PROFILE = ("b", "h", "u", "v", "w", "p")
 
@@ -109,7 +110,7 @@ def test_project_inverts_interpolate(model, label):
 def test_momentum_row_carries_h_factor():
     """A constant-``u = U``, depth-``h`` column projects to the CONSERVED
     momentum ``q_0 = h·U`` — not the bare mean ``U``."""
-    sm = SME(level=0, dimension=2).system_model
+    sm = SystemModel.from_model(SME(level=0, dimension=2))
     P = [sp.sympify(e) for e in sp.flatten(sm.project_from_3d)]
     P3h = sp.Symbol("P3_h", real=True)
     U, hval = 1.3, 2.5
@@ -151,7 +152,7 @@ def test_sme_projection_on_cell_center_exchange_nodes():
     node CONVENTION so it cannot silently regress to endpoints."""
     model = SME(level=1, dimension=2)
     N_z = int(model.project_nz)
-    P = [sp.sympify(e) for e in sp.flatten(model.system_model.project_from_3d)]
+    P = [sp.sympify(e) for e in sp.flatten(SystemModel.from_model(model).project_from_3d)]
     nodes = sorted({float(a.args[0])
                     for e in P for a in e.atoms(AppliedUndef)
                     if a.func.__name__ == "P3_u"})

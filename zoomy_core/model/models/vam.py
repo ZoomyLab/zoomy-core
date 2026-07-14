@@ -9,7 +9,7 @@ SWE hyperbolic structure (gravity wave speeds in the flux); the pressure
 modes ``P_0 … P_Nu`` are Lagrange multipliers of the divergence constraints
 (mass projections k = 1 … Nu+1 — zero mass-matrix rows after extraction).
 
-``VAM(level=Nu).system_model`` returns the square DAE
+``SystemModel.from_model(VAM(level=Nu))`` returns the square DAE
 (state ``[b, h, q_0…q_Nu, r_0…r_Nu, P_0…P_Nu]``);
 ``VAM(level=Nu).chorin_split(dt)`` returns the three Chorin sub-systems
 ``(SM_pred, SM_press, SM_corr)`` for
@@ -366,39 +366,12 @@ class VAM(BaseModel):
 
         return m
 
-    @property
-    def system_model(self) -> SystemModel:
-        """The square DAE: state ``[b, h, q_k, r_k, P_k]``; the P rows are
-        the divergence constraints (zero mass-matrix rows).
-
-        Reads everything from the derivation ``m`` (cached per spec) — the bed,
-        the pressure head, and the hydrostatic flux are recomputed here rather
-        than stashed on ``self`` in ``derive_model``.  A FRESH SystemModel is
-        built on every access, so callers may safely mutate its ICs/BCs."""
-        m = self.derivation
-        Nu = int(self.level)
-        # Pressure modes carry the SAME horizontal dependence as the rest of the
-        # state (see derive_model's ``horiz``): dim=2 → P(j,t,x); dim=3 →
-        # P(j,t,x,y).  A hard-coded ``x`` here mismatches the dim=3 derivation's
-        # P(j,t,x,y) atoms, so from_model fails to recognise them as state and
-        # the pressure silently drops out of every momentum/vertical row.
-        horiz = (x,) if int(self.dimension) == 2 else (x, y)
-        P_modes = [m.functions.P.head(j, t, *horiz) for j in range(Nu + 1)]
-        qs = list(m.explicit_state())
-        bed = sp.Function("b", real=True)(t, *horiz)
-        if bed not in qs:
-            qs = [bed, *qs]
-        # Manual hydrostatic-pressure tag (one-liner): mark g·h²/2 → pressure.
-        from zoomy_core.model.derivation.system_extract import HydrostaticPressure
-        h = sp.Function("h", positive=True)(t, *horiz)
-        pf = m.parameters.g * h ** 2 / 2
-        m.apply({pf: HydrostaticPressure(pf)})
-        sm = SystemModel.from_model(m, Q=[*qs, *P_modes], canonical_source=self)
-        m.apply({HydrostaticPressure(pf): pf})   # un-tag: leave derivation clean
-        from zoomy_core.model.boundary_conditions import resolve_and_attach
-        resolve_and_attach(sm, self.boundary_conditions,
-                           aux_bcs=self.aux_boundary_conditions)
-        return sm
+    # The square DAE (state ``[b, h, q_k, r_k, P_k]``; the P rows are the
+    # divergence constraints) is built via ``SystemModel.from_model(VAM(...))``
+    # (REQ-143); the builder in ``zoomy_core.systemmodel.model_builders`` selects
+    # Q (+ pressure modes), tags the hydrostatic flux and resolves the BCs.  A
+    # FRESH SystemModel is built on every call, so callers may mutate ICs/BCs.
+    _system_model_kind = "vam"
 
     def chorin_split(self, dt=None, *, system_model=None):
         """Structural Chorin split ``(SM_pred, SM_press, SM_corr)``.
@@ -409,7 +382,8 @@ class VAM(BaseModel):
         inherit them; re-attach BCs on ``SM_pred`` after — its aux signature
         is re-derived)."""
         from zoomy_core.model.splitter import split_for_pressure_structural
-        sm = system_model if system_model is not None else self.system_model
+        sm = system_model if system_model is not None \
+            else SystemModel.from_model(self)
         if dt is None:
             dt = sp.Symbol("dt", positive=True)
         P_syms = [s for s in sm.state if str(s).startswith("P_")]

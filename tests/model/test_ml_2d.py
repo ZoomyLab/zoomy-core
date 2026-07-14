@@ -13,6 +13,7 @@ import pytest
 
 from zoomy_core.model.models import MLSME, MLSWE, MLVAM
 from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
+from zoomy_core.systemmodel.system_model import SystemModel
 
 PARS = {"nu": 0.1, "lambda_s": 0.5}
 CLO = [Newtonian(), NavierSlip(), StressFree()]
@@ -36,8 +37,8 @@ def _flux_symmetry(sm, layers, modes):
 
 
 def test_mlsme_2d():
-    sm = MLSME(n_layers=2, level=1, dimension=3, parameters=PARS,
-               closures=CLO).system_model
+    sm = SystemModel.from_model(MLSME(n_layers=2, level=1, dimension=3, parameters=PARS,
+               closures=CLO))
     assert sm.n_dim == 2
     st = [str(s) for s in sm.state]
     assert "q_x_1_0" in st and "q_y_2_1" in st
@@ -45,8 +46,8 @@ def test_mlsme_2d():
 
 
 def test_mlswe_2d():
-    sm = MLSWE(n_layers=2, dimension=3, parameters=PARS,
-               closures=CLO).system_model
+    sm = SystemModel.from_model(MLSWE(n_layers=2, dimension=3, parameters=PARS,
+               closures=CLO))
     assert sm.n_dim == 2
     st = [str(s) for s in sm.state]
     assert "q_x_1_0" in st and "q_y_2_0" in st
@@ -54,8 +55,8 @@ def test_mlswe_2d():
 
 
 def test_mlvam_2d():
-    sm = MLVAM(n_layers=2, level=1, dimension=3, parameters=PARS,
-               closures=CLO).system_model
+    sm = SystemModel.from_model(MLVAM(n_layers=2, level=1, dimension=3, parameters=PARS,
+               closures=CLO))
     assert sm.n_dim == 2
     st = [str(s) for s in sm.state]
     # 2-D: q_x/q_y per layer; r (w-moments) and P (pressure) stay scalar

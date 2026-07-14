@@ -573,8 +573,8 @@ def to_numerical_system_model(obj) -> "NumericalSystemModel":
     - already a :class:`NumericalSystemModel` → returned unchanged;
     - a :class:`SystemModel` → promoted in place via
       :meth:`NumericalSystemModel.from_system_model`;
-    - a :class:`zoomy_core.model` ``Model`` (exposes ``.system_model``)
-      → its SystemModel is promoted;
+    - a :class:`zoomy_core.model` ``Model`` (carries ``_system_model_kind``)
+      → built via :meth:`SystemModel.from_model` and promoted;
     - anything else → :class:`TypeError`.
 
     The NSM-first check matters because ``NumericalSystemModel`` *is* a
@@ -585,13 +585,13 @@ def to_numerical_system_model(obj) -> "NumericalSystemModel":
         return obj
     if isinstance(obj, SystemModel):
         return NumericalSystemModel.from_system_model(obj)
-    sm = getattr(obj, "system_model", None)
-    if sm is not None:
-        return NumericalSystemModel.from_system_model(sm)
+    if getattr(obj, "_system_model_kind", None) is not None:
+        return NumericalSystemModel.from_system_model(
+            SystemModel.from_model(obj))
     raise TypeError(
         f"to_numerical_system_model: cannot coerce {type(obj).__name__!r} "
         "to a NumericalSystemModel — expected a NumericalSystemModel, a "
-        "SystemModel, or a Model exposing `.system_model`."
+        "SystemModel, or a Model built via `SystemModel.from_model`."
     )
 
 

@@ -30,6 +30,7 @@ import sympy as sp
 
 from zoomy_core.model.models import MLSWE
 from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 def _fractions(sm, N):
@@ -83,7 +84,7 @@ def _assert_rows_equal(sm, refs, extra_subs=None):
 
 @pytest.mark.parametrize("n_layers", [2, 3])
 def test_mlswe_mean_interface_matches_hornschemeyer_eq8(n_layers):
-    sm = MLSWE(closures=[Newtonian(), NavierSlip(), StressFree()], n_layers=n_layers, interface_velocity="mean").system_model
+    sm = SystemModel.from_model(MLSWE(closures=[Newtonian(), NavierSlip(), StressFree()], n_layers=n_layers, interface_velocity="mean"))
     assert [str(s) for s in sm.state] == (
         ["b", "h"] + [f"q_{a}_0" for a in range(1, n_layers + 1)])
 
@@ -105,7 +106,7 @@ def test_mlswe_upwind_interface_matches_eq9_branches(branch):
     (G_ours ≥ 0 ⟺ G_theirs ≤ 0) must be the paper's u_α ('below'),
     the false-branch their u_{α+1} ('above')."""
     n_layers = 2
-    sm = MLSWE(closures=[Newtonian(), NavierSlip(), StressFree()], n_layers=n_layers, interface_velocity="upwind").system_model
+    sm = SystemModel.from_model(MLSWE(closures=[Newtonian(), NavierSlip(), StressFree()], n_layers=n_layers, interface_velocity="upwind"))
 
     take_true = branch == "below"
 

@@ -64,7 +64,7 @@ def test_property_matches_raw_and_no_doubled_aux():
     bcs = BoundaryConditions([Wall(tag="left"), Wall(tag="right")])
     m = SWE(dimension=2, boundary_conditions=bcs)
     raw = SystemModel.from_model(m)
-    prop = SWE(dimension=2, boundary_conditions=bcs).system_model
+    prop = SystemModel.from_model(SWE(dimension=2, boundary_conditions=bcs))
     assert _tags(raw) == _tags(prop)
     assert [str(a) for a in raw.aux_state] == [str(a) for a in prop.aux_state]
     # de-dup held: no aux symbol appears twice.

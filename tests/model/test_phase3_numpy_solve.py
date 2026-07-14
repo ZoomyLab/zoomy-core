@@ -16,18 +16,19 @@ from zoomy_core.model.boundary_conditions import Extrapolation
 import zoomy_core.fvm.timestepping as timestepping
 from zoomy_core.fvm.solver_numpy import HyperbolicSolver
 from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 def _build_sme(level=2):
     """SME built entirely through the NEW structure: Mass()/Momentum()
     blueprints (Phase 2) closed by the composable closure list (Phase 1), with
     the NEW flat per-field boundary-condition list."""
-    return SME(
+    return SystemModel.from_model(SME(
         level=level,
         parameters={"nu": 1e-3, "lambda_s": 0.0},
         closures=[Newtonian(), NavierSlip(), StressFree()],
         boundary_conditions=[Extrapolation("left"), Extrapolation("right")],
-    ).system_model
+    ))
 
 
 def _solve_dambreak(sm, nc=100, t_end=0.3):

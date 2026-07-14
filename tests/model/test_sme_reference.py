@@ -34,6 +34,7 @@ import sympy as sp
 
 from zoomy_core.model.models import SME
 from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
+from zoomy_core.systemmodel.system_model import SystemModel
 
 
 def _kt_reference_rows(sm, N):
@@ -98,7 +99,7 @@ def _kt_reference_rows(sm, N):
 
 @pytest.mark.parametrize("level", [1, 2, 3])
 def test_sme_rows_match_kowalski_torrilhon(level):
-    sm = SME(closures=[Newtonian(), NavierSlip(), StressFree()], level=level).system_model
+    sm = SystemModel.from_model(SME(closures=[Newtonian(), NavierSlip(), StressFree()], level=level))
     assert [str(s) for s in sm.state] == (
         ["b", "h"] + [f"q_{i}" for i in range(level + 1)])
     rv = sm.reconstruct_residuals()
