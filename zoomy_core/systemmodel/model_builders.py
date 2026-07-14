@@ -175,11 +175,76 @@ _BUILDERS = {
 
 
 def build_system_model(model) -> SystemModel:
-    """Dispatch on ``model._system_model_kind`` to the matching builder."""
+    """Dispatch on ``model._system_model_kind`` to the matching builder.
+
+    Cached BY DEFAULT (REQ-163): the built SystemModel (final lowered operator
+    matrices) is stored across memory / user-dir / shipped-prebuilt tiers via
+    :mod:`zoomy_core.systemmodel.sm_cache`; a hit skips the derivation AND the
+    build entirely and returns a fresh, safely-mutable object.  Parameter
+    VALUES are not part of the identity (free symbols end-to-end).  Disable
+    with ``ZOOMY_DERIVATION_CACHE=0``; force ``ZOOMY_DERIVATION_REBUILD=1``.
+    """
     kind = model._system_model_kind
     try:
         builder = _BUILDERS[kind]
     except KeyError:
         raise ValueError(
             f"unknown _system_model_kind {kind!r} on {type(model).__name__}")
-    return builder(model)
+    from zoomy_core.systemmodel import sm_cache
+    key = sm_cache.cache_key(model, builder)
+    cached = sm_cache.fetch(key)
+    if cached is not None:
+        _attach_runtime_data(model, cached)
+        return cached
+    sm = builder(model)
+    sm_cache.store(key, sm)
+    return sm
+
+
+def _attach_runtime_data(model, sm) -> None:
+    """Re-attach the INSTANCE's runtime data to a cache-fetched SystemModel.
+
+    BCs/ICs embed parameter values and case choices — they are deliberately
+    NOT part of the cache identity.  ``resolve_and_attach`` replaces any
+    BCs the entry was built with; ICs are plain field assignments."""
+    from zoomy_core.model.boundary_conditions import resolve_and_attach
+    # Two BC homes (REQ-87): production models POP the constructor
+    # ``boundary_conditions=`` into ``_coupling_bcs`` (their param is then a
+    # fresh EMPTY default — do not let it shadow the real one); declarative
+    # models keep theirs on the param.  Mirror from_model's promotion check:
+    # only attach a container that actually HAS entries.
+    def _nonempty(bc):
+        if bc is None:
+            return None
+        entries = (list(bc) if isinstance(bc, list)
+                   else getattr(bc, "boundary_conditions_list", None))
+        return bc if entries else None
+
+    bcs = (_nonempty(getattr(model, "_coupling_bcs", None))
+           or _nonempty(getattr(model, "boundary_conditions", None)))
+    if bcs is not None:
+        resolve_and_attach(
+            sm, bcs, aux_bcs=getattr(model, "aux_boundary_conditions", None))
+    for field in ("initial_conditions", "aux_initial_conditions"):
+        val = getattr(model, field, None)
+        if val is not None:
+            setattr(sm, field, val)
+    # Parameter VALUES are runtime solver inputs (the whole point of keeping
+    # them out of the cache identity) — the fetched entry carries the
+    # BUILD-TIME numbers.  Update BY NAME inside the sm's own container: the
+    # lambdified kernels index the parameter vector positionally, so the sm's
+    # ordering/length must be preserved (never replace the container).
+    pv = getattr(model, "parameter_values", None)
+    tgt = getattr(sm, "parameter_values", None)
+    if pv is not None and tgt is not None:
+        names = pv.keys() if hasattr(pv, "keys") else ()
+        for k in names:
+            val = pv[k] if hasattr(pv, "__getitem__") else getattr(pv, k)
+            try:
+                if hasattr(tgt, "__setitem__"):
+                    if not hasattr(tgt, "keys") or k in tgt.keys():
+                        tgt[k] = val
+                elif hasattr(tgt, k):
+                    setattr(tgt, k, val)
+            except (KeyError, TypeError):
+                pass

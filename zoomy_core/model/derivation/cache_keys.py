@@ -31,7 +31,7 @@ from zoomy_core.model.derivation.basis_cache import _basis_fingerprint
 
 # Bump when the derivation pipeline changes in a way that invalidates every
 # cached entry (new op semantics, changed extraction, etc.).
-CACHE_VERSION = "v1"
+CACHE_VERSION = "v2"   # v2: parameter VALUES out of the spec key (REQ-163)
 
 # Fields that never affect the math: display names, verbosity, back-references.
 _COSMETIC_FIELDS = frozenset({"name", "description", "log_level", "_model"})
@@ -162,6 +162,11 @@ _NON_DERIVATION_PARAMS = frozenset({
     "name",
     "boundary_conditions", "aux_boundary_conditions",
     "initial_conditions", "aux_initial_conditions",
+    # REQ-163: the `parameters` constructor param records which SYMBOLS the
+    # caller passed values for — neither the names nor the values are
+    # structural (the class registers its parameter symbols in derive_model
+    # regardless; values stay free symbols and go to the solver at runtime).
+    "parameters",
 })
 
 
@@ -190,17 +195,26 @@ def model_spec_key(model, *, include_bc_ic=False) -> str:
             if name in skip:
                 continue
             parts.append(f"{name}=" + _canonical(getattr(model, name)))
-        # ``parameter_values`` (numeric defaults baked into the derivation) is
-        # NOT a param but DOES change the symbolic result — include it so two
-        # models that differ only in numeric values never share a derivation.
+        # ``parameter_values`` — numeric VALUES are NOT part of the identity
+        # (REQ-163, verified): parameters stay FREE SYMBOLS through the whole
+        # derivation and lowering (SWE/SME operators are str-identical across
+        # values); the numbers are handed to the solver at runtime.  Only the
+        # parameter NAME SET shapes the symbol table, so key on the keys.
+        # Exception: a model whose ``derive_model`` consumes a value in a
+        # PYTHON branch (structural decision) lists that name in the class
+        # allowlist ``_derivation_baked_params`` — those values are folded in.
         pv = getattr(model, "parameter_values", None)
         if pv is not None:
             if hasattr(pv, "items"):
-                parts.append("parameter_values=" + _canonical(
-                    {str(k): v for k, v in pv.items()}))
+                pv = {str(k): v for k, v in pv.items()}
             elif hasattr(pv, "keys"):
-                parts.append("parameter_values=" + _canonical(
-                    {k: getattr(pv, k) for k in pv.keys()}))
+                pv = {str(k): getattr(pv, k) for k in pv.keys()}
+            else:
+                pv = {}
+            baked = tuple(getattr(model, "_derivation_baked_params", ()) or ())
+            if baked:
+                parts.append("baked_params=" + _canonical(
+                    {k: pv[k] for k in sorted(baked) if k in pv}))
         return hashlib.sha256(
             f"{CACHE_VERSION}|spec|{'|'.join(parts)}".encode()).hexdigest()
 

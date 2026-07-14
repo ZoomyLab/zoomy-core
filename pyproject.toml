@@ -77,6 +77,9 @@ Issues = "https://github.com/mbd-rwth/Zoomy/issues"
 
 [tool.setuptools.packages.find]
 include = ["zoomy_core*"]
+
+[tool.setuptools.package-data]
+"zoomy_core.systemmodel" = ["_prebuilt/*.pkl"]
 exclude = ["zoomy_core.model.legacy*", "zoomy_core.model.models.legacy*", "zoomy_core.fvm.legacy*"]
 
 

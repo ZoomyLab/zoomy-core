@@ -117,6 +117,21 @@ class Model(param.Parameterized, SymbolicRegistrar):
     dimension = param.Integer(default=1)
     disable_differentiation = param.Boolean(default=False)
 
+    # ── General Gauss-Legendre quadrature order (REQ-160) ──────────────
+    # BASE-LEVEL capability inherited by EVERY moment model: any Galerkin
+    # integral with no closed form (non-polynomial material closures —
+    # Bingham/HB, k-ε, rational eddy-viscosity) is resolved numerically by a
+    # ``GaussQuadrature(var=ζ, order=quadrature_order)`` inserted after the
+    # analytic bracket machinery.  0 (default) = off: an unresolvable integral
+    # raises at extraction.  Each moment model (SME, MLSME, MLVAM, VAM, …)
+    # routes this SAME order into EVERY per-layer / per-column reduction, so a
+    # non-polynomial closure is never special-cased per class.
+    quadrature_order = param.Integer(default=0, bounds=(0, None), doc=(
+        "Gauss-Legendre order for NUMERICAL integration of Galerkin integrals "
+        "that survive the analytic bracket machinery (non-polynomial closures). "
+        "0 = off. Inherited by all moment models; routed into every per-layer / "
+        "per-column Galerkin reduction."))
+
     eigenvalue_mode = param.Selector(
         default="symbolic",
         objects=["symbolic", "numerical"],
@@ -200,7 +215,12 @@ class Model(param.Parameterized, SymbolicRegistrar):
         # Subclass derivation hook — populates ``self._equations``
         # via ``self.add_equation`` + ``self.apply(Op(...))`` and may
         # extend ``self.variables`` / ``self.parameters``.
-        self._run_derive_model()
+        # REQ-163: for cacheable (pure, RETURN-style) derivations the heavy
+        # symbolic build is DEFERRED to first ``.derivation`` access — a
+        # SystemModel cache hit (sm_cache) then never derives at all.  Impure
+        # models (derive_model mutates self) keep the eager call.
+        if not self._cacheable_derivation:
+            self._run_derive_model()
         # After the derivation, every Symbol used in any equation must
         # have a numeric value declared in ``self.parameter_values``.
         self._assert_parameter_values_supplied()
@@ -240,6 +260,20 @@ class Model(param.Parameterized, SymbolicRegistrar):
         and to set ``self._variable_map``."""
         return None
 
+    @property
+    def derivation(self):
+        """The symbolic derivation object (lazy for cacheable models —
+        REQ-163: built/restored on first access, never on construction)."""
+        d = self.__dict__.get("_derivation_obj")
+        if d is None:
+            self._run_derive_model()
+            d = self.__dict__.get("_derivation_obj")
+        return d
+
+    @derivation.setter
+    def derivation(self, value):
+        self.__dict__["_derivation_obj"] = value
+
     def _run_derive_model(self):
         """Run (or restore from cache) the symbolic derivation.
 
@@ -253,9 +287,14 @@ class Model(param.Parameterized, SymbolicRegistrar):
         if not self._cacheable_derivation:
             self.derive_model()
             return
+        import os
         from zoomy_core.model.derivation.cache_keys import model_spec_key
+        cache_on = os.environ.get(
+            "ZOOMY_DERIVATION_CACHE", "1").strip() not in {"0", "false", "no"}
+        rebuild = os.environ.get(
+            "ZOOMY_DERIVATION_REBUILD", "").strip() in {"1", "true", "yes"}
         key = model_spec_key(self)
-        cached = _DERIVATION_MODEL_CACHE.get(key)
+        cached = _DERIVATION_MODEL_CACHE.get(key) if (cache_on and not rebuild) else None
         if cached is not None:
             self.derivation = cached
             return

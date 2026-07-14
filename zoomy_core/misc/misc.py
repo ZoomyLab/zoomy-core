@@ -23,7 +23,20 @@ class ZArray(MutableDenseNDimArray):
     and vector algebra (+, -) with lists and Zstructs.
     """
 
+    def __reduce__(self):
+        """Pickle support (REQ-163 SystemModel cache): sympy's NDimArray
+        reduce protocol does not satisfy ZArray's required ``iterable``
+        argument — reconstruct from the nested list form instead.  Also fixes
+        ``applyfunc``-style reconstruction paths that hand ``__new__`` a
+        ``map`` (see the reshape below)."""
+        return (type(self), (self.tolist() if self.shape else [self._array[0]],))
+
     def __new__(cls, iterable, *args, **kwargs):
+        # Accept lazy iterators (e.g. sympy applyfunc passes a ``map``) by
+        # materializing them first; shape (if given) is handled by the
+        # flattener below.
+        if isinstance(iterable, map):
+            iterable = list(iterable)
         # 1. Normalize Input
         if hasattr(iterable, "tolist"):
             data = iterable.tolist()

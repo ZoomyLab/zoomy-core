@@ -130,10 +130,17 @@ class ReconstructionSpec:
     ``free_surface_aware``: when True, use the wet-dry-aware MUSCL
     variant (clamps ``h ≥ 0`` at faces, falls back to first order in
     dry cells).
+    ``positivity``: a-priori cell-mean depth positivity at order ≥ 2.
+    ``""`` = none; ``"zhang_shu"`` = Xing–Zhang–Shu 2010 deviation cap so the
+    reconstructed depth stays ``h ≥ 0`` (conservative — scales the deviation,
+    never the mean).  ``"mood"`` engages the same a-priori guarantee on the
+    numpy backend (jax ships the a-posteriori MOOD re-run; numpy provides the
+    a-priori XZS cap, which gives the same ``h ≥ 0`` + exact mass here).
     """
     order: int = 1
     limiter: str = "venkatakrishnan"
     free_surface_aware: bool = False
+    positivity: str = ""
 
 
 @dataclass
@@ -249,6 +256,10 @@ class NumericalSystemModel(SystemModel):
     """
 
     riemann: Optional[Type[Any]] = None
+    # True iff the caller explicitly chose ``riemann`` (vs the Rusanov
+    # default). Solvers with their own default numerics defer to the NSM's
+    # choice only when this is set (REQ-157).
+    riemann_explicit: bool = False
     reconstruction: ReconstructionSpec = field(default_factory=ReconstructionSpec)
     diffusion: DiffusionSpec = field(default_factory=DiffusionSpec)
     # Numerical eigenvalue regularization — added to the diagonal of the local
@@ -447,6 +458,13 @@ class NumericalSystemModel(SystemModel):
         for sub in (additional_systems or []):
             if isinstance(sub, SystemModel):
                 _assert_bc_kernels_match_state(sub)
+        # Whether the caller EXPLICITLY chose a Riemann solver.  The NSM
+        # defaults ``riemann`` to :class:`NonconservativeRusanov` below, so
+        # ``riemann is not None`` post-default cannot distinguish "the case
+        # asked for Rusanov" from "nobody asked" — solvers with their own
+        # sensible default (e.g. the free-surface positive Rusanov) must only
+        # be overridden when the choice was explicit (REQ-157).
+        riemann_explicit = riemann is not None
         if riemann is None:
             # Imported lazily — fvm/riemann_solvers.py imports from
             # zoomy_core.transformation.to_numpy which transitively
@@ -484,6 +502,7 @@ class NumericalSystemModel(SystemModel):
         # snapshot.
         sm.__class__ = cls
         sm.riemann = riemann
+        sm.riemann_explicit = riemann_explicit
         sm.reconstruction = reconstruction
         sm.diffusion = diffusion
         sm.eigenvalue_eps = eigenvalue_eps
