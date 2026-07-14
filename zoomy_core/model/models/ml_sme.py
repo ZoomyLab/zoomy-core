@@ -32,6 +32,7 @@ from zoomy_core.model.derivation import (
     ResolveModes, ResolveBasis, InvertMassMatrix, SolveLinearSystem, ChangeOfVariables,
     separation_of_variables, reset_modal_indices, modal_bound, test_index,
 )
+from zoomy_core.model.derivation.closure import GaussQuadrature
 from zoomy_core.model.derivation.projection import Integrate
 from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
 from zoomy_core.model.operations import Multiply, ProductRule, KinematicBC
@@ -48,7 +49,12 @@ class MLSME(BaseModel):
     _finalize_lazy = True
     _cacheable_derivation = True        # derive_model returns m; byproducts on m
     n_layers = param.Integer(default=2, bounds=(2, None))
-    level = param.Integer(default=1, bounds=(0, None))
+    level = param.Parameter(default=1, doc=(
+        "Moment truncation order per layer.  An int applies the SAME order to "
+        "every layer (the canonical MLSME).  A list ``[N_1, …, N_{n_layers}]`` "
+        "sets a PER-LAYER degree — e.g. ``level=[2, 0]`` makes the bottom layer "
+        "quadratic-sheared and the top a stress-free deg-0 PLUG (REQ-160: drops "
+        "the ε-stiffness of a viscoplastic film's yielded cap)."))
     dimension = param.Integer(default=2, bounds=(2, 3), doc=(
         "Total spatial dimension incl. vertical: 2 → (t,x,z), one horizontal "
         "(q_ℓ_i); 3 → (t,x,y,z), two horizontal (q_x_ℓ_i, q_y_ℓ_i).  Each layer "
@@ -69,7 +75,16 @@ class MLSME(BaseModel):
 
     def derive_model(self):
         N = int(self.n_layers)
-        Nu = int(self.level)
+        # per-layer moment order: int → uniform (byte-identical to before);
+        # list → one degree per layer (REQ-160 stress-free plug top).
+        if isinstance(self.level, (list, tuple)):
+            levels = [int(v) for v in self.level]
+            if len(levels) != N:
+                raise ValueError(
+                    f"level list has {len(levels)} entries but n_layers={N}")
+        else:
+            levels = [int(self.level)] * N
+        qorder = int(self.quadrature_order)
         dim = int(self.dimension)
         coords = (t, x, z) if dim == 2 else (t, x, y, z)
         horiz = (x,) if dim == 2 else (x, y)
@@ -104,11 +119,11 @@ class MLSME(BaseModel):
         rho_s = sp.Symbol("rho", positive=True)
 
         from zoomy_core.model.models.equations import Mass, small_slope_scaling
-        from types import SimpleNamespace
         from zoomy_core.model.models.material import ClosureState
         from zoomy_core.model.models.closures import apply_layer_stress_closures
 
         def derive_layer(ell):
+            Nu = levels[ell - 1]            # per-layer moment order
             z_bot, z_top, h_l = ifaces[ell - 1], ifaces[ell], hl[ell - 1]
             G_bot, G_top = Gf[ell - 1], Gf[ell]
             ml = DModel(coords=coords, parameters={"g": 9.81, "rho": 1.0})
@@ -150,14 +165,24 @@ class MLSME(BaseModel):
                 getattr(ml, nm).apply(ml.kbc_bot)
                 getattr(ml, nm).apply(ml.kbc_top)
                 getattr(ml, nm).apply({sp.Derivative(b, t): 0})
-            par_ns = SimpleNamespace(rho=rl, nu=nu_s, lambda_s=lam_s)
+            # REQ-160 root cause: the per-layer closure state must read the REAL
+            # model parameter namespace — the hand-built ``SimpleNamespace(rho,
+            # nu, lambda_s)`` silently lacked every OTHER closure parameter
+            # (``tau_y``, ``eps_reg``, …), so any non-polynomial closure died at
+            # ``s.par.tau_y``.  ``apply_layer_stress_closures`` calls
+            # ``c.register(ml)`` first, so ``ml.parameters`` already carries every
+            # closure's params by the time a state is built — exactly as SME does
+            # (``params=m.parameters``).  Register the closures up-front so the
+            # namespace is populated even for a bottom/surface-only closure set.
+            for c in (self.closures or []):
+                c.register(ml)
 
             def _state(at, *, alias=None, btag=None):
                 fields = {"u": getattr(ml.functions, f"u_{ell}"),
                           "w": getattr(ml.functions, f"w_{ell}")}
                 if dim == 3:
                     fields["v"] = getattr(ml.functions, f"v_{ell}")
-                return ClosureState(fields, params=par_ns, h=h_l, x=C.x,
+                return ClosureState(fields, params=ml.parameters, h=h_l, x=C.x,
                                     zeta=zeta, at=at, alias=alias,
                                     boundary_tag=btag, horiz=list(horiz))
             axes = [{"mx": getattr(ml, f"momentum_{CN[xd]}"),
@@ -206,7 +231,14 @@ class MLSME(BaseModel):
                 mxi.apply(w_closure)
                 mxi.apply(ResolveModes(index=kk, modes=range(Nu + 1)))
             for xd in horiz:
-                getattr(ml, f"momentum_{CN[xd]}").apply(ResolveBasis(legendre, var=zeta))
+                mxi = getattr(ml, f"momentum_{CN[xd]}")
+                mxi.apply(ResolveBasis(legendre, var=zeta))
+                # REQ-160: numerically resolve any Galerkin integral a
+                # non-polynomial closure (Bingham/HB, k-ε, rational ν_t) left
+                # behind — mirrors SME(sme.py:261).  Routed into EVERY per-layer
+                # reduction from the shared ``quadrature_order``.
+                if qorder > 0:
+                    mxi.apply(GaussQuadrature(var=zeta, order=qorder))
             for xd in horiz:
                 mxi = getattr(ml, f"momentum_{CN[xd]}")
                 for kmode in range(Nu + 1):
@@ -230,7 +262,7 @@ class MLSME(BaseModel):
         l_all = [*l_par, 1 - sum(l_par)]
         frac = {hl[j]: l_all[j] * ht for j in range(N)}
         q_mod = {ell: {xd: [sp.Function(qname(xd, ell), real=True)(k, t, *horiz)
-                            for k in range(Nu + 1)] for xd in horiz}
+                            for k in range(levels[ell - 1] + 1)] for xd in horiz}
                  for ell in range(1, N + 1)}
 
         glob_c = sp.expand(
@@ -246,12 +278,13 @@ class MLSME(BaseModel):
         # inner (per-layer) basis object — interface traces and the piecewise
         # reconstruction evaluate it at ζ_loc∈{0,1} and at interior nodes, so the
         # bed/surface values φ_k(0)=(−1)^k / φ_k(1)=1 go through the basis object.
-        inner_basis = Legendre_shifted(level=Nu + 2)
+        inner_basis = Legendre_shifted(level=max(levels) + 2)
 
         def _trace(ell, side, xd):
             """Modal interface velocity of layer ℓ in direction xd at ζ=side."""
             sgn = lambda i: inner_basis.eval(i, side)
-            return (sum(sgn(i) * q_mod[ell][xd][i] for i in range(Nu + 1))
+            return (sum(sgn(i) * q_mod[ell][xd][i]
+                        for i in range(levels[ell - 1] + 1))
                     / (l_all[ell - 1] * ht))
 
         from zoomy_core.model.models.closures import interface_closure
@@ -270,6 +303,11 @@ class MLSME(BaseModel):
         # model would wrongly read y as the vertical and collapse to n_dim=1.
         # (The depth-integrated equations carry no z-derivative.)
         m = DModel(coords=(t, *horiz, z), parameters=values)
+        # register the closures on the assembled model too, so their parameters
+        # (tau_y, eps_reg, …) are declared and BOUND at codegen even when the
+        # user did not pass an explicit value for every one (REQ-160).
+        for c in (self.closures or []):
+            c.register(m)
         par = {lam_s: m.parameters.lambda_s, nu_s: m.parameters.nu}
         par.update({l_par[j - 1]: getattr(m.parameters, f"l_{j}")
                     for j in range(1, N)})
@@ -277,7 +315,7 @@ class MLSME(BaseModel):
         m.add_equation("continuity", sp.expand(glob_c.subs(par)))
         for ell in range(1, N + 1):
             for xd in horiz:
-                for k in range(Nu + 1):
+                for k in range(levels[ell - 1] + 1):
                     mom = layer_eqs[ell][1][xd][k].subs(frac).doit()
                     # u* swap in the per-direction TRANSFER trace only
                     for a, side, sgn in ((ell, 1, +1), (ell - 1, 0, -1)):
@@ -307,7 +345,7 @@ class MLSME(BaseModel):
                 lf, c0 = l_all[ell - 1], cum[ell - 1]
                 zloc = (zeta - c0) / lf
                 u_l = sum((q_mod[ell][xd][k] / (lf * ht)) * inner_basis.eval(k, zloc)
-                          for k in range(Nu + 1))
+                          for k in range(levels[ell - 1] + 1))
                 pieces.append((u_l, (zeta <= cum[ell]) if ell < N else True))
             return sp.Piecewise(*pieces)
 
@@ -326,7 +364,7 @@ class MLSME(BaseModel):
         # 1/∫φ_k² normalisation; the physical factor is h·l_ℓ (the dζ = l_ℓ·dt
         # Jacobian times the layer height h·l_ℓ — matching the old
         # (2k+1)·h·∫_{c0}^{c1} … dζ form).
-        legendre = Legendre_shifted(level=Nu + 2)
+        legendre = Legendre_shifted(level=max(levels) + 2)
         N_z = int(self.project_nz)
         loc = [float(j) / (N_z - 1) for j in range(N_z)]
         weights = [1.0 / (N_z - 1)] * N_z
@@ -342,7 +380,7 @@ class MLSME(BaseModel):
                 rows = legendre.projection_rows(
                     loc, weights, samples,
                     norm=lambda _k, _lf=lf: P3["h"] * _lf)
-                for k in range(Nu + 1):
+                for k in range(levels[ell - 1] + 1):
                     proj[q_mod[ell][xd][k]] = rows[k]
         m.project_rows = proj
 
@@ -352,7 +390,7 @@ class MLSME(BaseModel):
         # equation registration order above)
         m.q_flat = [q_mod[ell][xd][k]
                     for ell in range(1, N + 1)
-                    for xd in horiz for k in range(Nu + 1)]
+                    for xd in horiz for k in range(levels[ell - 1] + 1)]
         m.G_closed = {str(kk_): sp.simplify(v.subs(par))
                       for kk_, v in G_sol.items()}
         return m

@@ -39,6 +39,7 @@ __all__ = [
     "reset_modal_indices",
     "separation_of_variables",
     "SeparationOfVariables",
+    "TensorSeparationOfVariables",
     "build_modal_sum",
     "modal_bound",
     "modal_index",
@@ -286,10 +287,57 @@ class SeparationOfVariables(Operation):
         # must expand to ``Σ_i a_i·φ(i, 0/1)`` too.  ``call_args[-1]`` is the
         # separation (basis) coordinate of each application — ζ in the bulk, 0/1
         # at a boundary.
-        def _expand(*call_args):
-            return sp.Sum(coeff_head(idx, *coords) * phi(idx, call_args[-1]),
-                          (idx, 0, order))
+        #
+        # FRESH DUMMY PER FIELD OCCURRENCE.  ``Basic.replace`` fires the callback
+        # once per DISTINCT subexpression, so two structurally different
+        # applications of the same head — e.g. ``u(t,x,ζ)`` in the bulk and
+        # ``u(t,x,0)`` at a bed BC, or a nested ``u·u`` whose factors differ by
+        # argument — used to collapse onto ONE shared summation dummy ``idx``.
+        # ``sympy`` then keeps the two ``Sum``s sharing that index and SILENTLY
+        # DROPS the cross terms (``i ≠ j``) when they multiply.  We hand the FIRST
+        # occurrence the canonical registry index (so single-field expansions and
+        # the ``Q`` redeclaration are byte-identical to before) and mint a fresh
+        # DISTINCT index for every subsequent occurrence, drawn from the same
+        # ``i, j, k, …`` pool.  A ``u·u`` that ``sympy`` has already folded to a
+        # ``Pow`` (one base node) still relies on :class:`ExpandSums` to relabel —
+        # this fix removes the collision for the DISTINCT-node cross terms that
+        # ``ExpandSums`` never sees (they are handed to it pre-multiplied).
+        def _make_expander():
+            """A fresh per-equation expander: the FIRST distinct occurrence keeps
+            the canonical registry index ``idx`` (byte-identical to the old
+            single-dummy behaviour when a field occurs once per equation); every
+            LATER distinct occurrence gets a fresh index from the ``i, j, k, …``
+            pool.  Resetting per equation keeps cross-equation dummy names stable
+            (they never interact) while removing the within-equation collision."""
+            used = {idx}
+            first = {"done": False}
+
+            def _next_index():
+                if not first["done"]:
+                    first["done"] = True
+                    return idx
+                for nm in _INDEX_NAMES:
+                    cand = sp.Symbol(nm, integer=True, nonnegative=True)
+                    if cand not in used:
+                        used.add(cand)
+                        return cand
+                n = 1
+                while True:
+                    cand = sp.Symbol(f"{idx.name}_{n}", integer=True,
+                                     nonnegative=True)
+                    if cand not in used:
+                        used.add(cand)
+                        return cand
+                    n += 1
+
+            def _expand(*call_args):
+                j = _next_index()
+                return sp.Sum(coeff_head(j, *coords) * phi(j, call_args[-1]),
+                              (j, 0, order))
+            return _expand
+
         for eq in model._equations.values():
+            _expand = _make_expander()
             eq.expr = eq.expr.replace(head, _expand)
             # An ORIENTED relation (e.g. ``ω = …`` after ``SolveFor``) keeps a
             # separate ``_as_relation`` dict; rewrite its lhs/rhs too so the
@@ -307,6 +355,96 @@ class SeparationOfVariables(Operation):
         # A genuine family rename (u → a): the Q key follows the new coeff family.
         model.redeclare_unknown(head, coeff_applied, rename_key=True)
         model._refresh_unknowns()
+        return model
+
+
+class TensorSeparationOfVariables(Operation):
+    r"""Direct **tensor-product** Galerkin ansatz — the N-direction generalization
+    of :func:`separation_of_variables`.
+
+    Approximates a field by a full tensor product over TWO (or, via the generic
+    ``slots`` form, N) separation coordinates at once:
+
+    .. math::
+
+        u(\dots,\eta,\zeta)\;\approx\;
+            \sum_{i=0}^{N_z}\sum_{j=0}^{N_y}
+            q_{ji}(t,x)\,\varphi_i(\zeta)\,\psi_j(\eta).
+
+    Unlike a *chain* of single-coordinate expansions, this is inserted
+    **concretely expanded** (integer orders), so every occurrence is
+    collision-free — no shared summation dummies to collapse the cross terms of a
+    product.  Boundary evaluations (a separation slot carrying a concrete ``0``/
+    ``scale`` instead of the reference coord) resolve through φ/ψ naturally.
+
+    Heads are matched **BY NAME** (the field head *and* its σ-decorated
+    ``\tilde{field}`` sibling): a ``PDETransformation`` σ-map produces a decorated
+    head that is a custom :class:`sympy.Function` subclass, and object identity is
+    unreliable across maps/assumptions — so name matching is the robust key.
+
+    Parameters
+    ----------
+    field : sympy applied Function
+        The ORIGINAL field application (e.g. ``u(t, x, y, z)``) whose head (and
+        decorated sibling) is expanded.
+    coeff_head : sympy Function head
+        The tensor coefficient family ``q``.  Applied as
+        ``coeff_head(j, i, *kept_args)`` — lateral index ``j`` OUTER, vertical
+        index ``i`` inner (matches the nested resolution order).
+    pos_z, basis_z, order_z : int, Basis, int
+        Argument position of the vertical (inner) separation coordinate, its
+        opaque basis, and truncation order ``N_z``.
+    pos_y, basis_y, order_y : int, Basis, int
+        Same for the lateral (outer) separation coordinate.
+    scale_y : sympy.Expr | int, optional
+        The lateral slot carries the PHYSICAL coordinate ``y = scale_y·η``
+        textually (a ``PDETransformation`` maps ``y → W·η``); the coefficient's
+        η is recovered as ``arg / scale_y`` (so ``W·η → η``, ``0 → 0``,
+        ``W → 1``).  Default ``1``.
+    """
+
+    whole_model_op = True
+
+    def __init__(self, field, coeff_head, *, pos_z, basis_z, order_z,
+                 pos_y, basis_y, order_y, scale_y=1, name="tensor_sov"):
+        self._field, self._coeff = field, coeff_head
+        self._pz, self._bz, self._oz = pos_z, basis_z, order_z
+        self._py, self._by, self._oy = pos_y, basis_y, order_y
+        self._sy = scale_y
+        super().__init__(
+            name=name,
+            description=(f"tensor separation of variables {field} → "
+                        f"Σ_ji {_coeff_key(coeff_head)}·φ_i·ψ_j"))
+
+    def apply_to_model(self, model):
+        # Match heads BY NAME — field + its σ-decorated ``\tilde{field}`` sibling
+        # (decorated heads are custom Function subclasses; identity is unreliable).
+        names = {self._field.func.__name__,
+                 "\\tilde{%s}" % self._field.func.__name__}
+        heads = {f.func for eq in model._equations.values()
+                 for f in eq.expr.atoms(sp.Function) if f.func.__name__ in names}
+        pz, py = self._pz, self._py
+        phi = getattr(self._bz, "phi", None) or getattr(self._bz, "phi_fn",
+                                                         self._bz)
+        psi = getattr(self._by, "phi", None) or getattr(self._by, "phi_fn",
+                                                         self._by)
+
+        def _expand(*call_args):
+            kept = tuple(a for p, a in enumerate(call_args) if p not in (pz, py))
+            eta_val = sp.cancel(call_args[py] / self._sy)   # W·η→η, 0→0, W→1
+            return sp.Add(*[
+                self._coeff(j, i, *kept)
+                * phi(i, call_args[pz]) * psi(j, eta_val)
+                for i in range(self._oz + 1) for j in range(self._oy + 1)])
+
+        for eq in model._equations.values():
+            for head in heads:
+                eq.expr = eq.expr.replace(head, _expand)
+                rel = getattr(eq, "_as_relation", None)
+                if rel:
+                    eq._as_relation = {k.replace(head, _expand):
+                                       v.replace(head, _expand)
+                                       for k, v in rel.items()}
         return model
 
 

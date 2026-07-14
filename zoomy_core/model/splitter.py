@@ -35,6 +35,7 @@ from typing import Sequence
 
 import sympy as sp
 
+from zoomy_core.misc.misc import ZArray
 from zoomy_core.systemmodel.system_model import SystemModel
 
 
@@ -649,6 +650,39 @@ class SplitForPressureResult:
     SM_corr: object
 
 
+def _assert_subsystem_symbols_declared(sm):
+    """Raise if any free symbol of ``sm``'s hyperbolic operators is not a
+    declared state / aux / parameter / coordinate / time / ``dt`` (REQ-151).
+
+    A sub-system referencing an aux it does not declare is the failure the
+    prefix fix prevents; this guard turns a would-be silent wrong-row read (or
+    a lambdify ``NameError`` three layers down) into a loud split-time error.
+    """
+    allowed = {str(s) for s in sm.state}
+    allowed |= {str(a) for a in sm.aux_state}
+    allowed |= {str(p) for p in sm.parameters.values()}
+    allowed |= {str(c) for c in sm.space}
+    allowed |= {str(sm.time), "dt"}
+    ops = [sm.flux, sm.hydrostatic_pressure, sm.nonconservative_matrix,
+           sm.source, sm.mass_matrix]
+    seen = set()
+    for op in ops:
+        if op is None:
+            continue
+        for entry in sp.flatten(op):
+            for atom in sp.sympify(entry).free_symbols:
+                seen.add(str(atom))
+    undeclared = seen - allowed
+    if undeclared:
+        raise ValueError(
+            f"split sub-system references symbols it does not declare: "
+            f"{sorted(undeclared)}.  Declared aux = "
+            f"{[str(a) for a in sm.aux_state]}; state = "
+            f"{[str(s) for s in sm.state]}.  This is the REQ-151 aux-layout "
+            f"divergence — the sub-system's aux pool must carry every row its "
+            f"own operators reference.")
+
+
 def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
                      equation_to_state_index, history_entry,
                      source_only=False):
@@ -915,6 +949,45 @@ def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
     # ``h_x``, the pressure stage carries the pressure derivatives
     # ``P_l_x`` / ``P_l_x_x``, etc.
     sm.expose_aux_atoms()
+    # ── REQ-151: keep the PARENT's aux layout a PREFIX of every sub-system's.
+    # ``expose_aux_atoms`` only routes Function / Derivative atoms, so a
+    # plain-Symbol aux the parent owns — e.g. the KP-desingularized ``hinv``
+    # that every velocity ``u = q·hinv`` depends on — is SILENTLY dropped from
+    # the sub-system.  Then two things break: (A) the sub-system's own flux /
+    # eigenvalues reference an aux row that is absent (``NameError: hinv`` on
+    # jax, an out-of-range aux index on numpy); (B) the parent's BC kernel,
+    # forwarded verbatim, indexes aux by the PARENT's row numbers against the
+    # sub-system's DIFFERENT layout (an out-of-range crash, or worse a silent
+    # wrong-row read).  In 1-D the parent rows happen to be a prefix, so this
+    # never fired.  Restore that invariant by construction: prepend the parent
+    # rows (in parent order), then reindex the registries to the new layout.
+    parent_aux = list(sm_parent.aux_state)
+    if parent_aux:
+        pnames = {str(a) for a in parent_aux}
+        extra = [a for a in sm.aux_state if str(a) not in pnames]
+        sm.aux_state = parent_aux + extra
+        names = [str(a) for a in sm.aux_state]
+        for reg in ("aux_registry", "aux_input_registry"):
+            for e in (getattr(sm, reg, None) or []):
+                if e.get("name") in names:
+                    e["row"] = names.index(e["name"])
+        # Carry the parent's LOCAL aux formula (``hinv = kp_hinv(h)``) so the
+        # desingularized rows are actually COMPUTED on the sub-system pool
+        # (defect D — the aux would otherwise sit at 0, zeroing every
+        # velocity).  The parent rows are now a prefix, so the parent's per-row
+        # column aligns 1:1; extra rows are identity passthrough.
+        parent_upd = getattr(sm_parent, "update_aux_variables", None)
+        if parent_upd is not None and getattr(parent_upd, "shape", (0,))[0]:
+            n_parent = parent_upd.shape[0]
+            rows = [parent_upd[i, 0] if i < n_parent else a
+                    for i, a in enumerate(sm.aux_state)]
+            sm.update_aux_variables = ZArray([[r] for r in rows])
+    # Guard that would have caught all of the above: every free symbol of the
+    # sub-system's hyperbolic operators must be a state, an aux, a parameter,
+    # a coordinate, time, or ``dt`` — anything else means a kernel references
+    # something the sub-system does not declare.  Fail LOUD at split time, not
+    # at lambdify/index time three layers down.
+    _assert_subsystem_symbols_declared(sm)
     sm.equation_names = list(eq_names)
     # Share the parent's BC source objects so the sub-system prints
     # standalone — the C++ Model printer reads ``sm._bc_source`` (tag

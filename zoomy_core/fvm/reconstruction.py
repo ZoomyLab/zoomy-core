@@ -815,6 +815,76 @@ class LSQMUSCLReconstruction:
         return Q_L, Q_R
 
 
+class _ZhangShuPPMixin:
+    """Xing–Zhang–Shu 2010 a-priori cell-mean positivity limiter (numpy).
+
+    Mirror of the jax ``_ZhangShuPP`` mixin.  Scales the reconstruction
+    *deviation* of the depth row by a per-cell ``θ ∈ [0, 1]`` so the
+    reconstructed depth at every face midpoint of the cell stays ``≥ 0``.  The
+    cell mean (hence conservation) is untouched, and ``θ = 1`` (no-op) wherever
+    the reconstruction is already non-negative — in particular at still water,
+    so well-balancing is preserved.
+    """
+
+    def _build_cell_face_rays(self, mesh, dim):
+        """``r_cf[:, f, c] = face_centers[cell_faces[f, c]] − cell_centers[c]``,
+        shape ``(dim, n_faces_per_cell, n_inner_cells)`` — the rays from each
+        cell centre to its own face midpoints, for evaluating the
+        reconstruction at the cell's faces."""
+        nc = self._nc
+        cell_faces = np.asarray(mesh.cell_faces)[:, :nc]        # (nf_pc, nc)
+        face_ctrs = np.asarray(mesh.face_centers)[:, :dim].T     # (dim, n_faces)
+        cell_ctrs = np.asarray(mesh.cell_centers)[:dim, :nc]     # (dim, nc)
+        self._r_cf = face_ctrs[:, cell_faces] - cell_ctrs[:, np.newaxis, :]
+
+    def _pp_theta(self, h_bar, h_slope, eps=1e-14):
+        """Per-cell ``θ`` so ``min_face(h_bar + h_slope·r_cf) ≥ 0`` (``θ=1`` if
+        already ``≥ 0``).  ``h_slope`` is the LIMITED depth slope ``(dim, nc)``.
+        Rescales the deviation, never the mean, so conservation is exact."""
+        delta = np.einsum("dc,dfc->fc", h_slope, self._r_cf)    # (nf_pc, nc)
+        h_min = np.min(h_bar[np.newaxis, :] + delta, axis=0)     # (nc,)
+        denom = np.maximum(h_bar - h_min, eps)
+        theta = np.where(h_min < 0.0,
+                         np.clip(h_bar / denom, 0.0, 1.0),
+                         np.ones_like(h_bar))
+        return theta
+
+
+class PositivityPreservingLSQMUSCL(_ZhangShuPPMixin, LSQMUSCLReconstruction):
+    """LSQ-MUSCL with a-priori Xing–Zhang–Shu cell-mean positivity (numpy).
+
+    Mirror of the jax ``PositivityPreservingLSQMUSCLJAX``: after the standard
+    slope limiter produces ``φ``, cap the DEPTH-row deviation by the per-cell
+    XZS ``θ`` so the reconstructed depth stays ``≥ 0`` at every face midpoint.
+    Only the depth row is scaled; the momentum rows keep their limited slope.
+    Conservative (mean untouched) and well-balanced (``θ=1`` at still water).
+    """
+
+    def __init__(self, mesh, dim, h_index, eps_positivity=1e-14, **kw):
+        super().__init__(mesh, dim, **kw)
+        self._h_idx = int(h_index)
+        self._eps_positivity = float(eps_positivity)
+        self._build_cell_face_rays(mesh, dim)
+
+    def __call__(self, Q, bf_face_values, phi=None):
+        n_vars = Q.shape[0]
+        grads = self._compute_gradients(Q, n_vars, bf_face_values=bf_face_values)
+        if phi is None:
+            phi = self._compute_phi(Q, n_vars, bf_face_values, grads)
+        else:
+            phi = np.array(phi, copy=True)
+        # A-priori XZS cap on the depth row: scale φ_h so the reconstructed
+        # depth is ≥ 0 at every face of the cell.  ``h_slope`` is the already
+        # slope-limited depth gradient (φ_h·∇h).
+        h_idx = self._h_idx
+        h_slope = phi[h_idx][np.newaxis, :] * grads[h_idx]
+        theta = self._pp_theta(Q[h_idx], h_slope, self._eps_positivity)
+        phi = np.array(phi, copy=True)
+        phi[h_idx] = phi[h_idx] * theta
+        self._limited_grad = phi[:, None, :] * grads
+        return self._reconstruct(Q, grads, phi, bf_face_values)
+
+
 class FreeSurfaceLSQMUSCL(LSQMUSCLReconstruction):
     """LSQ MUSCL with wet-dry fallback for free-surface flows (ghost-cell-free).
 

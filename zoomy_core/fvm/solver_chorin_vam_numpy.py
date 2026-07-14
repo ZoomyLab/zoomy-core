@@ -754,6 +754,23 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
             **kw)
         self.Qaux_corr = self._walk_derivative_aux(
             self.sm_corr, self.Qaux_corr, Q, mesh, **kw)
+        # REQ-151 defect D: the walk above only fills DERIVATIVE-kind rows.
+        # A plain-Symbol aux computed by a per-cell FORMULA — the
+        # KP-desingularized ``hinv`` every velocity ``u = q·hinv`` depends on —
+        # is filled by the lowered ``update_aux_variables`` leg, not by the LSQ
+        # walk.  Without this each pool's ``hinv`` sits at 0 and every velocity
+        # collapses to 0.  ``dt`` is not load-bearing for ``hinv`` (nor the
+        # identity-passthrough rows), so 0.0 is fine here.
+        self._apply_local_aux_formula(
+            self._sim_model, self._sim_Qaux, Q, self._sim_parameters, 0.0)
+        if getattr(self, "_params_press_base", None) is not None:
+            self._apply_local_aux_formula(
+                self.rt_press, self.Qaux_press, Q,
+                self._params_press_base, 0.0)
+        if getattr(self, "_params_corr_base", None) is not None:
+            self._apply_local_aux_formula(
+                self.rt_corr, self.Qaux_corr, Q,
+                self._params_corr_base, 0.0)
 
     def set_function_aux(self, name, values):
         """Set a function-aux row (e.g. static topography ``b``) on

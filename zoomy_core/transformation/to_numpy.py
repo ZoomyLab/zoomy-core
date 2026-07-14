@@ -566,14 +566,22 @@ class NumpyRuntimeModel:
         # sub-system it returns one value per ``equation_to_state_index`` row
         # (the closed-form projection, where ``dt`` is load-bearing).  Same
         # broadcast pattern as ``source``.
+        # When a split sub-system threads ``dt`` in as a MODEL PARAMETER
+        # (``chorin_split(dt)``), the explicit ``dt`` field of ``upd_sig`` is
+        # the SAME symbol as the parameter, so lambdify would see ``dt`` twice
+        # → ``SyntaxError: duplicate argument 'dt'`` (REQ-151 defect C).  Fall
+        # back to ``std_sig`` in that case — the parameter already supplies
+        # ``dt``, and the flattener ignores any trailing runtime ``dt`` the
+        # solver still passes.
+        _upd_sig = std_sig if dt_in_params else upd_sig
         _register("update_variables",
-                  _column_to_rank1(sm.update_variables), upd_sig)
+                  _column_to_rank1(sm.update_variables), _upd_sig)
         # Per-cell aux formula (e.g. KP hinv), lowered exactly like
         # ``update_variables`` with the trailing ``dt`` scalar; the solver
         # applies it to Qaux each step.
         _register("update_aux_variables",
                   _column_to_rank1(getattr(sm, "update_aux_variables", None)),
-                  upd_sig)
+                  _upd_sig)
         _register("eigenvalues", _column_to_rank1(sm.eigenvalues), eig_sig)
 
         # NDimArray operators (NCP, quasilinear) — per-axis slab as a

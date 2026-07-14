@@ -32,6 +32,7 @@ from zoomy_core.model.derivation import (
 )
 from zoomy_core.model.derivation.projection import Integrate
 from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
+from zoomy_core.model.derivation.closure import GaussQuadrature
 from zoomy_core.model.operations import Multiply, ProductRule, KinematicBC
 from zoomy_core.systemmodel import SystemModel
 
@@ -173,6 +174,11 @@ class VAM(BaseModel):
             getattr(m, nm).apply(EvaluateSums())
             getattr(m, nm).apply(ResolveModes(index=k, modes=modes))
             getattr(m, nm).apply(ResolveBasis(legendre, var=zeta))
+            # REQ-160: numerically resolve any Galerkin integral a
+            # non-polynomial closure leaves behind (no-op when none remain).
+            if int(self.quadrature_order) > 0:
+                getattr(m, nm).apply(
+                    GaussQuadrature(var=zeta, order=int(self.quadrature_order)))
 
         # 5b — top w/p mode closures (Escalante eq 6).  2-D: the bottom
         # kinematic is w(0) = Σ_d u_d(0)·∂_d b.

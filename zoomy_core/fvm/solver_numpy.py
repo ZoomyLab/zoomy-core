@@ -74,6 +74,30 @@ def _detect_scaled_q_indices(model):
     return [i for i in range(model.n_variables) if i not in excluded]
 
 
+def _nsm_explicit_numerics(solver, symbolic_model):
+    """Return the NSM-owned Riemann numerics when the case EXPLICITLY chose
+    one, else ``None`` so each solver keeps its own default (REQ-157).
+
+    The Riemann solver is owned by the :class:`NumericalSystemModel`
+    (``nsm.riemann`` + ``nsm.build_numerics()``) — jax and dmplex both honour
+    it.  numpy historically hard-coded its own class and silently ignored the
+    NSM's choice, so a case that built the NSM with e.g.
+    ``PositiveNonconservativeHLL`` still ran Rusanov on numpy (a *different*
+    discretisation than every other backend).  We defer only when the choice
+    was explicit (``nsm.riemann_explicit``), so a defaulted NSM leaves the
+    solver's own default (plain / positive / Roe) untouched."""
+    nsm = getattr(solver, "nsm", None)
+    if nsm is None or not getattr(nsm, "riemann_explicit", False):
+        return None
+    riemann = getattr(nsm, "riemann", None)
+    if riemann is None:
+        return None
+    scaled = getattr(nsm, "scaled_q_indices", None)
+    if scaled is None:
+        scaled = _detect_scaled_q_indices(symbolic_model)
+    return riemann(symbolic_model, scaled_q_indices=scaled)
+
+
 # -- Boundary condition helpers ------------------------------------------------
 
 def _compute_bf_face_gradients(Q, Qaux, bc_indices, bc_grad_fn, bf_cells,
@@ -200,6 +224,29 @@ class Solver(param.Parameterized):
             ).ravel()[:n_vars]
         return Q
 
+    def _apply_local_aux_formula(self, model, Qaux, Q, parameters, dt,
+                                 *, copy=False):
+        """Apply the lowered ``update_aux_variables`` per-cell formula (e.g.
+        the KP-desingularized ``hinv``) to ``Qaux``.
+
+        ``callable`` (not merely ``is not None``): a SystemModel used directly
+        (DAE path) carries ``update_aux_variables`` as a symbolic ZArray coerced
+        from ``None`` — non-callable, NOT a per-cell formula.  Only a lowered
+        runtime callable is a genuine local-aux leg; the placeholder is skipped
+        (returns ``Qaux`` unchanged).  ``copy=True`` writes into a fresh array
+        (the canonical :meth:`update_qaux` contract); ``copy=False`` refreshes
+        in place (the Chorin per-pool refresh)."""
+        local_fn = getattr(model, "update_aux_variables", None)
+        if not callable(local_fn) or Qaux.shape[0] == 0:
+            return Qaux
+        out = np.array(Qaux, copy=True) if copy else Qaux
+        for c in range(Q.shape[1]):
+            vals = np.asarray(
+                local_fn(Q[:, c], Qaux[:, c], parameters, dt),
+                dtype=float).ravel()
+            out[:vals.shape[0], c] = vals
+        return out
+
     def update_qaux(self, Q, Qaux, Qold, Qauxold, mesh, model, parameters, time, dt):
         """Fill the auxiliary vector with BOTH legs the SystemModel gathered:
 
@@ -215,22 +262,10 @@ class Solver(param.Parameterized):
         Subclasses override to supply the ``kind == 'function'`` rows and call
         ``super().update_qaux(...)``.  No-op if neither leg is present.
         """
-        out = Qaux
         # (1) LOCAL aux formula leg — per-cell (only present when the model
         # declares a real, non-identity update_aux_variables).
-        local_fn = getattr(model, "update_aux_variables", None)
-        # ``callable`` (not merely ``is not None``): when ``model`` is a
-        # SystemModel used directly (DAE path), its ``update_aux_variables``
-        # slot is a symbolic ZArray coerced from ``None`` — non-callable and
-        # NOT a real per-cell formula.  Only a lowered callable is a genuine
-        # local-aux leg; the ZArray placeholder is skipped.
-        if callable(local_fn) and Qaux.shape[0] > 0:
-            out = np.array(Qaux, copy=True)
-            for c in range(Q.shape[1]):
-                vals = np.asarray(
-                    local_fn(Q[:, c], Qaux[:, c], parameters, dt),
-                    dtype=float).ravel()
-                out[:vals.shape[0], c] = vals
+        out = self._apply_local_aux_formula(
+            model, Qaux, Q, parameters, dt, copy=True)
         # (2) DERIVATIVE aux leg — the non-local LSQ-gradient rows the
         # SystemModel gathered in aux_registry, via the shared walk (the SINGLE
         # source the Chorin per-pool refresh also calls).
@@ -492,7 +527,14 @@ class HyperbolicSolver(Solver):
         The source differs per mode (built in ``bernoulli_wb``): Audusse uses the
         PRESSURE jump only (momentum-only S̃ — zero mass row, no convective/aux
         dependence, dimension-agnostic), Bernoulli the full conservative-flux
-        jump (its discharge-preserving reconstruction zeroes the mass row)."""
+        jump (its discharge-preserving reconstruction zeroes the mass row).
+
+        When the NSM explicitly carries a Riemann choice, honour it (REQ-157)
+        — this is the same contract jax/dmplex follow; the NSM owns the
+        numerics."""
+        nsm_numerics = _nsm_explicit_numerics(self, symbolic_model)
+        if nsm_numerics is not None:
+            return nsm_numerics
         return NonconservativeRusanov(symbolic_model)
 
     def _build_diffusion_operators(self, mesh, symbolic_model, dim, n_vars):
@@ -588,9 +630,22 @@ class HyperbolicSolver(Solver):
         """Build ghost-cell-free face reconstruction."""
         from zoomy_core.fvm.reconstruction import (
             ConstantReconstructionV2, LSQMUSCLReconstruction,
+            PositivityPreservingLSQMUSCL,
         )
         dim = symbolic_model.dimension
         if self.nsm.reconstruction.order >= 2:
+            # A-priori Xing–Zhang–Shu cell-mean positivity (REQ-152): cap the
+            # depth-row deviation so the reconstructed h stays ≥ 0 at every
+            # face — conservative (mean untouched).  Engaged by the NSM's
+            # reconstruction spec (``positivity`` in {'zhang_shu','mood'}); the
+            # numpy backend supplies the a-priori guarantee the jax MOOD re-run
+            # gives, so order-2 wet/dry no longer stalls with h < 0.
+            positivity = getattr(self.nsm.reconstruction, "positivity", "")
+            h_idx = _var_index(symbolic_model, "h")
+            if positivity in ("zhang_shu", "mood") and h_idx is not None:
+                return PositivityPreservingLSQMUSCL(
+                    mesh, dim, h_index=h_idx,
+                    limiter=self.nsm.reconstruction.limiter)
             return LSQMUSCLReconstruction(
                 mesh, dim, limiter=self.nsm.reconstruction.limiter)
         return ConstantReconstructionV2(mesh, dim)
@@ -1206,6 +1261,9 @@ class FreeSurfaceFlowSolver(HyperbolicSolver):
     """
 
     def _build_numerics(self, symbolic_model):
+        nsm_numerics = _nsm_explicit_numerics(self, symbolic_model)
+        if nsm_numerics is not None:
+            return nsm_numerics
         return _build_free_surface_numerics(symbolic_model)
 
     def _build_reconstruction(self, mesh, symbolic_model):
@@ -1251,4 +1309,7 @@ class RoeFreeSurfaceFlowSolver(FreeSurfaceFlowSolver):
     wet/dry handling, time-stepping) is unchanged."""
 
     def _build_numerics(self, symbolic_model):
+        nsm_numerics = _nsm_explicit_numerics(self, symbolic_model)
+        if nsm_numerics is not None:
+            return nsm_numerics
         return _build_roe_numerics(symbolic_model)

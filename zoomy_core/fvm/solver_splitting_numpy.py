@@ -59,24 +59,31 @@ class SplittingSolver(IMEXSolver):
     def setup_simulation(self, mesh, model, write_output=False):
         """Build all operators including Poisson infrastructure.
 
-        NOTE: this solver is marked inactive in the audit — it has no
-        active tests.  The NSM auto-LSQ-degree derivation may not be
-        sufficient for its implicit pressure-Poisson stage; a proper
-        fix mirrors :class:`ChorinSplitVAMSolver` and exposes the
-        pressure block as a sibling SystemModel passed via
-        ``NumericalSystemModel.from_system_model(...,
-        additional_systems=[sm_press])``.
+        ``model`` may be a :class:`Model`, a :class:`SystemModel`, or an
+        already-built :class:`NumericalSystemModel`.  It is coerced to an NSM
+        (via :meth:`HyperbolicSolver._coerce_to_nsm`) and stored on
+        ``self.nsm`` — the base ``get_flux_operator`` /
+        ``get_compute_max_abs_eigenvalue`` read ``self.nsm.reconstruction`` and
+        ``self.nsm.eigenvalue_eps``, so WITHOUT this assignment the solver
+        raised ``AttributeError: 'SplittingSolver' object has no attribute
+        'nsm'`` for every model (REQ-148).
         """
         t0 = time.time()
-        mesh = ensure_lsq_mesh(mesh, model)
+        # Coerce Model / SystemModel / NSM to an NSM and seed ``self.nsm`` — the
+        # single wiring the class was missing (mirrors HyperbolicSolver).
+        nsm, source_model = self._coerce_to_nsm(model)
+        self.nsm = nsm
+        mesh = ensure_lsq_mesh(mesh, nsm)
         # Periodic-BC topology resolution needs the ``BoundaryConditions``
-        # object — done before the SystemModel normalisation.
-        if hasattr(mesh, "resolve_periodic_bcs") and not isinstance(model, SystemModel):
-            mesh.resolve_periodic_bcs(model.boundary_conditions)
-        # Normalise to a SystemModel — the self-contained numerical
-        # model every downstream method consumes.
-        if not isinstance(model, SystemModel):
-            model = SystemModel.from_model(model)
+        # object — the Model carries it directly; a declarative SystemModel
+        # retains it as ``_bc_source``.
+        bcs_obj = (source_model.boundary_conditions
+                   if source_model is not None
+                   else getattr(nsm.sm, "_bc_source", None))
+        if hasattr(mesh, "resolve_periodic_bcs") and bcs_obj is not None:
+            mesh.resolve_periodic_bcs(bcs_obj)
+        # The self-contained SystemModel every downstream method consumes.
+        model = nsm.sm
         self.sm = model
         dim = model.dimension
         Q, Qaux = self.initialize(mesh, model)

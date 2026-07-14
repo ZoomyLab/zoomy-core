@@ -51,6 +51,7 @@ from zoomy_core.model.derivation import (
 )
 from zoomy_core.model.derivation.projection import Integrate
 from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
+from zoomy_core.model.derivation.closure import GaussQuadrature
 from zoomy_core.model.operations import Multiply, ProductRule, KinematicBC
 from zoomy_core.systemmodel import SystemModel
 
@@ -138,7 +139,6 @@ class MLVAM(BaseModel):
             p = sp.Function(f"p_{ell}", real=True)(*coords)
             from zoomy_core.model.models.equations import (
                 Mass, MomentumNonHydrostatic, small_slope_scaling)
-            from types import SimpleNamespace
             from zoomy_core.model.models.material import ClosureState
             from zoomy_core.model.models.closures import apply_layer_stress_closures
             ml.add_equation(Mass(ml, suffix=f"_{ell}"))
@@ -176,14 +176,18 @@ class MLVAM(BaseModel):
                 getattr(ml, nm).apply(ml.kbc_top)
                 getattr(ml, nm).apply({sp.Derivative(b, t): 0})
                 getattr(ml, nm).apply({pp.at(1): p_top_trace_full})
-            par_ns = SimpleNamespace(rho=rl, nu=nu_s, lambda_s=lam_s)
+            # REQ-160 root cause (mirror MLSME): read the REAL layer parameter
+            # namespace so EVERY closure parameter (tau_y, eps_reg, …) resolves —
+            # the hand-built SimpleNamespace(rho, nu, lambda_s) lacked them.
+            for c in (self.closures or []):
+                c.register(ml)
 
             def _state(at, *, alias=None, btag=None):
                 fields = {"u": getattr(ml.functions, f"u_{ell}"),
                           "w": getattr(ml.functions, f"w_{ell}")}
                 if dim == 3:
                     fields["v"] = getattr(ml.functions, f"v_{ell}")
-                return ClosureState(fields, params=par_ns, h=h_l, x=C.x,
+                return ClosureState(fields, params=ml.parameters, h=h_l, x=C.x,
                                     zeta=zeta, at=at, alias=alias,
                                     boundary_tag=btag, horiz=list(horiz))
             axes = [{"mx": getattr(ml, f"momentum_{CN[xd]}"),
@@ -226,6 +230,11 @@ class MLVAM(BaseModel):
                 getattr(ml, nm).apply(EvaluateSums())
                 getattr(ml, nm).apply(ResolveModes(index=kk, modes=modes))
                 getattr(ml, nm).apply(ResolveBasis(legendre, var=zeta))
+                # REQ-160: numerically resolve non-polynomial-closure integrals
+                # (no-op when none remain), routed from the shared order.
+                if int(self.quadrature_order) > 0:
+                    getattr(ml, nm).apply(
+                        GaussQuadrature(var=zeta, order=int(self.quadrature_order)))
 
             # ── MODAL closures for the top w/p modes ─────────────────────
             # bottom kinematic/interface condition (KinematicBC orientation:
@@ -399,6 +408,10 @@ class MLVAM(BaseModel):
 
         # vertical-z placeholder so Model.horizontal = (x[, y]) (see ml_sme)
         m = DModel(coords=(t, *horiz, z), parameters=values)
+        # declare closure parameters (tau_y, eps_reg, …) on the assembled model
+        # so they bind at codegen even without an explicit user value (REQ-160).
+        for c in (self.closures or []):
+            c.register(m)
         par = {lam_s: m.parameters.lambda_s, nu_s: m.parameters.nu}
         par.update({l_par[j - 1]: getattr(m.parameters, f"l_{j}")
                     for j in range(1, N)})

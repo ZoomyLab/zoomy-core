@@ -40,6 +40,9 @@ import functools
 import hashlib
 import inspect
 import logging
+import os
+import pickle
+from pathlib import Path
 
 from zoomy_core.model.derivation.cache_keys import CACHE_VERSION, argument_key
 
@@ -47,6 +50,23 @@ logger = logging.getLogger(__name__)
 
 # function-id → { call_key: result }
 _STORE: dict[str, dict[str, object]] = {}
+
+
+def _persist_dir() -> Path:
+    """The on-disk derivation-cache directory (cross-session tier).
+
+    Rooted at ``$ZOOMY_CACHE_DIR`` (subdir ``derivation_cache``); defaults to
+    ``~/.cache/zoomy/derivation_cache``."""
+    base = os.environ.get("ZOOMY_CACHE_DIR")
+    root = str(Path(base) / "derivation_cache") if base else None
+    p = Path(root) if root else Path.home() / ".cache" / "zoomy" / "derivation_cache"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _persist_path(fid: str, key: str) -> Path:
+    safe = fid.replace(os.sep, "_").replace(".", "_")
+    return _persist_dir() / f"{safe}-{key}.pkl"
 
 
 class CacheStats:
@@ -88,7 +108,7 @@ def _call_key(source: str, args, kwargs, version) -> str:
     return hashlib.sha256("\x1f".join(parts).encode()).hexdigest()
 
 
-def derivation_cache(fn=None, *, version=0, verify=False):
+def derivation_cache(fn=None, *, version=0, verify=False, persist=False):
     """Memoise a derivation stage, keyed on (function source ⊕ argument content).
 
     Parameters
@@ -101,6 +121,17 @@ def derivation_cache(fn=None, *, version=0, verify=False):
         ``srepr``-identical to the cached one.  Defeats the purpose of caching
         (it always recomputes) — use it in tests / CI to catch a key that
         forgets a result-affecting argument.
+    persist : bool, optional
+        Add a CROSS-SESSION disk tier (REQ-142).  On an in-memory miss the
+        wrapper first tries to ``pickle.load`` a prior result from
+        ``$ZOOMY_DERIVATION_CACHE`` (default ``~/.cache/zoomy/derivation_cache``);
+        a disk hit is loaded into memory and counted as a HIT — the (minutes-long)
+        body never runs.  A fresh computation is written back best-effort;
+        UNpicklable results (e.g. a half-built ``Model`` carrying dynamically
+        created φ/ψ ``Function`` subclasses) are kept in memory only and skip disk
+        with a warning.  **Cache the FINAL, fully-resolved result** (a closed-row
+        dict of ordinary sympy expressions round-trips; an intermediate ``Model``
+        does not) to get cross-run reuse.
 
     The wrapper exposes ``.stats`` (a :class:`CacheStats`), ``.cache_clear()``,
     and ``.__wrapped__`` (the original function).
@@ -122,15 +153,37 @@ def derivation_cache(fn=None, *, version=0, verify=False):
                     fresh = func(*args, **kwargs)
                     _assert_same(fresh, cached, fid)
                 return cached
+            if persist:                              # cross-session disk tier
+                path = _persist_path(fid, key)
+                if path.exists():
+                    try:
+                        cached = pickle.loads(path.read_bytes())
+                    except Exception as exc:         # corrupt / stale pickle
+                        logger.warning(
+                            "derivation_cache[%s]: unreadable disk entry (%s); "
+                            "recomputing.", fid, exc)
+                    else:
+                        store[key] = cached
+                        stats.hits += 1
+                        return cached
             stats.misses += 1
             stats.calls += 1
             result = func(*args, **kwargs)
             store[key] = result
+            if persist:
+                try:
+                    _persist_path(fid, key).write_bytes(
+                        pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL))
+                except Exception as exc:             # unpicklable → memory-only
+                    logger.warning(
+                        "derivation_cache[%s]: result not picklable (%s); "
+                        "keeping in memory only.", fid, exc)
             return result
 
         wrapper.stats = stats
         wrapper.cache_clear = lambda: _STORE.get(fid, {}).clear()
         wrapper._cache_id = fid
+        wrapper._persist = persist
         return wrapper
 
     return decorate if fn is None else decorate(fn)

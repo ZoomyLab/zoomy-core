@@ -204,6 +204,19 @@ _DERIVED_OPERATORS = (
     "source_jacobian_wrt_aux_variables",
 )
 
+# The order-2 primitive reconstruction map ``state → primitive`` (e.g. SWE's
+# ``[b, b+h, hu/h, hv/h]``) divides the momentum by ``h``.  On a dry bed that
+# raw ``1/h`` is a division by zero — a SIGFPE on step 1 under OpenFOAM's FP
+# trapping, an inf/NaN elsewhere (REQ-156).  Sweep it through the SAME
+# desingularized ``hinv`` the flux/source already use, so ``hu/h → hu·hinv`` is
+# dry-bed-safe on every backend by construction.  ``state_from_reconstruction``
+# (the WB inverse) carries no ``1/h`` today, but include it so any future
+# reciprocal there is desingularized too.
+_RECONSTRUCTION_OPERATORS = (
+    "reconstruction_variables",
+    "state_from_reconstruction",
+)
+
 
 def regularize_pow(field: Union[str, sp.Symbol], aux_name: str):
     """Operation: replace every ``field**(-n)`` (``n > 0``) by ``aux_name**n``.
@@ -297,7 +310,8 @@ def regularize_pow(field: Union[str, sp.Symbol], aux_name: str):
         #    front and starves the dissipation, draining the cell negative
         #    (REQ-82).  The flux velocity already uses this same FP floor.
         inv_floor = sp.S.One / sp.Max(sp.Float(_WAVESPEED_H_FLOOR), hs)
-        for nm in _PRIMARY_OPERATORS + _DERIVED_OPERATORS:
+        for nm in (_PRIMARY_OPERATORS + _DERIVED_OPERATORS
+                   + _RECONSTRUCTION_OPERATORS):
             M = getattr(sm, nm, None)
             if M is not None:
                 inv = inv_floor if nm == "eigenvalues" else aux
