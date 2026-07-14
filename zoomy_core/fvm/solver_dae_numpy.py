@@ -969,10 +969,21 @@ class DAESolver(Solver):
             field_names = [str(s) for s in self.sm.state]
         if aux_field_names is None:
             aux_field_names = [str(s) for s in self.sm.aux_state]
-        io.generate_vtk(
-            self._output_hdf5_path,
+        try:
+            from zoomy_prepost import hdf5_to_vtk
+        except ImportError as e:
+            raise ImportError(
+                "export_vtk needs zoomy_prepost (the h5 -> vtk writer). It is "
+                "a sibling install in every zoomy environment — install it "
+                "(pip install -e library/zoomy_prepost)."
+            ) from e
+        from zoomy_core.misc import misc
+        abs_h5 = os.path.join(misc.get_main_directory(), self._output_hdf5_path)
+        hdf5_to_vtk(
+            abs_h5,
+            os.path.dirname(abs_h5),
+            basename=filename,
+            include_aux=not skip_aux,
             field_names=field_names,
             aux_field_names=aux_field_names,
-            skip_aux=skip_aux,
-            filename=filename,
         )

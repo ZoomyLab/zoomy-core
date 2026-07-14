@@ -2,15 +2,7 @@
 
 import os
 import numpy as np
-import json
 import shutil
-
-try:
-    import meshio
-
-    _HAVE_MESHIO = True
-except:
-    _HAVE_MESHIO = False
 
 try:
     import h5py
@@ -21,7 +13,6 @@ except ImportError:
 
 # import zoomy_core.mesh.fvm_mesh as fvm_mesh
 from zoomy_core.mesh.lsq_mesh import LSQMesh as Mesh
-import zoomy_core.mesh.mesh_util as mesh_util
 from zoomy_core.misc.misc import Zstruct, Settings
 from zoomy_core.misc import misc as misc
 from zoomy_core.misc.logger_config import logger
@@ -359,128 +350,7 @@ def load_timeline_of_fields_from_hdf5(filepath):
     return mesh.cell_centers[0], np.array(l_Q), np.array(l_Qaux), np.array(l_time)
 
 
-def _write_to_vtk_from_vertices_edges(
-    filepath,
-    mesh_type,
-    vertex_coordinates,
-    cell_vertices,
-    fields=None,
-    field_names=None,
-    point_fields=None,
-    point_field_names=None,
-):
-    """Internal helper `_write_to_vtk_from_vertices_edges`."""
-    if not _HAVE_MESHIO:
-        raise RuntimeError(
-            "_write_to_vtk_from_vertices_edges requires meshio, which is not available."
-        )
-    assert (
-        mesh_type == "triangle"
-        or mesh_type == "quad"
-        or mesh_type == "wface"
-        or mesh_type == "hexahedron"
-        or mesh_type == "line"
-        or mesh_type == "tetra"
-    )
-    d_fields = {}
-    n_inner_elements = cell_vertices.shape[0]
-    if fields is not None:
-        if field_names is None:
-            field_names = [str(i) for i in range(fields.shape[0])]
-        for i_fields, _ in enumerate(fields):
-            d_fields[field_names[i_fields]] = [fields[i_fields, :n_inner_elements]]
-    point_d_fields = {}
-    if point_fields is not None:
-        if point_field_names is None:
-            point_field_names = [str(i) for i in range(point_fields.shape[0])]
-        for i_fields, _ in enumerate(point_fields):
-            point_d_fields[point_field_names[i_fields]] = point_fields[i_fields]
-    meshout = meshio.Mesh(
-        vertex_coordinates,
-        [(mesh_util.convert_mesh_type_to_meshio_mesh_type(mesh_type), cell_vertices)],
-        cell_data=d_fields,
-        point_data=point_d_fields,
-    )
-    path, filename = os.path.split(filepath)
-    filename_base, filename_ext = os.path.splitext(filename)
-    os.makedirs(path, exist_ok=True)
-    meshout.write(filepath + ".vtk")
-
-
-def generate_vtk(
-    filepath: str,
-    field_names=None,
-    aux_field_names=None,
-    skip_aux=False,
-    filename="out",
-    warp=False,
-):
-    """Export VTK time series (and a ``.vtk.series`` manifest) from HDF5 mesh+fields."""
-    main_dir = misc.get_main_directory()
-    abs_filepath = os.path.join(main_dir, filepath)
-    path = os.path.dirname(abs_filepath)
-    full_filepath_out = os.path.join(path, filename)
-    # abs_filepath = os.path.join(main_dir, filepath)
-    # with h5py.File(os.path.join(filepath, 'mesh'), "r") as file_mesh, h5py.File(os.path.join(filepath, 'fields'), "r") as file_fields:
-    file = h5py.File(os.path.join(main_dir, filepath), "r")
-    file_fields = file["fields"]
-    mesh = Mesh.from_hdf5(abs_filepath)
-    snapshots = list(file_fields.keys())
-    # init timestamp file
-    vtk_timestamp_file = {"file-series-version": "1.0", "files": []}
-
-    def get_iteration_from_datasetname(name):
-        return int(name.split("_")[1])
-
-    # write out vtk files for each timestamp
-    for snapshot in snapshots:
-        time = file_fields[snapshot]["time"][()]
-        Q = file_fields[snapshot]["Q"][()]
-
-        if not skip_aux:
-            Qaux = file_fields[snapshot]["Qaux"][()]
-        else:
-            Qaux = np.empty((Q.shape[0], 0))
-        output_vtk = f"{filename}.{get_iteration_from_datasetname(snapshot)}"
-
-        # TODO callout to compute pointwise data?
-        point_fields = None
-        point_field_names = None
-
-        if field_names is None:
-            field_names = [str(i) for i in range(Q.shape[0])]
-        if aux_field_names is None:
-            aux_field_names = ["aux_{}".format(str(i)) for i in range(Qaux.shape[0])]
-
-        fields = np.concatenate((Q, Qaux), axis=0)
-        field_names = field_names + aux_field_names
-
-        vertex_coordinates_3d = np.zeros((mesh.vertex_coordinates.shape[1], 3))
-        # mesh.vertex_coordinates has shape (3, N) with zeros in unused
-        # rows for 1D / 2D meshes — slice to dim before assignment.
-        vertex_coordinates_3d[:, : mesh.dimension] = (
-            mesh.vertex_coordinates.T[:, : mesh.dimension]
-        )
-
-        _write_to_vtk_from_vertices_edges(
-            os.path.join(path, output_vtk),
-            mesh.type,
-            vertex_coordinates_3d,
-            mesh.cell_vertices.T,
-            fields=fields,
-            field_names=field_names,
-            point_fields=point_fields,
-            point_field_names=point_field_names,
-        )
-
-        vtk_timestamp_file["files"].append(
-            {
-                "name": output_vtk + ".vtk",
-                "time": time,
-            }
-        )
-    # finalize vtk
-    with open(os.path.join(path, f"{filename}.vtk.series"), "w") as f:
-        json.dump(vtk_timestamp_file, f)
-
-    file.close()
+# h5 -> vtk export lives in a single place now:
+# `zoomy_prepost.steps.hdf5_to_vtk` (writes a `.vtu` series + ParaView `.pvd`).
+# The former `generate_vtk` / `_write_to_vtk_from_vertices_edges` (legacy `.vtk`
+# + `.vtk.series`) were removed; callers import zoomy_prepost lazily.

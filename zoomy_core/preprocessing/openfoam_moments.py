@@ -476,12 +476,10 @@ if __name__ == "__main__":
     # test_sort()
     test_convert_openfoam_to_moments(level=1)
     filepath = os.path.join(main_dir, "openfoam_data/channelflow_mid")
-    filepath_mesh = os.path.join(main_dir, "meshes/simple_openfoam/mesh_2d_mid.msh")
-    io.generate_vtk(
+    from zoomy_prepost import hdf5_to_vtk
+
+    hdf5_to_vtk(
+        os.path.join(filepath, "fields_openfoam.hdf5"),
         filepath,
-        filepath_gmsh=filepath_mesh,
-        gmsh_mesh_type="triangle",
-        filename_fields="fields_openfoam.hdf5",
-        filename_out="fields_openfoam_vtk",
-        skip_aux=True,
+        basename="fields_openfoam_vtk",
     )
