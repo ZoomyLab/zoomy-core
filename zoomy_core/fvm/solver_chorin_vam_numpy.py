@@ -359,8 +359,74 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
              "force.  Both routes operate on the same SystemModel API; "
              "only the face-flux machinery changes."))
 
-    def __init__(self, sm_pred, sm_press, sm_corr, *,
-                 reconstruction=None, **kwargs):
+    # Stage kinds this solver realises, mapped to the sub-system role that
+    # already carries that executor.  The Chorin march is exactly one stage
+    # of each kind: ``hyperbolic`` → the inherited HyperbolicSolver step
+    # (predictor), ``elliptic`` → the matrix-free linear/GMRES solve
+    # (pressure), ``pointwise`` → the ``update_variables`` scatter
+    # (corrector).  Binding a ``stages=[...]`` list is naming this dispatch;
+    # it introduces no new numerics.  (REQ-173)
+    _STAGE_KINDS = ("hyperbolic", "elliptic", "pointwise")
+
+    @classmethod
+    def _bind_stages(cls, stages):
+        """Bind a canonical stage list to the ``(sm_pred, sm_press,
+        sm_corr)`` triple BY KIND (REQ-173).
+
+        Accepts :class:`~zoomy_core.model.splitter.Stage` NamedTuples or
+        bare ``(label, kind, sm)`` tuples — e.g. ``split.stages``.  The
+        binding is by ``kind``, never by position: ``hyperbolic`` →
+        predictor, ``elliptic`` → pressure, ``pointwise`` → corrector.
+        Validates that exactly one stage of each supported kind is present.
+        """
+        by_kind = {}
+        for stage in stages:
+            try:
+                label, kind, sm = stage
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    "ChorinSplitVAMSolver: each stage must be a "
+                    "(label, kind, sm) triple / Stage; got "
+                    f"{stage!r}") from exc
+            if kind not in cls._STAGE_KINDS:
+                raise ValueError(
+                    f"ChorinSplitVAMSolver: unknown stage kind {kind!r} "
+                    f"(stage {label!r}); this solver realises "
+                    f"{list(cls._STAGE_KINDS)}.")
+            if kind in by_kind:
+                raise ValueError(
+                    f"ChorinSplitVAMSolver: duplicate stage kind {kind!r} "
+                    f"(labels {by_kind[kind][0]!r} and {label!r}); the "
+                    "Chorin march has exactly one stage per kind.")
+            by_kind[kind] = (label, sm)
+        missing = [k for k in cls._STAGE_KINDS if k not in by_kind]
+        if missing:
+            raise ValueError(
+                f"ChorinSplitVAMSolver: stages missing kind(s) {missing}; "
+                f"need exactly one each of {list(cls._STAGE_KINDS)}.")
+        return (by_kind["hyperbolic"][1],
+                by_kind["elliptic"][1],
+                by_kind["pointwise"][1])
+
+    def __init__(self, sm_pred=None, sm_press=None, sm_corr=None, *,
+                 stages=None, reconstruction=None, **kwargs):
+        if stages is not None:
+            if not (sm_pred is None and sm_press is None and sm_corr is None):
+                raise TypeError(
+                    "ChorinSplitVAMSolver: pass EITHER the positional "
+                    "(sm_pred, sm_press, sm_corr) triple OR stages=[...], "
+                    "not both.")
+            sm_pred, sm_press, sm_corr = self._bind_stages(stages)
+        elif sm_pred is None or sm_press is None or sm_corr is None:
+            raise TypeError(
+                "ChorinSplitVAMSolver: give the positional "
+                "(sm_pred, sm_press, sm_corr) triple or stages=[...].")
+
+        # Elliptic-stage diagnostic (REQ-173 / jax's contract): the last
+        # relative residual ‖b − A x‖/‖b‖ of the pressure solve.  ``None``
+        # until the first pressure step runs.
+        self.last_elliptic_rel_resid = None
+
         if not isinstance(sm_pred, SystemModel):
             raise TypeError("sm_pred must be a SystemModel")
         if not isinstance(sm_press, SystemModel):
@@ -929,12 +995,15 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         b_norm = float(np.linalg.norm(b))
         if b_norm < self.pressure_tol:
             self._sim_Q = Q              # Q[e2s] unchanged (still p0)
+            # ‖b‖ ≈ 0 ⇒ P is already the exact solution (warm start).
+            self.last_elliptic_rel_resid = 0.0
             return
 
         # Linear operator: ``A·P = R(P) − b``.  Pure matvec callable.
         def apply_A(p_vec):
             return _residual(p_vec) - b
 
+        info = 0
         if self.pressure_solver == "lu":
             # Dense assembly by canonical-basis application + direct solve.
             A_dense = np.empty((N, N), dtype=float)
@@ -953,11 +1022,23 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
                 atol=self.pressure_tol,    # absolute floor — survives tiny ‖b‖
                 maxiter=self.pressure_maxit,
             )
-            if info != 0:
-                logger.warning(
-                    f"Chorin pressure GMRES did not fully converge "
-                    f"(info={info}, ‖b‖={b_norm:.3e})"
-                )
+
+        # Elliptic-stage residual contract (REQ-173 / jax's binding
+        # addition to the stage vocabulary): surface the relative residual
+        # ‖b − A x‖/‖b‖ of the solve.  An elliptic executor that returns
+        # only ``x`` is indistinguishable between "solved" and "gave up"
+        # (jax's placeholder ``info`` and dmplex's silent DIVERGED_ITS both
+        # hit this).  The solved system is ``A·P = −b`` (see apply_A), so
+        # the residual is ‖(−b) − A·p_new‖ / ‖b‖ = ‖R(p_new)‖ / ‖R(0)‖.
+        # One extra matvec; pure function of p_new, so state is unchanged.
+        rel_resid = float(np.linalg.norm(-b - apply_A(p_new)) / b_norm)
+        self.last_elliptic_rel_resid = rel_resid
+        if info != 0 or rel_resid > max(1e-6, 10.0 * self.pressure_tol):
+            logger.warning(
+                "Chorin pressure elliptic stage did not fully converge "
+                "(info=%s, rel_resid=%.3e, ‖b‖=%.3e)",
+                info, rel_resid, b_norm,
+            )
         Q[e2s, :] = p_new.reshape(nP, nc)
         self._sim_Q = Q
         # Reflect the solved pressure into Qaux_press derivative rows

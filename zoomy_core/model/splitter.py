@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
-from typing import Sequence
+from typing import NamedTuple, Sequence
 
 import sympy as sp
 
@@ -631,6 +631,28 @@ def _attach_pressure_operator(sm_press):
     return sm_press
 
 
+class Stage(NamedTuple):
+    """One stage of a split solver's march (REQ-173).
+
+    A split solver is supplied a *list* of stages and marches over it; a
+    backend supplies one executor per stage ``kind``.
+
+    * ``label`` — a STABLE, deterministic per-stage identifier
+      (``"predictor"`` / ``"pressure"`` / ``"corrector"`` for the Chorin
+      split).  Code-generating backends key generated names off it
+      (amrex emits ``Model_<label>.H``); it MUST NOT be derived from the
+      list position, or any reordering silently renames every header and
+      invalidates every build cache.
+    * ``kind`` — the executor kind: ``"hyperbolic" | "elliptic" |
+      "pointwise"`` (extensible).  It selects which per-kind executor the
+      backend runs for this stage.
+    * ``sm`` — the :class:`SystemModel` for the stage.
+    """
+    label: str
+    kind: str
+    sm: object
+
+
 @dataclass
 class SplitForPressureResult:
     """Three sub-SystemModels produced by :func:`split_for_pressure`.
@@ -648,6 +670,23 @@ class SplitForPressureResult:
     SM_pred: object
     SM_press: object
     SM_corr: object
+
+    @property
+    def stages(self):
+        """The split as a canonical stage list (REQ-173).
+
+        A split solver marches over this list; a backend supplies one
+        executor per :class:`Stage` ``kind``.  The Chorin split is exactly
+        this data — predictor (``hyperbolic``) → pressure (``elliptic``)
+        → corrector (``pointwise``).  ``.SM_pred`` / ``.SM_press`` /
+        ``.SM_corr`` remain the primary attributes; this is a view of the
+        same three objects with their stable labels and kinds attached.
+        """
+        return [
+            Stage("predictor", "hyperbolic", self.SM_pred),
+            Stage("pressure",  "elliptic",   self.SM_press),
+            Stage("corrector", "pointwise",  self.SM_corr),
+        ]
 
 
 def _assert_subsystem_symbols_declared(sm):
@@ -1699,4 +1738,5 @@ __all__ = [
     "split_for_pressure",
     "split_simple",
     "SplitForPressureResult",
+    "Stage",
 ]
