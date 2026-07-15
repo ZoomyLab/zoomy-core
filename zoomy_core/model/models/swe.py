@@ -45,6 +45,11 @@ class SWE(StructuredDerivativeModel):
         "n_m":  (0.0, "nonnegative"),     # Manning; 0 = frictionless
         "h_in": (0.0, "nonnegative"),     # inflow target depth
         "q_in": (0.0, "real"),            # inflow target discharge
+        # Velocity-magnitude regularizer for the Manning friction: keeps the
+        # source Jacobian ∂S/∂Q FINITE at rest (REQ-166).  |u|=sqrt(hu²+hv²)
+        # has derivative hu/|u| → 0/0 at zero velocity, so the unregularized
+        # source NaNs the implicit/IMEX Newton on step 0 of any from-rest run.
+        "vel_eps": (1e-12, "nonnegative"),
     }
 
     def __init__(self, **kw):
@@ -109,15 +114,27 @@ class SWE(StructuredDerivativeModel):
         return ZArray(B)
 
     def source(self):
-        """Manning friction on the momentum rows (off for n_m = 0)."""
+        """Manning friction on the momentum rows (off for n_m = 0).
+
+        The velocity magnitude carries the ``vel_eps`` regularizer,
+        ``|u| = sqrt(hu² + hv² + vel_eps)``, so the source Jacobian ∂S/∂Q is
+        FINITE at rest (REQ-166).  Without it the 2-D term ``hu·sqrt(hu²+hv²)``
+        has derivative ``sqrt(...) + hu²/sqrt(...) → 0/0`` at zero velocity,
+        which NaNs the implicit/IMEX Newton on step 0 of any from-rest run.
+        With eps ~ 1e-12 the friction is unchanged to ~1e-6 in velocity while
+        the Jacobian is smooth everywhere.  1-D uses the same regularized
+        magnitude (the old ``hu·|hu|`` was Jacobian-finite but non-smooth).
+        """
         h, hu = self.Q.h, self.Q.hu
-        g, n_m = self.parameters.g, self.parameters.n_m
+        g, n_m, eps = (self.parameters.g, self.parameters.n_m,
+                       self.parameters.vel_eps)
         S = sp.Matrix.zeros(self.n_variables, 1)
         if self.dimension == 1:
-            S[2, 0] = -g * n_m**2 * hu * sp.Abs(hu) / h ** sp.Rational(7, 3)
+            mag = sp.sqrt(hu * hu + eps)
+            S[2, 0] = -g * n_m**2 * hu * mag / h ** sp.Rational(7, 3)
         else:
             hv = self.Q.hv
-            mag = sp.sqrt(hu * hu + hv * hv)
+            mag = sp.sqrt(hu * hu + hv * hv + eps)
             S[2, 0] = -g * n_m**2 * hu * mag / h ** sp.Rational(7, 3)
             S[3, 0] = -g * n_m**2 * hv * mag / h ** sp.Rational(7, 3)
         return ZArray(S)

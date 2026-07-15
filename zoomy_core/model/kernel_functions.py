@@ -30,6 +30,27 @@ class eigensystem(sp.Function):
         return None  # always keep unevaluated
 
 
+class eigenvalues(sp.Function):
+    """eigenvalues(idx, *A_flat) — idx-th eigenvalue (real part) of the
+    row-major n*n matrix A_flat, with n inferred from ``len(A_flat) = n*n``.
+
+    The λ-only companion of :class:`eigensystem` (no right/left eigenvectors),
+    used for the wave-speed / CFL bound ``max|λ_i(A_n)|`` when the model has no
+    closed-form spectrum (SME / VAM).  A full ``eigensystem`` returns λ **and**
+    R **and** L=R⁻¹ — for a wave speed that needs only ``max|λ|`` that is ~2/3
+    waste per face per step, and the R⁻¹ is the part that can fail near wet/dry;
+    this kernel skips the eigenvector solve entirely and stays cheap /
+    on-device.  Opaque to SymPy; realised numerically per backend
+    (``np.linalg.eigvals`` / Eigen / on-device iteration)."""
+
+    is_commutative = True
+    is_real = True
+
+    @classmethod
+    def eval(cls, *args):
+        return None  # always keep unevaluated (opaque)
+
+
 class solve(sp.Function):
     """``solve(idx, *A_flat, *b_flat)`` — idx-th component of the per-cell
     linear solve ``A⁻¹ b``.  ``A`` is the row-major ``n*n`` matrix (the first
@@ -150,3 +171,23 @@ class conditional(sp.Function):
         """
         condition, true_expr, false_expr = self.args
         return conditional(condition, true_expr.diff(s), false_expr.diff(s))
+
+
+# ── The UserFunctions contract (REQ-168) ─────────────────────────────────────
+# The opaque kernels every backend must SUPPLY (numpy `module` /
+# `UserFunctions.H` / jax `userfunctions.py`).  A backend whose table is missing
+# one of these has a silent hole — each backend ships a contract test asserting
+# its table covers this set, so the next missing kernel is a RED test rather
+# than a `NameError` at lambdify (python) or a link error mid-build (C++).
+#
+# ``conditional`` is DELIBERATELY EXCLUDED: it is printer-lowered to an inline
+# ternary (``generic_c.py`` → ``((c) ? (t) : (f))``; numpy → ``np.where``), so
+# it never reaches a backend UserFunctions table — a flat "all kernel classes"
+# list would wrongly demand every C++ backend implement a function that must not
+# exist (dmplex REQ-168 item 5).
+REQUIRED_KERNELS = frozenset({
+    "compute_derivative",
+    "eigensystem",
+    "eigenvalues",
+    "solve",
+})

@@ -31,7 +31,10 @@ from zoomy_core.model.derivation.basis_cache import _basis_fingerprint
 
 # Bump when the derivation pipeline changes in a way that invalidates every
 # cached entry (new op semantics, changed extraction, etc.).
-CACHE_VERSION = "v2"   # v2: parameter VALUES out of the spec key (REQ-163)
+CACHE_VERSION = "v3"   # v3: SWE Manning source regularized (vel_eps, REQ-166) —
+#                              plain-model operator edits are not captured by the
+#                              spec/derive_model hash, so bump to invalidate.
+#                        v2: parameter VALUES out of the spec key (REQ-163)
 
 # Fields that never affect the math: display names, verbosity, back-references.
 _COSMETIC_FIELDS = frozenset({"name", "description", "log_level", "_model"})

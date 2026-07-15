@@ -982,6 +982,16 @@ def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
             rows = [parent_upd[i, 0] if i < n_parent else a
                     for i, a in enumerate(sm.aux_state)]
             sm.update_aux_variables = ZArray([[r] for r in rows])
+        # REQ-169: ``aux_state`` just GREW (parent rows prepended) AFTER
+        # ``expose_aux_atoms`` already sized ``source_jacobian_wrt_aux_variables``
+        # to the smaller sub-system aux vector.  Rebuild the derived jacobians so
+        # their columns match the FINAL aux_state layout — otherwise a printer
+        # that iterates ``c in range(len(aux_state))`` (e.g. the amrex Chorin
+        # header generator's ``_expr_source_jac_aux``) runs off the end of the
+        # stale ``(n_eq, n_aux_before)`` jacobian → ``Index (0, k) out of border``.
+        # Mirrors what ``expose_aux_atoms`` / ``expose_*_as_aux`` do after every
+        # ``aux_state`` mutation.
+        sm.refresh_derived_operators(eigenvalues=False)
     # Guard that would have caught all of the above: every free symbol of the
     # sub-system's hyperbolic operators must be a state, an aux, a parameter,
     # a coordinate, time, or ``dt`` — anything else means a kernel references

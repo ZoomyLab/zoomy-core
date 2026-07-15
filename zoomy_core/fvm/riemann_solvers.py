@@ -282,16 +282,29 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
 
     def local_max_abs_eigenvalue(self, Q=None, Qaux=None, p=None, n=None):
         """Spectral radius at the given state ``(Q, Qaux, p, n)`` — the real
-        expression substituted into Rusanov dissipation / CFL.  ``Max(|λ_i|)``
-        from the model's normal-projected ``eigenvalues``, or the Gershgorin
-        row-sum bound when the model has no closed-form spectrum."""
+        expression substituted into Rusanov dissipation / CFL.
+
+        ``Max(|λ_i|)`` from the model's closed-form normal-projected
+        ``eigenvalues`` when it has one; otherwise (SME / VAM, or SWE with
+        ``eigenvalues=None``) the DIMENSIONALLY CORRECT numerical spectrum via
+        the opaque ``eigenvalues`` kernel — the SAME wave speed the backends
+        realise for Roe (REQ-167/168).  The old Gershgorin row-sum
+        (:meth:`_gershgorin_spectral_radius`) is kept only as an explicit
+        opt-in: it row-sums a dimensionally-inhomogeneous matrix and returns
+        ``~g·h`` rather than ``sqrt(g·h)`` (~6-9× too large), which marches a
+        conservative scheme unstable — so it is no longer the default."""
         if Q is None:
             return self.local_max_eigenvalue_definition()
         if self.model.eigenvalues is not None:
             eig = list(sp.flatten(
                 self._model_eval("eigenvalues", Q, Qaux, p, n)))
             return sp.Max(*[sp.Abs(lam) for lam in eig])
-        return self._gershgorin_spectral_radius(Q, Qaux, p, n)
+        ev = list(sp.flatten(
+            self._model_eval("numerical_eigenvalues", Q, Qaux, p, n)))
+        # ``evaluate=False``: the ``eigenvalues`` kernel is opaque, so sympy
+        # cannot order the arguments (``not comparable``) — build the reduction
+        # node directly; it lowers to ``np.amax`` / the backend max unchanged.
+        return sp.Max(*[sp.Abs(lam) for lam in ev], evaluate=False)
 
     def _gershgorin_spectral_radius(self, Q, Qaux, p, n):
         """Gershgorin row-sum upper bound of the spectral radius of the

@@ -656,9 +656,9 @@ class HyperbolicSolver(Solver):
 
         numerics = self._build_numerics(symbolic_model)
         # ``local_max_abs_eigenvalue`` is a REAL expression of the model's
-        # normal-projected eigenvalues (Gershgorin row-sum when the model
-        # has no closed-form spectrum), so the numerical flux lowers
-        # directly — no opaque wave-speed kernel to inject.
+        # normal-projected eigenvalues — the closed-form spectrum, or the opaque
+        # numerical ``eigenvalues`` kernel when the model has none (REQ-167) —
+        # so the numerical flux lowers directly through the UserFunctions table.
         # Let the numerics declare any extra backend kernels it needs (e.g.
         # the Roe |A| dissipation), merged in before lambdification.
         extra_kernels = getattr(numerics, "runtime_kernels", None)

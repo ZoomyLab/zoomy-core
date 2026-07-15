@@ -148,7 +148,7 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
             )
             return analytic_source_jvp(
                 runtime_model, symbolic_model, Q, Qaux_state, V, mesh, dt,
-                include_chain_rule=True,
+                parameters, include_chain_rule=True,
             )
         # Finite difference fallback
         Rp = residual(Q + self.fd_eps * V)
@@ -176,7 +176,11 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
             io.init_output_directory(
                 self.settings.output.directory, self.settings.output.clean_directory
             )
-            self._sim_mesh.write_to_hdf5(output_hdf5_path)
+            # REQ-166: resolve the path against the main directory like the
+            # parent HyperbolicSolver (solver_numpy.py) — ``output.directory``
+            # is main-dir-relative, so ``BaseMesh.write_to_hdf5`` (raw path)
+            # dies with FileNotFoundError whenever cwd != main directory.
+            io.write_mesh_to_hdf5(output_hdf5_path, self._sim_mesh)
             io.save_settings(self.settings)
 
     def step(self, dt):

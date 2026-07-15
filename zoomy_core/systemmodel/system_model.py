@@ -1055,6 +1055,31 @@ class SystemModel:
         return ZArray([_es(sp.Integer(idx), *A_flat)
                        for idx in range(n + 2 * n * n)])
 
+    @property
+    def numerical_eigenvalues(self) -> ZArray:
+        """λ-only numerical spectrum of the normal-projected quasilinear matrix
+        ``A_n = Σ_d n_d · quasilinear_matrix[:, :, d]`` — ``n`` calls to the
+        opaque :class:`zoomy_core.model.kernel_functions.eigenvalues` kernel.
+
+        The light companion of :attr:`eigensystem` (no R / L): the wave-speed /
+        CFL bound needs only ``max|λ|``, so this feeds
+        ``Numerics.local_max_abs_eigenvalue`` when the model has no closed-form
+        ``eigenvalues`` (SME / VAM) — a DIMENSIONALLY CORRECT numerical spectrum
+        in place of the old Gershgorin row-sum bound, which was a row-sum of a
+        dimensionally-inhomogeneous matrix (mass row ~1, momentum row ~g·h) and
+        scaled as ``g·h`` rather than ``sqrt(g·h)`` — ~6-9× too large (REQ-167).
+        A *derived* operator (cheap symbolic wrapping of ``quasilinear_matrix``),
+        so exposed as a property — always consistent with the current matrix."""
+        from zoomy_core.model.kernel_functions import eigenvalues as _ev
+        n = self.n_equations
+        qm = self.quasilinear_matrix
+        normal = list(self.normal.values())
+        A_flat = [
+            sum(qm[i, j, d] * normal[d] for d in range(self.n_dim))
+            for i in range(n) for j in range(n)
+        ]
+        return ZArray([_ev(sp.Integer(idx), *A_flat) for idx in range(n)])
+
     def refresh_derived_operators(self, *, eigenvalues: bool = False):
         """Recompute ``quasilinear_matrix`` and the source jacobians from
         the (possibly just-mutated) primary operators, keeping the

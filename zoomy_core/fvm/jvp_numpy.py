@@ -58,6 +58,7 @@ def analytic_source_jvp(
     V,
     mesh,
     dt,
+    parameters,
     include_chain_rule=True,
 ):
     """
@@ -65,8 +66,15 @@ def analytic_source_jvp(
 
     - Without chain rule: Jv = (dS/dQ) v
     - With chain rule:    Jv = (dS/dQ) v + (dS/dQaux) (dQaux/dQ v)
+
+    ``parameters`` is the NUMERIC parameter vector the solver holds
+    (``self._sim_parameters``).  REQ-144: it MUST be passed in — since REQ-163
+    the model's parameters stay FREE SYMBOLS through derivation/lowering, so
+    reconstructing them from ``symbolic_model.parameters.values()`` yields
+    Symbols and ``float(Symbol)`` raised ``TypeError: Cannot convert expression
+    to float``, crashing the whole ``source_mode='global'`` implicit path.
     """
-    parameters = np.array(list(symbolic_model.parameters.values()), dtype=float)
+    parameters = np.asarray(parameters, dtype=float)
     Jq = runtime_model.source_jacobian_wrt_variables(Q, Qaux, parameters)
     # expected shape: (n_var, n_var, n_cells)
     jv = np.einsum("ijc,jc->ic", Jq, V)

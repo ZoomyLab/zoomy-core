@@ -8,6 +8,7 @@ from zoomy_core.misc.custom_types import FArray
 from zoomy_core.misc.misc import Zstruct
 from zoomy_core.model.basefunction import Function
 from zoomy_core.model.basemodel import Model
+from zoomy_core.fvm import userfunctions as _uf
 
 
 # Canonical time-step symbol — the trailing argument of the per-cell update
@@ -16,62 +17,12 @@ from zoomy_core.model.basemodel import Model
 # equal under sympy and resolves the corrector's baked ``dt``.
 DT_SYMBOL = sp.Symbol("dt", positive=True)
 
-_EIGENSYSTEM_CACHE = {"key": None, "out": None}
-_SOLVE_CACHE = {"key": None, "out": None}
-
-
-def _solve_numpy(idx, *args):
-    """Backend impl of the opaque ``solve`` kernel: idx-th component of the
-    per-cell linear solve ``A⁻¹ b``.  ``args`` = row-major ``A`` (n*n) followed
-    by ``b`` (n); ``n`` inferred from the count (``n*n + n``).  Vectorised over
-    the grid — each arg may be a scalar or a ``(n_cells,)`` array — so the NSM
-    point-implicit ``source`` lowers to one batched ``np.linalg.solve`` per
-    step.  The full batched solve is computed once and shared across the ``n``
-    component calls via a 1-slot id-keyed cache (lambdify passes the same array
-    objects to every ``solve(i, …)`` call within one evaluation)."""
-    m = len(args)
-    n = int(round((-1.0 + (1.0 + 4.0 * m) ** 0.5) / 2.0))
-    key = tuple(id(a) for a in args)
-    c = _SOLVE_CACHE
-    if c["key"] != key:
-        arrs = [np.asarray(a, dtype=float) for a in args]
-        ncells = max((a.shape[0] for a in arrs if a.ndim > 0), default=1)
-
-        def _col(a):
-            if a.ndim > 0 and a.shape[0] == ncells:
-                return a
-            return np.full(ncells, float(a))
-
-        cols = [_col(a) for a in arrs]
-        A = np.stack(cols[:n * n], axis=-1).reshape(ncells, n, n)
-        # Column RHS ``(ncells, n, 1)`` — unambiguous batched solve (NumPy 2.0
-        # reads a 2-D ``b`` as a matrix, so the vector RHS must be an explicit
-        # column).
-        b = np.stack(cols[n * n:], axis=-1).reshape(ncells, n, 1)
-        c["key"] = key
-        c["out"] = np.linalg.solve(A, b)[..., 0]   # (ncells, n)
-    return c["out"][:, int(idx)]
-
-
-def _eigensystem_numpy(idx, *a_flat):
-    """Backend impl of the opaque ``eigensystem`` kernel: numerical
-    eigendecomposition of the row-major matrix, returning the flat stack
-    [eigenvalues(n), R(n*n), L=R^{-1}(n*n)].  One eig is shared across the
-    n+2n^2 component calls via a 1-slot cache."""
-    key = tuple(float(x) for x in a_flat)
-    c = _EIGENSYSTEM_CACHE
-    if c["key"] != key:
-        n = int(round(len(key) ** 0.5))
-        A = np.array(key, float).reshape(n, n)
-        w, V = np.linalg.eig(A)
-        w = np.real(w); V = np.real(V)
-        try:
-            L = np.linalg.inv(V)
-        except np.linalg.LinAlgError:
-            L = np.linalg.pinv(V)
-        c["key"] = key
-        c["out"] = np.concatenate([w, V.flatten(), L.flatten()])
-    return float(c["out"][int(idx)])
+# The numpy UserFunctions kernels live in ``zoomy_core.fvm.userfunctions`` (the
+# python mirror of the C++ ``UserFunctions.H``, REQ-168).  Re-exported here for
+# back-compat with callers that imported them from this module.
+_eigensystem_numpy = _uf.eigensystem
+_eigenvalues_numpy = _uf.eigenvalues
+_solve_numpy = _uf.solve
 
 
 class NumpyRuntimeModel:
@@ -83,19 +34,12 @@ class NumpyRuntimeModel:
     """
 
     # --- Constants ---
-    module = {
-        "ones_like": np.ones_like,
-        "zeros_like": np.zeros_like,
-        "array": np.array,
-        "squeeze": np.squeeze,
-        "conditional": lambda c, t, f: np.where(c, t, f),
-        # NON-LOCAL spatial derivative aux — solver injects the mesh-bound
-        # impl (mesh.compute_derivatives) before the update_aux_variables slot
-        # is compiled.
-        "compute_derivative": None,
-        "eigensystem": _eigensystem_numpy,
-        "solve": _solve_numpy,
-    }
+    # Built from the numpy UserFunctions table (REQ-168): arithmetic helpers +
+    # the backend-supplied kernel contract (compute_derivative / eigensystem /
+    # eigenvalues / solve).  compute_derivative is None here — the solver injects
+    # the mesh-bound impl (mesh.compute_derivatives) before update_aux_variables
+    # is compiled.
+    module = _uf.numpy_module()
     printer = "numpy"
     
     def _flatten_signature_args(self, arg_struct):
