@@ -427,6 +427,13 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         # until the first pressure step runs.
         self.last_elliptic_rel_resid = None
 
+        # Declared per-pressure-mode Dirichlet BCs for the elliptic stage
+        # (REQ-174).  ``None`` ⇒ no pressure mode carries a Dirichlet, so the
+        # elliptic stage keeps its default homogeneous-Neumann behaviour
+        # (bit-identical to the pre-REQ-174 path).  Populated in
+        # ``setup_simulation`` from ``SM_press._bc_source``.
+        self._press_dir = None
+
         if not isinstance(sm_pred, SystemModel):
             raise TypeError("sm_pred must be a SystemModel")
         if not isinstance(sm_press, SystemModel):
@@ -708,6 +715,16 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
                 "limiter_scheme": scheme,
             })
 
+        # 6. Elliptic-stage boundary conditions (REQ-174).  The pressure solve
+        #    must CONSUME the declared per-field BCs on ``SM_press`` — it must
+        #    not silently substitute a default (a silently-substituted BC is
+        #    the same silent-wrong-answer class as an unreported residual).
+        #    ``_build_pressure_dirichlet`` reads which pressure modes carry a
+        #    declared Dirichlet VALUE and where; ``None`` ⇒ no Dirichlet ⇒ the
+        #    default homogeneous Neumann (``∂_n P = 0``) stays in force,
+        #    bit-identical to the pre-REQ-174 path.
+        self._press_dir = self._build_pressure_dirichlet(self._sim_mesh)
+
         logger.info(
             "ChorinSplitVAMSolver setup: pred → %s, press → %s, corr → %s "
             "in %.2fs",
@@ -910,6 +927,94 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         out[-1] = float(dt)
         return out
 
+    def _build_pressure_dirichlet(self, mesh):
+        """Read ``SM_press``'s declared per-field boundary conditions and record,
+        for each pressure mode, where a Dirichlet VALUE is pinned at a boundary
+        face (REQ-174).
+
+        The elliptic executor must consume the stage's declared BCs; today it
+        hardcoded ``u_boundary_face="extrapolation"`` (homogeneous Neumann) and
+        never read ``SM_press.boundary_conditions``, so a user-declared Dirichlet
+        P pin at a boundary was silently replaced by ``zeroGradient`` — a
+        well-posed solve of the WRONG problem (the operator is full-rank without
+        the pin; this is not a singularity).
+
+        Returns ``None`` when NO pressure mode carries a Dirichlet BC — the
+        elliptic stage then keeps homogeneous Neumann (the standard Chorin
+        pressure BC), bit-identical to the pre-REQ-174 path.  Otherwise a dict:
+
+        * ``face_mask``  ``(nP, n_bf)`` bool — a Dirichlet on mode ``k`` applies
+          at boundary face ``i_bf`` (drives the LSQ derivative-aux stencil);
+        * ``face_value`` ``(nP, n_bf)`` float — the prescribed face value there;
+        * ``bf_cells``   ``(n_bf,)`` int — inner cell adjacent to each face;
+        * ``cell_mask``  ``(nP, nc)`` bool — mode ``k``'s boundary cell is pinned
+          (drives the REAL Dirichlet row in the operator/residual);
+        * ``cell_value`` ``(nP, nc)`` float — the value each pinned cell carries.
+        """
+        from zoomy_core.model.boundary_conditions import Dirichlet
+        src = getattr(self.sm_press, "_bc_source", None)
+        n_bf = int(getattr(mesh, "n_boundary_faces", 0) or 0)
+        e2s = self._press_state_idx
+        nP = len(e2s)
+        if src is None or n_bf == 0 or nP == 0:
+            return None
+
+        bc_by_tag = src.boundary_conditions_list_dict
+        mesh_names = list(getattr(mesh, "boundary_conditions_sorted_names", []) or [])
+        bfn = np.asarray(mesh.boundary_face_function_numbers[:n_bf], dtype=int)
+        bf_cells = np.asarray(mesh.boundary_face_cells[:n_bf], dtype=int)
+
+        def _dirichlet_value(bc, slot):
+            """The declared Dirichlet value for state ``slot`` at this tag, or
+            ``None`` (a per-field :class:`PerFieldBoundary` delegates per slot;
+            a bare BC uses its resolved ``on=`` mask)."""
+            slot_bc = getattr(bc, "_slot_bc", None)
+            if slot_bc is not None:                        # PerFieldBoundary
+                sub = slot_bc.get(slot)
+                return float(sub.value) if isinstance(sub, Dirichlet) else None
+            if isinstance(bc, Dirichlet):                  # bare on-masked BC
+                slots = getattr(bc, "_on_slots", None)
+                if slots is None or slot in slots:
+                    return float(bc.value)
+            return None
+
+        face_mask = np.zeros((nP, n_bf), dtype=bool)
+        face_value = np.zeros((nP, n_bf), dtype=float)
+        for i_bf in range(n_bf):
+            tag = mesh_names[bfn[i_bf]] if mesh_names else None
+            bc = bc_by_tag.get(tag)
+            if bc is None:
+                continue
+            for k, s in enumerate(e2s):
+                v = _dirichlet_value(bc, int(s))
+                if v is not None:
+                    face_mask[k, i_bf] = True
+                    face_value[k, i_bf] = v
+
+        if not face_mask.any():
+            return None
+
+        # Per-mode boundary-cell pins for the operator row-replacement.  A cell
+        # may border several faces; ``resolve_per_field`` forbids two Dirichlets
+        # on one (tag, field), so the value is well-defined per face — a corner
+        # cell touching two Dirichlet-P patches takes the last-written value
+        # (an ill-posed geometry regardless).
+        nc = self.nc
+        cell_mask = np.zeros((nP, nc), dtype=bool)
+        cell_value = np.zeros((nP, nc), dtype=float)
+        for k in range(nP):
+            hit = np.nonzero(face_mask[k])[0]
+            for i_bf in hit:
+                c = bf_cells[i_bf]
+                cell_mask[k, c] = True
+                cell_value[k, c] = face_value[k, i_bf]
+
+        return {
+            "face_mask": face_mask, "face_value": face_value,
+            "bf_cells": bf_cells,
+            "cell_mask": cell_mask, "cell_value": cell_value,
+        }
+
     def _step_pressure(self, dt):
         """Solve the linear elliptic block for ``Q[press_e2s]``.
 
@@ -941,19 +1046,41 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         e2s   = self._press_state_idx
         nP    = len(e2s)
         N     = nP * nc
+        press_dir = self._press_dir          # declared P Dirichlet BCs, or None
 
         # Map state index → local pressure index (e.g. 5 → 0, 6 → 1).
         local_of_state = {int(s): k for k, s in enumerate(e2s)}
+
+        def _u_boundary_face(k, p_mat):
+            """Boundary-face samples for mode ``k``'s derivative-aux stencil.
+
+            REQ-174: honour the DECLARED per-field BC instead of hardcoding
+            ``'extrapolation'``.  When mode ``k`` carries no declared Dirichlet,
+            return the literal ``'extrapolation'`` (Neumann-zero / ``∂_n P = 0``)
+            — the standard Chorin pressure BC and bit-identical to the pre-fix
+            path.  Where a Dirichlet IS declared, pass an ``(n_bf,)`` array of
+            face values: the prescribed value on Dirichlet faces, the inner-cell
+            value elsewhere (which reproduces ``'extrapolation'`` exactly, since
+            ``2·u_face − u_cell = u_cell`` when ``u_face = u_cell``)."""
+            if press_dir is None:
+                return "extrapolation"
+            mask = press_dir["face_mask"][k]
+            if not mask.any():
+                return "extrapolation"
+            bf_cells = press_dir["bf_cells"]
+            face_vals = p_mat[k, bf_cells].astype(float, copy=True)
+            face_vals[mask] = press_dir["face_value"][k][mask]
+            return face_vals
 
         def _refresh_pressure_aux(p_mat, Qaux_work):
             """LSQ-recompute the P-dependent derivative-aux rows from
             the current iterate ``p_mat`` (shape ``(nP, nc)``).  In-
             place on ``Qaux_work``.
 
-            Pressure modes use ``'extrapolation'`` at boundary faces —
-            the standard Chorin / projection-method BC (``∂_n P = 0``).
-            The chain's SystemModel doesn't carry a separate BC kernel
-            for P, so we apply the convention explicitly here.
+            Boundary faces use the mode's DECLARED BC (REQ-174):
+            homogeneous Neumann (``∂_n P = 0``) by default — the standard
+            Chorin / projection-method pressure BC — and the prescribed value
+            wherever a Dirichlet P is declared on ``SM_press``.
             """
             u_full = np.zeros(n_cells)
             for entry in self._press_aux_recompute:
@@ -964,7 +1091,7 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
                 d = mesh.compute_derivatives(
                     u_full, degree=max(mi),
                     derivatives_multi_index=[mi],
-                    u_boundary_face="extrapolation",
+                    u_boundary_face=_u_boundary_face(k, p_mat),
                 )
                 grad_lsq = d[:nc, 0]
                 scheme = entry.get("limiter_scheme")
@@ -982,6 +1109,19 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
             R = np.asarray(rt.source(Q_try, Qaux_work, p_full), dtype=float)
             if R.ndim == 1:
                 R = R[:, None] * np.ones((1, nc))
+            if press_dir is not None:
+                # REAL Dirichlet rows (REQ-174): replace the elliptic PDE row
+                # at each pinned boundary cell with the constraint
+                # ``P_k[cell] − value = 0``, so the boundary cells satisfy the
+                # declared value exactly.  Carried inside the residual, so BOTH
+                # the matrix-free GMRES matvec (``apply_A = _residual − b``) and
+                # the dense-LU assembly path inherit it, and the surfaced
+                # ``last_elliptic_rel_resid`` measures the ACTUAL solved system.
+                # No shift / penalty / rank fix — @jax measured the operator
+                # full-rank without any pin; this is a wrong-problem fix.
+                R = np.array(R, dtype=float, copy=True).reshape(nP, nc)
+                cm = press_dir["cell_mask"]
+                R[cm] = p_mat[cm] - press_dir["cell_value"][cm]
             return R.ravel()
 
         # Data forcing: ``b = R(P = 0)``.  Pure data — no P enters.
