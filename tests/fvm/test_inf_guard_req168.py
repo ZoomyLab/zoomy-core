@@ -73,3 +73,13 @@ def test_eigensystem_finite_input_unchanged():
     assert np.allclose(sorted(lam), [-1.0, 5.0])
     assert np.allclose(R @ np.diag(lam) @ L, A, atol=1e-12)
     assert np.allclose(L @ R, np.eye(n), atol=1e-12)
+
+
+def test_cache_pins_argument_refs():
+    """REQ-168 ADDENDUM 3: the 1-slot caches hold STRONG refs to the argument
+    arrays, so a gc'd pack's ids can never be recycled into a stale hit."""
+    a = [np.array(x) for x in _swe_jacobian(1.0, 2.0)]
+    uf.eigenvalues(0, *a)
+    assert all(x is y for x, y in zip(uf._EIGENVALUES_CACHE["args"], a))
+    uf.eigensystem(0, *a)
+    assert all(x is y for x, y in zip(uf._EIGENSYSTEM_CACHE["args"], a))

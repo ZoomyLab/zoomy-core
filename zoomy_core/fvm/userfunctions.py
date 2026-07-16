@@ -74,6 +74,7 @@ def eigensystem(idx, *a_flat):
                 L[ok] = np.linalg.inv(V[ok])
             except np.linalg.LinAlgError:
                 L[ok] = np.linalg.pinv(V[ok])
+        c["args"] = a_flat   # REQ-168 ADD.3: pin refs — ids of gc'd arrays get recycled
         c["key"] = key
         c["out"] = np.concatenate(
             [w, V.reshape(m, n * n), L.reshape(m, n * n)],
@@ -104,6 +105,7 @@ def eigenvalues(idx, *a_flat):
         out = np.full((flat.shape[0], n), np.inf)
         if ok.any():
             out[ok] = np.real(np.linalg.eigvals(flat[ok]))
+        c["args"] = a_flat   # REQ-168 ADD.3: pin refs — ids of gc'd arrays get recycled
         c["key"] = key
         c["out"] = out.reshape(A.shape[:-2] + (n,))
     return _scalarize(c["out"][..., int(idx)])
@@ -133,6 +135,7 @@ def solve(idx, *args):
         # Column RHS ``(ncells, n, 1)`` — NumPy 2.0 reads a 2-D ``b`` as a
         # matrix, so the vector RHS must be an explicit column.
         b = np.stack(cols[n * n:], axis=-1).reshape(ncells, n, 1)
+        c["args"] = args     # REQ-168 ADD.3: pin refs — ids of gc'd arrays get recycled
         c["key"] = key
         c["out"] = np.linalg.solve(A, b)[..., 0]   # (ncells, n)
     return c["out"][:, int(idx)]
