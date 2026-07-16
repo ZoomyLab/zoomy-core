@@ -421,6 +421,23 @@ class Model(param.Parameterized, SymbolicRegistrar):
         eqs = self.__dict__.get("_equations", None)
         if eqs is not None and name in eqs:
             return eqs[name]
+        if name == "system_model":
+            # REQ-143/REQ-164 — REMOVED, not shimmed: a Model does not know
+            # SystemModel (hierarchy is strictly Model → SystemModel →
+            # NumericalSystemModel).  ``hasattr`` stays False; this only
+            # turns the broken call sites' bare AttributeError into the
+            # migration instruction.  (Must live HERE, not in a raising
+            # property: a property's AttributeError falls back into this
+            # ``__getattr__`` and its message would be swallowed.)
+            raise AttributeError(
+                "Model.system_model was REMOVED (REQ-143/REQ-164). Build it "
+                "explicitly:\n"
+                "    from zoomy_core.systemmodel.system_model import "
+                "SystemModel\n"
+                "    sm = SystemModel.from_model(model)\n"
+                "(verified field-identical for all models INCLUDING "
+                "overrides; use NumericalSystemModel.from_model(model) for "
+                "the numerics-ready variant)")
         raise AttributeError(
             f"{type(self).__name__!r} object has no attribute "
             f"or equation {name!r}"

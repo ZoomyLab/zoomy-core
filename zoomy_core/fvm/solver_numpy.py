@@ -500,7 +500,15 @@ class HyperbolicSolver(Solver):
             A_B = np.einsum("ijdk,dk->kij", ql[:, :, :, iB_int], n_int)
             A_I = np.einsum("ijdk,dk->kij", ql[:, :, :, iInner_bnd], n_bnd)
             A_all = np.concatenate([A_A, A_B, A_I], axis=0) + reg[None]
-            evs = np.real(np.linalg.eigvals(A_all))       # batched LAPACK
+            # REQ-168 ADDENDUM 2 (third site): batched LAPACK raises on
+            # non-finite entries.  A non-finite COMMITTED cell state at dt
+            # time maps to a +inf wave speed — dt clamps to zero, an honest
+            # halt instead of a crash; genuinely dry cells are still zeroed
+            # by the dry-cell skip below, exactly as before.
+            okA = np.isfinite(A_all).all(axis=(1, 2))
+            evs = np.full(A_all.shape[:2], np.inf)
+            if okA.any():
+                evs[okA] = np.real(np.linalg.eigvals(A_all[okA]))
             m = np.abs(evs).max(axis=1)
             n_if = len(interior_faces)
             max_ev = np.zeros(mesh.n_faces)

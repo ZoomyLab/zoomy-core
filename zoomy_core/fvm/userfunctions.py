@@ -55,17 +55,29 @@ def eigensystem(idx, *a_flat):
     c = _EIGENSYSTEM_CACHE
     if c["key"] != key:
         A = _stack_square(a_flat, n)
-        w, V = np.linalg.eig(A)
-        w = np.real(w)
-        V = np.real(V)
-        try:
-            L = np.linalg.inv(V)
-        except np.linalg.LinAlgError:
-            L = np.linalg.pinv(V)
+        # REQ-168 inf-guard (same contract as ``eigenvalues``): LAPACK raises
+        # on non-finite input.  Non-finite batch members get λ = +inf with an
+        # identity eigenbasis (R = L = I) — the +inf wave speed flags the
+        # garbage state; the identity basis keeps the |A| = R|Λ|L composition
+        # well-defined without inventing an inverse of a garbage matrix.
+        flat = A.reshape(-1, n, n)
+        m = flat.shape[0]
+        ok = np.isfinite(flat).all(axis=(1, 2))
+        w = np.full((m, n), np.inf)
+        V = np.broadcast_to(np.eye(n), (m, n, n)).copy()
+        L = V.copy()
+        if ok.any():
+            wk, Vk = np.linalg.eig(flat[ok])
+            V[ok] = np.real(Vk)
+            w[ok] = np.real(wk)
+            try:
+                L[ok] = np.linalg.inv(V[ok])
+            except np.linalg.LinAlgError:
+                L[ok] = np.linalg.pinv(V[ok])
         c["key"] = key
         c["out"] = np.concatenate(
-            [w, V.reshape(*A.shape[:-2], n * n),
-             L.reshape(*A.shape[:-2], n * n)], axis=-1)
+            [w, V.reshape(m, n * n), L.reshape(m, n * n)],
+            axis=-1).reshape(A.shape[:-2] + (n + 2 * n * n,))
     return _scalarize(c["out"][..., int(idx)])
 
 
@@ -79,8 +91,21 @@ def eigenvalues(idx, *a_flat):
     c = _EIGENVALUES_CACHE
     if c["key"] != key:
         A = _stack_square(a_flat, n)
+        # REQ-168 ADDENDUM 1/2 — the kernel MUST be inf-tolerant: LAPACK
+        # raises on non-finite input, but the order-2 MOOD path feeds
+        # not-yet-corrected candidate face states BY DESIGN (non-finite at a
+        # dry front), and transient non-finite BC-ghost states reach the
+        # wave-speed kernel at order 1 too.  Contract: eig the finite batch
+        # members, +inf eigenvalues for the rest — an infinite wave speed is
+        # exactly what a garbage face state should report (dt clamps, MOOD
+        # flags the candidate).
+        flat = A.reshape(-1, n, n)
+        ok = np.isfinite(flat).all(axis=(1, 2))
+        out = np.full((flat.shape[0], n), np.inf)
+        if ok.any():
+            out[ok] = np.real(np.linalg.eigvals(flat[ok]))
         c["key"] = key
-        c["out"] = np.real(np.linalg.eigvals(A))
+        c["out"] = out.reshape(A.shape[:-2] + (n,))
     return _scalarize(c["out"][..., int(idx)])
 
 
