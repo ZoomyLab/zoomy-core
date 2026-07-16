@@ -246,6 +246,17 @@ def least_squares_reconstruction_local(
     neighbors_array = np.empty((n_cells, max_neighbors), dtype=int)
     bdy_neighbors_array = -np.ones((n_cells, max_bdy_per_cell), dtype=int)
 
+    # REQ-174b: axis → rows of the *pure-normal* monomials for that axis
+    # (``e_axis``, ``2·e_axis``, …).  The boundary ghost is kept coupled ONLY
+    # to these pure boundary-normal derivatives at ≥2-D boundary cells; the
+    # tangential and mixed derivatives are fit from the interior stencil alone
+    # (see the pinv block below).
+    pure_axis_rows = {}
+    for k, mi in enumerate(mon_indices):
+        nz = [a for a in range(dim) if mi[a] != 0]
+        if len(nz) == 1:
+            pure_axis_rows.setdefault(nz[0], []).append(k)
+
     for i_c in range(n_cells):
         current_neighbors = list(neighbors_all[i_c])
         n_nbr = len(current_neighbors)
@@ -328,7 +339,51 @@ def least_squares_reconstruction_local(
         # pseudoinverse).
         for j in range(n_bdy_here, max_bdy_per_cell):
             V[max_neighbors + j, :] = 0.0
-        A_loc = np.linalg.pinv(V)
+
+        # REQ-174b — boundary-ghost / tangential-derivative decoupling.
+        #
+        # The extrapolation/Neumann ghost is placed at the mirror point
+        # 2·(face − cell); with an extrapolation value it encodes the ∂_n = 0
+        # (zeroGradient / Neumann) boundary condition along its own normal
+        # axis, and with a prescribed value the Dirichlet BC.  That is genuine
+        # boundary information for the *pure boundary-normal* derivatives
+        # (∂_n, ∂_nn, …): the Chorin pressure Poisson NEEDS ∂_nn kept — it is
+        # the discrete Neumann coupling at the lateral walls, and dropping it
+        # makes the elliptic operator gain a near-null transverse mode
+        # (measured: exact solve then blows the extruded VAM case).
+        #
+        # But when the SAME ghost is left in the coupled multivariate fit it
+        # also corrupts the TANGENTIAL and MIXED derivatives via cross terms:
+        # on an exact y-invariant quadratic f=1+2x+3x² a boundary cell gets
+        # d_yy≈21, d_xy≈14 (vs exact 0), which seeds spurious y-variation into
+        # the elliptic (∂_yy P) and corrector (∂_y P) and destabilises 2-D VAM.
+        #
+        # Fix: at ≥2-D boundary cells, fit the tangential and mixed
+        # derivatives from the INTERIOR stencil only (already complete and
+        # symmetric there), and restore each PURE-NORMAL derivative (∂_n,
+        # ∂_nn, …) from a fit carrying ONLY its own aligned ghost — so the
+        # elliptic Neumann coupling is preserved and corner cells (two ghosts)
+        # do not cross-contaminate.  A boundary edge cell's pure-normal
+        # derivatives are therefore bit-identical to the pre-fix coupled fit,
+        # preserving the REQ-174 BC-aware gradient, well-balancing and the
+        # elliptic well-posedness.  In 1-D there is no tangential direction ⇒
+        # this branch is skipped and the fit is bit-identical.
+        if dim >= 2 and n_bdy_here > 0:
+            V_int = V.copy()
+            V_int[max_neighbors:, :] = 0.0          # drop every ghost row
+            A_loc = np.linalg.pinv(V_int)           # interior-only base
+            for j in range(n_bdy_here):
+                n_axis = int(np.argmax(np.abs(dX[max_neighbors + j])))
+                rows = pure_axis_rows.get(n_axis)
+                if not rows:
+                    continue
+                V_one = V_int.copy()
+                V_one[max_neighbors + j, :] = V[max_neighbors + j, :]
+                A_one = np.linalg.pinv(V_one)
+                for row in rows:
+                    A_loc[row, :] = A_one[row, :]
+        else:
+            A_loc = np.linalg.pinv(V)
         A_glob.append(A_loc.T)
 
     A_glob = np.array(A_glob)
