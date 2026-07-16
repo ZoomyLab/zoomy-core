@@ -118,9 +118,17 @@ class MLSME(BaseModel):
         lam_s, nu_s = sp.symbols("lambda_s nu", positive=True)
         rho_s = sp.Symbol("rho", positive=True)
 
-        from zoomy_core.model.models.equations import Mass, small_slope_scaling
+        from zoomy_core.model.models.equations import (
+            Mass, small_slope_scaling, add_inplane_viscous, package_viscous)
         from zoomy_core.model.models.material import ClosureState
         from zoomy_core.model.models.closures import apply_layer_stress_closures
+
+        # KEEP-ALL: a NewtonianInPlane closure RETAINS the per-layer in-plane
+        # deviatoric stress τ_de = ρν(∂_d u_e + ∂_e u_d) (the streamwise normal
+        # stress ml_fullsme.py keeps); routed to conservative diffusion by
+        # package_viscous.  No-op by default → Gate-1 byte-identical.
+        retain_inplane = any(getattr(c, "closes", None) == "in_plane"
+                             for c in (self.closures or []))
 
         def derive_layer(ell):
             Nu = levels[ell - 1]            # per-layer moment order
@@ -143,6 +151,9 @@ class MLSME(BaseModel):
                     f"momentum_{CN[xd]}",
                     d.t(uvel[i]) + adv + d.z(uvel[i] * w)
                     + gl * DERIV[xd](b + H) - d.z(tau[xd]) / rl)
+            if retain_inplane:                       # add in-plane divergence pre-σ-map
+                add_inplane_viscous(ml, [getattr(ml, mn) for mn in MOM],
+                                    uvel, list(horiz), nu_s)
 
             def _kbc(iface, G):
                 kw = dict(w=w, u=uvel[0], interface=iface, rho=rl,
@@ -328,6 +339,22 @@ class MLSME(BaseModel):
                     enm = (f"momentum_{ell}_{k}" if dim == 2
                            else f"momentum_{CN[xd]}_{ell}_{k}")
                     m.add_equation(enm, sp.expand(mom.subs(par).doit()))
+
+        # KEEP-ALL: route the retained per-layer in-plane deviatoric-stress
+        # divergence into conservative diffusion (mirrors ml_fullsme.py); b is a
+        # STATE in `states` so topography couplings evaluate from the same stage.
+        if retain_inplane:
+            states = {ht, b}
+            for ell in range(1, N + 1):
+                for xd in horiz:
+                    states |= {q_mod[ell][xd][k] for k in range(levels[ell - 1] + 1)}
+            for ell in range(1, N + 1):
+                for xd in horiz:
+                    for k in range(levels[ell - 1] + 1):
+                        enm = (f"momentum_{ell}_{k}" if dim == 2
+                               else f"momentum_{CN[xd]}_{ell}_{k}")
+                        getattr(m, enm).expr = package_viscous(
+                            getattr(m, enm).expr, m.parameters.nu, states, list(horiz))
 
         # ── basic operators: interpolate_to_3d + project_from_3d, PIECEWISE over
         # the moving layers, so ML-SME exposes the same canonical operators as

@@ -500,6 +500,36 @@ class ShallowInPlane(Closure):
         return sp.S.Zero
 
 
+class NewtonianInPlane(Closure):
+    """KEEP the IN-PLANE deviatoric stress as incompressible Newtonian
+    ``τ_de = ρ ν (∂_d u_e + ∂_e u_d)`` — the RETAIN complement of
+    :class:`ShallowInPlane` (which drops it, the default ``moment_scaling``).
+
+    The shallow-moment / VAM families (SME, ML-SME, VAM, ML-VAM) drop the
+    in-plane deviatoric stress by default (only the vertical shear ``τ_xz``
+    survives).  Adding this closure to a model's ``closures=[…]`` RETAINS the
+    streamwise / cross normal stress (``τ_xx`` in 1-horizontal; ``τ_xx, τ_xy,
+    τ_yy`` in 2-horizontal): the model's derivation adds the in-plane Newtonian
+    divergence (``add_inplane_viscous``) and routes it into ``diffusion_matrix``
+    as a horizontal eddy viscosity (``package_viscous``) — the term the standard
+    shallow-moment quasilinear structure lacks.  Constant ``ν`` ⇒ mode-diagonal
+    diffusion; a ζ-dependent ``ν_t`` would fill the inter-moment off-diagonals.
+
+    A pure marker closure: it declares only that the in-plane stress is kept and
+    which molecular ``ν`` closes it; the model performs the (tensor-valued)
+    substitution, exactly as it consumes :class:`ShallowInPlane` for the drop.
+    """
+    closes = "in_plane"; requires = ("u",)
+
+    def register(self, m):
+        m.parameter("nu", 0.0)
+
+    def expression(self, s):
+        # in-plane stress is tensor-valued and consumed by the model's
+        # add_inplane_viscous (not the scalar apply_stress_closures path)
+        return s.par.rho * s.par.nu * s.dz(s.u)
+
+
 # ── surface closures ───────────────────────────────────────────────────────
 
 
@@ -627,5 +657,5 @@ __all__ = ["Closure", "ClosureState", "apply_stress_closures",
            "Newtonian", "KEpsilonViscosity", "QRViscosity", "NavierSlip", "RoughWall",
            "WallFunctionBed",
            "StressFree", "InterfaceFlux", "MeanInterface", "UpwindInterface",
-           "ManningFriction", "EddyViscosity", "ShallowInPlane",
+           "ManningFriction", "EddyViscosity", "ShallowInPlane", "NewtonianInPlane",
            "swe_closure_state"]

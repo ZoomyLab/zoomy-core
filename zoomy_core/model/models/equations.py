@@ -140,6 +140,72 @@ def moment_scaling(model, momentum):
     return model
 
 
+def add_inplane_viscous(model, momentum_eqs, uvel, horiz, nu):
+    """KEEP-ALL complement of :func:`moment_scaling`: ADD the incompressible-
+    Newtonian IN-PLANE deviatoric stress divergence
+
+        −(1/ρ) Σ_e ∂_e[ ρ ν (∂_d u_e + ∂_e u_d) ]
+
+    to each horizontal momentum residual ``momentum_eqs[d]`` (same −div/ρ sign
+    the momentum blueprints carry).  Applied BEFORE the σ-map on the 3-D
+    velocity fields ``uvel`` — exactly as the ``ml_fullsme`` / ``fullvam``
+    recipes inline ``tau_inplane`` — so the retained divergence σ-maps and
+    projects with the shear, then :func:`package_viscous` routes it into
+    conservative diffusion.
+
+    ``moment_scaling`` (dropping the opaque in-plane stress) is applied FIRST in
+    every family, so with ``ν=0`` this term vanishes and the model reduces
+    byte-identically to the shallow-moment default; only a retain-viscous
+    closure list turns it on.  Registering it on the model history keeps the
+    derivation honest."""
+    rho = model.parameters.rho
+    dop = {C.x: d.x, C.y: d.y}
+    for i, xd in enumerate(horiz):
+        # τ_de = ρ ν (∂_d u_e + ∂_e u_d);  sdiv_d = Σ_e ∂_e τ_de
+        sdiv = sum(dop[xe](rho * nu * (dop[xd](uvel[horiz.index(xe)]) + dop[xe](uvel[i])))
+                   for xe in horiz)
+        eq = momentum_eqs[i]
+        eq.expr = eq.expr - sdiv / rho
+    model._history("add_inplane_viscous", "momentum",
+                   description="keep in-plane deviatoric stress (incompressible "
+                               "Newtonian τ_de = ρν(∂_d u_e + ∂_e u_d))")
+    return model
+
+
+def package_viscous(expr, nu, states, space):
+    """Route a KEEP-ALL viscous residual into CONSERVATIVE diffusion.
+
+    After projection the retained in-plane stress lands as BARE second
+    derivatives of state ``C·∂_d∂_e Q`` (``Q ∈ states``, ``d,e ∈ space``); a
+    conservative FVM needs ``∂_d(D·∂_e Q)``.  Fully expand the ν-bearing terms
+    and rewrite each such compound via the EXACT identity
+
+        C·∂_d∂_e Q = ∂_d(C·∂_e Q) − (∂_d C)·∂_e Q
+
+    (→ a diffusive flux ``A`` the extractor routes into ``diffusion_matrix`` +
+    a first-derivative NCP remainder that includes every topography-coupled
+    ``ν·q·∂b`` product — ``b`` is a STATE, so those evaluate from the same stage
+    state, no flat-bed / frozen-b assumption).  Non-viscous terms pass through
+    untouched.  This is the single-source form of the identical helper copied
+    into the ``ml_fullsme`` / ``fullvam`` / ``ml_fullvam`` notebooks."""
+    expr = sp.expand(expr)
+    visc = sum((tt for tt in sp.Add.make_args(expr) if tt.has(nu)), sp.S.Zero)
+    rest = expr - visc
+    out = sp.S.Zero
+    for term in sp.Add.make_args(sp.expand(visc.doit())):
+        d2 = [dd for dd in term.atoms(sp.Derivative)
+              if len(dd.variables) == 2 and all(v in space for v in dd.variables)
+              and dd.args[0] in states]
+        if d2:
+            D2 = d2[0]; Q = D2.args[0]; v = D2.variables
+            Coef = sp.cancel(term / D2); de = sp.Derivative(Q, v[1])
+            out += (sp.Derivative(Coef * de, v[0], evaluate=False)
+                    - sp.Derivative(Coef, v[0]) * de)
+        else:
+            out += term
+    return rest + out
+
+
 # ── opaque boundary frame ────────────────────────────────────────────────────
 # A boundary stress closure prescribes the traction in the local frame
 # ``{n, t_α}`` (see closures.py).  The frame is built from OPAQUE slope symbols
@@ -278,4 +344,5 @@ class Transport(Equation):
 
 
 __all__ = ["Equation", "Mass", "Momentum", "MomentumNonHydrostatic", "Transport",
-           "moment_scaling", "small_slope_scaling", "frame_slope"]
+           "moment_scaling", "small_slope_scaling", "frame_slope",
+           "add_inplane_viscous", "package_viscous"]

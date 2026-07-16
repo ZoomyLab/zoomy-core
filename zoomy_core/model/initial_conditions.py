@@ -258,6 +258,56 @@ class UserFunction(InitialConditions):
             return ZArray.zeros(n_variables)
 
 
+class Project3D(InitialConditions):
+    """Initial condition from a 3-D profile via the model's OWN projection.
+
+    Give the physical fields as plain functions — ``height(x)``, optional
+    ``bed(x)`` and the vertical velocity profile ``velocity(x, zeta)`` — and
+    the moment vector comes from the SystemModel's ``project_from_3d`` map,
+    sampled at its projection nodes.  Cases never hand-roll basis code::
+
+        model.initial_conditions = IC.Project3D(
+            model,
+            height=lambda x: H0 * (1 + eps * np.sin(2 * np.pi * x[0] / L)),
+            velocity=lambda x, zeta: u_base(zeta))
+
+    Currently covers the horizontal-velocity moments (``P3_u`` nodes) —
+    the SME family.  Vertical/transverse moment models (``P3_w``/``P3_v``)
+    need the corresponding profile arguments added here (REQ pending).
+    """
+
+    def __init__(self, model, height, velocity, bed=None, **params):
+        super().__init__(**params)
+        self._model = model
+        self._height = height
+        self._velocity = velocity
+        self._bed = bed if bed is not None else (lambda x: 0.0)
+        self._rows = None
+        self._nodes = None
+
+    def _build(self):
+        import sympy as sp
+        pf = self._model.project_from_3d
+        p3u = sorted({a for e in pf for a in sp.sympify(e).atoms(sp.Function)
+                      if a.func.__name__ == "P3_u"},
+                     key=lambda a: float(a.args[0]))
+        self._nodes = [float(a.args[0]) for a in p3u]
+        args = [sp.Symbol("P3_b"), sp.Symbol("P3_h")] + list(p3u)
+        self._rows = [sp.lambdify(args, sp.sympify(pf[i]), "numpy")
+                      for i in range(len(pf))]
+
+    def apply(self, X, Q):
+        """Apply."""
+        if self._rows is None:
+            self._build()
+        assert X.shape[1] == Q.shape[1]
+        for i, x in enumerate(X.T):
+            b, h = float(self._bed(x)), float(self._height(x))
+            u = [float(self._velocity(x, z)) for z in self._nodes]
+            Q[:, i] = [float(np.squeeze(r(b, h, *u))) for r in self._rows]
+        return Q
+
+
 class RestartFromHdf5(InitialConditions):
     # Parameters omitted for brevity, functionality preserved
     """RestartFromHdf5. (class)."""

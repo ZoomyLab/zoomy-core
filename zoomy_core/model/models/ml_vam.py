@@ -113,6 +113,17 @@ class MLVAM(BaseModel):
         lam_s, nu_s = sp.symbols("lambda_s nu", positive=True)
         rho_s = sp.Symbol("rho", positive=True)
 
+        # KEEP-ALL: a NewtonianInPlane closure RETAINS the per-layer in-plane
+        # deviatoric stress τ_de = ρν(∂_d u_e + ∂_e u_d) (the streamwise normal
+        # stress ml_fullvam.py keeps).  The retained bare ∂² is regrouped into
+        # conservative diffusion by the SAME generalized second-derivative
+        # absorption the §6c curvature step already runs (no separate
+        # package_viscous needed); b is a state so topography couplings stay
+        # live.  No-op by default → Gate-1 byte-identical.
+        from zoomy_core.model.models.equations import add_inplane_viscous
+        retain_inplane = any(getattr(c, "closes", None) == "in_plane"
+                             for c in (self.closures or []))
+
         # inner (per-layer) basis object: the per-layer modal reconstruction,
         # top-mode closures and interface traces all go through it, so the
         # bed/surface values φ_k(0)=(−1)^k / φ_k(1)=1 and the running integral
@@ -159,6 +170,9 @@ class MLVAM(BaseModel):
                 return KinematicBC(**kw)
             ml.add_equation("kbc_bot", _kbc(z_bot, G_bot))
             ml.add_equation("kbc_top", _kbc(z_top, G_top))
+            if retain_inplane:                       # in-plane divergence pre-σ-map
+                add_inplane_viscous(ml, [getattr(ml, mn) for mn in MOM],
+                                    uvel, list(horiz), nu_s)
             ml.apply(PDETransformation({z: (zeta, sp.Eq(z, z_bot + h_l * zeta))}))
 
             basis = Basis(symbol="phi", weight="c"); c = basis.weight

@@ -66,7 +66,8 @@ class VAM(BaseModel):
         if user_vals is not None and hasattr(user_vals, "items"):
             values.update({k: float(v) for k, v in user_vals.items()})
         from zoomy_core.model.models.equations import (
-            Mass, MomentumNonHydrostatic, small_slope_scaling)
+            Mass, MomentumNonHydrostatic, small_slope_scaling,
+            add_inplane_viscous, package_viscous)
         from zoomy_core.model.models.material import ClosureState
         from zoomy_core.model.models.closures import apply_stress_closures
 
@@ -105,6 +106,19 @@ class VAM(BaseModel):
             return KinematicBC(**kw)
         m.add_equation("kbc_top", _kbc(b + h))
         m.add_equation("kbc_bot", _kbc(b))
+
+        # 1b — KEEP-ALL: with a NewtonianInPlane closure, RETAIN the in-plane
+        # deviatoric stress τ_de = ρν(∂_d u_e + ∂_e u_d) on each horizontal
+        # momentum (the streamwise normal stress the shallow VAM drops).  Added
+        # on the 3-D velocity BEFORE the σ-map, exactly like fullvam.py's
+        # tau_inplane; routed to conservative diffusion by package_viscous after
+        # the ω̃/regroup/curvature machinery (§6e).  No-op by default → Gate-1
+        # byte-identical.
+        retain_inplane = any(getattr(c, "closes", None) == "in_plane"
+                             for c in (self.closures or []))
+        if retain_inplane:
+            add_inplane_viscous(m, [getattr(m, mn) for mn in MOM],
+                                momblue.uvel, list(horiz), m.parameters.nu)
 
         # 2 — σ-map:  z = b + h ζ
         m.apply(PDETransformation({z: (zeta, sp.Eq(z, b + h * zeta))}))
@@ -318,6 +332,22 @@ class VAM(BaseModel):
                     if changed:
                         expr = sp.Add(*out)
                 eq.expr = expr
+
+        # 6e — KEEP-ALL: route the retained in-plane deviatoric-stress divergence
+        # into conservative diffusion (mirrors SME §9b / fullvam.py).  Runs AFTER
+        # the ω̃/regroup/curvature machinery so it repackages the residual bare
+        # second-derivatives C·∂²(q_i/h) (+ topography-coupled ν·q·∂b) into
+        # ∂(D·∂Q) − ∂(D)·∂Q; b is a STATE in `states` so those evaluate from the
+        # same stage (no frozen-b).  No-op unless retain_inplane.
+        if retain_inplane:
+            states = {h, b}
+            for qn in QNAME:
+                qh = getattr(m.functions, qn).head
+                states |= {qh(i, t, *horiz) for i in range(Nu + 1)}
+            for mn in MOM:
+                for kk in range(Nu + 1):
+                    getattr(m, mn)[kk].expr = package_viscous(
+                        getattr(m, mn)[kk].expr, m.parameters.nu, states, list(horiz))
 
         # 7 — vertical reconstruction → interpolate (field order [b,h,u,v,w,p];
         # v at index 3 only in dim=3).  The modal profiles assembled in §6b/§6c

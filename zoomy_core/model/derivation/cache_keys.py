@@ -31,7 +31,11 @@ from zoomy_core.model.derivation.basis_cache import _basis_fingerprint
 
 # Bump when the derivation pipeline changes in a way that invalidates every
 # cached entry (new op semantics, changed extraction, etc.).
-CACHE_VERSION = "v3"   # v3: SWE Manning source regularized (vel_eps, REQ-166) —
+CACHE_VERSION = "v4"   # v4: REQ-176(4) viscous-retained moment families —
+#                              SME/ML-SME/VAM/ML-VAM add_inplane_viscous +
+#                              package_viscous + NewtonianInPlane closure (default
+#                              path byte-identical, but derive_model changed).
+#                        v3: SWE Manning source regularized (vel_eps, REQ-166) —
 #                              plain-model operator edits are not captured by the
 #                              spec/derive_model hash, so bump to invalidate.
 #                        v2: parameter VALUES out of the spec key (REQ-163)

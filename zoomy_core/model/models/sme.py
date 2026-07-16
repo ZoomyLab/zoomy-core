@@ -105,7 +105,8 @@ class SME(BaseModel):
         if user_vals is not None and hasattr(user_vals, "items"):
             values.update({k: float(v) for k, v in user_vals.items()})
         from zoomy_core.model.models.equations import (
-            Mass, Momentum, moment_scaling, small_slope_scaling)
+            Mass, Momentum, moment_scaling, small_slope_scaling,
+            add_inplane_viscous, package_viscous)
         from zoomy_core.model.models.material import ClosureState
         from zoomy_core.model.models.closures import apply_stress_closures
 
@@ -139,7 +140,18 @@ class SME(BaseModel):
         m.add_equation("bottom", d.t(b))
         m.add_equation(Mass(m))
         mom = Momentum(m); m.add_equation(mom)
+        # DEFAULT: drop the in-plane deviatoric stress (shallow scaling).  Always
+        # applied → the ν=0 / no-in_plane-closure path stays byte-identical to
+        # K&T.  A retain-viscous closure list (NewtonianInPlane) then ADDS the
+        # incompressible-Newtonian in-plane divergence back (τ_xx etc.); it σ-maps
+        # and projects with the shear, and is routed to conservative diffusion by
+        # package_viscous after the CoV (§9b).
         moment_scaling(m, mom)
+        retain_inplane = any(getattr(c, "closes", None) == "in_plane"
+                             for c in (self.closures or []))
+        if retain_inplane:
+            add_inplane_viscous(m, [getattr(m.momentum, ax) for ax in HAXES],
+                                mom.uvel, list(horiz), m.parameters.nu)
         uvel, w, p = mom.uvel, mom.w, mom.p
         # hook: a turbulence subclass (KESME) declares its extra depth-averaged
         # state (k, ε) HERE so the bulk stress closure can read them in §5.
@@ -271,6 +283,24 @@ class SME(BaseModel):
             m.apply(ChangeOfVariables(nm, qn, lambda q_i: q_i / h))
         m.apply(InvertMassMatrix())
 
+        # 9b — KEEP-ALL: route the retained in-plane deviatoric-stress divergence
+        # into conservative diffusion.  The projected ∂_e(2ρν ∂_e u) landed as
+        # bare second derivatives C·∂²(q_i/h) (+ topography-coupled ν·q·∂b/∂²b);
+        # package_viscous regroups each into ∂(D·∂Q) − ∂(D)·∂Q (diffusive flux A
+        # + NCP), which the extractor routes into diffusion_matrix.  b is a STATE
+        # in `states`, so the topography couplings evaluate from the same stage
+        # (no flat-bed / frozen-b assumption).  No-op unless retain_inplane.
+        if retain_inplane:
+            q_heads = [getattr(m.functions, qn).head for qn in QNAME]
+            states = {h, b}
+            for qh in q_heads:
+                states |= {qh(i, t, *horiz) for i in range(Nu + 1)}
+            for ax in HAXES:
+                mxi = getattr(m.momentum, ax)
+                for kk in range(Nu + 1):
+                    mxi[kk].expr = package_viscous(
+                        mxi[kk].expr, m.parameters.nu, states, list(horiz))
+
         # 10 — vertical reconstruction → interpolate (field order [b,h,u,v,w,p];
         # v at index 3 only in 2-D, ŵ_j inlined as their closure)
         q_heads = [getattr(m.functions, qn).head for qn in QNAME]
@@ -382,6 +412,16 @@ class SME(BaseModel):
             for i in range(n_eq):
                 for j in range(n_eq):
                     A[i, j] += normal[k] * sm.quasilinear_matrix[i, j, k]
+        # Retained-viscous (NewtonianInPlane) models: package_viscous leaves a
+        # first-derivative NCP remainder (∝ ν) in the quasilinear matrix, which
+        # would pollute the HYPERBOLIC wave speed with the parabolic (diffusion)
+        # terms — the CFL bound must be the INVISCID characteristic speed (the
+        # diffusion is sub-stepped implicitly by the IMEX solver).  Zero ν so the
+        # HSWME spectrum stays the clean SWE/moment-wave form.  No-op when the
+        # model carries no ν (inviscid default).
+        nu_sym = getattr(sm.parameters, "nu", None)
+        if nu_sym is not None:
+            A = sp.Matrix(A).subs({nu_sym: 0})
         # β-HSWME truncation: drop the higher-order moment coefficients
         # (moment index ≥ 2) — the regularisation that makes the spectrum
         # computable.  Matches q_2…, q_x_2…, q_y_2… (1-D and 2-D names alike).
