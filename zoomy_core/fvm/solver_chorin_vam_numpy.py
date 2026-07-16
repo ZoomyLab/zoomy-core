@@ -294,6 +294,23 @@ def _pad_to_square(sm: SystemModel) -> SystemModel:
             f"{[i for i in range(n_st) if i not in src_of_dest]}"
         ),
     }]
+    # Propagate the BoundaryConditions CONTAINER (``_bc_source`` /
+    # ``_aux_bc_source``) — dynamic attributes, NOT constructor fields, so the
+    # ``SystemModel(...)`` above copies the lambdified BC *kernel*
+    # (``boundary_conditions``) but silently drops the container.  The flux
+    # operator's boundary-tag remap (``solver_numpy.get_flux_operator``) reads
+    # ``_bc_source.list_sorted_function_names`` to align the mesh's positional
+    # face-tag order (create_2d: left,right,bottom,top) with the BC kernel's
+    # ALPHABETICAL Piecewise-branch order (bottom,left,right,top).  Without the
+    # container that remap is skipped and 2-D boundary faces route by mesh
+    # position against alphabetical branches — inflow/outflow/lateral BCs
+    # rotate (e.g. the outflow face inherits the inflow Dirichlet ``q=Q_IN``,
+    # leaking mass out of the dry-shelf boundary cell until ``h`` goes
+    # negative).  1-D is accidentally safe because mesh order == alphabetical
+    # for {left,right}.  Restoring the container makes the padded predictor
+    # route boundaries exactly like every other HyperbolicSolver system.
+    sm_square._bc_source = getattr(sm, "_bc_source", None)
+    sm_square._aux_bc_source = getattr(sm, "_aux_bc_source", None)
     return sm_square
 
 
