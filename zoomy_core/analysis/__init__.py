@@ -26,6 +26,16 @@ from .pencil import (
     symbolic_eigenvalues_at,
 )
 from .reduce_pencil import reduce_singular_pencil
+from .stability import (
+    NumericPencil,
+    temporal_branch,
+    spatial_branch,
+    spatial_dispersion,
+    spatial_cutoff,
+    growth_cutoff,
+    critical_parameter,
+    viscous_operator,
+)
 from .hyperbolicity import (
     is_hyperbolic_at,
     sample_hyperbolicity,
@@ -44,6 +54,14 @@ __all__ = [
     "sample_generalised_eigenvalues",
     "symbolic_eigenvalues_at",
     "reduce_singular_pencil",
+    "NumericPencil",
+    "temporal_branch",
+    "spatial_branch",
+    "spatial_dispersion",
+    "spatial_cutoff",
+    "growth_cutoff",
+    "critical_parameter",
+    "viscous_operator",
     "is_hyperbolic_at",
     "sample_hyperbolicity",
     "plot_dispersion",
