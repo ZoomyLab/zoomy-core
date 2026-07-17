@@ -31,7 +31,13 @@ from zoomy_core.model.derivation.basis_cache import _basis_fingerprint
 
 # Bump when the derivation pipeline changes in a way that invalidates every
 # cached entry (new op semantics, changed extraction, etc.).
-CACHE_VERSION = "v6"   # v6: REQ-176(4) correction — package_viscous now tags its
+CACHE_VERSION = "v7"   # v7: REQ-188 — the SystemModel cache key now hashes the
+#                              FULL source of every class in the model's MRO
+#                              (sm_cache.cache_key) instead of only derive_model,
+#                              so a case-local operator override (e.g. RainSWE.source)
+#                              invalidates the entry; bump busts stale v6 SM entries
+#                              (incl. the shipped _prebuilt) keyed the old way.
+#                        v6: REQ-176(4) correction — package_viscous now tags its
 #                              diffusive flux with the ViscousDiffusion marker so the
 #                              in-plane σ-metric h/b cross pieces route to the
 #                              diffusion tensor (A[q_k←h] non-zero); changes the

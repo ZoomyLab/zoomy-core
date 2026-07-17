@@ -11,10 +11,24 @@ per model pickled) — across three tiers:
        (``zoomy_core/systemmodel/_prebuilt/`` — regenerate with
        ``python -m zoomy_core.systemmodel.build_prebuilt_cache``).
 
-The key is ``model_spec_key(model, include_bc_ic=True)`` (parameter VALUES
-excluded — they stay free symbols end-to-end and are passed to the solver at
-runtime; see cache_keys) combined with source hashes of the model's
-``derive_model`` AND its builder, so editing either invalidates.
+The key is ``model_spec_key(model)`` (parameter VALUES excluded — they stay
+free symbols end-to-end and are passed to the solver at runtime; see
+cache_keys) combined with a source hash of EVERY class in the model's MRO
+(``type(model).__mro__`` minus ``object``/``abc`` plumbing) plus a hash of its
+builder (REQ-188).  Hashing the full source of every class in the chain
+captures every overridden operator (``source``/``flux``/
+``nonconservative_matrix``/``update_variables``/closures/…) automatically, so
+editing ANY method of ANY class in the MRO invalidates the entry — no operator
+enumeration, no silent-stale.  This replaces the pre-REQ-188 ``derive_model``
+source hash, which missed operator overrides on subclasses that inherited
+``derive_model`` (e.g. ``RainSWE(SWE)`` editing only ``source``).
+
+If ``inspect.getsource`` fails for any class in the chain (a REPL/exec-defined
+model with no on-disk source), the model is treated as UNCACHEABLE:
+:func:`cache_key` returns ``None`` and the model is derived fresh every time.
+Serving a possibly-stale cached entry for a source we cannot fingerprint is the
+exact failure mode REQ-188 kills, so we refuse to cache rather than risk it
+(warned once per model class).
 
 Cache hits return a FRESH object (``pickle.loads`` per call) — callers may
 mutate ICs/BCs on the result, exactly like a fresh build.
@@ -27,11 +41,18 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import logging
 import os
 import pickle
 from pathlib import Path
 
 _MEMORY: dict[str, bytes] = {}
+
+_LOG = logging.getLogger(__name__)
+
+# Model classes we've already warned are uncacheable (REPL/exec-defined) — the
+# warning fires once per class, not once per derivation.
+_UNCACHEABLE_WARNED: set[str] = set()
 
 
 def _enabled() -> bool:
@@ -59,21 +80,73 @@ def _src_hash(obj) -> str:
         return "nosrc"
 
 
-def cache_key(model, builder) -> str:
-    """BC/IC are NOT part of the key: they are runtime data (they embed
-    parameter values) and are RE-ATTACHED to every fetched result by
+def _mro_classes(cls):
+    """The model's MRO minus ``object`` and ``abc`` plumbing — the classes whose
+    source actually defines the derivation/operators."""
+    for c in cls.__mro__:
+        if c is object or c.__module__ == "abc":
+            continue
+        yield c
+
+
+def _mro_source_terms(cls) -> str | None:
+    """Identity + full-source hash of every class in the MRO (REQ-188).
+
+    Returns ``None`` if ANY class in the chain has no retrievable source
+    (REPL/exec-defined) — the model is then uncacheable, because we cannot
+    detect an edit to that class and must not serve a possibly-stale entry."""
+    parts = []
+    for c in _mro_classes(cls):
+        try:
+            src = inspect.getsource(c)
+        except (OSError, TypeError):
+            _warn_uncacheable(cls, c)
+            return None
+        digest = hashlib.sha256(src.encode()).hexdigest()[:16]
+        parts.append(f"{c.__module__}.{c.__qualname__}:{digest}")
+    return "|".join(parts)
+
+
+def _warn_uncacheable(model_cls, failed_cls) -> None:
+    ident = f"{model_cls.__module__}.{model_cls.__qualname__}"
+    if ident in _UNCACHEABLE_WARNED:
+        return
+    _UNCACHEABLE_WARNED.add(ident)
+    _LOG.warning(
+        "SystemModel cache DISABLED for %s: cannot read the source of %s.%s "
+        "(REPL/exec-defined?). Deriving fresh every call — a source we cannot "
+        "fingerprint could otherwise be served stale after an edit (REQ-188).",
+        ident, failed_cls.__module__, failed_cls.__qualname__,
+    )
+
+
+def cache_key(model, builder) -> str | None:
+    """Symbolic identity of the model's built SystemModel, or ``None`` if the
+    model is UNCACHEABLE (a class in its MRO has no on-disk source).
+
+    Composition (REQ-188): ``CACHE_VERSION | model_spec_key(model) | <per-class
+    identity+source hash for every class in the MRO minus object/abc> |
+    builder-source hash``.  Hashing the full source of every MRO class captures
+    every overridden operator automatically, so an edit to any method of any
+    class in the chain invalidates the entry.
+
+    BC/IC are NOT part of the key: they are runtime data (they embed parameter
+    values) and are RE-ATTACHED to every fetched result by
     ``build_system_model`` — the cache stores only the symbolic identity."""
     from zoomy_core.model.derivation.cache_keys import CACHE_VERSION, model_spec_key
+    mro = _mro_source_terms(type(model))
+    if mro is None:
+        return None                       # uncacheable: always derive fresh
     spec = model_spec_key(model)
-    dm = getattr(type(model), "derive_model", None)
     return hashlib.sha256(
-        f"{CACHE_VERSION}|sm|{spec}|dm={_src_hash(dm)}|b={_src_hash(builder)}".encode()
+        f"{CACHE_VERSION}|sm|{spec}|mro={mro}|b={_src_hash(builder)}".encode()
     ).hexdigest()
 
 
-def fetch(key: str):
-    """Return a FRESH SystemModel for ``key`` or None (miss / disabled)."""
-    if not _enabled() or _rebuild():
+def fetch(key: str | None):
+    """Return a FRESH SystemModel for ``key`` or None (miss / disabled /
+    uncacheable ``key is None``)."""
+    if key is None or not _enabled() or _rebuild():
         return None
     blob = _MEMORY.get(key)
     if blob is None:
@@ -95,8 +168,8 @@ def fetch(key: str):
         return None
 
 
-def store(key: str, sm) -> None:
-    if not _enabled():
+def store(key: str | None, sm) -> None:
+    if key is None or not _enabled():   # uncacheable model: never persist
         return
     try:
         blob = pickle.dumps(sm)
