@@ -387,6 +387,14 @@ class FoamSystemModelPrinter(GenericCppBase):
                           if e["kind"] in ("derivative", "limited_derivative")}
             state_syms, aux_syms = list(sm.state), list(sm.aux_state)
             allowed = set(state_syms) | set(aux_syms)
+            # REQ-183: bake this model instance's parameter VALUES into the
+            # closure before lowering — the field-level refresh structurally
+            # has no parameter vector ``p`` (unlike the per-cell numpy/jax
+            # leg), so a parameterized aux (e.g. the KP ``hinv``'s
+            # ``wet_dry_eps``) must emit with its resolved literals.
+            psubs = {sm.parameters[k]:
+                     sp.Float(getattr(sm.parameter_values, k, 0.0))
+                     for k in sm.parameters.keys()}
             deref = [
                 {s: f"*Q[{i}]" for i, s in enumerate(state_syms)},
                 {s: f"*Qaux[{i}]" for i, s in enumerate(aux_syms)},
@@ -397,7 +405,7 @@ class FoamSystemModelPrinter(GenericCppBase):
                 for row in range(len(aux_syms)):
                     if row in deriv_rows or row >= len(rows):
                         continue
-                    expr = sp.sympify(rows[row])
+                    expr = sp.sympify(rows[row]).subs(psubs)
                     if expr == aux_syms[row]:
                         continue                       # identity passthrough
                     unknown = expr.free_symbols - allowed
