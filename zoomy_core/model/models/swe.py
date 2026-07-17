@@ -50,6 +50,10 @@ class SWE(StructuredDerivativeModel):
         # has derivative hu/|u| → 0/0 at zero velocity, so the unregularized
         # source NaNs the implicit/IMEX Newton on step 0 of any from-rest run.
         "vel_eps": (1e-12, "nonnegative"),
+        # Wet/dry depth threshold (REQ-48 canonical name — same symbol the FVM
+        # Riemann solvers, jax backend and MalpassetSWE read).  Sets the depth
+        # below which ``update_variables`` caps the momentum band to zero.
+        "wet_dry_eps": (1e-2, "positive"),
     }
 
     def __init__(self, **kw):
@@ -138,6 +142,52 @@ class SWE(StructuredDerivativeModel):
             S[2, 0] = -g * n_m**2 * hu * mag / h ** sp.Rational(7, 3)
             S[3, 0] = -g * n_m**2 * hv * mag / h ** sp.Rational(7, 3)
         return ZArray(S)
+
+    # ── state hygiene: wet/dry momentum cap (DG(1) dry-bed dt-collapse) ──
+    def update_variables(self):
+        """Per-cell wet/dry momentum cap — ``h`` and ``b`` NEVER modified.
+
+        The DG(1) shoreline dt-collapse fix, lifted from :class:`MalpassetSWE`
+        into the base so every SWE consumer (numpy / jax / OpenFOAM /
+        Firedrake) inherits it.  A Riemann/limiter transient can leave a large
+        momentum ``hu`` sitting on a vanishing depth ``h → wet_dry_eps``; the
+        derived velocity ``u = hu/h`` then blows up and collapses the explicit
+        ``dt`` at the wet/dry front.  Cap each momentum COMPONENT to the
+        physically admissible band ``|hu| ≤ h_wet · 4·√(g·max(h,0))`` with
+        ``h_wet = max(h − wet_dry_eps, 0)``, so the bound collapses smoothly to
+        zero as the cell dries (the celerity ``2√(gh)`` sets the scale; the
+        factor 4 keeps the cap loose enough to stay inert on wet supercritical
+        flow, where ``|hu| = h|u| ≪ 4h√(gh)`` for Froude ≲ 4).
+
+        A plain ``h``-floor is deliberately NOT the fix: flooring ``h`` moves
+        the bad ``(h, hu)`` pair up a threshold instead of bounding the
+        momentum, so the ``1/h`` blow-up simply reappears at the new floor.
+
+        ``Min``/``Max``/``sqrt`` only (no ``Heaviside``/``sign``/``Piecewise``)
+        so it lowers through every backend; resolved BY FIELD NAME so it is
+        dimension-agnostic — ``hv`` is capped only when present, ``h``/``b``
+        pass through untouched.
+        """
+        v = self.variables
+        g = self.parameters.g
+        h = v.h
+        h_wet = sp.Max(h - self.parameters.wet_dry_eps, sp.S.Zero)
+        max_hu = h_wet * 4 * sp.sqrt(g * sp.Max(h, sp.S.Zero))
+
+        def cap(c):
+            return sp.Max(-max_hu, sp.Min(c, max_hu))
+
+        momenta = {"hu", "hv"}
+        return ZArray([cap(s) if str(s) in momenta else s
+                       for s in v.get_list()])
+
+    def update_variables_jacobian_wrt_variables(self):
+        # The Min/Max cap differentiates to non-serialisable Piecewise/sign;
+        # this Jacobian is only consumed by the IMEX implicit-update Newton
+        # (which does not run on update_variables), so return explicit zeros
+        # (mirrors MalpassetSWE).
+        n = self.n_variables
+        return ZArray.zeros(n, n)
 
     # ── function groups: canonical operators + boundary definitions ───
     def _build_function_groups(self):
