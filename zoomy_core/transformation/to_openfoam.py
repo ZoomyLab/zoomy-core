@@ -787,9 +787,28 @@ class FoamNumericsPrinter(GenericCppBase):
             printer.doprint(a) for a in args
         ) + ")"
 
+    # REQ-187: EVERY opaque UserFunctions kernel needs the same qualification —
+    # ``eigenvalues`` (the λ-only wave-speed kernel, REQ-167/168) and ``solve``
+    # (point-implicit source) were emitted unqualified, so VAM / opaque-
+    # eigenvalue models failed to compile ('eigenvalues' not declared in this
+    # scope) while analytic-eigenvalue SWE was unaffected.
+    @staticmethod
+    def _emit_eigenvalues(printer, *args):
+        return "numerics::eigenvalues(" + ", ".join(
+            printer.doprint(a) for a in args
+        ) + ")"
+
+    @staticmethod
+    def _emit_solve(printer, *args):
+        return "numerics::solve(" + ", ".join(
+            printer.doprint(a) for a in args
+        ) + ")"
+
     c_functions = {
         **GenericCppBase.c_functions,
         "eigensystem": _emit_eigensystem.__func__,
+        "eigenvalues": _emit_eigenvalues.__func__,
+        "solve": _emit_solve.__func__,
     }
 
     def __init__(self, numerics, **opts):
