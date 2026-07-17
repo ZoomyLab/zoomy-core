@@ -137,6 +137,14 @@ class NumpyRuntimeModel:
         convention — see :meth:`to_ufl.UFLRuntimeModel._lower_opaque_kernels`)."""
         if not isinstance(expr, sp.Basic):
             return expr
+        # Lower array containers ELEMENT-WISE and rebuild the container in the
+        # normal (evaluating) context: the ``evaluate=False`` guard below must
+        # not catch an ``NDimArray``'s internal shape / loop-size arithmetic
+        # (``prod(shape)``), or ``.tolist()`` later trips over an unevaluated
+        # ``Mul`` size.  ``list(arr)`` iterates the flat scalar entries.
+        if isinstance(expr, sp.NDimArray):
+            lowered = [self._lower_opaque_kernels(e) for e in list(expr)]
+            return type(expr)(lowered, expr.shape)
         reps = {}
         for src_cls, pack_cls in _compute_once_pack_map().items():
             for call in expr.atoms(src_cls):
