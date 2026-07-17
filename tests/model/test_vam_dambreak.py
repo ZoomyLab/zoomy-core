@@ -59,10 +59,10 @@ def test_vam_chorin_split_roles(vam_sm):
     assert sp.Symbol("dt", positive=True) in corr_syms
 
 
-def test_vam_dambreak_over_bump():
-    """Short dam break over a Gaussian bump: finite, positive depth, mass
-    conserved, bounded non-hydrostatic pressure."""
-    nc = 60
+def _build_dambreak_solver(nc=60):
+    """Shared setup for the VAM(1) dam-break-over-a-bump march: build the model,
+    split, mesh and solver, return the solver plus the index metadata both the
+    large march and its 1-step twin need.  DT=2e-4."""
     model = VAM(closures=[Newtonian(), NavierSlip(), StressFree()], level=1)
     sm = SystemModel.from_model(model)
 
@@ -92,6 +92,29 @@ def test_vam_dambreak_over_bump():
     ih, ip0 = state_names.index("h"), state_names.index("P_0")
     dx = 3.0 / nc
     mass0 = solver._sim_Q[ih, :nc].sum() * dx
+    return solver, nc, ih, ip0, dx, mass0
+
+
+def test_vam_dambreak_over_bump_one_step_twin():
+    """Default-tier regression canary for the large VAM dam break: identical
+    setup, exactly ONE step.  Asserts the cheap invariants (finite, positive
+    depth, bounded mass change, bounded pressure) at ~seconds cost — catches a
+    predictor/elliptic/corrector regression without the full march."""
+    solver, nc, ih, ip0, dx, mass0 = _build_dambreak_solver()
+    solver.step(2e-4)
+    Q = solver._sim_Q
+    h = Q[ih, :nc]
+    assert np.all(np.isfinite(Q[:, :nc]))
+    assert h.min() > 0.0
+    assert abs(h.sum() * dx - mass0) < 1e-4 * mass0
+    assert np.isfinite(np.abs(Q[ip0, :nc]).max())      # pressure solve returned
+
+
+@pytest.mark.large
+def test_vam_dambreak_over_bump():
+    """Short dam break over a Gaussian bump: finite, positive depth, mass
+    conserved, bounded non-hydrostatic pressure."""
+    solver, nc, ih, ip0, dx, mass0 = _build_dambreak_solver()
     dt = 2e-4
     for _ in range(40):
         solver.step(dt)

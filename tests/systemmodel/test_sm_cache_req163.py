@@ -17,6 +17,7 @@ def cache_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.mark.rederive
 def test_param_value_sweep_hits_cache(cache_dir):
     """Two instances differing ONLY in a parameter VALUE share one build:
     values are runtime solver inputs, not derivation identity."""
@@ -34,6 +35,7 @@ def test_param_value_sweep_hits_cache(cache_dir):
                  else b.parameter_values.g) == 1.23
 
 
+@pytest.mark.rederive
 def test_cache_hit_returns_fresh_mutable_object(cache_dir):
     from zoomy_core.model.models.swe import SWE
     from zoomy_core.systemmodel.system_model import SystemModel
@@ -44,6 +46,7 @@ def test_cache_hit_returns_fresh_mutable_object(cache_dir):
     assert str(b.flux) == ref           # cache not poisoned
 
 
+@pytest.mark.rederive
 def test_env_disable_and_rebuild(cache_dir, monkeypatch):
     from zoomy_core.model.models.swe import SWE
     from zoomy_core.systemmodel import sm_cache
@@ -64,6 +67,7 @@ def test_env_disable_and_rebuild(cache_dir, monkeypatch):
     assert sm_cache.fetch(key) is None          # rebuild bypasses reads
 
 
+@pytest.mark.rederive
 def test_cross_process_disk_hit(cache_dir):
     """REQ-163 (a): a SECOND python process with the same spec loads from disk."""
     from zoomy_core.model.models.sme import SME

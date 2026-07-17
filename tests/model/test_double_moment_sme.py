@@ -340,7 +340,7 @@ def verify_nu0(closed):
 
 # ── tests ──────────────────────────────────────────────────────────────────
 
-@pytest.mark.slow
+@pytest.mark.rederive
 def test_dm_full_matches_hand_rows():
     """(full) Nu=1, Ny=1 closed rows == hand-derived double-moment rows."""
     _, rows = derive_dm(Nu=1, Ny=1)
@@ -350,7 +350,7 @@ def test_dm_full_matches_hand_rows():
         {k: sp.sstr(v)[:160] for k, v in res.items() if v != 0}
 
 
-@pytest.mark.slow
+@pytest.mark.rederive
 def test_dm_ny0_reduces_to_reference_sme():
     """(SME) Ny=0 reduction == core SME(level=1) reconstruct rows, row-for-row."""
     _, rows = derive_dm(Nu=1, Ny=0)
@@ -360,7 +360,7 @@ def test_dm_ny0_reduces_to_reference_sme():
         {k: sp.sstr(v)[:160] for k, v in res.items() if v != 0}
 
 
-@pytest.mark.slow
+@pytest.mark.rederive
 def test_dm_nu0_reduces_to_width_rows():
     """(width) Nu=0 reduction == width-only hand rows, row-for-row."""
     _, rows = derive_dm(Nu=0, Ny=1)
@@ -370,7 +370,7 @@ def test_dm_nu0_reduces_to_width_rows():
         {k: sp.sstr(v)[:160] for k, v in res.items() if v != 0}
 
 
-@pytest.mark.slow
+@pytest.mark.rederive
 def test_dm_pipeline_second_invocation_is_cache_hit():
     """REQ-142: a 2nd identical pipeline call is a HIT — the minutes-long
     symbolic body does NOT re-run (asserted on the wrapped-body call count)."""
@@ -392,7 +392,7 @@ def test_dm_pipeline_second_invocation_is_cache_hit():
     assert warm < 0.05 * cold + 0.01, f"warm={warm:.3f}s not << cold={cold:.1f}s"
 
 
-@pytest.mark.slow
+@pytest.mark.rederive
 def test_dm_pipeline_persists_across_sessions(tmp_path, monkeypatch):
     """REQ-142: the closed rows persist to disk, so a FRESH session (in-memory
     store cleared) re-loads them from disk WITHOUT re-running the symbolic body."""

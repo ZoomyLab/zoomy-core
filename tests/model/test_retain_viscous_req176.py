@@ -113,17 +113,12 @@ def test_variable_b_topography_coupling_is_live(cls):
     assert found > 0, f"{cls.__name__}: no live ν·q·∂_x b topography coupling"
 
 
-def test_variable_b_smoke_marches_over_topography():
-    """Retain-viscous SME on a topography bump (∂_x b ≠ 0), IMEX (implicit dense
-    diffusion + INVISCID hyperbolic wave speed): the solve actually MARCHES —
-    the state evolves, stays finite and conserves mass.  Proves the
-    topography-coupled viscous NCP terms are evaluated from the stage state
-    every step (no lagged/frozen bed gradient)."""
+def _build_variable_b():
+    """Retain-viscous SME(1, dim=2) over a topography bump — shared by the large
+    IMEX march and its 1-step twin.  Returns (sm, mesh, nsm, names, Q0)."""
     import zoomy_core.model.initial_conditions as IC
     from zoomy_core.model.boundary_conditions import BoundaryConditions, Extrapolation
     from zoomy_core.mesh import BaseMesh
-    import zoomy_core.fvm.timestepping as timestepping
-    from zoomy_core.fvm.solver_imex_numpy import IMEXSolver
     from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
 
     sm = SystemModel.from_model(SME(
@@ -150,6 +145,36 @@ def test_variable_b_smoke_marches_over_topography():
     Q0 = np.zeros((len(names), 80))
     for j in range(80):
         Q0[:, j] = _ic([(j + 0.5) * 10.0 / 80])
+    return sm, mesh, nsm, names, Q0
+
+
+def test_variable_b_one_step_twin():
+    """Default-tier canary: identical retain-viscous IMEX setup, exactly ONE
+    step; cheap invariants only (finite, positive depth). The genuine march
+    (state advanced, mass conserved) stays in the large tier."""
+    import zoomy_core.fvm.timestepping as timestepping
+    from zoomy_core.fvm.solver_imex_numpy import IMEXSolver
+
+    _, mesh, nsm, names, _ = _build_variable_b()
+    solver = IMEXSolver(time_end=0.2, compute_dt=timestepping.adaptive(CFL=0.2))
+    solver.setup_simulation(mesh, nsm, write_output=False)
+    solver.step(1e-3)
+    Q = np.asarray(solver._sim_Q, float)
+    assert np.all(np.isfinite(Q[:, :80])), "retain-viscous SME went non-finite"
+    assert np.asarray(Q[names.index("h"), :80], float).min() > 0.0
+
+
+@pytest.mark.large
+def test_variable_b_smoke_marches_over_topography():
+    """Retain-viscous SME on a topography bump (∂_x b ≠ 0), IMEX (implicit dense
+    diffusion + INVISCID hyperbolic wave speed): the solve actually MARCHES —
+    the state evolves, stays finite and conserves mass.  Proves the
+    topography-coupled viscous NCP terms are evaluated from the stage state
+    every step (no lagged/frozen bed gradient)."""
+    import zoomy_core.fvm.timestepping as timestepping
+    from zoomy_core.fvm.solver_imex_numpy import IMEXSolver
+
+    sm, mesh, nsm, names, Q0 = _build_variable_b()
     solver = IMEXSolver(time_end=0.2, compute_dt=timestepping.adaptive(CFL=0.2))
     Q, _ = solver.solve(mesh, nsm, write_output=False)
     q0 = np.asarray(Q[names.index("q_0"), :80], float)

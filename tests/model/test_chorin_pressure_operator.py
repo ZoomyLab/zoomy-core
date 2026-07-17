@@ -149,7 +149,7 @@ def test_pressure_operator_lazy_cached_and_nonbreaking():
     assert sp.sympify(smp.source[0, 0]) == src_before    # source untouched
 
 
-@pytest.mark.slow
+@pytest.mark.rederive
 def test_pressure_operator_vam_1_3():
     op = _verify(VAM(level=1, dimension=3))
     assert len(op.P_modes) == 2
@@ -157,7 +157,7 @@ def test_pressure_operator_vam_1_3():
     assert op.Axx is not None and op.Ayy is not None
 
 
-@pytest.mark.slow
+@pytest.mark.rederive
 def test_pressure_operator_ml_vam():
     op = _verify(MLVAM(n_layers=2, level=1, dimension=2))
     assert len(op.P_modes) >= 2

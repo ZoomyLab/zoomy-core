@@ -14,6 +14,7 @@ wrapping (mass leaks / perturbations decay instead of re-entering).
 """
 
 import numpy as np
+import pytest
 
 from zoomy_core.model.models import SME
 from zoomy_core.model.boundary_conditions import BoundaryConditions, Periodic
@@ -41,8 +42,9 @@ def test_resolve_periodic_bcs_is_idempotent():
                 and mesh.boundary_face_cells[1] == 0)
 
 
-def test_bump_wraps_and_conserves_mass():
-    NC, XMAX = 100, 10.0
+def _build_bump(NC=100, XMAX=10.0):
+    """Right-moving surface bump on a periodic SME(0) channel — shared by the
+    large wrap-around march and its 1-step twin."""
     bcs = BoundaryConditions([
         Periodic(tag="left", periodic_to_physical_tag="right"),
         Periodic(tag="right", periodic_to_physical_tag="left"),
@@ -67,6 +69,28 @@ def test_bump_wraps_and_conserves_mass():
     xc = np.linspace(XMAX / NC / 2, XMAX - XMAX / NC / 2, NC)
     dx = XMAX / NC
     m_ic = sum(ic([x])[1] for x in xc) * dx
+    return sm, mesh, nsm, NC, dx, m_ic
+
+
+def test_bump_periodic_one_step_twin(one_hyperbolic_step):
+    """Default-tier canary: identical periodic-bump setup, exactly ONE step.
+    Periodic BCs mean no boundary-flux imbalance, so mass is conserved to
+    machine precision and the internal mesh is remapped to the opposite side
+    even after a single step (the wrap-around itself stays in the large tier)."""
+    _, mesh, nsm, NC, dx, m_ic = _build_bump()
+    solver = HyperbolicSolver(
+        time_end=0.5, compute_dt=timestepping.adaptive(CFL=0.9, dimension=1))
+    Q = one_hyperbolic_step(solver, mesh, nsm)
+    assert solver._bf_cells[0] == NC - 1 and solver._bf_cells[1] == 0
+    assert np.all(np.isfinite(Q[:, :NC]))
+    np.testing.assert_allclose(Q[1, :NC].sum() * dx, m_ic, rtol=1e-12)
+
+
+@pytest.mark.large
+def test_bump_wraps_and_conserves_mass():
+    sm, mesh, nsm, NC, dx, m_ic = _build_bump()
+    XMAX = 10.0
+    xc = np.linspace(XMAX / NC / 2, XMAX - XMAX / NC / 2, NC)
 
     # THREE consecutive solves on the same script-level mesh: each
     # setup_simulation takes a fresh internal mesh copy that SHARES the

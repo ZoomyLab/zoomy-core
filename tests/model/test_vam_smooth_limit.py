@@ -50,22 +50,17 @@ def _ic(n):
     return ic
 
 
-@pytest.mark.slow
-def test_vam1_matches_sme1_in_long_wave_limit():
-    mesh = BaseMesh.create_1d(domain=(0.0, XMAX), n_inner_cells=NC)
-
+def _build_sme(mesh):
     sme = SME(closures=[Newtonian(), NavierSlip(), StressFree()], level=1, parameters=dict(PAR), boundary_conditions=_bcs())
     sm_s = SystemModel.from_model(sme)
     sm_s.initial_conditions = IC.UserFunction(function=_ic(len(sm_s.state)))
     sm_s.aux_initial_conditions = IC.Constant(constants=lambda n: np.zeros(n))
     nsm = NumericalSystemModel.from_system_model(
         sm_s, reconstruction=ReconstructionSpec(order=1))
-    solver = HyperbolicSolver(
-        time_end=T_END, compute_dt=timestepping.adaptive(CFL=CFL, dimension=1))
-    Qs, _ = solver.solve(mesh, nsm, write_output=False)
-    Qs = np.asarray(Qs[:, :NC], float)
-    ns = [str(s) for s in sm_s.state]
+    return nsm, [str(s) for s in sm_s.state]
 
+
+def _build_vam(mesh):
     vam = VAM(closures=[Newtonian(), NavierSlip(), StressFree()], level=1, parameters=dict(PAR), boundary_conditions=_bcs())
     sm_v = SystemModel.from_model(vam)
     sm_v.initial_conditions = IC.UserFunction(function=_ic(len(sm_v.state)))
@@ -78,17 +73,53 @@ def test_vam1_matches_sme1_in_long_wave_limit():
                                pressure_solver="gmres", pressure_tol=1e-8,
                                riemann_solver="hr")
     sol.setup_simulation(mesh)
+    return sol, [str(s) for s in sm_v.state]
+
+
+def _vam_dt(sol):
     cdt = timestepping.adaptive(CFL=CFL, dimension=1)
+    return min(float(cdt(sol._sim_Q, sol._sim_Qaux, sol._sim_parameters,
+                         sol._sim_cell_inradius_face,
+                         sol._sim_compute_max_abs_eigenvalue)), 5e-3)
+
+
+def test_vam1_sme1_long_wave_one_step_twin(one_hyperbolic_step):
+    """Default-tier canary: identical smooth-hump SME + VAM(Chorin) setup, ONE
+    step each.  The O(mu) agreement holds only after real evolution, so the
+    twin asserts the cheap invariants (finite, positive depth, bounded
+    non-hydrostatic pressure) — the regression guard for a broken split."""
+    mesh = BaseMesh.create_1d(domain=(0.0, XMAX), n_inner_cells=NC)
+    nsm, ns = _build_sme(mesh)
+    solver = HyperbolicSolver(
+        time_end=T_END, compute_dt=timestepping.adaptive(CFL=CFL, dimension=1))
+    Qs = one_hyperbolic_step(solver, mesh, nsm)[:, :NC]
+    sol, nv = _build_vam(mesh)
+    sol.step(_vam_dt(sol))
+    Qv = np.asarray(sol._sim_Q[:, :NC], float)
+    assert np.all(np.isfinite(Qs)) and np.all(np.isfinite(Qv))
+    assert Qs[ns.index("h")].min() > 0.0 and Qv[nv.index("h")].min() > 0.0
+    p_scale = 9.81 * H0 * AMP
+    assert np.abs(Qv[nv.index("P_0")]).max() < p_scale
+    assert np.abs(Qv[nv.index("P_1")]).max() < p_scale
+
+
+@pytest.mark.large
+def test_vam1_matches_sme1_in_long_wave_limit():
+    mesh = BaseMesh.create_1d(domain=(0.0, XMAX), n_inner_cells=NC)
+
+    nsm, ns = _build_sme(mesh)
+    solver = HyperbolicSolver(
+        time_end=T_END, compute_dt=timestepping.adaptive(CFL=CFL, dimension=1))
+    Qs, _ = solver.solve(mesh, nsm, write_output=False)
+    Qs = np.asarray(Qs[:, :NC], float)
+
+    sol, nv = _build_vam(mesh)
     t_now = 0.0
     while t_now < T_END - 1e-12:
-        dt = float(cdt(sol._sim_Q, sol._sim_Qaux, sol._sim_parameters,
-                       sol._sim_cell_inradius_face,
-                       sol._sim_compute_max_abs_eigenvalue))
-        dt = min(dt, 5e-3, T_END - t_now)
+        dt = min(_vam_dt(sol), T_END - t_now)
         sol.step(dt)
         t_now += dt
     Qv = np.asarray(sol._sim_Q[:, :NC], float)
-    nv = [str(s) for s in sm_v.state]
 
     hs, q0s, q1s = (Qs[ns.index(k)] for k in ("h", "q_0", "q_1"))
     hv, q0v, q1v = (Qv[nv.index(k)] for k in ("h", "q_0", "q_1"))

@@ -101,6 +101,7 @@ class RainSWE(SWE):
 
 # ── (a) rain: volume rises before T_rain, FLAT after (solver march) ──────────
 
+@pytest.mark.large
 def test_rain_volume_plateaus_after_T_rain():
     """Full numpy-solver march: with a periodic domain and a uniform tracer,
     ``∂_t c = r_o`` everywhere; total volume must rise while t < T_rain and be

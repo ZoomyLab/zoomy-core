@@ -97,6 +97,7 @@ def test_hswme_bound_quality_in_hyperbolic_regime(level):
     assert worst_rel < 0.08, f"HSWME bound degraded: {worst_rel:.2%}"
 
 
+@pytest.mark.rederive
 @pytest.mark.parametrize("level", [6, 7])
 def test_high_level_spectrum_falls_back_to_truncated_twin(level):
     """Level ≥ 6: the truncated moment block is Abel-unsolvable in radicals, so

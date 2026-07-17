@@ -49,7 +49,9 @@ def test_mlvam_split_has_all_correctors(mlvam):
         "corr_r_1_0", "corr_r_1_1", "corr_r_2_0", "corr_r_2_1"]
 
 
-def test_mlvam_dambreak_over_bump(mlvam):
+def _build_dambreak_solver(mlvam, nc=60):
+    """Shared setup for the ML-VAM dam-break-over-a-bump march used by both the
+    large march and its 1-step twin."""
     sm = SystemModel.from_model(mlvam)
 
     def _bump_ic(xv):
@@ -67,7 +69,6 @@ def test_mlvam_dambreak_over_bump(mlvam):
     split = mlvam.chorin_split(system_model=sm)
     split.SM_pred.attach_boundary_conditions(bcs)
 
-    nc = 60
     mesh = BaseMesh.create_1d(domain=(-1.5, 1.5), n_inner_cells=nc)
     solver = ChorinSplitVAMSolver(split.SM_pred, split.SM_press,
                                   split.SM_corr, pressure_solver="lu",
@@ -77,6 +78,27 @@ def test_mlvam_dambreak_over_bump(mlvam):
     ih = sn.index("h")
     dx = 3.0 / nc
     mass0 = solver._sim_Q[ih, :nc].sum() * dx
+    return solver, sn, nc, ih, dx, mass0
+
+
+def test_mlvam_dambreak_over_bump_one_step_twin(mlvam):
+    """Default-tier canary: identical ML-VAM setup, exactly ONE step. Cheap
+    invariants only (finite, positive depth, bounded mass change, finite
+    pressures)."""
+    solver, sn, nc, ih, dx, mass0 = _build_dambreak_solver(mlvam)
+    solver.step(2e-4)
+    Q = solver._sim_Q
+    h = Q[ih, :nc]
+    assert np.all(np.isfinite(Q[:, :nc]))
+    assert h.min() > 0.0
+    assert abs(h.sum() * dx - mass0) < 1e-4 * mass0
+    for p in ("P_1_0", "P_1_1", "P_2_0", "P_2_1"):
+        assert np.isfinite(np.abs(Q[sn.index(p), :nc]).max())
+
+
+@pytest.mark.large
+def test_mlvam_dambreak_over_bump(mlvam):
+    solver, sn, nc, ih, dx, mass0 = _build_dambreak_solver(mlvam)
     for _ in range(40):
         solver.step(2e-4)
     Q = solver._sim_Q

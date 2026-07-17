@@ -17,6 +17,7 @@ numerics, the equilibrium reconstruction selected by the model keyword:
   monotone.)
 """
 import numpy as np
+import pytest
 
 from zoomy_core.model.models import SME
 from zoomy_core.model.boundary_conditions import BoundaryConditions, Extrapolation
@@ -43,15 +44,35 @@ def _lake_at_rest_model(eqr):
     return sm
 
 
-def _run(SolverClass, eqr, tend=2.0):
+def _build(eqr):
     sm = _lake_at_rest_model(eqr)
     mesh = BaseMesh.create_1d(domain=(-5., 5.), n_inner_cells=_NX)
     nsm = NumericalSystemModel.from_system_model(sm, reconstruction=ReconstructionSpec(order=1))
+    return mesh, nsm
+
+
+def _run(SolverClass, eqr, tend=2.0):
+    mesh, nsm = _build(eqr)
     solver = SolverClass(time_end=tend, compute_dt=timestepping.adaptive(CFL=0.45))
     Q, _ = solver.solve(mesh, nsm, write_output=False)
     return Q[0, :_NX] + Q[1, :_NX], np.asarray(Q)[:, :_NX]
 
 
+def test_audusse_hook_holds_lake_at_rest_one_step_twin(one_hyperbolic_step):
+    """Default-tier canary: the Audusse-hook lake-at-rest, exactly ONE step.
+    Well-balancing is a per-step property, so even a single step must hold the
+    lake flat to machine precision (and stay finite) — a cheap WB regression
+    guard without the 2 s march."""
+    mesh, nsm = _build("audusse")
+    solver = HyperbolicSolver(time_end=2.0,
+                              compute_dt=timestepping.adaptive(CFL=0.45))
+    Q = one_hyperbolic_step(solver, mesh, nsm)[:, :_NX]
+    eta = Q[0] + Q[1]
+    assert np.all(np.isfinite(Q))
+    assert np.max(np.abs(eta - _ETA0)) < 1e-11, "audusse-hook must hold lake-at-rest"
+
+
+@pytest.mark.large
 def test_audusse_hook_holds_lake_at_rest_and_matches_reference():
     """Audusse via the unified hook on a plain HyperbolicSolver holds lake-at-rest
     to machine precision and is bit-identical to FreeSurfaceFlowSolver."""

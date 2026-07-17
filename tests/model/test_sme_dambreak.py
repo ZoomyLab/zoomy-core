@@ -28,8 +28,9 @@ from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
 from zoomy_core.systemmodel.system_model import SystemModel
 
 
-def _run_dambreak(level, *, hL=2.0, hR=1.0, n_cells=100, t_end=0.3):
-    """Build the new SME at `level` with BCs as always, run a 1-D dam break."""
+def _build_dambreak(level, *, hL=2.0, hR=1.0, n_cells=100):
+    """Build the new SME at `level` with BCs as always, ready to run a 1-D dam
+    break — shared by the large march (`_run_dambreak`) and its 1-step twin."""
     # the NORMAL interface — BoundaryConditions in the model constructor,
     # exactly as the production models always took them (transmissive here)
     sm = SystemModel.from_model(SME(closures=[Newtonian(), NavierSlip(), StressFree()], level=level, boundary_conditions=BoundaryConditions(
@@ -49,6 +50,11 @@ def _run_dambreak(level, *, hL=2.0, hR=1.0, n_cells=100, t_end=0.3):
     mesh = BaseMesh.create_1d(domain=(0.0, 10.0), n_inner_cells=n_cells)
     nsm = NumericalSystemModel.from_system_model(
         sm, reconstruction=ReconstructionSpec(order=1))
+    return sm, mesh, nsm, n_cells
+
+
+def _run_dambreak(level, *, hL=2.0, hR=1.0, n_cells=100, t_end=0.3):
+    _, mesh, nsm, n_cells = _build_dambreak(level, hL=hL, hR=hR, n_cells=n_cells)
     solver = HyperbolicSolver(time_end=t_end,
                               compute_dt=timestepping.adaptive(CFL=0.9))
     Q, _ = solver.solve(mesh, nsm, write_output=False)
@@ -68,11 +74,9 @@ def test_wall_bc_comes_from_the_model():
     assert list(ghost) == [b, h, -q0, -q1, -q2]
 
 
-def test_sme_dambreak_between_walls_conserves_mass():
-    """Dam break in a closed box: both walls are the MODEL-derived wall BC.
-    The mirrored ghost gives an exactly zero mass flux at each wall, so total
-    mass is conserved to machine precision while the wave keeps reflecting."""
-    n_cells, hL, hR = 50, 2.0, 1.0
+def _build_walls(n_cells=50, hL=2.0, hR=1.0):
+    """Closed-box SME(2) dam break, model-derived wall BCs — shared by the large
+    reflection march and its 1-step mass-conservation twin."""
     sm = SystemModel.from_model(SME(closures=[Newtonian(), NavierSlip(), StressFree()], level=2, boundary_conditions=BoundaryConditions(
         [FromModel(tag="left", definition="wall"),
          FromModel(tag="right", definition="wall")])))
@@ -85,6 +89,29 @@ def test_sme_dambreak_between_walls_conserves_mass():
     mesh = BaseMesh.create_1d(domain=(0.0, 2.0), n_inner_cells=n_cells)
     nsm = NumericalSystemModel.from_system_model(
         sm, reconstruction=ReconstructionSpec(order=1))
+    return sm, mesh, nsm, n_cells, hL, hR
+
+
+def test_sme_dambreak_between_walls_one_step_twin(one_hyperbolic_step):
+    """Default-tier canary: the mirrored wall ghost gives zero mass flux, so
+    mass is conserved to machine precision after even ONE step — a cheap
+    wall-BC regression guard (the full reflection dynamics stay in the large
+    tier)."""
+    _, mesh, nsm, n_cells, hL, hR = _build_walls()
+    solver = HyperbolicSolver(time_end=1.0,
+                              compute_dt=timestepping.adaptive(CFL=0.9))
+    h = one_hyperbolic_step(solver, mesh, nsm)[1, :n_cells]
+    assert np.all(np.isfinite(h)) and h.min() > 0.0
+    mass0 = (hL + hR) / 2 * 2.0
+    assert abs(h.sum() * (2.0 / n_cells) - mass0) < 1e-10 * mass0, "wall leaks mass"
+
+
+@pytest.mark.large
+def test_sme_dambreak_between_walls_conserves_mass():
+    """Dam break in a closed box: both walls are the MODEL-derived wall BC.
+    The mirrored ghost gives an exactly zero mass flux at each wall, so total
+    mass is conserved to machine precision while the wave keeps reflecting."""
+    _, mesh, nsm, n_cells, hL, hR = _build_walls()
     solver = HyperbolicSolver(time_end=1.0,
                               compute_dt=timestepping.adaptive(CFL=0.9))
     Q, _ = solver.solve(mesh, nsm, write_output=False)
@@ -121,10 +148,9 @@ def test_friction_decays_uniform_flow():
     assert abs(q0.mean() - 0.1 * np.exp(-2.5)) < 1e-3
 
 
-def test_friction_excites_q1_boundedly():
-    """Level-1 dam break with bottom friction must EXCITE shear (q_1 ≠ 0 —
-    the physics the inter-level coupling wants to see) and stay bounded."""
-    n_cells = 100
+def _build_friction_l1(n_cells=100):
+    """Level-1 friction dam break — shared by the large shear-excitation march
+    and its 1-step twin."""
     sm = SystemModel.from_model(SME(closures=[Newtonian(), NavierSlip(), StressFree()], level=1, parameters={"lambda_s": 0.5, "nu": 1e-3},
              boundary_conditions=BoundaryConditions(
                  [Extrapolation(tag="left"), Extrapolation(tag="right")])
@@ -138,6 +164,26 @@ def test_friction_excites_q1_boundedly():
     mesh = BaseMesh.create_1d(domain=(0.0, 10.0), n_inner_cells=n_cells)
     nsm = NumericalSystemModel.from_system_model(
         sm, reconstruction=ReconstructionSpec(order=1))
+    return sm, mesh, nsm, n_cells
+
+
+def test_friction_excites_q1_one_step_twin(one_hyperbolic_step):
+    """Default-tier canary: identical level-1 friction dam break, exactly ONE
+    step; cheap invariants only (finite, positive depth). The q_1 shear
+    excitation needs real evolution and stays in the large tier."""
+    _, mesh, nsm, n_cells = _build_friction_l1()
+    solver = HyperbolicSolver(time_end=0.3,
+                              compute_dt=timestepping.adaptive(CFL=0.9))
+    Q = one_hyperbolic_step(solver, mesh, nsm)
+    h = Q[1, :n_cells]
+    assert np.all(np.isfinite(Q[:, :n_cells])) and h.min() > 0.0
+
+
+@pytest.mark.large
+def test_friction_excites_q1_boundedly():
+    """Level-1 dam break with bottom friction must EXCITE shear (q_1 ≠ 0 —
+    the physics the inter-level coupling wants to see) and stay bounded."""
+    _, mesh, nsm, n_cells = _build_friction_l1()
     solver = HyperbolicSolver(time_end=0.3,
                               compute_dt=timestepping.adaptive(CFL=0.9))
     Q, _ = solver.solve(mesh, nsm, write_output=False)
@@ -148,6 +194,22 @@ def test_friction_excites_q1_boundedly():
     assert np.abs(q1).max() < 1.0, "q_1 unbounded — friction sign regressed?"
 
 
+@pytest.mark.parametrize("level", [0, 2])      # SWE (level 0) and SME (level 2)
+def test_sme_dambreak_1d_one_step_twin(level, one_hyperbolic_step):
+    """Default-tier canary: identical SME dam-break setup, exactly ONE step.
+    Cheap invariants only (finite, positive depth, bounded by the two dam
+    levels) — the dam-break wave itself is the large-tier assertion."""
+    hL, hR = 2.0, 1.0
+    _, mesh, nsm, nc = _build_dambreak(level, hL=hL, hR=hR)
+    solver = HyperbolicSolver(time_end=0.3,
+                              compute_dt=timestepping.adaptive(CFL=0.9))
+    h = one_hyperbolic_step(solver, mesh, nsm)[1, :nc]
+    assert np.all(np.isfinite(h))
+    assert h.min() > 0.0
+    assert hR - 1e-6 <= h.min() and h.max() <= hL + 1e-6
+
+
+@pytest.mark.large
 @pytest.mark.parametrize("level", [0, 2])      # SWE (level 0) and SME (level 2)
 def test_sme_dambreak_1d(level):
     hL, hR = 2.0, 1.0

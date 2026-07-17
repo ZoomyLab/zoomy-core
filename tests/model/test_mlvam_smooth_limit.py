@@ -40,10 +40,7 @@ def _ic(n):
     return ic
 
 
-@pytest.mark.slow
-def test_mlvam21_matches_mlsme21_in_long_wave_limit():
-    mesh = BaseMesh.create_1d(domain=(0.0, XMAX), n_inner_cells=NC)
-
+def _build_mlsme(mesh):
     sme = MLSME(closures=[Newtonian(), NavierSlip(), StressFree()], n_layers=2, level=1, interface_velocity="mean",
                 parameters=dict(PAR), boundary_conditions=_bcs())
     sm_s = SystemModel.from_model(sme)
@@ -51,12 +48,10 @@ def test_mlvam21_matches_mlsme21_in_long_wave_limit():
     sm_s.aux_initial_conditions = IC.Constant(constants=lambda n: np.zeros(n))
     nsm = NumericalSystemModel.from_system_model(
         sm_s, reconstruction=ReconstructionSpec(order=1))
-    solver = HyperbolicSolver(
-        time_end=T_END, compute_dt=timestepping.adaptive(CFL=CFL, dimension=1))
-    Qs, _ = solver.solve(mesh, nsm, write_output=False)
-    Qs = np.asarray(Qs[:, :NC], float)
-    ns = [str(s) for s in sm_s.state]
+    return nsm, [str(s) for s in sm_s.state]
 
+
+def _build_mlvam(mesh):
     vam = MLVAM(closures=[Newtonian(), NavierSlip(), StressFree()], n_layers=2, level=1, parameters=dict(PAR),
                 boundary_conditions=_bcs())
     sm_v = SystemModel.from_model(vam)
@@ -70,17 +65,52 @@ def test_mlvam21_matches_mlsme21_in_long_wave_limit():
                                pressure_solver="gmres", pressure_tol=1e-8,
                                riemann_solver="hr")
     sol.setup_simulation(mesh)
+    return sol, [str(s) for s in sm_v.state]
+
+
+def _mlvam_dt(sol):
     cdt = timestepping.adaptive(CFL=CFL, dimension=1)
+    return min(float(cdt(sol._sim_Q, sol._sim_Qaux, sol._sim_parameters,
+                         sol._sim_cell_inradius_face,
+                         sol._sim_compute_max_abs_eigenvalue)), 5e-3)
+
+
+def test_mlvam21_mlsme21_long_wave_one_step_twin(one_hyperbolic_step):
+    """Default-tier canary: identical smooth-hump ML-SME + ML-VAM(Chorin)
+    setup, ONE step each; cheap invariants only (finite, positive depth,
+    bounded per-mode non-hydrostatic pressure)."""
+    mesh = BaseMesh.create_1d(domain=(0.0, XMAX), n_inner_cells=NC)
+    nsm, ns = _build_mlsme(mesh)
+    solver = HyperbolicSolver(
+        time_end=T_END, compute_dt=timestepping.adaptive(CFL=CFL, dimension=1))
+    Qs = one_hyperbolic_step(solver, mesh, nsm)[:, :NC]
+    sol, nv = _build_mlvam(mesh)
+    sol.step(_mlvam_dt(sol))
+    Qv = np.asarray(sol._sim_Q[:, :NC], float)
+    assert np.all(np.isfinite(Qs)) and np.all(np.isfinite(Qv))
+    assert Qs[ns.index("h")].min() > 0.0 and Qv[nv.index("h")].min() > 0.0
+    p_scale = 9.81 * H0 * AMP
+    for key in ("P_1_0", "P_1_1", "P_2_0", "P_2_1"):
+        assert np.abs(Qv[nv.index(key)]).max() < p_scale, key
+
+
+@pytest.mark.large
+def test_mlvam21_matches_mlsme21_in_long_wave_limit():
+    mesh = BaseMesh.create_1d(domain=(0.0, XMAX), n_inner_cells=NC)
+
+    nsm, ns = _build_mlsme(mesh)
+    solver = HyperbolicSolver(
+        time_end=T_END, compute_dt=timestepping.adaptive(CFL=CFL, dimension=1))
+    Qs, _ = solver.solve(mesh, nsm, write_output=False)
+    Qs = np.asarray(Qs[:, :NC], float)
+
+    sol, nv = _build_mlvam(mesh)
     t_now = 0.0
     while t_now < T_END - 1e-12:
-        dt = float(cdt(sol._sim_Q, sol._sim_Qaux, sol._sim_parameters,
-                       sol._sim_cell_inradius_face,
-                       sol._sim_compute_max_abs_eigenvalue))
-        dt = min(dt, 5e-3, T_END - t_now)
+        dt = min(_mlvam_dt(sol), T_END - t_now)
         sol.step(dt)
         t_now += dt
     Qv = np.asarray(sol._sim_Q[:, :NC], float)
-    nv = [str(s) for s in sm_v.state]
 
     def rel(a, b, scale):
         return np.linalg.norm(a - b) / (np.linalg.norm(scale) + 1e-14)

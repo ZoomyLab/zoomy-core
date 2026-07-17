@@ -140,6 +140,32 @@ def test_outflow_ghost_is_not_the_inflow_discharge(extruded_split):
 
 # ── (c) positivity + y-invariance over the march ─────────────────────────────
 
+def test_predictor_keeps_h_positive_one_step_twin(extruded_split):
+    """Default-tier canary for the REQ-174c positivity march: positivity and
+    top/bottom symmetry are PER-STEP properties (the pre-fix outflow mis-route
+    broke both on the very first step), so a single step is a real regression
+    guard.  The full 15-step drain-to-negative dynamics stay in the large tier."""
+    solver, idx, xc, cc = _setup(extruded_split)
+    yc = cc[1, :solver.nc]
+    hi = idx["h"]
+    nx = 30
+    dx = (DOMAIN[1] - DOMAIN[0]) / nx
+    dt = 0.08 * dx / np.sqrt(G * H_RES)
+    x_cols = np.unique(np.round(xc, 6))
+    solver.step(dt)
+    h = np.asarray(solver._sim_Q, float)[hi, :solver.nc]
+    assert np.isfinite(h).all(), "non-finite h after one step"
+    assert h.min() >= 0.0, f"h went negative after one step: {h.min():.3e}"
+    tb = 0.0
+    for xv in x_cols:
+        col = h[np.abs(xc - xv) < 1e-9]
+        ys = yc[np.abs(xc - xv) < 1e-9]
+        colo = col[np.argsort(ys)]
+        tb = max(tb, float(np.max(np.abs(colo - colo[::-1]))))
+    assert tb < 1e-11, f"top/bottom asymmetry {tb:.3e} after one step (tag mis-route)"
+
+
+@pytest.mark.large
 def test_predictor_keeps_h_positive_and_y_invariant(extruded_split):
     solver, idx, xc, cc = _setup(extruded_split)
     yc = cc[1, :solver.nc]

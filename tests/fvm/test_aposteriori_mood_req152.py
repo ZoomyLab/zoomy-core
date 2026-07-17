@@ -112,6 +112,7 @@ def _drive(solver, record=False):
 
 # ── the acceptance ───────────────────────────────────────────────────────
 
+@pytest.mark.large
 def test_plain_order2_goes_negative_control():
     """Control: without the corrector the plain order-2 candidate drives the
     depth negative on the dry dam break (so the corrector below has real
@@ -120,6 +121,7 @@ def test_plain_order2_goes_negative_control():
     assert hmin < 0.0, f"plain order-2 stayed non-negative (hmin={hmin}); test is vacuous"
 
 
+@pytest.mark.large
 def test_mood_keeps_depth_nonnegative_and_conserves_mass():
     """positivity='mood': the a-posteriori corrector keeps h ≥ 0 at EVERY
     step and mass is conserved to machine precision (closed box, shared face
@@ -132,6 +134,7 @@ def test_mood_keeps_depth_nonnegative_and_conserves_mass():
     assert drift < 1e-13, f"mass drifted {drift:.2e} (corrector must be conservative)"
 
 
+@pytest.mark.large
 def test_mood_is_strict_noop_on_wet_smooth_run():
     """On a fully-wet smooth run no cell is ever troubled, so the mood step is
     bit-identical to the plain order-2 step at every step — proving (a) the
@@ -159,6 +162,7 @@ def test_mood_is_strict_noop_on_wet_smooth_run():
     assert n_steps > 0
 
 
+@pytest.mark.large
 def test_mood_output_is_exactly_the_masked_o1_restep():
     """Mandate: the committed depth on a troubled step equals the masked
     order-1 re-step EXACTLY — no clamp, no floor, no post-processing.

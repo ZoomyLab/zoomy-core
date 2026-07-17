@@ -75,6 +75,17 @@ Source = "https://github.com/mbd-rwth/Zoomy"
 Issues = "https://github.com/mbd-rwth/Zoomy/issues"
 
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Tiered test suite (see tests/README.md).  The DEFAULT run is the pre-publish
+# gate: it excludes the `large` and `rederive` tiers (conftest.py deselects
+# them unless --run-large / --run-rederive is passed, or an explicit -m
+# expression takes over selection).  Register the markers so nothing warns.
+markers = [
+    "large: real time-march / simulation test (multi-step solver marches, DAE Chorin solves). Excluded by default; enable with --run-large or -m large. Each has a 1-step 'small twin' regression canary in the default tier.",
+    "rederive: deliberately clears/bypasses the derivation cache or forces a fresh derivation of a heavy family (double-moment SME, cold-cache sm_cache builds). Excluded by default so routine runs always hit the warm cache; enable with --run-rederive or -m rederive.",
+]
+
 [tool.setuptools.packages.find]
 include = ["zoomy_core*"]
 

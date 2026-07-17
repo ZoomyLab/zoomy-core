@@ -37,11 +37,9 @@ def test_mlswe_structure_and_closed_G():
     assert sp.simplify(G - expected.doit()) == 0
 
 
-@pytest.mark.parametrize("ustar", ["upwind", "mean"])
-def test_mlswe_dambreak_with_shear(ustar):
-    """Sheared two-layer dam break: finite, positive depth, mass conserved,
-    shear bounded — for both interface-velocity variants."""
-    nc = 100
+def _build(ustar, nc=100):
+    """Shared sheared two-layer MLSWE dam-break setup for the large march and
+    its 1-step twin."""
     sm = SystemModel.from_model(MLSWE(closures=[Newtonian(), NavierSlip(), StressFree()], n_layers=2, interface_velocity=ustar,
                boundary_conditions=BoundaryConditions(
                    [Extrapolation(tag="left"), Extrapolation(tag="right")])
@@ -56,6 +54,29 @@ def test_mlswe_dambreak_with_shear(ustar):
     mesh = BaseMesh.create_1d(domain=(0.0, 10.0), n_inner_cells=nc)
     nsm = NumericalSystemModel.from_system_model(
         sm, reconstruction=ReconstructionSpec(order=1))
+    return sm, mesh, nsm, nc
+
+
+@pytest.mark.parametrize("ustar", ["upwind", "mean"])
+def test_mlswe_dambreak_one_step_twin(ustar, one_hyperbolic_step):
+    """Default-tier canary: identical MLSWE setup, exactly ONE step. Cheap
+    invariants only (finite, positive depth, bounded mass change)."""
+    _, mesh, nsm, nc = _build(ustar)
+    solver = HyperbolicSolver(time_end=0.3,
+                              compute_dt=timestepping.adaptive(CFL=0.45))
+    Q = one_hyperbolic_step(solver, mesh, nsm)
+    h = Q[1, :nc]
+    assert np.all(np.isfinite(Q[:, :nc]))
+    assert h.min() > 0.0
+    assert abs(h.sum() * (10.0 / nc) - 12.0) < 0.05
+
+
+@pytest.mark.large
+@pytest.mark.parametrize("ustar", ["upwind", "mean"])
+def test_mlswe_dambreak_with_shear(ustar):
+    """Sheared two-layer dam break: finite, positive depth, mass conserved,
+    shear bounded — for both interface-velocity variants."""
+    _, mesh, nsm, nc = _build(ustar)
     solver = HyperbolicSolver(time_end=0.3,
                               compute_dt=timestepping.adaptive(CFL=0.45))
     Q, _ = solver.solve(mesh, nsm, write_output=False)

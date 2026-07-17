@@ -7,6 +7,7 @@ closure interface and the Phase-2 equation blueprints carry all the way through
 to a running numerical solution.
 """
 import numpy as np
+import pytest
 
 from zoomy_core.model.models import SME
 from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
@@ -31,7 +32,7 @@ def _build_sme(level=2):
     ))
 
 
-def _solve_dambreak(sm, nc=100, t_end=0.3):
+def _build_dambreak(sm, nc=100):
     def _ic(xv):
         h = 1.5 if float(xv[0]) < 5.0 else 0.75
         return np.array([0.0, h] + [0.0] * (sm.n_equations - 2))
@@ -41,12 +42,33 @@ def _solve_dambreak(sm, nc=100, t_end=0.3):
     mesh = BaseMesh.create_1d(domain=(0.0, 10.0), n_inner_cells=nc)
     nsm = NumericalSystemModel.from_system_model(
         sm, reconstruction=ReconstructionSpec(order=1))
+    return mesh, nsm, nc
+
+
+def _solve_dambreak(sm, nc=100, t_end=0.3):
+    mesh, nsm, nc = _build_dambreak(sm, nc)
     solver = HyperbolicSolver(time_end=t_end,
                               compute_dt=timestepping.adaptive(CFL=0.45))
     Q, _ = solver.solve(mesh, nsm, write_output=False)
     return np.asarray(Q, float), mesh, nc
 
 
+def test_phase3_sme_closures_blueprints_numpy_dambreak_one_step_twin(
+        one_hyperbolic_step):
+    """Default-tier canary for the phase-3 integration gate: same closure/
+    blueprint SME → NSM, exactly ONE step; cheap invariants only."""
+    sm = _build_sme(level=2)
+    assert [str(s) for s in sm.state] == ["b", "h", "q_0", "q_1", "q_2"]
+    mesh, nsm, nc = _build_dambreak(sm)
+    solver = HyperbolicSolver(time_end=0.3,
+                              compute_dt=timestepping.adaptive(CFL=0.45))
+    Q = one_hyperbolic_step(solver, mesh, nsm)
+    h = Q[1, :nc]
+    assert np.all(np.isfinite(Q)), "solution went non-finite"
+    assert np.all(h > 0.0), "depth went non-positive"
+
+
+@pytest.mark.large
 def test_phase3_sme_closures_blueprints_numpy_dambreak():
     sm = _build_sme(level=2)
     assert [str(s) for s in sm.state] == ["b", "h", "q_0", "q_1", "q_2"]

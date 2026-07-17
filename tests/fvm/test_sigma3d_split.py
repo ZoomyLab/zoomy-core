@@ -13,6 +13,7 @@ divergence-free), so:
 These are run, not asserted by hand.
 """
 import numpy as np
+import pytest
 
 from zoomy_core.model.models.sigma3d import Sigma3D
 from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree, ShallowInPlane
@@ -50,6 +51,46 @@ def _l1_error(NX, NY, t_end):
     return L1u, dEta, s.omega_max
 
 
+_TINY = 1e-6      # < first CFL dt ⇒ Sigma3DSplitSolver.solve takes exactly 1 step
+
+
+def test_bbsm13_split_one_step_twin():
+    """Default-tier canary for the inviscid BBSM13 refinement marches: same
+    model + exact IC, exactly ONE (tiny) step on the coarse grid.  The steady
+    state barely moves, so the cheap invariants (finite fields, |ω| bounded,
+    surface held) must hold after a single step."""
+    s = Sigma3DSplitSolver(80, 8, domain=(-5., 5., 0., 1.), cfl=0.4, rk=2)
+    r = s.solve(_bbsm13_model(), _ic, _TINY)
+    assert np.all(np.isfinite(r["h"])) and np.all(np.isfinite(r["u"]))
+    dEta = float(np.max(np.abs(r["b"] + r["h"] - (_zb(r["x"]) + _h(r["x"])))))
+    assert dEta < 1e-2, f"surface moved after one step: {dEta:.3e}"
+    assert s.omega_max < 0.1, f"|ω| not bounded: {s.omega_max:.3e}"
+
+
+def test_viscous_navierslip_dambreak_one_step_twin():
+    """Default-tier canary for the viscous Navier-slip dam break: same model +
+    IC, exactly ONE step; finite fields + mass conserved to machine precision."""
+    model = Sigma3D(closures=[Newtonian(), NavierSlip(), StressFree(), ShallowInPlane()],
+                    parameters={"nu": 1e-2, "e_x": 0.0, "g": 9.81,
+                                "rho": 1.0, "lambda_s": 1.0})
+    model.boundary_conditions = [Extrapolation(tag="left"),
+                                 Extrapolation(tag="right")]
+
+    def ic(x, zeta):
+        return 0.0, (2.0 if x < 5.0 else 1.0), 0.0
+
+    NX, NY = 100, 8
+    r = Sigma3DSplitSolver(NX, NY, domain=(0., 10., 0., 1.), cfl=0.4, rk=2).solve(
+        model, ic, _TINY)
+    h, mom = r["h"], r["mom"]
+    dx = 10.0 / NX
+    mass = float(np.sum(h) * dx)
+    mass0 = (2.0 * (NX // 2) + 1.0 * (NX - NX // 2)) * dx
+    assert np.all(np.isfinite(h)) and np.all(np.isfinite(mom))
+    assert abs(mass - mass0) / mass0 < 1e-6, f"mass drift {mass-mass0:.2e}"
+
+
+@pytest.mark.large
 def test_bbsm13_converges_under_refinement():
     """Inviscid BBSM13 at standard CFL: error decays ≈O(Δx); |ω| bounded."""
     e0, eta0, om0 = _l1_error(80, 8, 1.0)
@@ -62,6 +103,7 @@ def test_bbsm13_converges_under_refinement():
     assert abs(om1 - om0) < 0.2 * om0, "|ω| not grid-independent"
 
 
+@pytest.mark.large
 def test_bbsm13_stays_accurate_long_time():
     """At t=5 the steady state is held and STILL converges (not a transient)."""
     e0, eta0, _ = _l1_error(80, 8, 5.0)
@@ -70,6 +112,7 @@ def test_bbsm13_stays_accurate_long_time():
     assert eta1 < 0.05, f"t=5 surface drift too large: {eta1:.4e}"
 
 
+@pytest.mark.large
 def test_relaxes_to_steady_state_from_perturbed_ic():
     """Different IC → SAME steady state: a localized depth-bump perturbation of
     BBSM13 radiates out the transmissive boundaries and the solution RETURNS to
@@ -98,6 +141,7 @@ def test_relaxes_to_steady_state_from_perturbed_ic():
     assert float(np.mean(np.abs(rp["u"] - uref))) < 0.04, "velocity did not return to cosine"
 
 
+@pytest.mark.large
 def test_viscous_navierslip_dambreak_stable():
     """Viscous + Navier-slip dam break: stable, mass-conserving, sheared."""
     model = Sigma3D(closures=[Newtonian(), NavierSlip(), StressFree(), ShallowInPlane()],
