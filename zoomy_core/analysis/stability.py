@@ -43,6 +43,17 @@ __all__ = [
 ]
 
 
+def _aux_list(sm):
+    """The SystemModel's aux symbols (gradient fields etc.), [] when absent."""
+    aux = getattr(sm, "aux_variables", None)
+    if aux is None:
+        return []
+    try:
+        return list(aux.get_list())
+    except AttributeError:
+        return list(aux)
+
+
 class NumericPencil:
     """Numeric evaluator of a SystemModel's quasilinear pencil.
 
@@ -54,16 +65,21 @@ class NumericPencil:
 
     def __init__(self, sm):
         M_t, M_xa, M_0 = extract_quasilinear_pencil(sm)
-        args = list(sm.state) + list(sm.parameters)
+        aux = _aux_list(sm)
+        args = list(sm.state) + aux + list(sm.parameters)
         self.sm = sm
         self.state_names = [str(s) for s in sm.state]
+        self._n_aux = len(aux)
         self._A = sp.lambdify(args, M_xa[0], "numpy")       # d(F+P)/dQ + B
         self._JS = sp.lambdify(args, -M_0, "numpy")         # dS/dQ
         self._Mt = sp.lambdify(args, sp.Matrix(M_t), "numpy")
         self._S = sp.lambdify(args, list(sp.Matrix(sm.source)), "numpy")
 
     def _pvals(self, params):
-        return [float(params[str(p)]) for p in self.sm.parameters]
+        # aux variables (gradient fields etc.) vanish at the uniform base
+        # state — passed as zeros between state and parameters.
+        return [0.0] * self._n_aux + [float(params[str(p)])
+                                      for p in self.sm.parameters]
 
     def equilibrium(self, params, fixed, guess=None):
         """Uniform base state: source rows of the FREE states vanish.
@@ -373,7 +389,12 @@ def viscous_operator(mats_or_sm, params=None, Q=None):
             "SystemModel has no diffusion_matrix — the derivation dropped the "
             "viscous terms (REQ-176(4)); build V case-side and pass it to "
             "temporal_branch(viscous=...) instead.")
-    args = list(sm.state) + list(sm.parameters)
-    fD = sp.lambdify(args, sp.Matrix(np.asarray(D)[:, :, 0].tolist()), "numpy")
-    pv = [float(params[str(p)]) for p in sm.parameters]
+    aux = _aux_list(sm)
+    args = list(sm.state) + aux + list(sm.parameters)
+    arr = np.asarray(D.tolist() if hasattr(D, "tolist") else D, dtype=object)
+    n = arr.shape[0]
+    Dxx = arr.reshape(n, arr.shape[1], -1)[:, :, 0]     # first direction pair
+    fD = sp.lambdify(args, sp.Matrix([[sp.sympify(e) for e in row]
+                                      for row in Dxx]), "numpy")
+    pv = [0.0] * len(aux) + [float(params[str(p)]) for p in sm.parameters]
     return -np.asarray(fD(*(list(Q) + pv)), float)
