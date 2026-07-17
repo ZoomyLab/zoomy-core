@@ -32,6 +32,20 @@ def default_models():
         yield f"sme-l{lvl}-2d", lambda lvl=lvl: SME(level=lvl, dimension=2)
     for lvl in (1, 2):
         yield f"vam-l{lvl}-2d", lambda lvl=lvl: VAM(closures=list(clo), level=lvl, dimension=2)
+    # 3-D (two-horizontal, t,x,y,z) structural specs.  These are built COLD by
+    # default-tier structural tests (``test_sme_2d`` SME(dim=3); ``test_vam_2d``
+    # + the ``fvm`` elliptic-BC / wet-dry Chorin tests VAM(dim=3)) — ~10-20 s
+    # each uncached, which is the residual default-tier floor.  Ship them so the
+    # tests hit the warm cache.  Closures/parameters MUST match the test spec
+    # verbatim (they are part of ``model_spec_key``; parameter VALUES are not).
+    for lvl in (1, 2):
+        yield f"sme-l{lvl}-3d", lambda lvl=lvl: SME(
+            level=lvl, dimension=3, parameters={"nu": 0.1, "lambda_s": 0.5},
+            closures=[Newtonian(), NavierSlip(), StressFree()])
+    yield "vam-l1-3d-navierslip", lambda: VAM(
+        level=1, dimension=3, closures=[NavierSlip(), StressFree()])
+    yield "vam-l1-3d-newtonian", lambda: VAM(
+        level=1, dimension=3, closures=[Newtonian(), StressFree()])
     yield "mlswe-2d", lambda: MLSWE(dimension=2)
     yield "mlsme-2d", lambda: MLSME(dimension=2)
     yield "mlvam-2d", lambda: MLVAM(dimension=2)

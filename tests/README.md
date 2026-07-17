@@ -16,6 +16,29 @@ exactly one timestep, asserting the cheap invariants (finite, `h >= 0`, bounded
 mass change) — a real regression canary at ~seconds cost. The twins **add**
 coverage; the large tests keep their full assertions.
 
+## Fast-verify — the ONE entry point
+
+`scripts/verify.py` is the single "is this change ok?" gate: it runs the default
+(small) tier, prints the **wall-clock time**, and exits non-zero on failure
+(so a git hook / CI can gate on it). Target: **≤ 2 minutes on a warm cache**.
+
+```bash
+micromamba run -n zoomy python scripts/verify.py            # full small tier + wall time
+micromamba run -n zoomy python scripts/verify.py --changed  # only tests for changed subdirs
+micromamba run -n zoomy python scripts/verify.py -k sme -x   # extra args pass to pytest
+```
+
+The small tier assumes a **warm derivation cache** (the shipped `_prebuilt` set +
+the REQ-163 `sm_cache`). Every default-tier structural build — including the
+`SME(dim=3)` and `VAM(dim=3)` specs that `test_sme_2d` / `test_vam_2d` / the
+`fvm` elliptic-BC + wet-dry Chorin tests build — is in `_prebuilt`, so a fresh
+checkout is warm. After a `CACHE_VERSION` bump or a derivation/builder edit,
+**regenerate first** (otherwise the first run pays the cold symbolic cost):
+
+```bash
+python -m zoomy_core.systemmodel.build_prebuilt_cache
+```
+
 ## Commands
 
 ```bash
