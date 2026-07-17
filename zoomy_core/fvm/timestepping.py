@@ -64,12 +64,20 @@ def adaptive(CFL=0.9, nu=0.0, dimension=2, degree=0, dt_max=None):
     deg_fac = float(2 * degree + 1)
     dim_fac = float(dimension)
 
-    def compute_dt(Q, Qaux, parameters, min_inradius, compute_max_abs_eigenvalue):
+    def compute_dt(Q, Qaux, parameters, inradius, compute_max_abs_eigenvalue):
+        # LOCAL CFL: ``inradius`` is the per-face (or per-cell) inradius array
+        # paired elementwise with the per-face local wave speed — each face is
+        # limited by ITS OWN size and ITS OWN |λ|, and the global dt is the
+        # minimum of those local limits.  A global-scalar radius (the old
+        # behavior) silently paired the smallest cell anywhere with the
+        # fastest wave anywhere — strictly over-restrictive on non-uniform
+        # meshes.  A scalar still works (uniform mesh) and gives the same dt.
         ev_abs_max = compute_max_abs_eigenvalue(Q, Qaux, parameters)
-        h = 2.0 * min_inradius                                # conservative cell size
-        dt = (CFL * h / (dim_fac * deg_fac * ev_abs_max)).min()
+        h = 2.0 * inradius                                    # conservative size
+        dt_local = CFL * h / (dim_fac * deg_fac * ev_abs_max)
         if nu > 0:
-            dt = _safe_minimum(dt, CFL * h ** 2 / (2.0 * dim_fac * nu))
+            dt_local = _safe_minimum(dt_local, CFL * h ** 2 / (2.0 * dim_fac * nu))
+        dt = dt_local.min()
         if dt_max is not None:
             dt = _safe_minimum(dt, dt_max)
         return dt

@@ -1148,20 +1148,22 @@ class HyperbolicSolver(Solver):
         self._sim_Q = self.update_q(self._sim_Q, Qaux, mesh, model,
                                     parameters, 0.0)
 
-        # Precompute mesh constant for CFL
+        # Per-face inradius for the LOCAL CFL: each face carries the min of
+        # its two adjacent cells' inradii (boundary faces: the inner cell's),
+        # so ``compute_dt`` pairs every face's own size with its own local
+        # wave speed — never the global smallest cell with the global fastest
+        # wave.
         nc = mesh.n_inner_cells
         inner_face_mask = (mesh.face_cells[0] < nc) & (mesh.face_cells[1] < nc)
-        inner_inradii = np.minimum(
+        face_inradius = np.full(mesh.n_faces, np.inf)
+        face_inradius[inner_face_mask] = np.minimum(
             mesh.cell_inradius[mesh.face_cells[0, inner_face_mask]],
             mesh.cell_inradius[mesh.face_cells[1, inner_face_mask]],
         )
-        bnd_inradii = mesh.cell_inradius[
-            mesh.face_cells[0, ~inner_face_mask]
-        ] if (~inner_face_mask).any() else np.array([np.inf])
-        self._sim_cell_inradius_face = min(
-            inner_inradii.min() if len(inner_inradii) > 0 else np.inf,
-            bnd_inradii.min() if len(bnd_inradii) > 0 else np.inf,
-        )
+        if (~inner_face_mask).any():
+            face_inradius[~inner_face_mask] = mesh.cell_inradius[
+                mesh.face_cells[0, ~inner_face_mask]]
+        self._sim_face_inradius = face_inradius
 
         # Output setup
         if write_output:
@@ -1255,7 +1257,7 @@ class HyperbolicSolver(Solver):
         while time_now < self.time_end:
             dt = self.compute_dt(
                 self._sim_Q, self._sim_Qaux, self._sim_parameters,
-                self._sim_cell_inradius_face, self._sim_compute_max_abs_eigenvalue,
+                self._sim_face_inradius, self._sim_compute_max_abs_eigenvalue,
             )
             dt = min(float(dt), float(self.time_end - time_now))
             if not np.isfinite(dt) or dt <= 0.0:
