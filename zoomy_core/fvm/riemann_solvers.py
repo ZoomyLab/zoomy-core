@@ -298,13 +298,19 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         if self.model.eigenvalues is not None:
             eig = list(sp.flatten(
                 self._model_eval("eigenvalues", Q, Qaux, p, n)))
-            return sp.Max(*[sp.Abs(lam) for lam in eig])
-        ev = list(sp.flatten(
-            self._model_eval("numerical_eigenvalues", Q, Qaux, p, n)))
-        # ``evaluate=False``: the ``eigenvalues`` kernel is opaque, so sympy
-        # cannot order the arguments (``not comparable``) — build the reduction
-        # node directly; it lowers to ``np.amax`` / the backend max unchanged.
-        return sp.Max(*[sp.Abs(lam) for lam in ev], evaluate=False)
+            src = eig
+        else:
+            src = list(sp.flatten(
+                self._model_eval("numerical_eigenvalues", Q, Qaux, p, n)))
+        # ``evaluate=False`` (both the closed-form and the opaque spectrum):
+        # ``Max`` over a wave spectrum is a runtime reduction, never a symbolic
+        # simplification target.  Letting sympy evaluate it triggers the O(n²)
+        # ``_find_localzeros`` → ``factor_terms(λ_i − λ_j)`` pairwise ordering
+        # attempt — which cannot succeed (opaque / non-orderable wave speeds)
+        # yet expands each huge Jacobian-eigenvalue tree, exploding SETUP.  The
+        # unevaluated node lowers to ``np.amax``/the backend max UNCHANGED (max
+        # is exact + associative → bit-identical numerics).
+        return sp.Max(*[sp.Abs(lam) for lam in src], evaluate=False)
 
     def _gershgorin_spectral_radius(self, Q, Qaux, p, n):
         """Gershgorin row-sum upper bound of the spectral radius of the
@@ -438,6 +444,7 @@ class Rusanov(Numerics):
         s_max = sp.Max(
             self.local_max_abs_eigenvalue(qL, auxL, p, n),
             self.local_max_abs_eigenvalue(qR, auxR, p, n),
+            evaluate=False,
         )
         Id = self.get_viscosity_identity_flux()
         return 0.5 * ((FL + PL) @ n + (FR + PR) @ n) - 0.5 * s_max * Id @ (qR - qL)
@@ -480,11 +487,15 @@ class HLL(Numerics):
             a = sp.Max(
                 self.local_max_abs_eigenvalue(qL, auxL, p, n),
                 self.local_max_abs_eigenvalue(qR, auxR, p, n),
+                evaluate=False,
             )
             return -a, a
         eig = list(sp.flatten(self._model_eval("eigenvalues", qL, auxL, p, n)))
         eig += list(sp.flatten(self._model_eval("eigenvalues", qR, auxR, p, n)))
-        return sp.Min(*eig), sp.Max(*eig)
+        # ``evaluate=False`` — Davis wave-speed bounds are a runtime min/max over
+        # the spectrum, never a symbolic ordering target (see
+        # ``local_max_abs_eigenvalue``); bit-identical when lowered.
+        return sp.Min(*eig, evaluate=False), sp.Max(*eig, evaluate=False)
 
     def _physical_flux_n(self, q, aux, p, n):
         """Normal-projected physical flux ``(F + P) @ n`` for a single state."""
@@ -834,6 +845,7 @@ class NonconservativeRusanov(Rusanov):
         s_max = sp.Max(
             self.local_max_abs_eigenvalue(qL, auxL, p, n),
             self.local_max_abs_eigenvalue(qR, auxR, p, n),
+            evaluate=False,
         )
 
         term_advection = A_int @ dQ
