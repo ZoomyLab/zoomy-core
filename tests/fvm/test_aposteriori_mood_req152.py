@@ -190,7 +190,11 @@ def test_mood_output_is_exactly_the_masked_o1_restep():
 
         def _rhs(tt, Qin, f):
             z = np.zeros_like(Qin)
-            return flux(dt, tt, Qin, Qaux, params, z, f) + source(dt, Qin, Qaux, params, z)
+            # REQ-185: the source operator now takes the current time
+            # ``compute_source(dt, time, Q, Qaux, p, dQ)`` (cell centres are
+            # captured in the closure).
+            return (flux(dt, tt, Qin, Qaux, params, z, f)
+                    + source(dt, tt, Qin, Qaux, params, z))
 
         def _rk2(f):
             Q1 = Q0 + dt * _rhs(t, Q0, f)

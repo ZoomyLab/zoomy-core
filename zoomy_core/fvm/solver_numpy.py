@@ -35,6 +35,10 @@ from zoomy_core.fvm.riemann_solvers import (
 
 _EMPTY_AUX = np.array([])
 _EMPTY_AUX2 = np.empty((0, 0))
+# REQ-185: coordinate origin for the single position VECTOR argument ``X`` of
+# the cell operators, used when a caller has no coordinate context (exact for
+# coordinate-independent operators).  Binds x→0, y→0, z→0.
+_ORIGIN3 = np.zeros(3)
 
 
 # -- Field detection helpers ---------------------------------------------------
@@ -224,10 +228,18 @@ class Solver(param.Parameterized):
             ).ravel()[:n_vars]
         return Q
 
-    def _apply_local_aux_formula(self, model, Qaux, Q, parameters, dt,
-                                 *, copy=False):
+    def _apply_local_aux_formula(self, model, Qaux, Q, parameters, time,
+                                 cell_centers=None, *, copy=False):
         """Apply the lowered ``update_aux_variables`` per-cell formula (e.g.
-        the KP-desingularized ``hinv``) to ``Qaux``.
+        the KP-desingularized ``hinv``, or a time-dependent rain rate) to
+        ``Qaux``.
+
+        REQ-185: ``update_aux_variables`` is lowered as
+        ``(Q, Qaux, p, t, x, y, z)`` — a time-dependent aux (rain rate
+        ``r_o = Piecewise((rate, t<T_rain),(0,True))``) binds ``t``; a spatial
+        aux binds the cell centre.  ``cell_centers`` is the mesh's
+        ``(3, n_cells)`` array; when absent the coordinate origin is used
+        (exact for coordinate-independent aux such as ``hinv``).
 
         ``callable`` (not merely ``is not None``): a SystemModel used directly
         (DAE path) carries ``update_aux_variables`` as a symbolic ZArray coerced
@@ -241,8 +253,10 @@ class Solver(param.Parameterized):
             return Qaux
         out = np.array(Qaux, copy=True) if copy else Qaux
         for c in range(Q.shape[1]):
+            pos_c = (cell_centers[:, c] if cell_centers is not None
+                     else _ORIGIN3)
             vals = np.asarray(
-                local_fn(Q[:, c], Qaux[:, c], parameters, dt),
+                local_fn(Q[:, c], Qaux[:, c], parameters, time, pos_c),
                 dtype=float).ravel()
             out[:vals.shape[0], c] = vals
         return out
@@ -263,9 +277,12 @@ class Solver(param.Parameterized):
         ``super().update_qaux(...)``.  No-op if neither leg is present.
         """
         # (1) LOCAL aux formula leg — per-cell (only present when the model
-        # declares a real, non-identity update_aux_variables).
+        # declares a real, non-identity update_aux_variables).  REQ-185: thread
+        # the current ``time`` and the mesh cell centres so a time/space-
+        # dependent aux (rain rate, manufactured source) binds them.
         out = self._apply_local_aux_formula(
-            model, Qaux, Q, parameters, dt, copy=True)
+            model, Qaux, Q, parameters, time,
+            getattr(mesh, "cell_centers", None), copy=True)
         # (2) DERIVATIVE aux leg — the non-local LSQ-gradient rows the
         # SystemModel gathered in aux_registry, via the shared walk (the SINGLE
         # source the Chorin per-pool refresh also calls).
@@ -792,12 +809,14 @@ class HyperbolicSolver(Solver):
         # value (best available — a single ghost state has no stencil).
         local_aux_fn = getattr(model, "update_aux_variables", None)
 
-        def _ghost_aux(q_right, qaux_inner, parameters, dt):
-            """Aux consistent with the ghost state ``q_right``."""
+        def _ghost_aux(q_right, qaux_inner, parameters, time, position=_ORIGIN3):
+            """Aux consistent with the ghost state ``q_right``.  REQ-185:
+            ``update_aux_variables`` is lowered as ``(Q, Qaux, p, t, x)``; pass
+            the current ``time`` and the (boundary-face) position vector."""
             if local_aux_fn is None or not has_aux:
                 return qaux_inner
             return np.asarray(
-                local_aux_fn(q_right, qaux_inner, parameters, dt),
+                local_aux_fn(q_right, qaux_inner, parameters, time, position),
                 dtype=float).reshape(-1)
 
         d_face = np.array([
@@ -948,7 +967,8 @@ class HyperbolicSolver(Solver):
                     qauxR = np.empty_like(qauxI)
                     for j in range(qB.shape[1]):
                         qauxR[:, j] = _ghost_aux(
-                            qB[:, j], qauxI[:, j], parameters, dt)
+                            qB[:, j], qauxI[:, j], parameters, time,
+                            face_centers[boundary_faces[j], :])
                 else:
                     qauxR = qauxI
                 n_f = normals_arr[:, boundary_faces]
@@ -995,7 +1015,8 @@ class HyperbolicSolver(Solver):
                     qB = Q_R[:, f]
                     qauxA = Qaux[:, iInner_bnd[bi]] if has_aux else _EMPTY_AUX
                     # Right-side aux consistent with the ghost state qB.
-                    qauxR = (_ghost_aux(qB, qauxA, parameters, dt)
+                    qauxR = (_ghost_aux(qB, qauxA, parameters, time,
+                                        face_centers[f, :])
                              if has_aux else _EMPTY_AUX)
                     n = normals_arr[:, f]
                     fluct = np.asarray(
@@ -1046,18 +1067,23 @@ class HyperbolicSolver(Solver):
         in the convective step.
         """
         has_explicit = hasattr(model, "source_explicit")
-        # The NSM ``source_treatment="linearized"`` transform bakes ``dt`` into
-        # the lowered source (``S_lin = (I − dt·J)⁻¹ S``); the runtime flags it
-        # via ``source_needs_dt`` and we thread ``dt`` exactly like the Chorin
-        # corrector threads it into ``update_variables``.  Default explicit
-        # source keeps the (Q, Qaux, p) signature unchanged.
+        # REQ-185: the ``source`` operator is lowered as
+        # ``(Q, Qaux, p, t, [dt], x)`` — time and the position VECTOR ``x``
+        # (cell centres, ``(dim, n_cells)``) are always passed; ``dt`` is passed
+        # explicitly when ``source_needs_dt`` (i.e. ``dt`` is a first-class
+        # source arg rather than a baked model parameter).  Cell centres are
+        # captured once here.  ``source_explicit`` is NOT in this cut's scope and
+        # keeps its ``(Q, Qaux, p)`` signature (padded coordinate args).
         source_needs_dt = getattr(model, "source_needs_dt", False)
+        cell_centers = getattr(mesh, "cell_centers", None)
 
-        def compute_source(dt, Q, Qaux, parameters, dQ):
+        def compute_source(dt, time, Q, Qaux, parameters, dQ):
             if source_needs_dt:
-                dQ = model.source(Q[:, :], Qaux[:, :], parameters, dt)
+                dQ = model.source(Q[:, :], Qaux[:, :], parameters,
+                                  time, dt, cell_centers)
             else:
-                dQ = model.source(Q[:, :], Qaux[:, :], parameters)
+                dQ = model.source(Q[:, :], Qaux[:, :], parameters,
+                                  time, cell_centers)
             if has_explicit:
                 dQ = dQ + model.source_explicit(Q[:, :], Qaux[:, :], parameters)
             return dQ
@@ -1171,7 +1197,7 @@ class HyperbolicSolver(Solver):
             only; the source is slope-free so it is unaffected."""
             dQ_f = flux(dt, t, Q_in, Qaux, parameters, np.zeros_like(Q_in),
                         force_o1)
-            dQ_s = source(dt, Q_in, Qaux, parameters, np.zeros_like(Q_in))
+            dQ_s = source(dt, t, Q_in, Qaux, parameters, np.zeros_like(Q_in))
             return dQ_f + dQ_s
 
         if self.nsm.reconstruction.order >= 2:

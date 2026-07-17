@@ -859,18 +859,21 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         # KP-desingularized ``hinv`` every velocity ``u = q·hinv`` depends on —
         # is filled by the lowered ``update_aux_variables`` leg, not by the LSQ
         # walk.  Without this each pool's ``hinv`` sits at 0 and every velocity
-        # collapses to 0.  ``dt`` is not load-bearing for ``hinv`` (nor the
-        # identity-passthrough rows), so 0.0 is fine here.
+        # collapses to 0.  REQ-185: ``update_aux_variables`` is now lowered as
+        # ``(Q, Qaux, p, t, x)``; thread the current time + cell centres (a
+        # dt/space-independent aux like ``hinv`` ignores them, bit-identical).
+        _t = getattr(self, "_sim_time", 0.0)
+        _cc = getattr(mesh, "cell_centers", None)
         self._apply_local_aux_formula(
-            self._sim_model, self._sim_Qaux, Q, self._sim_parameters, 0.0)
+            self._sim_model, self._sim_Qaux, Q, self._sim_parameters, _t, _cc)
         if getattr(self, "_params_press_base", None) is not None:
             self._apply_local_aux_formula(
                 self.rt_press, self.Qaux_press, Q,
-                self._params_press_base, 0.0)
+                self._params_press_base, _t, _cc)
         if getattr(self, "_params_corr_base", None) is not None:
             self._apply_local_aux_formula(
                 self.rt_corr, self.Qaux_corr, Q,
-                self._params_corr_base, 0.0)
+                self._params_corr_base, _t, _cc)
 
     def set_function_aux(self, name, values):
         """Set a function-aux row (e.g. static topography ``b``) on

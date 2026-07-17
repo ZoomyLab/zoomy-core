@@ -157,9 +157,23 @@ class NumpyRuntimeModel:
             compiled = sp.lambdify(args, expr, modules=modules)
 
         fast_flatten = self._compile_flattener(function_obj.args)
+        # REQ-185: ``source`` / ``update_aux_variables`` carry trailing
+        # coordinate/time groups (time, [dt], position).  A caller with no
+        # coordinate context (autonomous evaluation — e.g. the DAE/IMEX solvers
+        # or a Newton residual) may omit them; the missing trailing groups
+        # default to the coordinate origin (t=0, x=y=z=0), which is EXACT for
+        # operators that do not reference them.  ``0.0`` flattens onto every
+        # leaf of a missing group (the scalar time, or the three position
+        # components) via ``fast_flatten``.
+        sig_vals = (function_obj.args.values()
+                    if hasattr(function_obj.args, "values")
+                    else function_obj.args)
+        n_groups = len(list(sig_vals))
 
         def runtime_callable(*runtime_args):
             """Runtime callable."""
+            if len(runtime_args) < n_groups:
+                runtime_args = runtime_args + (0.0,) * (n_groups - len(runtime_args))
             return compiled(*fast_flatten(runtime_args))
 
         return runtime_callable
@@ -520,6 +534,19 @@ class NumpyRuntimeModel:
         Qaux_struct = sm.aux_variables   # Zstruct of aux Symbols
         p_struct = sm.parameters         # Zstruct of parameter Symbols
         n_struct = sm.normal             # Zstruct of normal Symbols
+        # REQ-185: time + position are first-class trailing arguments of the
+        # ``source`` and ``update_aux_variables`` operators (t → the ``time``
+        # scalar; x/y/z → the ``position`` components), mirroring the BC kernel
+        # signature ``(…, time, position, …)``.  ``sm.time`` is always defined;
+        # ``sm.position`` may be absent on a bare SystemModel, so fall back to
+        # the canonical (space[0], y, z) symbols exactly like
+        # ``attach_boundary_conditions``.
+        time_sym = sm.time
+        pos_struct = sm.position
+        if pos_struct is None:
+            pos_struct = Zstruct(X0=sm.space[0],
+                                 X1=sp.Symbol("y", real=True),
+                                 X2=sp.Symbol("z", real=True))
 
         std_sig = Zstruct(variables=Q_struct, aux_variables=Qaux_struct,
                           parameters=p_struct)
@@ -554,24 +581,25 @@ class NumpyRuntimeModel:
 
         _register("flux", sm.flux, std_sig)
         _register("hydrostatic_pressure", sm.hydrostatic_pressure, std_sig)
-        # ``source`` is normally a function of (Q, Qaux, p) only.  The NSM
-        # point-implicit treatment (``source_treatment="linearized"``) rewrites
-        # it into ``(I − dt·J)⁻¹ S``, so the lowered source then carries the
-        # canonical ``dt`` and is registered with the dt-bearing signature —
-        # exactly how the Chorin corrector threads ``dt`` through
-        # ``update_variables``.  ``source_needs_dt`` tells the solver to pass
-        # ``dt`` at call time; for the default explicit source it stays False
-        # and the call signature is unchanged.
+        # REQ-185: the ``source`` operator signature is
+        # ``(Q, Qaux, p, t, [dt], x, y, z)`` — time + position are always
+        # bound, and ``dt`` (reusing the Chorin ``DT_SYMBOL``) is a first-class
+        # source argument UNLESS ``dt`` is already a model parameter (Chorin/VAM
+        # split bakes it into ``p``), which would duplicate the lambdify arg.
+        # Autonomous sources ignore the extra args (bit-identical); a source
+        # referencing t / dt / x binds them here.  ``source_needs_dt`` tells the
+        # solver to pass ``dt`` explicitly at call time.
         _src = _column_to_rank1(sm.source)
-        dt_in_src = _src is not None and DT_SYMBOL in _src.free_symbols
-        # A Chorin/VAM source threads ``dt`` through its PARAMETERS already; only
-        # the NSM linearized source introduces ``dt`` as a non-parameter symbol.
-        # Add the explicit ``dt`` signature field ONLY in the latter case, else the
-        # parameter ``dt`` collides with it (duplicate lambdify argument).
         dt_in_params = bool(getattr(p_struct, "contains", lambda *_: False)("dt"))
-        src_needs_dt = dt_in_src and not dt_in_params
-        _register("source", _src, upd_sig if src_needs_dt else std_sig)
-        rt.source_needs_dt = bool(src_needs_dt)
+        src_has_dt = not dt_in_params
+        _src_fields = dict(variables=Q_struct, aux_variables=Qaux_struct,
+                           parameters=p_struct, time=time_sym)
+        if src_has_dt:
+            _src_fields["dt"] = DT_SYMBOL
+        _src_fields["position"] = pos_struct
+        src_sig = Zstruct(**_src_fields)
+        _register("source", _src, src_sig)
+        rt.source_needs_dt = bool(src_has_dt)
         _register("source_explicit",
                   _column_to_rank1(sm.source_explicit), std_sig)
         _register("mass_matrix", sm.mass_matrix, std_sig)
@@ -595,12 +623,17 @@ class NumpyRuntimeModel:
         _upd_sig = std_sig if dt_in_params else upd_sig
         _register("update_variables",
                   _column_to_rank1(sm.update_variables), _upd_sig)
-        # Per-cell aux formula (e.g. KP hinv), lowered exactly like
-        # ``update_variables`` with the trailing ``dt`` scalar; the solver
-        # applies it to Qaux each step.
+        # REQ-185: the per-cell aux formula ``update_aux_variables`` signature is
+        # ``(Q, Qaux, p, t, x, y, z)`` — time + position, NO dt (algebraic aux
+        # closures are dt-independent; a rain-rate aux
+        # ``r_o = Piecewise((rate, t<T_rain),(0,True))`` binds t, a manufactured
+        # ``S(x)`` binds position).  State-dependent aux (e.g. KP ``hinv``)
+        # ignores the coordinate args (bit-identical).
+        uav_sig = Zstruct(variables=Q_struct, aux_variables=Qaux_struct,
+                          parameters=p_struct, time=time_sym, position=pos_struct)
         _register("update_aux_variables",
                   _column_to_rank1(getattr(sm, "update_aux_variables", None)),
-                  _upd_sig)
+                  uav_sig)
         _register("eigenvalues", _column_to_rank1(sm.eigenvalues), eig_sig)
 
         # NDimArray operators (NCP, quasilinear) — per-axis slab as a

@@ -986,14 +986,24 @@ class GenericCppModel(GenericCppBase):
         # (uniform across backends).  Map the canonical time-step symbol to the
         # bare identifier so it prints as a scalar, not an array accessor.
         smap[sp.Symbol("dt", positive=True)] = "dt"
+        # REQ-185: the ``source`` / ``update_aux_variables`` kernels take the
+        # current time ``t`` (scalar) and the position VECTOR ``X`` (length 3,
+        # x→X[0], y→X[1], z→X[2]) — same binding the BC kernel already uses.
+        smap[sm.time] = self.ARG_MAPPING.get("time", "time")
+        pos = getattr(sm, "position", None)
+        if pos is not None:
+            for i, s in enumerate(pos.values()):
+                smap[s] = self.format_accessor(
+                    self.ARG_MAPPING.get("position", "X"), i)
         return smap
 
     def _sm_arg_decl(self, key):
         """C++ declaration for one operator-kernel argument (pointer
         form: ``const T* Q``; ``dt`` is the one scalar argument).  Backends
         with a different calling convention override this."""
-        if key == "dt":
-            return f"const {self.real_type} dt"
+        if key in ("dt", "time"):
+            # REQ-185: ``time`` (like ``dt``) is a scalar by-value argument.
+            return f"const {self.real_type} {key}"
         if key == "column":
             # the resolved interface column ``column[N_z][n_fields]`` the
             # depth→moment projection reduces (2-D sampled profile).
@@ -1104,8 +1114,13 @@ class GenericCppModel(GenericCppBase):
                 "eigenvalues", eig_expr, (n_eq, 1), ["Q", "Qaux", "p", "n"]
             )
         )
+        # REQ-185: source signature gains the time scalar ``time``, the
+        # time-step scalar ``dt``, and the position VECTOR ``X`` (length 3) —
+        # ``source(Q, Qaux, p, time, dt, X)``.  Bodies bind only what they
+        # reference (an autonomous source ignores them).
         blocks.append(
-            self._sm_kernel("source", sm.source, (n_eq, 1), ["Q", "Qaux", "p"])
+            self._sm_kernel("source", sm.source, (n_eq, 1),
+                            ["Q", "Qaux", "p", "time", "dt", "X"])
         )
         if self._detect_has_diffusion():
             blocks += self._sm_per_direction(
@@ -1292,9 +1307,13 @@ class GenericCppModel(GenericCppBase):
             rows[k] != sm.aux_state[k] for k in range(n_aux)
         )
         if has_pointwise_closure:
+            # REQ-185: the per-cell algebraic aux closure is lowered as
+            # ``update_aux_variables(Q, Qaux, p, time, X)`` — time scalar +
+            # position VECTOR ``X`` (length 3), NO dt (aux closures are
+            # dt-independent; a rain-rate aux binds ``time``).
             blocks.append(self._sm_kernel(
                 "update_aux_variables", sp.Array(rows), (n_aux,),
-                ["Q", "Qaux", "p", "dt"],
+                ["Q", "Qaux", "p", "time", "X"],
             ))
             # Jacobian — pointwise (algebraic) leg only; the non-local
             # derivative leg carries no per-cell local Jacobian (foam emits
@@ -1302,7 +1321,7 @@ class GenericCppModel(GenericCppBase):
             jac = sp.derive_by_array(sp.Array(rows), list(sm.state))
             blocks.append(self._sm_kernel(
                 "update_aux_variables_jacobian_wrt_variables",
-                jac, (n_aux, n_state), ["Q", "Qaux", "p", "dt"],
+                jac, (n_aux, n_state), ["Q", "Qaux", "p", "time", "X"],
             ))
 
         # FIELD-LEVEL, mesh-aware derivative refresh (REQ-65) — mirrors foam.

@@ -217,6 +217,18 @@ class FoamSystemModelPrinter(GenericCppBase):
         sig = ",\n    ".join(_FOAM_ARG[a] for a in args)
         return self.wrap_function_signature(name, sig, body, shape)
 
+    def _coord_symbol_map(self):
+        """REQ-185: bind the time scalar ``t`` → ``time`` and the position
+        VECTOR components ``x/y/z`` → ``X.x()/X.y()/X.z()`` for the ``source``
+        kernel (same convention the BC kernel uses).  Scoped-pushed only around
+        that kernel so it never shadows the ``interpolate_to_3d`` z-mapping."""
+        cmap = {self.sm.time: "time"}
+        pos = getattr(self.sm, "position", None)
+        if pos is not None:
+            for i, s in enumerate(pos.values()):
+                cmap[s] = self.format_accessor("X", i)
+        return cmap
+
     def _slice(self, tensor, axis_idx, out_shape):
         """``tensor[..., axis_idx]`` reshaped to ``out_shape``.  If
         ``out_shape`` has a trailing ``1`` padding (the ``flux_x`` column
@@ -332,9 +344,19 @@ class FoamSystemModelPrinter(GenericCppBase):
             )
         )
 
-        blocks.append(
-            self._kernel("source", sm.source, (n_eq, 1), ["Q", "Qaux", "p"])
-        )
+        # REQ-185: source gains the time scalar ``time``, the time-step scalar
+        # ``dt``, and the position VECTOR ``X`` — ``source(Q, Qaux, p, time,
+        # dt, X)``.  Bodies bind only what they reference.  The coordinate map
+        # (t→time, x/y/z→X.x()/…) is scoped-pushed at highest precedence only
+        # here, so it never shadows ``interpolate_to_3d``'s z-mapping.
+        self.symbol_maps.insert(0, self._coord_symbol_map())
+        try:
+            blocks.append(
+                self._kernel("source", sm.source, (n_eq, 1),
+                             ["Q", "Qaux", "p", "time", "dt", "X"])
+            )
+        finally:
+            self.symbol_maps.pop(0)
 
         # REQ-40 (a): the mass matrix ``M(Q, Qaux, p)`` — the predictor
         # sub-system carries the non-trivial ``μ_k·h`` diagonal the driver
@@ -424,6 +446,21 @@ class FoamSystemModelPrinter(GenericCppBase):
                 {s: f"*Qaux[{i}]" for i, s in enumerate(aux_syms)},
                 {s: f"p[{i}]" for i, s in enumerate(param_syms)},
             ]
+            # REQ-185: a time/space-dependent aux (rain rate ``r_o =
+            # Piecewise((rate, t<T),(0,True))``, a manufactured ``S(x)``) binds
+            # ``t`` and the position components ``x/y/z``.  The field-level
+            # refresh has the OpenFOAM ``mesh`` in scope, so ``t`` lowers to the
+            # runtime time ``mesh.time().value()`` and ``x/y/z`` to the cell-
+            # centre field components ``mesh.C().component(i)`` (field algebra) —
+            # NOT a compile error.
+            coord_map = {sm.time: "mesh.time().value()"}
+            allowed.add(sm.time)
+            pos = getattr(sm, "position", None)
+            if pos is not None:
+                for i, s in enumerate(pos.values()):
+                    coord_map[s] = f"mesh.C().component({i})"
+                    allowed.add(s)
+            deref.append(coord_map)
             saved_maps = self.symbol_maps
             try:
                 self.symbol_maps = deref
