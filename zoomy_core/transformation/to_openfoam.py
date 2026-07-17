@@ -363,6 +363,7 @@ class FoamSystemModelPrinter(GenericCppBase):
             "inline void update_aux_variables(",
             "    const Foam::List<Foam::volScalarField*>& Q,",
             "    const Foam::List<Foam::volScalarField*>& Qaux,",
+            "    const Foam::List<Foam::scalar>& p,",
             "    const Foam::scalar dt,",
             "    const Foam::fvMesh& mesh)",
             "{",
@@ -386,18 +387,19 @@ class FoamSystemModelPrinter(GenericCppBase):
             deriv_rows = {e["row"] for e in sm.aux_registry
                           if e["kind"] in ("derivative", "limited_derivative")}
             state_syms, aux_syms = list(sm.state), list(sm.aux_state)
-            allowed = set(state_syms) | set(aux_syms)
-            # REQ-183: bake this model instance's parameter VALUES into the
-            # closure before lowering — the field-level refresh structurally
-            # has no parameter vector ``p`` (unlike the per-cell numpy/jax
-            # leg), so a parameterized aux (e.g. the KP ``hinv``'s
-            # ``wet_dry_eps``) must emit with its resolved literals.
-            psubs = {sm.parameters[k]:
-                     sp.Float(getattr(sm.parameter_values, k, 0.0))
-                     for k in sm.parameters.keys()}
+            param_syms = self._parameter_symbols()
+            allowed = set(state_syms) | set(aux_syms) | set(param_syms)
+            # REQ-183 (corrected): parameters are a RUNTIME INPUT to every
+            # operator — the printer contract (``p`` is always in the interface).
+            # The field-level refresh is no exception: it now takes ``p`` and each
+            # parameter symbol lowers to its ``p[idx]`` slot, so a parameterized
+            # aux (the KP ``hinv``'s ``wet_dry_eps``, Manning ``n_m`` …) resolves
+            # at runtime and can be varied — NOT baked as literals.  Same p-index
+            # order as the per-cell operators (``register_map("p", ...)``).
             deref = [
                 {s: f"*Q[{i}]" for i, s in enumerate(state_syms)},
                 {s: f"*Qaux[{i}]" for i, s in enumerate(aux_syms)},
+                {s: f"p[{i}]" for i, s in enumerate(param_syms)},
             ]
             saved_maps = self.symbol_maps
             try:
@@ -405,7 +407,7 @@ class FoamSystemModelPrinter(GenericCppBase):
                 for row in range(len(aux_syms)):
                     if row in deriv_rows or row >= len(rows):
                         continue
-                    expr = sp.sympify(rows[row]).subs(psubs)
+                    expr = sp.sympify(rows[row])
                     if expr == aux_syms[row]:
                         continue                       # identity passthrough
                     unknown = expr.free_symbols - allowed
