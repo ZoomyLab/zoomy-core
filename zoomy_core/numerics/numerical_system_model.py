@@ -369,9 +369,13 @@ class NumericalSystemModel(SystemModel):
         :meth:`derive`, before :attr:`extra_operations`.
 
         Shallow-water transport systems (state carrying a depth ``h``) get the
-        wet/dry-safe defaults — the KP ``1/h`` desingularization plus the dry
-        eigenvalue gate — so every depth-based FVM run is positivity-robust at
-        the wet/dry front without a per-case opt-in.  The list is gated on:
+        KP ``1/h`` desingularization so every depth-based FVM run divides by a
+        desingularized inverse depth without a per-case opt-in.  The dry
+        eigenvalue gate / power guard are NOT defaults (REQ-181, "we do not make
+        this eigenvalues guard a default"): opt in per case via
+        ``extra_operations=[gate_eigenvalues_dry()]`` (or
+        ``guard_eigenvalue_powers()`` for the always-safe half alone).  The list
+        is gated on:
 
         * :meth:`_is_transport_system` — the Chorin pressure/corrector
           sub-systems share the same ``h``-bearing state but are NOT transport
@@ -385,9 +389,8 @@ class NumericalSystemModel(SystemModel):
             return []
         if not any(str(s) == "h" for s in self.state):
             return []
-        from zoomy_core.systemmodel.operations import (
-            desingularize_hinv, gate_eigenvalues_dry)
-        return [desingularize_hinv(), gate_eigenvalues_dry()]
+        from zoomy_core.systemmodel.operations import desingularize_hinv
+        return [desingularize_hinv()]
 
     def derive(self) -> "NumericalSystemModel":
         """Run the operation pipeline on this NSM in place and return ``self``.

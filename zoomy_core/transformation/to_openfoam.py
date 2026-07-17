@@ -16,6 +16,29 @@ from zoomy_core.numerics.numerical_system_model import to_numerical_system_model
 from zoomy_core.transformation.generic_c import GenericCppBase, GenericCppModel
 
 
+def _promote_with_dry_gate(obj):
+    """Coerce ``obj`` to an NSM, opting the depth eigenvalue gate back in.
+
+    REQ-181 dropped ``gate_eigenvalues_dry`` from the depth
+    :meth:`NumericalSystemModel.default_operations` ("we do not make this
+    eigenvalues guard a default").  The foam pipeline hands the printer a raw
+    :class:`SystemModel` (``SystemModel.from_model(model)``), so this coercion
+    is where foam used to receive the gate via the default.  Re-apply it here —
+    under the SAME predicate the default used (transport system carrying a depth
+    ``h``) — so foam's generated eigenvalue code stays byte-identical.
+
+    An already-built NSM is returned unchanged: its builder already chose its
+    operations (and re-gating would double-wrap the ``conditional``)."""
+    from zoomy_core.numerics.numerical_system_model import NumericalSystemModel
+    from zoomy_core.systemmodel.operations import gate_eigenvalues_dry
+    if isinstance(obj, NumericalSystemModel):
+        return obj
+    nsm = to_numerical_system_model(obj)
+    if nsm._is_transport_system() and any(str(s) == "h" for s in nsm.state):
+        nsm.apply(gate_eigenvalues_dry())   # no-op when eigenvalues is None
+    return nsm
+
+
 # ── Legacy printer (unchanged) ───────────────────────────────────────────
 
 
@@ -107,7 +130,7 @@ class FoamSystemModelPrinter(GenericCppBase):
     def __init__(self, sm, **opts):
         super().__init__()
         # Normalise the entry: accept a Model, a SystemModel, or an NSM.
-        self.sm = sm = to_numerical_system_model(sm)
+        self.sm = sm = _promote_with_dry_gate(sm)
         # Apply printer options first so ``dt_symbol`` is in effect before the
         # parameter symbol map (which may append it) is built.
         for k, v in opts.items():
@@ -730,7 +753,7 @@ class FoamNumericsPrinter(GenericCppBase):
         self.numerics = numerics
         # Normalise the contained model to an NSM (numerics.model is a
         # SystemModel; promote it so the printer always operates on an NSM).
-        sm = to_numerical_system_model(numerics.model)
+        sm = _promote_with_dry_gate(numerics.model)
         self.sm = sm
         # State / aux / parameter / normal symbol maps.
         self.register_map("Q", list(sm.state))

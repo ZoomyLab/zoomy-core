@@ -43,6 +43,7 @@ from zoomy_core.model.boundary_conditions import BoundaryConditions, FromModel
 import zoomy_core.fvm.timestepping as timestepping
 from zoomy_core.fvm.solver_numpy import FreeSurfaceFlowSolver
 from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
+from zoomy_core.systemmodel.operations import gate_eigenvalues_dry
 
 
 # ── setup helper ─────────────────────────────────────────────────────────
@@ -70,7 +71,11 @@ def _make_solver(positivity, nx=8, cfl=0.45, t_end=0.1, ic="slab", H=1.0):
     sm.aux_initial_conditions = Constant(constants=lambda n: np.zeros(n))
     mesh = BaseMesh.create_2d(domain=(0.0, 1.0, 0.0, 1.0), nx=nx, ny=nx)
     nsm = NumericalSystemModel.from_system_model(
-        sm, reconstruction=ReconstructionSpec(order=2, positivity=positivity))
+        sm, reconstruction=ReconstructionSpec(order=2, positivity=positivity),
+        # REQ-181: the dry eigenvalue gate is no longer an NSM default; this
+        # wet/dry dam break opts in explicitly (byte-identical to the old
+        # default) so the recorded dry-front h_min values still hold.
+        extra_operations=[gate_eigenvalues_dry()])
     solver = FreeSurfaceFlowSolver(
         time_end=t_end, compute_dt=timestepping.adaptive(CFL=cfl))
     solver.setup_simulation(mesh, nsm, write_output=False)

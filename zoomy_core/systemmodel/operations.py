@@ -26,6 +26,7 @@ __all__ = [
     "kp_hinv",
     "desingularize_hinv",
     "desingularize_positivity",
+    "guard_eigenvalue_powers",
     "gate_eigenvalues_dry",
 ]
 
@@ -432,57 +433,124 @@ def desingularize_positivity(floor):
     return _op
 
 
-# ── gate_eigenvalues_dry ───────────────────────────────────────────────────
+# ── eigenvalue power guard + dry gate ───────────────────────────────────────
+#
+# Two composable ops (REQ-181, "operations, not options" — neither a default):
+#
+# * ``guard_eigenvalue_powers()`` — A, the ALWAYS-SAFE half: wrap every
+#   fractional power of ``h`` in ``Max(., 0)`` so the wet-branch expression
+#   stays real at a transient ``h < 0``.  A no-op for physical ``h >= 0``.
+# * ``gate_eigenvalues_dry()`` — B, the dry zeroing: wrap each eigenvalue in
+#   ``conditional(h > eps, e, 0)``.  Because a backend ``conditional`` lowered
+#   branchless (``mask*a + (1-mask)*b``) computes BOTH arms and ``NaN*0 = NaN``
+#   would leak a ``sqrt(negative)`` past the gate (REQ-74), the dry gate MUST
+#   carry the power guard — so ``gate_eigenvalues_dry`` applies A internally
+#   before the ``conditional``.  It therefore reproduces the pre-split combined
+#   op BYTE-FOR-BYTE as a single op, and the explicit composition
+#   ``[guard_eigenvalue_powers(), gate_eigenvalues_dry()]`` reproduces it too
+#   (the guard is idempotent — ``Max(., 0)`` is never re-wrapped).
+
+
+def _guard_frac_pow_of_h(h):
+    """Predicate for ``expr.replace``: a fractional power of ``h`` whose base
+    can go negative and is NOT already floored by ``Max(., 0)``.
+
+    The ``Max(., 0)`` exclusion makes the guard idempotent, so applying it
+    twice (``[guard, gate]``) equals applying it once (``gate`` alone)."""
+    def _q(x):
+        return (isinstance(x, sp.Pow) and x.exp.is_number
+                and not x.exp.is_integer and x.base.has(h)
+                and not (isinstance(x.base, sp.Max)
+                         and sp.S.Zero in x.base.args))
+    return _q
+
+
+def _guard_eigenvalue_expr(e, h):
+    """Return ``e`` with every fractional power of ``h`` (e.g. ``sqrt(h**5)``
+    from the desingularized wave speed) wrapped in ``Max(., 0)``.  Idempotent;
+    a no-op for the physical ``h >= 0`` case, so wet wave speeds are unchanged."""
+    return sp.sympify(e).replace(
+        _guard_frac_pow_of_h(h),
+        lambda x: sp.Pow(sp.Max(x.base, sp.S.Zero), x.exp))
+
+
+def _flat_eigenvalues(sm, what):
+    """Return ``(ev, [scalar entries])`` for ``sm.eigenvalues`` or ``(None,
+    None)`` when the model emits numerical wave speeds.
+
+    ``sp.flatten`` yields SCALARS for both the ZArray and the sympy-Matrix forms
+    ``sm.eigenvalues`` can take (the WB/audusse path stores a Matrix).  Operating
+    on scalars is essential: a ``(n, 1)`` column iterates row-wise into 1-element
+    sub-arrays, which the numpy backend would lower to inhomogeneous-rank
+    branches (``[0]`` shape ``(1,)`` vs ``[e(h)]`` shape ``(1, n)``) and raise."""
+    ev = getattr(sm, "eigenvalues", None)
+    if ev is None:
+        return None, None
+    h = _depth_state(sm, what)
+    return ev, [sp.sympify(e) for e in sp.flatten(ev)]
+
+
+def guard_eigenvalue_powers():
+    """Operation: guard every fractional power of the depth ``h`` in
+    ``sm.eigenvalues`` with ``Max(., 0)`` — the ALWAYS-SAFE half of the wet/dry
+    eigenvalue treatment, with NO dry zeroing.
+
+    ``sqrt(h**5)``/``h**(5/2)`` → ``sqrt(Max(h**5, 0))``/``Max(h, 0)**(5/2)`` so
+    the wave-speed expression stays real at a transient ``h < 0`` (roundoff at
+    the wet/dry front).  ``Max(., 0)`` is a no-op for the physical ``h >= 0``
+    case, so wet wave speeds are unchanged, and the op is idempotent.
+
+    ``h`` is the state named ``"h"``.  No-op when ``sm.eigenvalues is None`` (the
+    model emits numerical wave speeds, gated by the solver instead).
+
+    This is A of the (A, B) split (REQ-181); B is
+    :func:`gate_eigenvalues_dry`.  Neither is an NSM default — opt in via
+    ``extra_operations``."""
+    def _op(sm):
+        ev, flat = _flat_eigenvalues(sm, "guard_eigenvalue_powers")
+        if ev is None:
+            return
+        h = _depth_state(sm, "guard_eigenvalue_powers")
+        guarded = [_guard_eigenvalue_expr(e, h) for e in flat]
+        sm.eigenvalues = ZArray(guarded).reshape(*ev.shape)
+
+    _op.name = "guard_eigenvalue_powers"
+    _op.description = "guard fractional powers of h in eigenvalues with Max(.,0)"
+    return _op
+
 
 def gate_eigenvalues_dry(eps=None):
     """Operation: gate the symbolic eigenvalues to 0 in dry cells (``h < eps``).
 
     Wraps every entry ``e`` of ``sm.eigenvalues`` in ``conditional(h > eps, e,
-    0)`` so the wave speeds (and the Rusanov dissipation built from them)
-    vanish at dry cells — the reusable core form of the Malpasset SME
-    ``ev_gate``.  ``h`` is the state named ``"h"``; ``eps`` defaults to the
-    model's ``wet_dry_eps`` parameter when present, else
-    :data:`_DEFAULT_WET_DRY_EPS` (pass ``eps=`` to override).
+    0)`` so the wave speeds (and the Rusanov dissipation built from them) vanish
+    at dry cells — the reusable core form of the Malpasset SME ``ev_gate``.
+    ``h`` is the state named ``"h"``; ``eps`` defaults to the model's
+    ``wet_dry_eps`` parameter when present, else :data:`_DEFAULT_WET_DRY_EPS`
+    (pass ``eps=`` to override).
 
-    Also guards every fractional power of ``h`` (e.g. ``sqrt(h**5)`` from the
-    desingularized wave speed) with ``Max(., 0)`` so the wet-branch expression
-    stays finite at a transient ``h < 0`` (roundoff at the wet/dry front).  This
-    matters because a backend ``conditional`` lowered branchless
-    (``mask*a + (1-mask)*b``) computes BOTH arms, and ``NaN*0 = NaN`` would leak
-    a ``sqrt(negative)`` past the ``h > eps`` gate (REQ-74).  ``Max(.,0)`` is a
-    no-op for the physical ``h >= 0`` case, so wet wave speeds are unchanged.
+    The dry gate MUST carry the power guard (:func:`guard_eigenvalue_powers`):
+    a backend ``conditional`` lowered branchless (``mask*a + (1-mask)*b``)
+    computes BOTH arms, and ``NaN*0 = NaN`` would leak a ``sqrt(negative)`` past
+    the ``h > eps`` gate (REQ-74).  So this op applies the guard to each wet
+    branch before the ``conditional`` — reproducing the pre-split combined op
+    byte-for-byte as a single op.  The guard is idempotent, so the explicit
+    composition ``[guard_eigenvalue_powers(), gate_eigenvalues_dry()]``
+    reproduces it too.
 
-    No-op when ``sm.eigenvalues is None`` (the model emits numerical wave
-    speeds, gated by the solver instead)."""
+    This is B of the (A, B) split (REQ-181); A is
+    :func:`guard_eigenvalue_powers`.  Neither is an NSM default — opt in via
+    ``extra_operations``.  No-op when ``sm.eigenvalues is None`` (the model
+    emits numerical wave speeds, gated by the solver instead)."""
     def _op(sm):
-        ev = sm.eigenvalues
+        ev, flat = _flat_eigenvalues(sm, "gate_eigenvalues_dry")
         if ev is None:
             return
         h = _depth_state(sm, "gate_eigenvalues_dry")
         e_eps = _wet_dry_eps(sm, eps)
         cond = sp.Function("conditional")
-
-        def _is_frac_pow_of_h(x):
-            # sqrt(h**5), h**(5/2), ... — fractional power whose base can go
-            # negative because it carries the depth ``h``.
-            return (isinstance(x, sp.Pow) and x.exp.is_number
-                    and not x.exp.is_integer and x.base.has(h))
-
-        def _guard(e):
-            return sp.sympify(e).replace(
-                _is_frac_pow_of_h,
-                lambda x: sp.Pow(sp.Max(x.base, sp.S.Zero), x.exp))
-
-        # Gate SCALAR entries. A ``(n, 1)`` eigenvalue column iterates
-        # row-wise into 1-element sub-arrays, which would lower each gated
-        # entry to ``conditional(cond, array([e]), 0)`` — the constant
-        # (``[0]`` → shape ``(1,)``) vs array-valued (``[e(h)]`` → shape
-        # ``(1, n)``) branches then broadcast to DIFFERENT ranks in the numpy
-        # backend, so ``np.array([...])`` over the entries is inhomogeneous
-        # and raises.  ``sp.flatten`` yields scalars for both the ZArray and
-        # the sympy-Matrix forms ``sm.eigenvalues`` can take (the WB/audusse
-        # path stores a Matrix); gate each, then restore the shape.
-        gated = [cond(h > e_eps, _guard(e), sp.S.Zero) for e in sp.flatten(ev)]
+        gated = [cond(h > e_eps, _guard_eigenvalue_expr(e, h), sp.S.Zero)
+                 for e in flat]
         sm.eigenvalues = ZArray(gated).reshape(*ev.shape)
 
     _op.name = "gate_eigenvalues_dry"
