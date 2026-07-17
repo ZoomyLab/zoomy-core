@@ -34,6 +34,58 @@ import sympy as sp
 from zoomy_core.misc.misc import Zstruct, ZArray
 
 
+# ── SINGLE SOURCE OF TRUTH: operator argument signatures ─────────────────────
+# Each operator kernel (``flux`` / ``source`` / ``update_aux_variables`` / …) is
+# CARRIED on a frozen SystemModel as a :class:`zoomy_core.model.basefunction.
+# Function` whose ``args`` declare its ordered argument groups ONCE — here.
+# Every backend printer/runtime reads ``function.args`` (via :meth:`SystemModel.
+# operator`) and only translates SYNTAX (how a signature/call is spelled in
+# C / python / UFL); no printer re-declares or routes arguments.  This is the
+# same representation the boundary-condition kernel already used end-to-end.
+#
+# Slot tokens are the numpy-runtime Zstruct field names (== the C-family
+# ``GenericCppBase.ARG_MAPPING`` group keys), so both families derive from the
+# same declaration:
+#   variables      Q      the state vector
+#   aux_variables  Qaux   the auxiliary vector
+#   parameters     p      the parameter vector
+#   normal         n      the interface normal
+#   time           time   scalar simulation time ``t``
+#   dt             dt     scalar time step
+#   position       X      the length-3 cell/face position vector ``x``
+#
+# ``dt`` is declared on ``source`` / ``update_variables``.  The C-family emits
+# it as a distinct by-value scalar arg unconditionally; the numpy/jax path DROPS
+# it when a split sub-system baked ``dt`` in as a model PARAMETER (the dt symbol
+# would then be a duplicate lambdify argument) — a lowering-SYNTAX constraint,
+# not a signature difference (handled in ``NumpyRuntimeModel``).
+_V, _A, _P, _N, _T, _DT, _X = (
+    "variables", "aux_variables", "parameters",
+    "normal", "time", "dt", "position")
+
+OPERATOR_ARG_SLOTS = {
+    "flux": (_V, _A, _P),
+    "hydrostatic_pressure": (_V, _A, _P),
+    "nonconservative_matrix": (_V, _A, _P),
+    "quasilinear_matrix": (_V, _A, _P),
+    "diffusion_matrix": (_V, _A, _P),
+    "diffusion_matrix_explicit": (_V, _A, _P),
+    "mass_matrix": (_V, _A, _P),
+    "source_explicit": (_V, _A, _P),
+    "source_jacobian_wrt_variables": (_V, _A, _P),
+    "source_jacobian_wrt_aux_variables": (_V, _A, _P),
+    "eigenvalues": (_V, _A, _P, _N),
+    "source": (_V, _A, _P, _T, _DT, _X),
+    "update_variables": (_V, _A, _P, _DT),
+    "update_aux_variables": (_V, _A, _P, _T, _X),
+    "update_aux_variables_jacobian_wrt_variables": (_V, _A, _P, _T, _X),
+}
+
+# The canonical time-step symbol (matches ``to_numpy.DT_SYMBOL`` and the
+# ``sp.Symbol("dt", positive=True)`` the C printers bind).
+_DT_SYMBOL = sp.Symbol("dt", positive=True)
+
+
 def _to_zarray(obj):
     """Coerce a sympy Matrix / NDimArray / list into ``ZArray``.
 
@@ -746,6 +798,43 @@ class SystemModel:
     def _parameter_symbols(self) -> Zstruct:
         """Alias of ``parameters`` (name → Symbol) for Model-API parity."""
         return self.parameters
+
+    # ── Operators carried as declared Functions (single signature source) ──
+
+    def _position_struct(self) -> Zstruct:
+        """The length-3 position group ``(x, y, z)``.  ``self.position`` is set
+        by the derivation / BC path; fall back to the canonical symbols exactly
+        like ``attach_boundary_conditions`` for a bare SystemModel."""
+        if self.position is not None:
+            return self.position
+        return Zstruct(X0=self.space[0],
+                       X1=sp.Symbol("y", real=True),
+                       X2=sp.Symbol("z", real=True))
+
+    def operator_signature(self, name: str) -> Zstruct:
+        """The declared ``args`` :class:`Zstruct` for operator ``name`` — the
+        SINGLE source every backend reads.  Groups are materialised from this
+        SystemModel's own symbols in the ``OPERATOR_ARG_SLOTS`` order."""
+        group = {
+            "variables": self.variables,
+            "aux_variables": self.aux_variables,
+            "parameters": self.parameters,
+            "normal": self.normal,
+            "time": self.time,
+            "dt": _DT_SYMBOL,
+            "position": self._position_struct(),
+        }
+        return Zstruct(**{s: group[s] for s in OPERATOR_ARG_SLOTS[name]})
+
+    def operator(self, name: str) -> "Any":
+        """The operator kernel CARRIED as a ``basefunction.Function``: ``args``
+        is the declared signature (:meth:`operator_signature`) and ``definition``
+        is the live operator array.  Backends read ``operator(name).args`` for
+        the signature and only translate syntax — they never route arguments."""
+        from zoomy_core.model.basefunction import Function
+        defn = getattr(self, name, None)
+        return Function(name=name, args=self.operator_signature(name),
+                        definition=defn if defn is not None else ZArray([0]))
 
     @property
     def eigenvalue_mode(self) -> str:

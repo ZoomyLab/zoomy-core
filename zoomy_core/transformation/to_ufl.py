@@ -2,7 +2,10 @@
 
 import sympy as sp
 import ufl
+from zoomy_core.misc.misc import Zstruct
+from zoomy_core.systemmodel.system_model import OPERATOR_ARG_SLOTS
 from zoomy_core.transformation.to_numpy import (
+    DT_SYMBOL,
     NumpyRuntimeModel,
     NumpyRuntimeSymbolic,
 )
@@ -184,17 +187,20 @@ class UFLRuntimeModel(NumpyRuntimeModel):
     def _lambdify_function(self, function_obj, modules):
         """Skip functions with zero-size output (e.g. Jacobian when n_aux=0).
 
-        Otherwise pre-substitute inline ``sp.Derivative`` atoms with
-        the :class:`_ZdGrad` placeholder Function so lambdify's default
-        printer can serialise the expression.  The UFL module dict
-        binds ``_ZdGrad`` to a resolver that chains ``ufl.grad`` to
-        produce the requested partial.
+        Otherwise re-derive slot-operator ``args`` from the declaration
+        registry (legacy raw-Model path only — see
+        :meth:`_with_declared_operator_args`), then pre-substitute inline
+        ``sp.Derivative`` atoms with the :class:`_ZdGrad` placeholder
+        Function so lambdify's default printer can serialise the
+        expression.  The UFL module dict binds ``_ZdGrad`` to a resolver
+        that chains ``ufl.grad`` to produce the requested partial.
         """
         expr = function_obj.definition
         if hasattr(expr, 'shape') and any(int(s) == 0 for s in expr.shape):
             import numpy as np
             shape = tuple(int(s) for s in expr.shape)
             return lambda *a, _s=shape: np.empty(_s)
+        function_obj = self._with_declared_operator_args(function_obj)
         # Replace every Derivative atom with its _ZdGrad image.  This
         # is structurally equivalent to ``SystemModel.expose_aux_atoms``
         # but stays at the Model-level lambdify path — needed because
@@ -203,6 +209,60 @@ class UFLRuntimeModel(NumpyRuntimeModel):
         # runs.
         function_obj = self._substitute_derivative_atoms(function_obj)
         return super()._lambdify_function(function_obj, modules)
+
+    def _with_declared_operator_args(self, function_obj):
+        """Re-derive a slot operator's ``args`` from ``OPERATOR_ARG_SLOTS``
+        (the declaration table behind ``sm.operator(name).args`` /
+        ``sm.operator_signature(name)``) on the LEGACY raw-Model path.
+
+        ``Model._initialize_functions`` still registers the pre-REQ-185
+        signatures (``source(Q, Qaux, p)``, ``update_aux_variables(Q, Qaux,
+        p, dt)``), so a Firedrake runtime built via ``UFLRuntimeModel(model)``
+        would emit them stale.  Materialising the declared groups from the
+        model's own symbols — exactly like ``SystemModel.operator_signature``
+        — makes the UFL emit gain the REQ-185 trailing groups:
+
+        * ``source(Q, Qaux, p, time, [dt], X)``
+        * ``update_aux_variables(Q, Qaux, p, time, X)`` (and its jacobian)
+
+        with everything else unchanged (the other declared slots carry the
+        same groups the legacy registry already binds).  Mirrors
+        ``NumpyRuntimeModel.from_system_model._op_sig``'s one
+        lowering-SYNTAX constraint: the ``dt`` group is dropped when ``dt``
+        is already a model parameter (duplicate lambdify argument —
+        Chorin/VAM split sub-systems).
+
+        The SystemModel/NSM path already receives the declared args from
+        ``from_system_model`` (which reads ``sm.operator_signature``), so it
+        passes through untouched — only a runtime whose ``model`` carries a
+        ``.functions`` registry (a legacy ``Model``) is rewritten.  Non-slot
+        registry functions (``residual``, ``eigensystem``, the BC kernels,
+        ``interpolate_to_3d``, …) keep their registered signatures.
+        """
+        model = getattr(self, "model", None)
+        if model is None or not hasattr(model, "functions"):
+            return function_obj
+        slots = OPERATOR_ARG_SLOTS.get(function_obj.name)
+        if slots is None:
+            return function_obj
+        if bool(getattr(model.parameters, "contains",
+                        lambda *_: False)("dt")):
+            slots = tuple(s for s in slots if s != "dt")
+        group = {
+            "variables": model.variables,
+            "aux_variables": model.aux_variables,
+            "parameters": model.parameters,
+            "normal": model.normal,
+            "time": model.time,
+            "dt": DT_SYMBOL,
+            "position": model.position,
+        }
+        from zoomy_core.model.basefunction import Function
+        return Function(
+            name=function_obj.name,
+            args=Zstruct(**{s: group[s] for s in slots}),
+            definition=function_obj.definition,
+        )
 
     def _lower_opaque_kernels(self, expr):
         """UFL keeps the opaque kernels in the ``eigensystem(idx, …)``

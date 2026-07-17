@@ -74,6 +74,7 @@ class GenericCppBase(CXX11CodePrinter):
         "aux_variables": "Qaux",
         "gradient_variables": "gradQ",
         "p": "p",
+        "parameters": "p",
         "normal": "n",
         "position": "X",
         "time": "time",
@@ -133,6 +134,15 @@ class GenericCppBase(CXX11CodePrinter):
         self.symbol_maps = []
         self._std_regex = re.compile(r"std::([A-Za-z_]\w*)")
         self._route_math_funcs_through_caster()
+
+    def _operator_arg_keys(self, name):
+        """Ordered C-family argument-key list for operator ``name`` — read off
+        the SystemModel's DECLARED ``Function.args`` (the single signature
+        source) and translated to this backend's argument spelling via
+        ``ARG_MAPPING``.  Pure syntax: the printer never routes or invents
+        arguments, it only spells the declared groups (``variables`` → ``Q``,
+        ``position`` → ``X`` …).  Shared by the dmplex/amrex/openfoam printers."""
+        return [self.ARG_MAPPING[k] for k in self.sm.operator(name).args.keys()]
 
     def _route_math_funcs_through_caster(self):
         """Re-point the sympy ``_print_<mathfunc>`` dispatchers (``log`` /
@@ -1090,19 +1100,19 @@ class GenericCppModel(GenericCppBase):
         n_eq, n_state = sm.n_equations, len(sm.state)
         blocks = []
         blocks += self._sm_per_direction(
-            "flux", sm.flux, (n_eq, 1), ["Q", "Qaux", "p"]
+            "flux", sm.flux, (n_eq, 1), self._operator_arg_keys("flux")
         )
         blocks += self._sm_per_direction(
             "nonconservative_matrix",
             sm.nonconservative_matrix,
             (n_eq, n_state),
-            ["Q", "Qaux", "p"],
+            self._operator_arg_keys("nonconservative_matrix"),
         )
         blocks += self._sm_per_direction(
             "quasilinear_matrix",
             sm.quasilinear_matrix,
             (n_eq, n_state),
-            ["Q", "Qaux", "p"],
+            self._operator_arg_keys("quasilinear_matrix"),
         )
         eig_expr = (
             sm.eigenvalues
@@ -1111,23 +1121,24 @@ class GenericCppModel(GenericCppBase):
         )
         blocks.append(
             self._sm_kernel(
-                "eigenvalues", eig_expr, (n_eq, 1), ["Q", "Qaux", "p", "n"]
+                "eigenvalues", eig_expr, (n_eq, 1),
+                self._operator_arg_keys("eigenvalues")
             )
         )
-        # REQ-185: source signature gains the time scalar ``time``, the
-        # time-step scalar ``dt``, and the position VECTOR ``X`` (length 3) —
-        # ``source(Q, Qaux, p, time, dt, X)``.  Bodies bind only what they
-        # reference (an autonomous source ignores them).
+        # ``source(Q, Qaux, p, time, dt, X)`` — the declared signature carries
+        # the time scalar, the time-step scalar and the length-3 position vector
+        # ``X``.  Bodies bind only what they reference (an autonomous source
+        # ignores them).
         blocks.append(
             self._sm_kernel("source", sm.source, (n_eq, 1),
-                            ["Q", "Qaux", "p", "time", "dt", "X"])
+                            self._operator_arg_keys("source"))
         )
         if self._detect_has_diffusion():
             blocks += self._sm_per_direction(
                 "diffusion_matrix",
                 sm.diffusion_matrix,
                 (n_eq, n_state),
-                ["Q", "Qaux", "p"],
+                self._operator_arg_keys("diffusion_matrix"),
             )
         return blocks
 
@@ -1146,13 +1157,14 @@ class GenericCppModel(GenericCppBase):
         n_eq, n_state, dim = sm.n_equations, len(sm.state), sm.dimension
         return [
             self._sm_kernel(
-                "flux", sm.flux, (n_eq, dim), ["Q", "Qaux", "p"]
+                "flux", sm.flux, (n_eq, dim),
+                self._operator_arg_keys("flux")
             ),
             self._sm_kernel(
                 "nonconservative_matrix",
                 sm.nonconservative_matrix,
                 (n_eq, n_state, dim),
-                ["Q", "Qaux", "p"],
+                self._operator_arg_keys("nonconservative_matrix"),
             ),
         ]
 
@@ -1181,13 +1193,13 @@ class GenericCppModel(GenericCppBase):
         blocks.append(self._sm_kernel(
             "source_jacobian_wrt_variables",
             sm.source_jacobian_wrt_variables, (n_eq, n_state),
-            ["Q", "Qaux", "p"],
+            self._operator_arg_keys("source_jacobian_wrt_variables"),
         ))
         if n_aux > 0:
             blocks.append(self._sm_kernel(
                 "source_jacobian_wrt_aux_variables",
                 sm.source_jacobian_wrt_aux_variables, (n_eq, n_aux),
-                ["Q", "Qaux", "p"],
+                self._operator_arg_keys("source_jacobian_wrt_aux_variables"),
             ))
         return blocks
 
@@ -1232,7 +1244,7 @@ class GenericCppModel(GenericCppBase):
         if uv is not None and len(sp.flatten(uv)) > 0:
             blocks.append(self._sm_kernel(
                 "update_variables", uv, (len(sp.flatten(uv)),),
-                ["Q", "Qaux", "p", "dt"],
+                self._operator_arg_keys("update_variables"),
             ))
         else:
             blocks.append(self._doc_note(
@@ -1307,13 +1319,12 @@ class GenericCppModel(GenericCppBase):
             rows[k] != sm.aux_state[k] for k in range(n_aux)
         )
         if has_pointwise_closure:
-            # REQ-185: the per-cell algebraic aux closure is lowered as
-            # ``update_aux_variables(Q, Qaux, p, time, X)`` — time scalar +
-            # position VECTOR ``X`` (length 3), NO dt (aux closures are
-            # dt-independent; a rain-rate aux binds ``time``).
+            # ``update_aux_variables(Q, Qaux, p, time, X)`` — the declared
+            # signature carries time + the length-3 position vector ``X``, NO dt
+            # (aux closures are dt-independent; a rain-rate aux binds ``time``).
             blocks.append(self._sm_kernel(
                 "update_aux_variables", sp.Array(rows), (n_aux,),
-                ["Q", "Qaux", "p", "time", "X"],
+                self._operator_arg_keys("update_aux_variables"),
             ))
             # Jacobian — pointwise (algebraic) leg only; the non-local
             # derivative leg carries no per-cell local Jacobian (foam emits
@@ -1321,7 +1332,9 @@ class GenericCppModel(GenericCppBase):
             jac = sp.derive_by_array(sp.Array(rows), list(sm.state))
             blocks.append(self._sm_kernel(
                 "update_aux_variables_jacobian_wrt_variables",
-                jac, (n_aux, n_state), ["Q", "Qaux", "p", "time", "X"],
+                jac, (n_aux, n_state),
+                self._operator_arg_keys(
+                    "update_aux_variables_jacobian_wrt_variables"),
             ))
 
         # FIELD-LEVEL, mesh-aware derivative refresh (REQ-65) — mirrors foam.

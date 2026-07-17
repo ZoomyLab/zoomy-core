@@ -107,6 +107,10 @@ class FoamSystemModelPrinter(GenericCppBase):
     _output_subdir = ".foam_interface"
     real_type = "Foam::scalar"
     math_namespace = "Foam::"
+    # The BC kernel's ``idx`` group has no entry in the shared C-family
+    # ``ARG_MAPPING``; the C family (foam included) spells it ``bc_idx``.
+    # Pure spelling — the group itself is declared on the BC Function.
+    ARG_MAPPING = {**GenericCppBase.ARG_MAPPING, "idx": "bc_idx"}
     analytical_eigenvalues = False
     # Phase 7 coupling: the inverse 3D→2D map.  Read from the model-owned
     # ``sm.project_from_3d`` slot (filled by ``register_group("project", …)``)
@@ -316,21 +320,23 @@ class FoamSystemModelPrinter(GenericCppBase):
                 f"{{ {e2s_str} }};"
             )
 
-        # Every operator takes (Q, Qaux, p, …) — parameters are always in the interface.
+        # Every operator's argument list is read off the SystemModel's declared
+        # ``Function.args`` (the single signature source) and spelled in Foam
+        # syntax via ``_FOAM_ARG``.
         blocks += self._per_direction(
-            "flux", sm.flux, (n_eq, 1), ["Q", "Qaux", "p"]
+            "flux", sm.flux, (n_eq, 1), self._operator_arg_keys("flux")
         )
         blocks += self._per_direction(
             "nonconservative_matrix",
             sm.nonconservative_matrix,
             (n_eq, n_state),
-            ["Q", "Qaux", "p"],
+            self._operator_arg_keys("nonconservative_matrix"),
         )
         blocks += self._per_direction(
             "quasilinear_matrix",
             sm.quasilinear_matrix,
             (n_eq, n_state),
-            ["Q", "Qaux", "p"],
+            self._operator_arg_keys("quasilinear_matrix"),
         )
 
         eig_expr = (
@@ -340,20 +346,20 @@ class FoamSystemModelPrinter(GenericCppBase):
         )
         blocks.append(
             self._kernel(
-                "eigenvalues", eig_expr, (n_eq, 1), ["Q", "Qaux", "p", "n"]
+                "eigenvalues", eig_expr, (n_eq, 1),
+                self._operator_arg_keys("eigenvalues")
             )
         )
 
-        # REQ-185: source gains the time scalar ``time``, the time-step scalar
-        # ``dt``, and the position VECTOR ``X`` — ``source(Q, Qaux, p, time,
-        # dt, X)``.  Bodies bind only what they reference.  The coordinate map
-        # (t→time, x/y/z→X.x()/…) is scoped-pushed at highest precedence only
-        # here, so it never shadows ``interpolate_to_3d``'s z-mapping.
+        # ``source(Q, Qaux, p, time, dt, X)`` — declared signature.  The
+        # coordinate map (t→time, x/y/z→X.x()/…) is scoped-pushed at highest
+        # precedence only here, so it never shadows ``interpolate_to_3d``'s
+        # z-mapping.  Bodies bind only what they reference.
         self.symbol_maps.insert(0, self._coord_symbol_map())
         try:
             blocks.append(
                 self._kernel("source", sm.source, (n_eq, 1),
-                             ["Q", "Qaux", "p", "time", "dt", "X"])
+                             self._operator_arg_keys("source"))
             )
         finally:
             self.symbol_maps.pop(0)
@@ -555,7 +561,8 @@ class FoamSystemModelPrinter(GenericCppBase):
         sm = self.sm
         return self._kernel(
             "mass_matrix", sm.mass_matrix,
-            (sm.n_equations, len(sm.state)), ["Q", "Qaux", "p"],
+            (sm.n_equations, len(sm.state)),
+            self._operator_arg_keys("mass_matrix"),
         )
 
     def _emit_update_variables(self):
@@ -567,7 +574,8 @@ class FoamSystemModelPrinter(GenericCppBase):
         uv = sp.Array(sp.flatten(sm.update_variables))
         n = len(uv)
         return self._kernel(
-            "update_variables", uv, (n,), ["Q", "Qaux", "p", "dt"])
+            "update_variables", uv, (n,),
+            self._operator_arg_keys("update_variables"))
 
     def _emit_reconstruction_kernels(self):
         """Emit ``Model::reconstruction_variables(Q, Qaux, p)`` (forward)
@@ -684,6 +692,12 @@ class FoamSystemModelPrinter(GenericCppBase):
         """Emit ``Model::boundary_conditions(bc_idx, time, X, dX, Q,
         Qaux, p, n)`` from the SystemModel's symbolic Piecewise kernel.
 
+        The argument list is read off the BC Function's DECLARED ``args``
+        (idx, time, position, distance, variables, aux_variables,
+        parameters, normal) — the same single-source pattern as
+        ``_operator_arg_keys`` — and spelled in Foam syntax via
+        ``ARG_MAPPING`` + ``_FOAM_ARG``.
+
         Returns a ``Foam::List<scalar>`` of size ``n_eq`` — the
         boundary state for the branch matching ``bc_idx``.
         """
@@ -712,16 +726,9 @@ class FoamSystemModelPrinter(GenericCppBase):
             # count differs from the state count, so size off the state.
             shape = (len(self.sm.state),)
             body = self.convert_expression_body(bc.definition, shape)
-            sig = ",\n    ".join([
-                "const int bc_idx",
-                "const Foam::scalar& time",
-                "const Foam::vector& X",
-                "const Foam::scalar& dX",
-                "const Foam::List<Foam::scalar>& Q",
-                "const Foam::List<Foam::scalar>& Qaux",
-                "const Foam::List<Foam::scalar>& p",
-                "const Foam::vector& n",
-            ])
+            sig = ",\n    ".join(
+                _FOAM_ARG[self.ARG_MAPPING[k]] for k in bc.args.keys()
+            )
             return self.wrap_function_signature(
                 "boundary_conditions", sig, body, shape
             )

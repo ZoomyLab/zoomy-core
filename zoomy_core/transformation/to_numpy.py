@@ -335,7 +335,7 @@ class NumpyRuntimeModel:
         return uniform_rank(arr, vector_symbols, anchor)
 
     def _lower_ndarray_operator(self, name, arr, n_cols, n_eq, n_dim,
-                                std_sig, modules):
+                                op_sig, modules):
         """Lower a rank-3 operator ``arr(Q, Qaux, p)`` of shape
         ``(n_eq, n_cols, n_dim)`` (NCP / quasilinear) to a runtime callable.
 
@@ -348,17 +348,20 @@ class NumpyRuntimeModel:
         slab_fns = []
         for d in range(n_dim):
             slab = sp.Matrix(n_eq, n_cols, lambda i, j, _d=d: arr[i, j, _d])
-            fn = Function(name=f"{name}__d{d}", args=std_sig, definition=slab)
+            fn = Function(name=f"{name}__d{d}", args=op_sig, definition=slab)
             slab_fns.append(self._lambdify_function(fn, modules))
 
-        def _runtime(Q, Qaux, p, _slab_fns=slab_fns):
-            slabs = [np.asarray(f(Q, Qaux, p), dtype=float)
+        # No hand-built arg list: the runtime forwards ``*op_args`` and the
+        # slab callables bind them per the operator's DECLARED ``Function.args``
+        # (``sm.operator_signature(name)``).
+        def _runtime(*op_args, _slab_fns=slab_fns):
+            slabs = [np.asarray(f(*op_args), dtype=float)
                      for f in _slab_fns]
             return np.stack(slabs, axis=-1)
         return _runtime
 
     def _lower_rank4_operator(self, name, A_arr, n_eq, n_st, n_dim,
-                              std_sig, modules):
+                              op_sig, modules):
         """Lower a rank-4 constitutive tensor ``A(Q, Qaux, p)`` of shape
         ``(n_eq, n_state, n_dim, n_dim)`` (the ``div(A : grad Q)``
         diffusion tensor) to a runtime callable.
@@ -375,13 +378,15 @@ class NumpyRuntimeModel:
                     n_eq, n_st,
                     lambda i, j, _d=d, _e=e: A_arr[i, j, _d, _e],
                 )
-                fn = Function(name=f"{name}__d{d}_e{e}", args=std_sig,
+                fn = Function(name=f"{name}__d{d}_e{e}", args=op_sig,
                               definition=slab)
                 slab_fns_4d.append(self._lambdify_function(fn, modules))
 
-        def _runtime_A(Q, Qaux, p, _fns=slab_fns_4d,
+        # Same *op_args forwarding as ``_lower_ndarray_operator`` — the arg
+        # list is the slab Functions' declared args, never re-listed here.
+        def _runtime_A(*op_args, _fns=slab_fns_4d,
                        _n_dim=n_dim, _n_eq=n_eq, _n_st=n_st):
-            slabs = [np.asarray(f(Q, Qaux, p), dtype=float)
+            slabs = [np.asarray(f(*op_args), dtype=float)
                      for f in _fns]
             stacked = np.stack(slabs, axis=-1)
             new_shape = stacked.shape[:-1] + (_n_dim, _n_dim)
@@ -482,8 +487,10 @@ class NumpyRuntimeModel:
         the runtime built from a ``Model``: the resulting object has
         ``flux``, ``nonconservative_matrix``, ``source``,
         ``hydrostatic_pressure``, ``mass_matrix`` callable attributes,
-        each accepting ``(Q, Qaux, p)`` and returning the corresponding
-        numpy array.
+        each accepting its DECLARED operator args (read off
+        ``sm.operator_signature(name)`` — e.g. ``(Q, Qaux, p)`` for flux,
+        ``(Q, Qaux, p, t, [dt], x)`` for source) and returning the
+        corresponding numpy array.
 
         For most solver code paths the existing ``NumpyRuntimeModel(model)``
         flow is still preferred because it carries the model's full
@@ -530,42 +537,35 @@ class NumpyRuntimeModel:
         # ``_collect_vector_symbols``: ``variables`` / ``aux_variables``
         # / ``normal`` / ``position`` are the *vector* groups whose
         # symbols anchor the broadcast).
-        Q_struct = sm.variables          # Zstruct of state Symbols
-        Qaux_struct = sm.aux_variables   # Zstruct of aux Symbols
         p_struct = sm.parameters         # Zstruct of parameter Symbols
-        n_struct = sm.normal             # Zstruct of normal Symbols
-        # REQ-185: time + position are first-class trailing arguments of the
-        # ``source`` and ``update_aux_variables`` operators (t → the ``time``
-        # scalar; x/y/z → the ``position`` components), mirroring the BC kernel
-        # signature ``(…, time, position, …)``.  ``sm.time`` is always defined;
-        # ``sm.position`` may be absent on a bare SystemModel, so fall back to
-        # the canonical (space[0], y, z) symbols exactly like
-        # ``attach_boundary_conditions``.
-        time_sym = sm.time
-        pos_struct = sm.position
-        if pos_struct is None:
-            pos_struct = Zstruct(X0=sm.space[0],
-                                 X1=sp.Symbol("y", real=True),
-                                 X2=sp.Symbol("z", real=True))
+        # Operator signatures are DECLARED once on the SystemModel
+        # (``OPERATOR_ARG_SLOTS``) and carried as ``Function.args``; this runtime
+        # reads ``sm.operator_signature(name)`` and only handles the one numpy
+        # lowering-SYNTAX constraint: ``dt`` cannot appear twice in a lambdify
+        # arg list, so drop the declared ``dt`` group when a split sub-system
+        # baked ``dt`` in as a model PARAMETER (Chorin/VAM).  ``time`` /
+        # ``position`` (source, update_aux) and the trailing ``dt`` (source,
+        # update_variables) all flow from the declaration — no local re-listing.
+        dt_in_params = bool(getattr(p_struct, "contains", lambda *_: False)("dt"))
 
-        std_sig = Zstruct(variables=Q_struct, aux_variables=Qaux_struct,
-                          parameters=p_struct)
-        eig_sig = Zstruct(variables=Q_struct, aux_variables=Qaux_struct,
-                          parameters=p_struct, normal=n_struct)
-        # The per-cell update kernels carry an explicit trailing ``dt`` scalar
-        # (uniform across backends; full models ignore it, the Chorin corrector
-        # ``U_k ← U_k − (dt/h)·T_u_k(P)`` is load-bearing in it).
-        upd_sig = Zstruct(variables=Q_struct, aux_variables=Qaux_struct,
-                          parameters=p_struct, dt=DT_SYMBOL)
+        def _op_sig(name):
+            """Declared ``args`` for ``name``, minus the ``dt`` group when
+            ``dt`` is already a parameter (duplicate lambdify argument)."""
+            args = sm.operator_signature(name)
+            if dt_in_params and args.contains("dt"):
+                args = Zstruct(**{k: args[k] for k in args.keys()
+                                  if k != "dt"})
+            return args
 
         rt.runtime_functions = {}
 
-        def _register(name, definition, signature):
-            """Synthesize a ``Function`` and route through
-            ``_lambdify_function`` so vectorisation is applied."""
+        def _register(name, definition, sig_name=None):
+            """Route the operator through ``_lambdify_function`` with its
+            DECLARED signature (read off the SystemModel Function)."""
             if definition is None:
                 return
-            fn = Function(name=name, args=signature, definition=definition)
+            fn = Function(name=name, args=_op_sig(sig_name or name),
+                          definition=definition)
             rt.runtime_functions[name] = rt._lambdify_function(fn, modules)
             setattr(rt, name, rt.runtime_functions[name])
 
@@ -579,62 +579,38 @@ class NumpyRuntimeModel:
                 return None
             return sp.Array([mat[i, 0] for i in range(mat.shape[0])])
 
-        _register("flux", sm.flux, std_sig)
-        _register("hydrostatic_pressure", sm.hydrostatic_pressure, std_sig)
-        # REQ-185: the ``source`` operator signature is
-        # ``(Q, Qaux, p, t, [dt], x, y, z)`` — time + position are always
-        # bound, and ``dt`` (reusing the Chorin ``DT_SYMBOL``) is a first-class
-        # source argument UNLESS ``dt`` is already a model parameter (Chorin/VAM
-        # split bakes it into ``p``), which would duplicate the lambdify arg.
-        # Autonomous sources ignore the extra args (bit-identical); a source
-        # referencing t / dt / x binds them here.  ``source_needs_dt`` tells the
-        # solver to pass ``dt`` explicitly at call time.
-        _src = _column_to_rank1(sm.source)
-        dt_in_params = bool(getattr(p_struct, "contains", lambda *_: False)("dt"))
-        src_has_dt = not dt_in_params
-        _src_fields = dict(variables=Q_struct, aux_variables=Qaux_struct,
-                           parameters=p_struct, time=time_sym)
-        if src_has_dt:
-            _src_fields["dt"] = DT_SYMBOL
-        _src_fields["position"] = pos_struct
-        src_sig = Zstruct(**_src_fields)
-        _register("source", _src, src_sig)
-        rt.source_needs_dt = bool(src_has_dt)
+        _register("flux", sm.flux)
+        _register("hydrostatic_pressure", sm.hydrostatic_pressure)
+        # ``source(Q, Qaux, p, t, [dt], x)`` — the declaration carries time +
+        # position always, and ``dt`` unless it collides with a model parameter
+        # (handled by ``_op_sig``).  ``source_needs_dt`` tells the solver to
+        # pass ``dt`` explicitly at call time (True iff ``dt`` survives as a
+        # first-class source arg, i.e. it is NOT already a parameter).
+        _register("source", _column_to_rank1(sm.source))
+        rt.source_needs_dt = not dt_in_params
         _register("source_explicit",
-                  _column_to_rank1(sm.source_explicit), std_sig)
-        _register("mass_matrix", sm.mass_matrix, std_sig)
+                  _column_to_rank1(sm.source_explicit))
+        _register("mass_matrix", sm.mass_matrix)
         _register("source_jacobian_wrt_variables",
-                  sm.source_jacobian_wrt_variables, std_sig)
+                  sm.source_jacobian_wrt_variables)
         _register("source_jacobian_wrt_aux_variables",
-                  sm.source_jacobian_wrt_aux_variables if sm.aux_state else None,
-                  std_sig)
+                  sm.source_jacobian_wrt_aux_variables if sm.aux_state else None)
         # ``update_variables(Q, Qaux, p, dt)`` — per-cell state remap.  For a
         # full model it returns the whole state; for a Chorin corrector
         # sub-system it returns one value per ``equation_to_state_index`` row
         # (the closed-form projection, where ``dt`` is load-bearing).  Same
         # broadcast pattern as ``source``.
         # When a split sub-system threads ``dt`` in as a MODEL PARAMETER
-        # (``chorin_split(dt)``), the explicit ``dt`` field of ``upd_sig`` is
-        # the SAME symbol as the parameter, so lambdify would see ``dt`` twice
-        # → ``SyntaxError: duplicate argument 'dt'`` (REQ-151 defect C).  Fall
-        # back to ``std_sig`` in that case — the parameter already supplies
-        # ``dt``, and the flattener ignores any trailing runtime ``dt`` the
-        # solver still passes.
-        _upd_sig = std_sig if dt_in_params else upd_sig
+        # (``chorin_split(dt)``), the declared ``dt`` group is the SAME symbol as
+        # the parameter, so ``_op_sig`` drops it (else lambdify raises
+        # ``SyntaxError: duplicate argument 'dt'`` — REQ-151 defect C); the
+        # parameter already supplies ``dt`` and the flattener ignores any
+        # trailing runtime ``dt`` the solver still passes.
         _register("update_variables",
-                  _column_to_rank1(sm.update_variables), _upd_sig)
-        # REQ-185: the per-cell aux formula ``update_aux_variables`` signature is
-        # ``(Q, Qaux, p, t, x, y, z)`` — time + position, NO dt (algebraic aux
-        # closures are dt-independent; a rain-rate aux
-        # ``r_o = Piecewise((rate, t<T_rain),(0,True))`` binds t, a manufactured
-        # ``S(x)`` binds position).  State-dependent aux (e.g. KP ``hinv``)
-        # ignores the coordinate args (bit-identical).
-        uav_sig = Zstruct(variables=Q_struct, aux_variables=Qaux_struct,
-                          parameters=p_struct, time=time_sym, position=pos_struct)
+                  _column_to_rank1(sm.update_variables))
         _register("update_aux_variables",
-                  _column_to_rank1(getattr(sm, "update_aux_variables", None)),
-                  uav_sig)
-        _register("eigenvalues", _column_to_rank1(sm.eigenvalues), eig_sig)
+                  _column_to_rank1(getattr(sm, "update_aux_variables", None)))
+        _register("eigenvalues", _column_to_rank1(sm.eigenvalues))
 
         # NDimArray operators (NCP, quasilinear) — per-axis slab as a
         # Matrix, each routed through ``_lambdify_function`` (so each
@@ -645,7 +621,7 @@ class NumpyRuntimeModel:
 
         def _register_ndarray(name, arr, n_cols):
             fn = rt._lower_ndarray_operator(
-                name, arr, n_cols, n_eq, n_dim, std_sig, modules)
+                name, arr, n_cols, n_eq, n_dim, _op_sig(name), modules)
             rt.runtime_functions[name] = fn
             setattr(rt, name, fn)
 
@@ -663,7 +639,7 @@ class NumpyRuntimeModel:
             if A_arr is None:
                 return
             fn = rt._lower_rank4_operator(
-                name, A_arr, n_eq, n_st, n_dim, std_sig, modules)
+                name, A_arr, n_eq, n_st, n_dim, _op_sig(name), modules)
             rt.runtime_functions[name] = fn
             setattr(rt, name, fn)
 
