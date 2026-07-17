@@ -130,12 +130,15 @@ class ReconstructionSpec:
     ``free_surface_aware``: when True, use the wet-dry-aware MUSCL
     variant (clamps ``h ≥ 0`` at faces, falls back to first order in
     dry cells).
-    ``positivity``: a-priori cell-mean depth positivity at order ≥ 2.
-    ``""`` = none; ``"zhang_shu"`` = Xing–Zhang–Shu 2010 deviation cap so the
+    ``positivity``: depth positivity at order ≥ 2.  ``""`` = none.
+    ``"zhang_shu"`` = A-PRIORI Xing–Zhang–Shu 2010 deviation cap so the
     reconstructed depth stays ``h ≥ 0`` (conservative — scales the deviation,
-    never the mean).  ``"mood"`` engages the same a-priori guarantee on the
-    numpy backend (jax ships the a-posteriori MOOD re-run; numpy provides the
-    a-priori XZS cap, which gives the same ``h ≥ 0`` + exact mass here).
+    never the mean); guaranteed only under CFL ≤ 1/(2k+1).
+    ``"mood"`` = A-POSTERIORI MOOD (matches the jax / dmplex backends): the
+    solver takes the order-2 candidate, flags troubled cells (``h < 0`` or
+    non-finite) and re-steps ONLY those cells at order 1 (constant
+    reconstruction) — positivity from the order-1 Xing–Zhang lemma, no
+    deviation cap and no depth clamp, so it rides the run CFL (e.g. 0.45).
     """
     order: int = 1
     limiter: str = "venkatakrishnan"

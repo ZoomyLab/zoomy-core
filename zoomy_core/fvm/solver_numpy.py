@@ -642,15 +642,19 @@ class HyperbolicSolver(Solver):
         )
         dim = symbolic_model.dimension
         if self.nsm.reconstruction.order >= 2:
-            # A-priori Xing–Zhang–Shu cell-mean positivity (REQ-152): cap the
-            # depth-row deviation so the reconstructed h stays ≥ 0 at every
-            # face — conservative (mean untouched).  Engaged by the NSM's
-            # reconstruction spec (``positivity`` in {'zhang_shu','mood'}); the
-            # numpy backend supplies the a-priori guarantee the jax MOOD re-run
-            # gives, so order-2 wet/dry no longer stalls with h < 0.
+            # ``positivity`` routing (REQ-152):
+            #   * ``"zhang_shu"`` — A-PRIORI Xing–Zhang–Shu cell-mean cap: scale
+            #     the depth-row deviation so the reconstructed h stays ≥ 0 at
+            #     every face (conservative — the mean is untouched).  Guarantees
+            #     h ≥ 0 only under CFL ≤ 1/(2k+1).
+            #   * ``"mood"`` — A-POSTERIORI MOOD (matches jax/dmplex): the plain
+            #     LSQ-MUSCL reconstruction (force_o1-aware) rides at the run CFL;
+            #     ``HyperbolicSolver.step`` re-steps troubled cells at order 1
+            #     (constant reconstruction) so positivity comes from the
+            #     order-1 Xing–Zhang lemma — NO deviation cap, NO depth clamp.
             positivity = getattr(self.nsm.reconstruction, "positivity", "")
             h_idx = _var_index(symbolic_model, "h")
-            if positivity in ("zhang_shu", "mood") and h_idx is not None:
+            if positivity == "zhang_shu" and h_idx is not None:
                 return PositivityPreservingLSQMUSCL(
                     mesh, dim, h_index=h_idx,
                     limiter=self.nsm.reconstruction.limiter)
@@ -687,6 +691,15 @@ class HyperbolicSolver(Solver):
 
         # Build reconstruction (ghost-cell-free)
         reconstruct = self._build_reconstruction(mesh, symbolic_model)
+        # A-posteriori MOOD wiring (REQ-152): whether ``positivity="mood"`` is
+        # requested AND the reconstruction honours a per-cell ``force_o1``
+        # demotion mask (zero its slopes → constant reconstruction).  Read by
+        # ``step`` to run the a-posteriori re-step; stored here so IMEX / coupled
+        # subclasses that reuse this flux operator inherit the same corrector.
+        self._support_o1 = bool(getattr(reconstruct, "supports_force_o1", False))
+        self._free_surface_h_index = _var_index(symbolic_model, "h")
+        self._mood = (
+            getattr(self.nsm.reconstruction, "positivity", "") == "mood")
 
         # Runtime non-conservative matrix B(Q) for the cell-interior NCP
         # integral (path-conservative consistency at order ≥ 2).  Built only
@@ -812,7 +825,9 @@ class HyperbolicSolver(Solver):
         self._d_face = d_face
         self._n_bf = n_bf
 
-        def flux_operator(dt, time, Q, Qaux, parameters, dQ):
+        support_o1 = bool(getattr(reconstruct, "supports_force_o1", False))
+
+        def flux_operator(dt, time, Q, Qaux, parameters, dQ, force_o1=None):
             dQ = np.zeros((n_vars, nc))
 
             # 1. Compute boundary face values via the indexed BC kernel.
@@ -828,8 +843,12 @@ class HyperbolicSolver(Solver):
                     q_inner, qaux_inner, parameters, normal,
                 )
 
-            # 2. Reconstruct (uses bf_values for limiter bounds + Q_R placeholder)
-            Q_L, Q_R = reconstruct(Q, bf_values)
+            # 2. Reconstruct (uses bf_values for limiter bounds + Q_R placeholder).
+            # ``force_o1`` (a-posteriori MOOD re-step, when the reconstruction
+            # supports it) zeroes the slopes of flagged cells → constant
+            # reconstruction; ``None`` on every normal / order-1 path.
+            o1kw = {"force_o1": force_o1} if support_o1 else {}
+            Q_L, Q_R = reconstruct(Q, bf_values, **o1kw)
 
             # 3. Override Q_R at boundary faces with BC(Q_L) — except
             # periodic faces, whose face value is the opposite-side cell
@@ -1146,18 +1165,43 @@ class HyperbolicSolver(Solver):
         flux = self._sim_flux_operator
         source = self._sim_source_operator
 
-        def rhs(t, Q_in):
-            """Total RHS = flux + source."""
-            dQ_f = flux(dt, t, Q_in, Qaux, parameters, np.zeros_like(Q_in))
+        def rhs(t, Q_in, force_o1=None):
+            """Total RHS = flux + source.  ``force_o1`` (a-posteriori MOOD)
+            demotes flagged cells to order 1 inside the *flux* reconstruction
+            only; the source is slope-free so it is unaffected."""
+            dQ_f = flux(dt, t, Q_in, Qaux, parameters, np.zeros_like(Q_in),
+                        force_o1)
             dQ_s = source(dt, Q_in, Qaux, parameters, np.zeros_like(Q_in))
             return dQ_f + dQ_s
 
         if self.nsm.reconstruction.order >= 2:
-            # SSP-RK2 (Heun) — flux + source per stage
+            # SSP-RK2 (Heun) — flux + source per stage.  ``force_o1`` (or None)
+            # is threaded through BOTH stages so the a-posteriori MOOD re-run
+            # demotes the SAME cells in both.
             Q0 = np.array(Q)
-            Q1 = Q + dt * rhs(time_now, Q)
-            Q2 = Q1 + dt * rhs(time_now + dt, Q1)
-            Qnew = 0.5 * (Q0 + Q2)
+
+            def _rk2(force_o1):
+                Q1 = Q + dt * rhs(time_now, Q, force_o1)
+                Q2 = Q1 + dt * rhs(time_now + dt, Q1, force_o1)
+                return 0.5 * (Q0 + Q2)
+
+            Qnew = _rk2(None)
+            # A-posteriori MOOD (REQ-152, mirrors solver_jax
+            # ``_explicit_hyperbolic_step``): detect troubled cells on the
+            # order-2 candidate — PAD (h < 0) + CAD (non-finite) — and, ONLY if
+            # any is troubled, re-run forcing those cells to 1st order.  The
+            # re-step is conservative (shared face flux) and the demoted cells
+            # are positivity-preserving by the order-1 Xing–Zhang lemma.  NO
+            # depth is ever clamped/floored: if the re-step still yields h < 0
+            # that surfaces as a real result, not a truncated one.
+            h_idx = getattr(self, "_free_surface_h_index", None)
+            if (getattr(self, "_mood", False)
+                    and getattr(self, "_support_o1", False)
+                    and h_idx is not None):
+                troubled = ((Qnew[h_idx, :] < 0.0)
+                            | ~np.isfinite(Qnew).all(axis=0))
+                if troubled.any():
+                    Qnew = _rk2(troubled)
         else:
             # RK1
             Qnew = Q + dt * rhs(time_now, Q)
@@ -1249,9 +1293,14 @@ class _SurfaceReconAdapter:
     def __init__(self, surf):
         self.surf = surf
         self._limited_grad = None
+        # Forward the a-posteriori MOOD ``force_o1`` capability of the wrapped
+        # surface reconstruction (which forwards it to its LSQ base).
+        self.supports_force_o1 = bool(
+            getattr(surf, "supports_force_o1", False))
 
-    def __call__(self, Q, bf, phi=None):
-        Q_L, Q_R, _b_L, _b_R = self.surf(Q, None, bf, phi=phi)
+    def __call__(self, Q, bf, phi=None, force_o1=None):
+        Q_L, Q_R, _b_L, _b_R = self.surf(Q, None, bf, phi=phi,
+                                         force_o1=force_o1)
         self._limited_grad = self.surf._limited_grad
         return Q_L, Q_R
 

@@ -366,6 +366,11 @@ class LSQMUSCLReconstruction:
         neighbour min/max bounds.
     """
 
+    # Honours an external per-cell ``force_o1`` mask: the solver's a-posteriori
+    # MOOD corrector passes a boolean array over inner cells; flagged cells get
+    # their limiter zeroed → genuine constant reconstruction (order-1 demotion).
+    supports_force_o1 = True
+
     def __init__(self, mesh, dim, limiter="venkatakrishnan",
                  unlimited_indices=None):
         self.dim = dim
@@ -458,7 +463,7 @@ class LSQMUSCLReconstruction:
         h = cell_vols ** (1.0 / max(dim, 1))
         self._eps_v2 = h ** 2
 
-    def __call__(self, Q, bf_face_values, phi=None):
+    def __call__(self, Q, bf_face_values, phi=None, force_o1=None):
         """Reconstruct face states.
 
         Parameters
@@ -474,6 +479,11 @@ class LSQMUSCLReconstruction:
             implicit solver call it inside a Newton iteration with a
             clean finite-difference Jacobian.  When ``None`` (default)
             φ is computed from ``Q``.
+        force_o1 : ndarray of bool, shape (n_inner_cells,), optional
+            A-posteriori MOOD demotion mask.  Flagged cells have EVERY
+            row's limiter zeroed → genuine piecewise-constant
+            reconstruction (Q_L = Q_R = cell mean).  This is a slope
+            demotion, NOT a clamp — no state row is truncated.
 
         Returns (Q_L, Q_R) each (n_vars, n_faces).
         Q_R at boundary faces is set to bf_face_values (placeholder; overwritten
@@ -483,10 +493,20 @@ class LSQMUSCLReconstruction:
         grads = self._compute_gradients(Q, n_vars, bf_face_values=bf_face_values)
         if phi is None:
             phi = self._compute_phi(Q, n_vars, bf_face_values, grads)
+        phi = self._apply_force_o1(phi, force_o1)
         # Limited cell-centre gradient (n_vars, dim, nc) — consumed by
         # the solver's cell-interior non-conservative integral.
         self._limited_grad = phi[:, None, :] * grads
         return self._reconstruct(Q, grads, phi, bf_face_values)
+
+    def _apply_force_o1(self, phi, force_o1):
+        """Zero the limiter of every ``force_o1`` cell → order-1 (constant)
+        reconstruction there.  Identity when ``force_o1`` is ``None``."""
+        if force_o1 is None:
+            return phi
+        phi = np.array(phi, copy=True)
+        phi[:, np.asarray(force_o1, dtype=bool)[:self._nc]] = 0.0
+        return phi
 
     def compute_phi(self, Q, bf_face_values):
         """Limiter coefficients φ (n_vars, nc) for the given state.
@@ -866,7 +886,7 @@ class PositivityPreservingLSQMUSCL(_ZhangShuPPMixin, LSQMUSCLReconstruction):
         self._eps_positivity = float(eps_positivity)
         self._build_cell_face_rays(mesh, dim)
 
-    def __call__(self, Q, bf_face_values, phi=None):
+    def __call__(self, Q, bf_face_values, phi=None, force_o1=None):
         n_vars = Q.shape[0]
         grads = self._compute_gradients(Q, n_vars, bf_face_values=bf_face_values)
         if phi is None:
@@ -881,6 +901,9 @@ class PositivityPreservingLSQMUSCL(_ZhangShuPPMixin, LSQMUSCLReconstruction):
         theta = self._pp_theta(Q[h_idx], h_slope, self._eps_positivity)
         phi = np.array(phi, copy=True)
         phi[h_idx] = phi[h_idx] * theta
+        # A-posteriori MOOD demotion on top of the a-priori cap (order-1 in the
+        # flagged cells).  Applied last so it wins over the θ-scaled slope.
+        phi = self._apply_force_o1(phi, force_o1)
         self._limited_grad = phi[:, None, :] * grads
         return self._reconstruct(Q, grads, phi, bf_face_values)
 
@@ -957,6 +980,11 @@ class SurfaceReconstruction:
         self.h_index = int(h_index)
         self.b_index = int(b_index)
         self.b_in_state = bool(b_in_state)
+        # Delegates the a-posteriori MOOD ``force_o1`` mask to the base
+        # reconstruction (which zeroes the slope of flagged cells on the
+        # η-extended array → constant h = η − b there).
+        self.supports_force_o1 = bool(
+            getattr(base, "supports_force_o1", False))
 
     def _extend(self, Q, Qaux, bf_Q):
         """Build the extended arrays the base reconstruction operates
@@ -991,7 +1019,7 @@ class SurfaceReconstruction:
         Q_ext, bf_ext = self._extend(Q, Qaux, bf_Q)
         return self.base.compute_phi(Q_ext, bf_ext)
 
-    def __call__(self, Q, Qaux, bf_Q, phi=None):
+    def __call__(self, Q, Qaux, bf_Q, phi=None, force_o1=None):
         """Reconstruct face states in surface-elevation variables.
 
         Parameters
@@ -1005,6 +1033,11 @@ class SurfaceReconstruction:
             (see :meth:`compute_phi`).  When supplied the limiter is
             frozen — passed straight through to the base reconstruction
             — so the result is a smooth function of ``Q``.
+        force_o1 : ndarray of bool, shape (n_inner_cells,), optional
+            A-posteriori MOOD demotion mask forwarded to the base
+            reconstruction: flagged cells go piecewise-constant on the
+            η-extended array, so ``h = η − b`` collapses to the cell
+            mean (order-1) there — no depth clamp.
 
         Returns
         -------
@@ -1019,7 +1052,7 @@ class SurfaceReconstruction:
         h_idx = self.h_index
         n_state = Q.shape[0]
         Q_ext, bf_ext = self._extend(Q, Qaux, bf_Q)
-        QE_L, QE_R = self.base(Q_ext, bf_ext, phi=phi)
+        QE_L, QE_R = self.base(Q_ext, bf_ext, phi=phi, force_o1=force_o1)
 
         if self.b_in_state:
             b_L = QE_L[self.b_index, :]
