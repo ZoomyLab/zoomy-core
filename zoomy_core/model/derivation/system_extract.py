@@ -44,7 +44,36 @@ import sympy as sp
 from zoomy_core.misc.misc import Zstruct
 
 
-__all__ = ["extract_system_operators", "HydrostaticPressure"]
+__all__ = ["extract_system_operators", "HydrostaticPressure", "ViscousDiffusion"]
+
+
+class ViscousDiffusion(sp.Function):
+    """Opaque marker wrapping the integrand of a viscous diffusive flux.
+
+    ``package_viscous`` emits the retained in-plane deviatoric-stress divergence
+    as a conservative compound ``∂_{x_d}(ViscousDiffusion(D · ∂_{x_e} Q_j))``.
+    The marker is a PROVENANCE tag: it declares "this second-order compound is a
+    genuine ν-viscous diffusive flux — route the WHOLE rank-4 tensor, including
+    the off-diagonal σ-metric cross pieces ``D·∂_x h`` / ``D·∂_x b`` that the
+    coordinate transform produces, into ``diffusion_matrix`` (``A[i, j, d, e]``,
+    ``j`` possibly a FOREIGN state)".  Without it the extractor's
+    ``_is_self_diffusion`` gate — which only recognises the row's OWN conserved
+    variable — mis-routes the foreign-state pieces to the conservative ``flux``
+    (as a frozen gradient-aux), which SILENTLY DROPPED the in-plane h-column of
+    the diffusion matrix (``A[q_k←h] ≡ 0``; REQ-176(4) correction).  A bed-slope
+    KBC flux ``∂_x(A·∂_x b)`` carries NO such marker (it is not a ν term and
+    never passes through ``package_viscous``), so it stays a conservative flux —
+    REQ-80 preserved.  ``eval`` returns ``None`` (unevaluated, excluded from
+    field collection) and ``0`` for a zero integrand so ``ν → 0`` collapses it
+    cleanly."""
+
+    nargs = 1
+
+    @classmethod
+    def eval(cls, arg):
+        if arg == 0:
+            return sp.S.Zero
+        return None
 
 
 class HydrostaticPressure(sp.Function):
@@ -363,6 +392,21 @@ def _classify_row(residual, i, state, state_funcs, t, space, gravity_param,
                 f"row {i}: unhandled time-derivative term {term}")
 
         coeff, deriv = _split_coeff_and_derivative(term)
+
+        # 1b. ViscousDiffusion-marked compound → ALWAYS the diffusion tensor.
+        # ``package_viscous`` tags its conservative viscous flux
+        # ``∂_{x_d}(ViscousDiffusion(D·∂_{x_e} Q_j))`` so the extractor routes
+        # the WHOLE rank-4 A[i, j, d, e] — including the σ-metric OFF-DIAGONAL
+        # cross pieces ``D·∂_x h`` / ``D·∂_x b`` (``j`` a foreign state) that
+        # ``_is_self_diffusion`` would otherwise send to the flux (dropping the
+        # in-plane h-column; REQ-176(4)).  Unwrap the marker and route.
+        if term.has(ViscousDiffusion):
+            unwrapped = term.replace(
+                lambda e: isinstance(e, ViscousDiffusion), lambda e: e.args[0])
+            coeff_u, deriv_u = _split_coeff_and_derivative(unwrapped)
+            _route_diffusion(unwrapped, i, deriv_u, coeff_u,
+                             state_funcs, space, A)
+            continue
 
         # 2. Second-order ``∂_{x_d}( A · ∂_{x_e}(·) )`` — split by WHAT is being
         # differentiated inside:

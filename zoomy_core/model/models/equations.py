@@ -187,7 +187,18 @@ def package_viscous(expr, nu, states, space):
     ``ν·q·∂b`` product — ``b`` is a STATE, so those evaluate from the same stage
     state, no flat-bed / frozen-b assumption).  Non-viscous terms pass through
     untouched.  This is the single-source form of the identical helper copied
-    into the ``ml_fullsme`` / ``fullvam`` / ``ml_fullvam`` notebooks."""
+    into the ``ml_fullsme`` / ``fullvam`` / ``ml_fullvam`` notebooks.
+
+    The diffusive-flux compound is wrapped in a :class:`~zoomy_core.model.
+    derivation.system_extract.ViscousDiffusion` PROVENANCE marker so the
+    extractor routes the WHOLE rank-4 ``A[i, j, d, e]`` — including the
+    σ-metric OFF-DIAGONAL cross pieces ``D·∂_x h`` / ``D·∂_x b`` that the
+    coordinate transform produces (``Q`` = a FOREIGN state h/b, not just the
+    row's own ``q_i``) — into ``diffusion_matrix``.  Without the tag the
+    extractor's own-variable ``_is_self_diffusion`` gate mis-routed those cross
+    pieces to the flux, silently zeroing the in-plane h-column ``A[q_k←h]``
+    (REQ-176(4) correction)."""
+    from zoomy_core.model.derivation.system_extract import ViscousDiffusion
     expr = sp.expand(expr)
     visc = sum((tt for tt in sp.Add.make_args(expr) if tt.has(nu)), sp.S.Zero)
     rest = expr - visc
@@ -199,7 +210,8 @@ def package_viscous(expr, nu, states, space):
         if d2:
             D2 = d2[0]; Q = D2.args[0]; v = D2.variables
             Coef = sp.cancel(term / D2); de = sp.Derivative(Q, v[1])
-            out += (sp.Derivative(Coef * de, v[0], evaluate=False)
+            out += (sp.Derivative(ViscousDiffusion(Coef * de), v[0],
+                                  evaluate=False)
                     - sp.Derivative(Coef, v[0]) * de)
         else:
             out += term
