@@ -204,6 +204,13 @@ class UFLRuntimeModel(NumpyRuntimeModel):
         function_obj = self._substitute_derivative_atoms(function_obj)
         return super()._lambdify_function(function_obj, modules)
 
+    def _lower_opaque_kernels(self, expr):
+        """UFL keeps the opaque kernels in the ``eigensystem(idx, …)``
+        convention — the REQ-179 compute-once rewrite (``pick`` /
+        ``eigensystem_pack``) is numpy-module-internal and has no UFL/Firedrake
+        binding, so it must NOT run on this lowering path."""
+        return expr
+
     @staticmethod
     def _substitute_derivative_atoms(function_obj):
         """Return a function object with every ``sp.Derivative`` atom in

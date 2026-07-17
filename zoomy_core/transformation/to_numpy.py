@@ -9,6 +9,7 @@ from zoomy_core.misc.misc import Zstruct
 from zoomy_core.model.basefunction import Function
 from zoomy_core.model.basemodel import Model
 from zoomy_core.fvm import userfunctions as _uf
+from zoomy_core.transformation.vectorize import uniform_rank
 
 
 # Canonical time-step symbol — the trailing argument of the per-cell update
@@ -23,6 +24,66 @@ DT_SYMBOL = sp.Symbol("dt", positive=True)
 _eigensystem_numpy = _uf.eigensystem
 _eigenvalues_numpy = _uf.eigenvalues
 _solve_numpy = _uf.solve
+
+
+# ── REQ-179 compute-once lowering symbols ────────────────────────────────────
+# Opaque sympy Functions the numpy printer rewrites the per-component kernel
+# calls into (``K(idx, *A_flat)`` → ``pick(K_pack(*A_flat), idx)``).  Their
+# ``__name__`` MUST match the numpy-module keys (``eigensystem_pack`` etc.) so
+# ``lambdify`` prints them to those impls.  Numpy-internal — never emitted to
+# other backends (their printers keep the ``eigensystem(idx, …)`` convention).
+class eigensystem_pack(sp.Function):
+    is_commutative = True
+    is_real = True
+
+    @classmethod
+    def eval(cls, *args):
+        return None
+
+
+class eigenvalues_pack(sp.Function):
+    is_commutative = True
+    is_real = True
+
+    @classmethod
+    def eval(cls, *args):
+        return None
+
+
+class solve_pack(sp.Function):
+    is_commutative = True
+    is_real = True
+
+    @classmethod
+    def eval(cls, *args):
+        return None
+
+
+class pick(sp.Function):
+    is_commutative = True
+    is_real = True
+
+    @classmethod
+    def eval(cls, *args):
+        return None
+
+
+_COMPUTE_ONCE_PACK = None   # lazily built {opaque-kernel class: pack class}
+
+
+def _compute_once_pack_map():
+    """``{eigensystem: eigensystem_pack, …}`` — built lazily to avoid importing
+    ``kernel_functions`` (→ ``misc`` → …) at module import time."""
+    global _COMPUTE_ONCE_PACK
+    if _COMPUTE_ONCE_PACK is None:
+        from zoomy_core.model.kernel_functions import (
+            eigensystem as _es, eigenvalues as _ev, solve as _sv)
+        _COMPUTE_ONCE_PACK = {
+            _es: eigensystem_pack,
+            _ev: eigenvalues_pack,
+            _sv: solve_pack,
+        }
+    return _COMPUTE_ONCE_PACK
 
 
 class NumpyRuntimeModel:
@@ -60,10 +121,34 @@ class NumpyRuntimeModel:
         _flatten(arg_struct)
         return flat_args
 
+    def _lower_opaque_kernels(self, expr):
+        """REQ-179 compute-once lowering: rewrite each per-component opaque
+        kernel call ``K(idx, *A_flat)`` into ``pick(K_pack(*A_flat), idx)``.
+
+        Every component of one face (the ``n+2n²`` ``eigensystem`` reads, the
+        ``n`` ``eigenvalues`` / ``solve`` reads) shares the SAME ``A_flat``
+        objects, so all ``K_pack(*A_flat)`` collapse to ONE sympy node — cse
+        then hoists it to a single temp, emitting the (large) ``A_flat``
+        argument list ONCE instead of duplicating it into every component call.
+        That inlining was 93% of the lowered eigensystem tree and the ~20-min
+        single-core lambdify at ML-FullVAM scale; the rewrite is bit-identical
+        (``pick(K_pack(a), i)`` shares the ``*_pack`` numerics with ``K(i,*a)``)
+        and numpy-internal (other backends keep the ``eigensystem(idx,…)``
+        convention — see :meth:`to_ufl.UFLRuntimeModel._lower_opaque_kernels`)."""
+        if not isinstance(expr, sp.Basic):
+            return expr
+        reps = {}
+        for src_cls, pack_cls in _compute_once_pack_map().items():
+            for call in expr.atoms(src_cls):
+                idx, *rest = call.args
+                reps[call] = pick(pack_cls(*rest), idx)
+        return expr.xreplace(reps) if reps else expr
+
     def _lambdify_function(self, function_obj, modules):
         """Internal helper `_lambdify_function`."""
         args = self._flatten_signature_args(function_obj.args)
         expr = self._vectorize_expression(function_obj.definition, function_obj.args)
+        expr = self._lower_opaque_kernels(expr)
 
         use_cse = getattr(self, 'use_cse', True)
         try:
@@ -229,21 +314,11 @@ class NumpyRuntimeModel:
         arr = sp.Array(expr.tolist())
         vector_symbols = self._collect_vector_symbols(signature)
         anchor = self._get_anchor_symbol(signature)
-        if not vector_symbols or anchor is None:
-            return arr
-
-        ones_like = sp.Function("ones_like")
-        zeros_like = sp.Function("zeros_like")
-        flat = []
-        for item in list(arr._array):
-            if isinstance(item, sp.Basic) and not item.has(*vector_symbols):
-                if item.is_zero:
-                    flat.append(zeros_like(anchor))
-                else:
-                    flat.append(item * ones_like(anchor))
-            else:
-                flat.append(item)
-        return sp.Array(flat, arr.shape)
+        # REQ-84: shared constant-entry rank-normalization seam so every
+        # vector backend (numpy here, jax via jax_runtime) gets uniform-rank
+        # rows by construction.  ``uniform_rank`` is a byte-for-byte lift of
+        # the old inline loop.
+        return uniform_rank(arr, vector_symbols, anchor)
 
     def _lower_ndarray_operator(self, name, arr, n_cols, n_eq, n_dim,
                                 std_sig, modules):
