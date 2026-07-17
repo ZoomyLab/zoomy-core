@@ -25,6 +25,7 @@ from zoomy_core.mesh import ensure_lsq_mesh
 from zoomy_core.systemmodel.system_model import SystemModel
 from zoomy_core.mesh.lsq_reconstruction import find_derivative_indices
 import zoomy_core.fvm.ode as ode
+import zoomy_core.fvm.timestepping as timestepping
 import zoomy_core.misc.io as io
 from zoomy_core.misc.logger_config import logger
 
@@ -73,6 +74,9 @@ class SplittingSolver(IMEXSolver):
         # single wiring the class was missing (mirrors HyperbolicSolver).
         nsm, source_model = self._coerce_to_nsm(model)
         self.nsm = nsm
+        # REQ-190: fill the adaptive dt cap from the standard NSM ``dt_max``
+        # (explicit cap wins; wave-free domains step at dt_max, not a floor).
+        timestepping.apply_default_dt_max(self.compute_dt, nsm.dt_max)
         mesh = ensure_lsq_mesh(mesh, nsm)
         # Periodic-BC topology resolution needs the ``BoundaryConditions``
         # object — the Model carries it directly; a declarative SystemModel
@@ -137,11 +141,9 @@ class SplittingSolver(IMEXSolver):
         # Velocity component slots in the state vector (subclass-overridable)
         self._sim_vel_idx = self._velocity_indices(model)
 
-        # Precompute mesh constant
-        self._sim_cell_inradius_face = np.minimum(
-            mesh.cell_inradius[mesh.face_cells[0, :]],
-            mesh.cell_inradius[mesh.face_cells[1, :]],
-        ).min()
+        # Per-face inradius for the LOCAL CFL (shared base helper — no global
+        # ``.min()`` collapse: each face pairs its own size with its own λ).
+        self._sim_face_inradius = self._compute_face_inradius(mesh)
 
         # Output setup
         if write_output:
@@ -409,7 +411,7 @@ class SplittingSolver(IMEXSolver):
         while time_now < self.time_end:
             dt = self.compute_dt(
                 self._sim_Q, self._sim_Qaux, self._sim_parameters,
-                self._sim_cell_inradius_face, self._sim_compute_max_abs_eigenvalue,
+                self._sim_face_inradius, self._sim_compute_max_abs_eigenvalue,
             )
             dt = min(float(dt), float(self.time_end - time_now))
             if not np.isfinite(dt) or dt <= 0:

@@ -97,7 +97,7 @@ def _drive(solver, record=False):
     while t < solver.time_end:
         dt = solver.compute_dt(
             solver._sim_Q, solver._sim_Qaux, solver._sim_parameters,
-            solver._sim_cell_inradius_face,
+            solver._sim_face_inradius,
             solver._sim_compute_max_abs_eigenvalue)
         dt = min(float(dt), float(solver.time_end - t))
         if not np.isfinite(dt) or dt <= 0.0:
@@ -147,7 +147,7 @@ def test_mood_is_strict_noop_on_wet_smooth_run():
     while t < s_plain.time_end:
         dt = s_plain.compute_dt(
             s_plain._sim_Q, s_plain._sim_Qaux, s_plain._sim_parameters,
-            s_plain._sim_cell_inradius_face,
+            s_plain._sim_face_inradius,
             s_plain._sim_compute_max_abs_eigenvalue)
         dt = min(float(dt), float(s_plain.time_end - t))
         if not np.isfinite(dt) or dt <= 0.0:
@@ -184,7 +184,7 @@ def test_mood_output_is_exactly_the_masked_o1_restep():
     while t < solver.time_end and n < 20:
         dt = solver.compute_dt(
             solver._sim_Q, solver._sim_Qaux, solver._sim_parameters,
-            solver._sim_cell_inradius_face,
+            solver._sim_face_inradius,
             solver._sim_compute_max_abs_eigenvalue)
         dt = min(float(dt), float(solver.time_end - t))
         if not np.isfinite(dt) or dt <= 0.0:

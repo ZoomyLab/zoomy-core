@@ -272,6 +272,16 @@ class NumericalSystemModel(SystemModel):
     # modes).  This is solver config, not a system operation, so it lives as a
     # slim NSM attribute rather than driving a ``.apply`` op.
     eigenvalue_eps: float = 1e-8
+    # Standard numerical timestep CAP (seconds) carried on the NSM so EVERY
+    # backend reads the SAME value instead of a per-solver magic knob (REQ-190).
+    # Default 5.0 s = amrex's historical ``dtmax``.  Rationale (wave-free):
+    # a fully-dry / sub-``wet_dry_eps`` domain has ``max|λ| = 0`` everywhere,
+    # so the gated eigenvalues are 0 and the CFL imposes NO constraint — the
+    # local dt limits are ``+inf`` and the step is bounded only by this
+    # ``dt_max`` (and by output/end-time clipping), never by a hardcoded floor.
+    # Every printer emits it alongside the other numerical parameters; the numpy
+    # timestepper reads it off the NSM when the caller passed no explicit cap.
+    dt_max: float = 5.0
     # Opt-in system operations run on this NSM by :meth:`derive`, in addition to
     # :meth:`default_operations`.  Each entry is a reusable ``op(sm)`` callable
     # from :mod:`zoomy_core.systemmodel.operations` (e.g.
@@ -431,6 +441,7 @@ class NumericalSystemModel(SystemModel):
         reconstruction: Optional[ReconstructionSpec] = None,
         diffusion: Optional[DiffusionSpec] = None,
         eigenvalue_eps: float = 1e-8,
+        dt_max: float = 5.0,
         extra_operations: Optional[list] = None,
         additional_systems: Optional[list] = None,
         scaled_q_indices: Optional[list] = None,
@@ -446,6 +457,8 @@ class NumericalSystemModel(SystemModel):
               non-zero ``diffusion_matrix`` and a positive ``nu``;
               otherwise disabled.
             - ``eigenvalue_eps`` → ``1e-8``
+            - ``dt_max`` → ``5.0`` (standard numerical timestep cap; a
+              wave-free dry domain steps at this value, not a magic floor)
             - ``extra_operations`` → ``[]`` (opt-in system ops run by
               :meth:`derive`, e.g. ``[desingularize_hinv()]``)
 
@@ -512,6 +525,7 @@ class NumericalSystemModel(SystemModel):
         sm.reconstruction = reconstruction
         sm.diffusion = diffusion
         sm.eigenvalue_eps = eigenvalue_eps
+        sm.dt_max = dt_max
         sm.extra_operations = list(extra_operations or [])
         sm.source_derivative_specs = (
             list(source_specs) if source_specs else None)

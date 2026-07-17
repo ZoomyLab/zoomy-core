@@ -54,7 +54,7 @@ def one_hyperbolic_step():
         solver.setup_simulation(mesh, nsm, write_output=False)
         dt = solver.compute_dt(
             solver._sim_Q, solver._sim_Qaux, solver._sim_parameters,
-            solver._sim_cell_inradius_face,
+            solver._sim_face_inradius,
             solver._sim_compute_max_abs_eigenvalue,
         )
         solver.step(float(dt))

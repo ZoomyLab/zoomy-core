@@ -1096,6 +1096,24 @@ class HyperbolicSolver(Solver):
 
     # -- Setup / Step / Run / Solve ------------------------------------
 
+    def _compute_face_inradius(self, mesh):
+        """Per-face inradius for the LOCAL CFL: each face carries the min of
+        its two adjacent cells' inradii (boundary faces: the inner cell's),
+        so ``compute_dt`` pairs every face's own size with its own local
+        wave speed — never the global smallest cell with the global fastest
+        wave.  Shared by every solver setup (base, IMEX, splitting)."""
+        nc = mesh.n_inner_cells
+        inner_face_mask = (mesh.face_cells[0] < nc) & (mesh.face_cells[1] < nc)
+        face_inradius = np.full(mesh.n_faces, np.inf)
+        face_inradius[inner_face_mask] = np.minimum(
+            mesh.cell_inradius[mesh.face_cells[0, inner_face_mask]],
+            mesh.cell_inradius[mesh.face_cells[1, inner_face_mask]],
+        )
+        if (~inner_face_mask).any():
+            face_inradius[~inner_face_mask] = mesh.cell_inradius[
+                mesh.face_cells[0, ~inner_face_mask]]
+        return face_inradius
+
     def setup_simulation(self, mesh, model, write_output=True):
         """Build all operators once. Stores simulation state on self.
 
@@ -1108,6 +1126,11 @@ class HyperbolicSolver(Solver):
         """
         nsm, source_model = self._coerce_to_nsm(model)
         self.nsm = nsm
+        # REQ-190: the timestep cap is a STANDARD NSM parameter.  Fill the
+        # adaptive strategy's dt_max from ``nsm.dt_max`` unless the caller
+        # passed an explicit cap (explicit wins); a wave-free (fully-dry)
+        # domain then steps at dt_max instead of leaking ``inf``.
+        timestepping.apply_default_dt_max(self.compute_dt, nsm.dt_max)
         mesh = ensure_lsq_mesh(mesh, nsm)
         # Periodic-BC topology resolution needs the ``BoundaryConditions``
         # object (it iterates ``.boundary_conditions_list`` for tagged
@@ -1148,22 +1171,7 @@ class HyperbolicSolver(Solver):
         self._sim_Q = self.update_q(self._sim_Q, Qaux, mesh, model,
                                     parameters, 0.0)
 
-        # Per-face inradius for the LOCAL CFL: each face carries the min of
-        # its two adjacent cells' inradii (boundary faces: the inner cell's),
-        # so ``compute_dt`` pairs every face's own size with its own local
-        # wave speed — never the global smallest cell with the global fastest
-        # wave.
-        nc = mesh.n_inner_cells
-        inner_face_mask = (mesh.face_cells[0] < nc) & (mesh.face_cells[1] < nc)
-        face_inradius = np.full(mesh.n_faces, np.inf)
-        face_inradius[inner_face_mask] = np.minimum(
-            mesh.cell_inradius[mesh.face_cells[0, inner_face_mask]],
-            mesh.cell_inradius[mesh.face_cells[1, inner_face_mask]],
-        )
-        if (~inner_face_mask).any():
-            face_inradius[~inner_face_mask] = mesh.cell_inradius[
-                mesh.face_cells[0, ~inner_face_mask]]
-        self._sim_face_inradius = face_inradius
+        self._sim_face_inradius = self._compute_face_inradius(mesh)
 
         # Output setup
         if write_output:

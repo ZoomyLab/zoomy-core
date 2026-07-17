@@ -298,6 +298,10 @@ class FoamSystemModelPrinter(GenericCppBase):
             f"constexpr int n_dof_qaux = {len(sm.aux_state)};",
             f"constexpr int n_parameters = {len(p_keys)};",
             f"constexpr int dimension  = {sm.dimension};",
+            # REQ-190: standard numerical timestep cap (a wave-free/dry domain
+            # steps at this value, not a magic floor) — the same dt_max the NSM
+            # carries and every other backend reads.
+            f"constexpr Foam::scalar dt_max = {float(sm.dt_max)};",
             f"const Foam::List<Foam::word> map_boundary_tag_to_function_index{{ {bc_str} }};",
             f"const Foam::List<Foam::word> parameter_names{{ {p_names} }};",
             f"inline Foam::List<Foam::scalar> default_parameters() {{ return {{ {p_vals} }}; }}",

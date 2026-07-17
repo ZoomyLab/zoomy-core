@@ -305,7 +305,7 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
         while time_now < self.time_end:
             dt = self.compute_dt(
                 self._sim_Q, self._sim_Qaux, self._sim_parameters,
-                self._sim_cell_inradius_face, self._sim_compute_max_abs_eigenvalue,
+                self._sim_face_inradius, self._sim_compute_max_abs_eigenvalue,
             )
             remaining = float(self.time_end - time_now)
             if remaining < 1e-10 * max(self.time_end, 1.0):

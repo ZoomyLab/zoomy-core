@@ -71,7 +71,7 @@ def _build_mlvam(mesh):
 def _mlvam_dt(sol):
     cdt = timestepping.adaptive(CFL=CFL, dimension=1)
     return min(float(cdt(sol._sim_Q, sol._sim_Qaux, sol._sim_parameters,
-                         sol._sim_cell_inradius_face,
+                         sol._sim_face_inradius,
                          sol._sim_compute_max_abs_eigenvalue)), 5e-3)
 
 

@@ -142,7 +142,19 @@ class NumpyRuntimeModel:
             for call in expr.atoms(src_cls):
                 idx, *rest = call.args
                 reps[call] = pick(pack_cls(*rest), idx)
-        return expr.xreplace(reps) if reps else expr
+        if not reps:
+            return expr
+        # ``xreplace`` rebuilds every ancestor of a replaced kernel atom via
+        # ``node.func(*new_args)`` with the GLOBAL evaluate flag.  For a
+        # spectral-radius ``Max(|λ_i|)`` sitting above the ``eigenvalues``
+        # kernels (Rusanov dissipation), that rebuild re-runs ``Max``'s O(n²)
+        # ``factor_terms`` ordering on the still-inlined Jacobian tree — the
+        # SETUP explosion (REQ-189).  The rewrite is a pure STRUCTURAL kernel
+        # swap, so it must not re-evaluate: pin ``evaluate=False`` for the
+        # rebuild.  cse in the following ``lambdify`` still hoists the shared
+        # ``*_pack`` node, so the reduction lowers unchanged / bit-identically.
+        with sp.evaluate(False):
+            return expr.xreplace(reps)
 
     def _lambdify_function(self, function_obj, modules):
         """Internal helper `_lambdify_function`."""
@@ -517,6 +529,10 @@ class NumpyRuntimeModel:
         rt.n_parameters = sm.parameters.length()
         rt.parameters = np.array(list(sm.parameter_values.values()),
                                  dtype=float)
+        # REQ-190: standard numerical timestep cap, carried on the runtime so
+        # the numpy/UFL "emit" exposes the same ``dt_max`` every other backend
+        # reads (``sm`` is an NSM after the front-door coercion above).
+        rt.dt_max = sm.dt_max
         rt.module = dict(cls.module) if module is None else dict(module)
         rt.printer = cls.printer if printer is None else printer
 

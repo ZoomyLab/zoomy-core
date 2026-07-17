@@ -154,7 +154,7 @@ def test_rain_volume_plateaus_after_T_rain():
     while t < solver.time_end:
         dt = solver.compute_dt(
             solver._sim_Q, solver._sim_Qaux, solver._sim_parameters,
-            solver._sim_cell_inradius_face,
+            solver._sim_face_inradius,
             solver._sim_compute_max_abs_eigenvalue)
         dt = min(float(dt), float(solver.time_end - t))
         if not np.isfinite(dt) or dt <= 0.0:

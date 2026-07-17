@@ -1666,6 +1666,11 @@ class GenericCppModel(GenericCppBase):
                 f"    static constexpr int n_dof_qaux = {self.n_dof_qaux};",
                 f"    static constexpr int n_parameters = {self.n_parameters};",
                 f"    static constexpr int dimension  = {dimension};",
+                # REQ-190: standard numerical timestep cap — a wave-free (dry)
+                # domain steps at this value, not a magic floor.  Emitted
+                # alongside the other numerical constants so every C-family
+                # driver reads the SAME dt_max the NSM carries.
+                f"    static constexpr double dt_max = {float(sm.dt_max)};",
                 f"    static constexpr int n_dof_gradQ = {n_dof_gradQ};",
                 f"    static constexpr bool has_diffusion = {'true' if has_diffusion else 'false'};",
                 f"    static constexpr bool has_free_surface = {'true' if has_free_surface else 'false'};",
