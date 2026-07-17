@@ -31,7 +31,12 @@ from zoomy_core.model.derivation.basis_cache import _basis_fingerprint
 
 # Bump when the derivation pipeline changes in a way that invalidates every
 # cached entry (new op semantics, changed extraction, etc.).
-CACHE_VERSION = "v4"   # v4: REQ-176(4) viscous-retained moment families —
+CACHE_VERSION = "v5"   # v5: REQ-176-firedrake — SWE base gained a wet/dry
+#                              momentum cap (update_variables) not folded into the
+#                              spec key (which hashes derive_model, not the model's
+#                              update_variables method); bump invalidates stale
+#                              identity-update_variables SWE entries on every tier.
+#                        v4: REQ-176(4) viscous-retained moment families —
 #                              SME/ML-SME/VAM/ML-VAM add_inplane_viscous +
 #                              package_viscous + NewtonianInPlane closure (default
 #                              path byte-identical, but derive_model changed).

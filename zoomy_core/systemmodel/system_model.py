@@ -307,6 +307,13 @@ def _attach_function_groups(sm, model, canonical_source=None) -> None:
     # ambiguous and refused.
     y_pos, z_pos = sp.Symbol("y", real=True), sp.Symbol("z", real=True)
     new_aux: list = []
+    # Did a function group (re)register the WB reconstruction forward map?  If
+    # so it is the AUTHORITATIVE runtime map (the limiter reconstructs these
+    # primitives), and ``state_from_reconstruction`` must be re-derived as its
+    # genuine inverse — a model-method inverse built from a stale/duplicate
+    # ``reconstruction_variables()`` may disagree (e.g. SWE's method left the
+    # velocity row identity while the group limits ``hu/h``).  REQ-180.
+    recon_group_registered = False
 
     def _parse(rhs, group, idx):
         # ``.doit()`` expands derivatives of compounds (the CoV leaves
@@ -363,10 +370,16 @@ def _attach_function_groups(sm, model, canonical_source=None) -> None:
         arr = (sp.Array(vec) if attr == "reconstruction_variables"
                else sp.Matrix(vec))
         setattr(sm, attr, _to_zarray(arr))
+        if attr == "reconstruction_variables":
+            recon_group_registered = True
     # A model-registered WB reconstruction implies its inverse (the runtime
-    # feeds reconstructed primitives back through ``WB_<name>`` symbols).
-    if (getattr(sm, "reconstruction_variables", None) is not None
-            and getattr(sm, "state_from_reconstruction", None) is None):
+    # feeds reconstructed primitives back through ``WB_<name>`` symbols).  Derive
+    # it whenever a group set the forward map (that map is authoritative — its
+    # inverse must ×-back every quotient row, e.g. hu = WB_hu·(η−b)), or when a
+    # model supplied ``reconstruction_variables`` but no inverse yet.
+    if getattr(sm, "reconstruction_variables", None) is not None and (
+            recon_group_registered
+            or getattr(sm, "state_from_reconstruction", None) is None):
         from zoomy_core.model.reconstruction_inverse import (
             invert_reconstruction,
         )
