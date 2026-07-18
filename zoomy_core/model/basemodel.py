@@ -40,6 +40,30 @@ def _derivation_byproduct(model, on_derivation, legacy_attr):
     return val
 
 
+def register_sympy_attribute(definition, prefix="q"):
+    """Turn int or list field specs into a Zstruct of sympy Symbols.
+
+    Kept for the superrepo's legacy callers (``tests/old/regressiontests/*``,
+    ``notebooks/legacy/demo_smm_sediment.py``), which are outside this
+    submodule and therefore outside its test gate.  Symbol construction is
+    delegated to :func:`_constrained_symbol` so a ``(name, constraint)`` entry
+    is honoured rather than stringified to ``"('h', 'nonnegative')"``.
+
+    Prefer :func:`parse_definition_to_zstruct`; this stays only until the
+    legacy callers are retired (root-owned paths — see REQ-199)."""
+    if isinstance(definition, Zstruct):
+        return definition
+    if isinstance(definition, int):
+        entries = [(f"{prefix}_{i}", "real") for i in range(definition)]
+    elif isinstance(definition, (list, tuple)):
+        entries = [_split_declaration(e) for e in definition]
+    else:
+        raise TypeError(f"Unsupported definition type: {type(definition)}")
+    z = Zstruct(**{str(n): _constrained_symbol(n, c) for n, c in entries})
+    z._symbolic_name = prefix
+    return z
+
+
 def eigenvalue_dict_to_matrix(eigenvals_dict):
     """Flatten a sympy eigenvals() dict {eigenvalue: multiplicity} into a ZArray."""
     result = []
