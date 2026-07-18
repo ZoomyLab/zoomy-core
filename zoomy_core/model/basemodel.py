@@ -40,22 +40,6 @@ def _derivation_byproduct(model, on_derivation, legacy_attr):
     return val
 
 
-def register_sympy_attribute(definition, prefix="q"):
-    """Turn int or list field specs into a Zstruct of real sympy Symbols."""
-    if isinstance(definition, int):
-        names = [f"{prefix}_{i}" for i in range(definition)]
-    elif isinstance(definition, (list, tuple)):
-        names = [str(n) for n in definition]
-    elif isinstance(definition, Zstruct):
-        return definition
-    else:
-        raise TypeError(f"Unsupported definition type: {type(definition)}")
-    attrs = {n: sp.Symbol(n, real=True) for n in names}
-    z = Zstruct(**attrs)
-    z._symbolic_name = prefix
-    return z
-
-
 def eigenvalue_dict_to_matrix(eigenvals_dict):
     """Flatten a sympy eigenvals() dict {eigenvalue: multiplicity} into a ZArray."""
     result = []
@@ -68,28 +52,86 @@ def default_simplify(expr):
     return sp.powsimp(expr, combine="all", force=False, deep=True)
 
 
+#: Declared constraint name → extra sympy assumptions on the Symbol.
+#: A declaration carries the constraint as the SECOND element of a pair —
+#: ``("h", "nonnegative")`` in a variable list, ``"g": (9.81, "positive")``
+#: in a parameter dict.  The assumption is what lets the CAS pull depth out
+#: of a radical (``sqrt(h**2) → h``, ``sqrt(g*h**5) → sqrt(g)*h**(5/2)``), so
+#: a dropped constraint is a silent loss of algebraic simplification, not
+#: cosmetic.
+SYMBOL_CONSTRAINTS = {
+    "real": {},
+    "nonnegative": {"nonnegative": True},   # x >= 0 — wet/dry depth admits h = 0
+    "positive": {"positive": True},         # x >  0
+}
+
+
+def _constrained_symbol(name, constraint):
+    """Build one ``sp.Symbol`` carrying a declared constraint.
+
+    Every symbol is real; ``constraint`` adds the sign assumption.  An
+    unknown constraint RAISES — a typo'd or newly-invented constraint must
+    not silently degrade to a plain real symbol."""
+    if constraint not in SYMBOL_CONSTRAINTS:
+        raise ValueError(
+            f"unknown constraint {constraint!r} on symbol {str(name)!r}; "
+            f"expected one of {sorted(SYMBOL_CONSTRAINTS)}")
+    return sp.Symbol(str(name), real=True, **SYMBOL_CONSTRAINTS[constraint])
+
+
+def _split_declaration(entry):
+    """Split a declaration entry into ``(payload, constraint)``.
+
+    ``entry`` is either the bare payload — a name in a variable list, a
+    numeric default in a parameter dict — or a ``(payload, constraint)``
+    pair.  A bare entry carries the neutral constraint ``"real"``."""
+    if isinstance(entry, (list, tuple)) and len(entry) > 1:
+        return entry[0], entry[1]
+    return entry, "real"
+
+
 def parse_definition_to_zstruct(definition, prefix="q_"):
-    """Turn int/list/dict/:class:`~zoomy_core.misc.misc.Zstruct` specs into symbolic :class:`~zoomy_core.misc.misc.Zstruct` fields."""
+    """Turn int/list/dict/:class:`~zoomy_core.misc.misc.Zstruct` specs into symbolic :class:`~zoomy_core.misc.misc.Zstruct` fields.
+
+    List entries are ``name`` or ``(name, constraint)``; dict entries are
+    ``name: default`` or ``name: (default, constraint)``.  See
+    :data:`SYMBOL_CONSTRAINTS` for the constraint vocabulary."""
     attributes = {}
     if isinstance(definition, int):
         for i in range(definition):
             name = f"{prefix}{i}"
             attributes[name] = sp.Symbol(name, real=True)
     elif isinstance(definition, (list, tuple)):
-        for name in definition:
-            attributes[str(name)] = sp.Symbol(str(name), real=True)
+        for entry in definition:
+            name, constraint = _split_declaration(entry)
+            attributes[str(name)] = _constrained_symbol(name, constraint)
     elif isinstance(definition, dict):
         for name, data in definition.items():
-            assumptions = {"real": True}
-            if isinstance(data, (list, tuple)) and len(data) > 1:
-                constraint = data[1]
-                if constraint == "positive":
-                    assumptions["positive"] = True
-            attributes[str(name)] = sp.Symbol(str(name), **assumptions)
+            _, constraint = _split_declaration(data)
+            attributes[str(name)] = _constrained_symbol(name, constraint)
     elif isinstance(definition, Zstruct):
         return parse_definition_to_zstruct(definition.as_dict(), prefix=prefix)
 
     return Zstruct(**attributes)
+
+
+def merge_parameter_overrides(declared, overrides):
+    """Merge user ``parameters=`` over a declared parameter dict, KEEPING the
+    declared constraint.
+
+    A user override is a bare value (``{"g": 9.81}``) — assigning it straight
+    over the declared ``("g", … )`` pair would drop the constraint and hand
+    the CAS an assumption-free symbol.  Re-wrap the user value in the
+    declared constraint; an override that carries its own ``(value,
+    constraint)`` pair wins outright."""
+    merged = dict(declared)
+    for name, value in (overrides or {}).items():
+        if isinstance(value, (list, tuple)) and len(value) > 1:
+            merged[name] = value          # override states its own constraint
+            continue
+        _, constraint = _split_declaration(merged.get(name))
+        merged[name] = (value, constraint)
+    return merged
 
 
 def extract_parameter_defaults(definition):

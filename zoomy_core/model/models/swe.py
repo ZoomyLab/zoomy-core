@@ -28,6 +28,7 @@ import param
 import sympy as sp
 
 from zoomy_core.misc.misc import ZArray
+from zoomy_core.model.basemodel import merge_parameter_overrides
 from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
 from zoomy_core.model.derivative_workflow import StructuredDerivativeModel
 from zoomy_core.systemmodel.system_model import SystemModel
@@ -39,7 +40,14 @@ class SWE(StructuredDerivativeModel):
     """Shallow water + bed (+ Manning friction), 1D or 2D."""
 
     dimension = param.Integer(default=1, bounds=(1, 2))
-    variables = ["b", "h", "hu"]          # + "hv" when dimension == 2
+    # ``h`` is declared NONNEGATIVE (h >= 0, not h > 0: wet/dry admits a dry
+    # cell h = 0).  The assumption reaches the sympy Symbol, so the CAS pulls
+    # the depth out of the radicals the face kernels are built from —
+    # sqrt(g*h**5) → sqrt(g)*h**(5/2), sqrt(h**2) → h — instead of carrying
+    # them as Abs/composite powers no CSE pass can share.  Measured on the
+    # three face operators of PositiveNonconservativeHLL / 2-D SWE:
+    # post-CSE ops 256 → 224 (-12.5%), CSE temps 68 → 52.
+    variables = ["b", ("h", "nonnegative"), "hu"]   # + "hv" when dimension == 2
     parameters = {
         "g":    (9.81, "positive"),
         "n_m":  (0.0, "nonnegative"),     # Manning; 0 = frictionless
@@ -58,12 +66,12 @@ class SWE(StructuredDerivativeModel):
 
     def __init__(self, **kw):
         if int(kw.get("dimension", 1)) == 2:
-            self.variables = ["b", "h", "hu", "hv"]
+            self.variables = ["b", ("h", "nonnegative"), "hu", "hv"]
         # constructor parameters override the declared defaults ONE BY ONE
-        # (a partial dict must not drop g)
-        defaults = dict(type(self).parameters)
-        defaults.update(kw.get("parameters") or {})
-        kw["parameters"] = defaults
+        # (a partial dict must not drop g) and KEEP the declared constraint
+        # (a bare ``{"g": 9.81}`` must not drop g's positivity)
+        kw["parameters"] = merge_parameter_overrides(
+            type(self).parameters, kw.get("parameters"))
         # FromModel BCs resolve against the SystemModel — hold them aside
         # and attach in ``system_model`` (the SME semantics), instead of
         # letting the production pipeline resolve them at construction.

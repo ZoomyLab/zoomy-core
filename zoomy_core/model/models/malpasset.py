@@ -52,7 +52,7 @@ class MalpassetSWE(SWE):
 
     # Own state + parameter set (overrides the SWE class defaults so the
     # SWE.__init__ parameter merge does NOT drag in n_m / h_in / q_in).
-    variables = ["b", "h", "hu", "hv"]
+    variables = ["b", ("h", "nonnegative"), "hu", "hv"]
     parameters = {
         "g":   (9.81, "positive"),
         "n":   (0.033, "nonnegative"),   # Manning roughness
