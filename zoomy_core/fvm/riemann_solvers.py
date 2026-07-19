@@ -251,9 +251,22 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
             normal=self.normal,
         )
 
-        self.register_symbolic_function("numerical_flux", self.numerical_flux, sig)
+        # Build each face definition ONCE.  The two legacy names and the
+        # fused ``numerical_face`` are registered from the *same* expression
+        # objects, so the fused kernel is a repack of the legacy ones — never
+        # a re-derivation.  Registering a cached definition is byte-identical
+        # to registering the bound method (``register_symbolic_function``
+        # calls it exactly once either way), so ``numerical_face`` is purely
+        # additive: existing backends that never ask for it are unaffected.
+        flux = self.numerical_flux()
+        fluctuations = self.numerical_fluctuations()
+
+        self.register_symbolic_function("numerical_flux", lambda: flux, sig)
         self.register_symbolic_function(
-            "numerical_fluctuations", self.numerical_fluctuations, sig
+            "numerical_fluctuations", lambda: fluctuations, sig
+        )
+        self.register_symbolic_function(
+            "numerical_face", lambda: self.pack_face(flux, fluctuations), sig
         )
 
         eig_sig = Zstruct(
@@ -261,6 +274,77 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         )
         self.register_symbolic_function(
             "local_max_abs_eigenvalue", self.local_max_eigenvalue_definition, eig_sig
+        )
+
+    def pack_face(self, flux, fluctuations):
+        """Pack one face's COMPLETE Riemann answer into the flat layout
+
+            ``[ flux(n) | D_plus(n) | D_minus(n) | lambda_max(1) ]``
+
+        of shape ``(3·n_variables + 1, 1)``, on the same two-state
+        ``(q_minus, q_plus, aux_minus, aux_plus, p, normal)`` signature the
+        legacy face kernels carry.
+
+        ``flux`` / ``fluctuations`` are the ALREADY-BUILT definitions of
+        :meth:`numerical_flux` / :meth:`numerical_fluctuations` (shape
+        ``(n,)`` and ``(2, n)``, row 0 = ``D_plus``, row 1 = ``D_minus`` —
+        the convention every ``numerical_fluctuations`` override follows).
+        Packing the same expression objects is what makes the fused kernel a
+        strict repack: unpacking it reproduces the three legacy kernels
+        exactly, not just to tolerance.
+
+        The payoff is the CSE silo.  The printers run one ``sp.cse`` per
+        registered function, so ``1/h``, the hydrostatic reconstruction and
+        the eigenvalue candidates are each recomputed once PER legacy
+        kernel.  Fused, they are shared subexpressions in a single silo and
+        collapse to one temp apiece.
+
+        ``lambda_max`` is the face wave speed on the RAW (un-reconstructed)
+        face states — the Rusanov/CFL speed a driver needs for ``dt``, and
+        by construction the same block the schemes already build for their
+        own dissipation (see :meth:`face_max_abs_eigenvalue`), so it costs
+        nothing extra in the fused silo for the non-reconstructing schemes.
+
+        NB the flux row alone is NOT a usable scheme: for the
+        nonconservative variants ``get_viscosity_identity_flux`` is zero and
+        ALL dissipation lives in ``D_plus``/``D_minus``.  A consumer must
+        use the fluctuation rows too.
+        """
+        lambda_max = self.face_max_abs_eigenvalue(
+            self.variables_minus,
+            self.variables_plus,
+            self.aux_variables_minus,
+            self.aux_variables_plus,
+            self.parameters,
+            self.normal,
+        )
+        rows = list(sp.flatten(flux))
+        rows += list(sp.flatten(fluctuations))
+        rows.append(lambda_max)
+        expected = 3 * self.n_variables + 1
+        if len(rows) != expected:
+            raise ValueError(
+                f"pack_face: expected {expected} rows "
+                f"(3·{self.n_variables} + 1), got {len(rows)} — "
+                f"numerical_flux has shape {getattr(flux, 'shape', None)} and "
+                f"numerical_fluctuations {getattr(fluctuations, 'shape', None)}; "
+                "the packed layout requires (n,) and (2, n)."
+            )
+        return ZArray(rows).reshape(expected, 1)
+
+    def face_max_abs_eigenvalue(self, qL, qR, auxL, auxR, p, n):
+        """Face wave speed ``max(ρ(A_n)|_L, ρ(A_n)|_R)`` — the Rusanov /
+        local-Lax-Friedrichs dissipation speed at a face.
+
+        ``evaluate=False`` for the same reason as
+        :meth:`local_max_abs_eigenvalue`: the outer ``Max`` is a runtime
+        reduction over two opaque wave speeds, never a symbolic ordering
+        target.
+        """
+        return sp.Max(
+            self.local_max_abs_eigenvalue(qL, auxL, p, n),
+            self.local_max_abs_eigenvalue(qR, auxR, p, n),
+            evaluate=False,
         )
 
     def local_max_eigenvalue_definition(self):
@@ -441,11 +525,7 @@ class Rusanov(Numerics):
         FR = self._model_eval("flux", qR, auxR, p)
         PL = self._model_eval("hydrostatic_pressure", qL, auxL, p)
         PR = self._model_eval("hydrostatic_pressure", qR, auxR, p)
-        s_max = sp.Max(
-            self.local_max_abs_eigenvalue(qL, auxL, p, n),
-            self.local_max_abs_eigenvalue(qR, auxR, p, n),
-            evaluate=False,
-        )
+        s_max = self.face_max_abs_eigenvalue(qL, qR, auxL, auxR, p, n)
         Id = self.get_viscosity_identity_flux()
         return 0.5 * ((FL + PL) @ n + (FR + PR) @ n) - 0.5 * s_max * Id @ (qR - qL)
 
@@ -484,11 +564,7 @@ class HLL(Numerics):
     def wave_speed_bounds(self, qL, qR, auxL, auxR, p, n):
         """Return ``(s_L, s_R)`` — slowest / fastest signal speeds at the face."""
         if self.model.eigenvalues is None:
-            a = sp.Max(
-                self.local_max_abs_eigenvalue(qL, auxL, p, n),
-                self.local_max_abs_eigenvalue(qR, auxR, p, n),
-                evaluate=False,
-            )
+            a = self.face_max_abs_eigenvalue(qL, qR, auxL, auxR, p, n)
             return -a, a
         eig = list(sp.flatten(self._model_eval("eigenvalues", qL, auxL, p, n)))
         eig += list(sp.flatten(self._model_eval("eigenvalues", qR, auxR, p, n)))
@@ -842,11 +918,7 @@ class NonconservativeRusanov(Rusanov):
                     A_n[i, j] = val
             A_int += wi * A_n
 
-        s_max = sp.Max(
-            self.local_max_abs_eigenvalue(qL, auxL, p, n),
-            self.local_max_abs_eigenvalue(qR, auxR, p, n),
-            evaluate=False,
-        )
+        s_max = self.face_max_abs_eigenvalue(qL, qR, auxL, auxR, p, n)
 
         term_advection = A_int @ dQ
         Id = self.get_viscosity_identity_fluctuations()
