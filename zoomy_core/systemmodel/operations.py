@@ -70,7 +70,6 @@ _DEFAULT_WET_DRY_EPS = 1e-8
 # dry cell (``h<0``).  Instead the eigenvalue velocity uses the same classical
 # floor ``max(1e-14, h)`` the flux velocity already uses, so ``λ = |u·n| +
 # √(g·h*)·|n|`` with the TRUE velocity ``u = q/max(1e-14, h)``.
-_WAVESPEED_H_FLOOR = 1e-14
 
 
 # REGULARIZATION epsilon (REQ-194) — a DIFFERENT QUANTITY at a DIFFERENT SCALE
@@ -667,7 +666,7 @@ def regularize_pow(field: Union[str, sp.Symbol], aux_name: str):
         # ``inv`` is the replacement for ``1/h``: the desingularized ``aux``
         # (``hinv``) for the flux/source/NCP operators, but the plain floored
         # inverse ``1/Max(1e-14, h)`` for the EIGENVALUE / wave-speed (REQ-82 —
-        # see ``_WAVESPEED_H_FLOOR``).  See :func:`_pow_rewrite` for the
+        # see the internal ``eps_h`` at the use site).  See :func:`_pow_rewrite` for the
         # rewrite rules themselves.
         def _rw(e, inv):
             return _pow_rewrite(hs, inv)(e)
@@ -686,7 +685,18 @@ def regularize_pow(field: Union[str, sp.Symbol], aux_name: str):
         #    regulariser suppresses the speed by ``(h*/eps)²`` at a wet/dry
         #    front and starves the dissipation, draining the cell negative
         #    (REQ-82).  The flux velocity already uses this same FP floor.
-        inv_floor = sp.S.One / sp.Max(sp.Float(_WAVESPEED_H_FLOOR), hs)
+        # eps_h — the EIGENVALUE-SLOT wave-speed floor.  Deliberately an
+        # INTERNAL constant of this operator (user ruling 2026-07-19, task
+        # cid=5): not a parameter, not exposed, not tunable.  Every PHYSICAL
+        # operator uses only the wet/dry KP reciprocal (u -> 0 as h -> 0);
+        # the spectrum needs the OPPOSITE guarantee — large-but-finite at a
+        # wet/dry front — because a KP-damped celerity starves the Riemann
+        # dissipation and drains cells negative (measured: lake h_min
+        # -2.5e-15 with this floor vs -1.6e-2 with KP on the eigenvalues).
+        # A fully-dry domain's dt is governed by NSM dt_max (REQ-190), so
+        # this floor never sets a global timestep.
+        eps_h = 1e-14
+        inv_floor = sp.S.One / sp.Max(sp.Float(eps_h), hs)
         for nm in (_PRIMARY_OPERATORS + _DERIVED_OPERATORS
                    + _RECONSTRUCTION_OPERATORS):
             M = getattr(sm, nm, None)
