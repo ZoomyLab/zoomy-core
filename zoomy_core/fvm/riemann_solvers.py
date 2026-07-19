@@ -1188,26 +1188,58 @@ class NonconservativeRoe(NonconservativeRusanov):
 
 class PositiveNonconservativeHLL(PositiveHLL, NonconservativeRusanov):
     """HLL conservative flux + Audusse-Bristeau-Klein hydrostatic
-    reconstruction + path-integral NCP fluctuations.
+    reconstruction + path-integral NCP fluctuations — dissipating ONCE,
+    in the flux.
 
-    Combines the sharper HLL two-wave numerical flux (vs.
-    Rusanov / LF) with the same well-balanced reconstruction and
-    path-integral NCP fluctuations as
-    :class:`PositiveNonconservativeRusanov`.  The bed row is
-    automatically excluded from the LF-style fluctuation dissipation
-    via the bed mask in
-    :meth:`NonconservativeRusanov.get_viscosity_identity_fluctuations`.
+    Combines the sharper HLL two-wave numerical flux (vs. Rusanov / LF)
+    with the same well-balanced reconstruction and path-integral NCP
+    fluctuations as :class:`PositiveNonconservativeRusanov`.
+
+    Dissipation placement — the two nonconservative families differ:
+
+    * The Rusanov nonconservative family has a PURE CENTRAL flux
+      (:meth:`NonconservativeRusanov.get_viscosity_identity_flux` is
+      zero), so its single LF dissipation ``s_max·Id·Δq`` correctly
+      lives in the fluctuations.
+    * HLL's upwinding is STRUCTURAL — the ``sLm·sRp·Δq`` term inside
+      :meth:`HLL._compute_flux` — it does not route through the
+      viscosity-identity hooks.  The flux therefore already carries
+      this scheme's dissipation, and this class zeros
+      :meth:`get_viscosity_identity_fluctuations` so the fluctuation
+      side carries ONLY the DLM path-integral NCP advection term plus
+      the Audusse ``S̃`` consistency source.  (Inheriting the Rusanov
+      fluctuation identity here dissipated TWICE — measured as an O(1)
+      cell-update error vs :class:`PositiveHLL` on NCP-free
+      configurations and a blow-up on river's R2 smooth-bump run at
+      CFL 0.5 where :class:`PositiveHLL` ran clean: the doubled
+      viscosity halves the scheme's stability bound.)
 
     The Python MRO ``(PositiveNonconservativeHLL → PositiveHLL → HLL →
     NonconservativeRusanov → Rusanov → Numerics)`` resolves
     ``numerical_flux`` to ``PositiveHLL.numerical_flux`` (hydrostatic
     reconstruction → HLL combine → bed-row mask) and
-    ``numerical_fluctuations`` to ``NonconservativeRusanov.
-    numerical_fluctuations`` (path-integral NCP + LF identity, bed
-    masked) — exactly the split we want.
+    ``numerical_fluctuations`` to ``PositiveHLL.
+    numerical_fluctuations`` (the Audusse ``S̃`` source), which chains
+    via ``super()`` into ``NonconservativeRusanov.
+    numerical_fluctuations`` — the NCP path integral on the
+    reconstructed states below, with its LF term disabled by the zero
+    viscosity identity.
     """
 
     name = param.String(default="PositiveNonconservativeHLLV2")
+
+    def get_viscosity_identity_fluctuations(self):
+        """Zero matrix — single-dissipation split.
+
+        The Malaga-style placement hook, used here to MOVE the
+        dissipation, not remove it: the HLL flux upwinds structurally,
+        so the LF ``s_max·Id·Δq`` the Rusanov nonconservative family
+        adds in :meth:`NonconservativeRusanov._compute_fluctuations`
+        would dissipate a second time on top.  The NCP path-integral
+        advection term and the Audusse ``S̃`` source are unaffected.
+        """
+        n = self.n_variables
+        return ZArray.zeros(n, n)
 
     def get_path_integral_states(self):
         """NCP path-integral evaluated on the hydrostatically-

@@ -69,8 +69,24 @@ def test_conservative_solvers_never_build_a_fluctuation():
 
 
 def test_nonconservative_solvers_do_build_one():
-    for riemann in (NonconservativeRusanov, PositiveNonconservativeHLL):
-        assert _nsm(_swe(), riemann).fluctuations_are_zero is False
+    assert _nsm(_swe(), NonconservativeRusanov).fluctuations_are_zero is False
+    # PositiveNonconservativeHLL keeps a genuine fluctuation whenever the
+    # model has one: SME's moment-coupling NCP survives the Audusse
+    # reconstruction (only the bed column is equalised).
+    assert _nsm(_sme(), PositiveNonconservativeHLL).fluctuations_are_zero \
+        is False
+
+
+def test_positive_nonconservative_hll_erases_swe_fluctuation():
+    """Single-dissipation PosNCHLL on SWE is the Audusse case again: the
+    reconstruction equalises ``b*`` (kills the bed-column NCP), SWE's empty
+    ``hydrostatic_pressure`` slot kills ``S̃``, and the LF ``s_max·Id·Δq``
+    now lives ONLY in the HLL flux — so every emitted fluctuation entry is
+    literal zero, exactly like ``PositiveRusanov`` above.  (Before the
+    double-dissipation fix the spurious fluctuation-side LF term kept this
+    flag False.)"""
+    assert _nsm(_swe(), PositiveNonconservativeHLL).fluctuations_are_zero \
+        is True
 
 
 def test_audusse_cancellation_is_swe_specific():
