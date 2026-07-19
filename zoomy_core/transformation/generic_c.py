@@ -66,6 +66,36 @@ class GenericCppBase(CXX11CodePrinter):
     gpu_enabled = True
     real_type = "double"
     math_namespace = "std::"
+    # ``resolve_opaque`` — PRINTER option (codegen-time, never a case/settings
+    # key): when True, calls to REGISTERED symbolic functions found inside an
+    # expression body (the ``SymbolicRegistrar.proxy_caller`` products —
+    # ``numerical_flux(...)``-style bare names from a Numerics registrar,
+    # ``Model<T>::foo(...)`` / ``Model::foo(...)`` from a legacy Model
+    # registrar) are INLINED — the registered symbolic definition is spliced
+    # into the consuming expression BEFORE its per-kernel ``sp.cse`` pass, so
+    # CSE sees through the call boundary and shares subexpressions across it.
+    # This is the printer-side replacement for the fused ``numerical_face``
+    # kernel: a driver-shaped consumer expression that calls several
+    # registered kernels collapses to ONE CSE silo instead of N calls.
+    #
+    # Only calls that HAVE a registered symbolic definition are resolved.
+    # Genuinely external kernels — the opaque ``kernel_functions`` primitives
+    # ``eigenvalues`` / ``eigensystem`` / ``solve`` / ``compute_derivative``
+    # (numerical UserFunctions impls per backend) and anything in the
+    # ``c_functions`` print-map — have no symbolic body and are ALWAYS
+    # emitted as calls, exactly as with the option off.  A call whose
+    # argument pattern cannot be matched to the declared signature is also
+    # left as a call (never guess).
+    #
+    # Default False: emission is byte-identical to the pre-option printer.
+    resolve_opaque = False
+    # Never-resolvable call names (external numerical kernels + the inline
+    # conditional) — independent of what a subclass maps in ``c_functions``.
+    _NON_RESOLVABLE = frozenset(
+        {"eigenvalues", "eigensystem", "solve", "compute_derivative",
+         "conditional"}
+    )
+    _RESOLVE_MAX_DEPTH = 8
     # Typed-C++ backends cast bare numeric literals in ``Min``/``Max`` to
     # ``real_type`` (``std::max((T)0, ...)``) so a literal int operand does not
     # clash with the templated ``real_type`` (``std::max(int, double)`` fails to
@@ -133,6 +163,9 @@ class GenericCppBase(CXX11CodePrinter):
 
     def __init__(self, *args, **kwargs):
         """Initialize the instance."""
+        self.resolve_opaque = bool(
+            kwargs.pop("resolve_opaque", type(self).resolve_opaque))
+        self._opaque_registry_cache = None
         super().__init__(*args, **kwargs)
         self.symbol_maps = []
         self._std_regex = re.compile(r"std::([A-Za-z_]\w*)")
@@ -352,6 +385,195 @@ class GenericCppBase(CXX11CodePrinter):
             new_exprs.append(new_e)
         return definitions, new_exprs
 
+    # ── resolve_opaque machinery ─────────────────────────────────────
+    #
+    # The opaque-call mechanism being resolved is ``SymbolicRegistrar.
+    # proxy_caller`` (``basefunction.py``): a registered function invoked
+    # symbolically becomes ``sp.Function("<prefix><name>")(*args)`` — bare
+    # ``<name>`` for a Numerics registrar, ``Model<T>::<name>`` for a Model
+    # registrar — wrapped in an ``IndexedBase(call)[i]`` element read when the
+    # result is array-valued.  ``_optimize_array_calls`` normally extracts
+    # these to ``auto v_call_k = <call>;`` lines, which is the CSE boundary.
+    # With ``resolve_opaque`` on, ``_resolve_opaque_calls`` splices the
+    # registered definition in first, so nothing is left to extract.
+
+    def _resolve_opaque_registry(self):
+        """``{callable-name: basefunction.Function}`` for every registered
+        symbolic function reachable from the object being printed — the
+        numerics registrar (bare names, as its proxies emit) and a legacy
+        Model registrar (``Model<T>::``- / ``Model::``-prefixed and bare).
+        External kernel primitives (``_NON_RESOLVABLE``) and every
+        ``c_functions`` print-map entry are excluded: they have no symbolic
+        definition and must stay calls."""
+        if self._opaque_registry_cache is not None:
+            return self._opaque_registry_cache
+        reg = {}
+        numerics = getattr(self, "numerics", None)
+        if numerics is not None and hasattr(numerics, "functions"):
+            for name in list(numerics.functions.keys()):
+                reg.setdefault(name, numerics.functions[name])
+        model = getattr(self, "model", None)
+        if model is not None and hasattr(model, "functions"):
+            try:
+                names = list(model.functions.keys())
+            except Exception:
+                names = []
+            for name in names:
+                fobj = model.functions[name]
+                reg.setdefault(f"Model<T>::{name}", fobj)
+                reg.setdefault(f"Model::{name}", fobj)
+                reg.setdefault(name, fobj)
+        for banned in self._NON_RESOLVABLE | set(self.c_functions):
+            reg.pop(banned, None)
+        self._opaque_registry_cache = reg
+        return reg
+
+    @staticmethod
+    def _flatten_arg_group(group):
+        """Flat symbol list of one declared signature group (mirror of the
+        flattening ``proxy_caller`` applies to caller-supplied groups)."""
+        if isinstance(group, sp.Basic) and not isinstance(group, sp.NDimArray):
+            return [group]
+        if hasattr(group, "values") and callable(getattr(group, "values")):
+            out = []
+            for child in group.values():
+                out.extend(GenericCppBase._flatten_arg_group(child))
+            return out
+        if hasattr(group, "__iter__"):
+            return list(sp.flatten(list(group)))
+        return [group]
+
+    def _match_call_args(self, fobj, call_args):
+        """Map the DECLARED signature of registered function ``fobj`` onto the
+        actual ``call_args`` of a proxy call.
+
+        Returns a substitution dict ``{declared symbol: call arg}`` (possibly
+        empty — the verbatim case), or ``None`` when the pattern cannot be
+        matched (the call is then left un-resolved, i.e. emitted as today).
+
+        Three per-group forms exist, decided positionally exactly like
+        ``proxy_caller`` builds them:
+
+        * the caller passed the registrar's OWN array for the group —
+          proxy emitted ONE ``sp.Symbol(group._symbolic_name)``; the declared
+          element symbols already print correctly through this printer's
+          ``symbol_maps``, so no substitution is needed;
+        * the caller passed one ARRAY covering the whole group (a group
+          without ``_symbolic_name``, e.g. ``parameters`` / ``normal``) —
+          zip its flat elements against the declared flat symbols;
+        * the caller passed explicit scalar elements — proxy flattened
+          them; zip them against the declared flat symbols.
+        """
+        sig_groups = (list(fobj.args.values())
+                      if hasattr(fobj.args, "values") else list(fobj.args))
+        args_list = list(call_args)
+        subs = {}
+        pos = 0
+        for group in sig_groups:
+            gname = getattr(group, "_symbolic_name", None)
+            if (gname is not None and pos < len(args_list)
+                    and isinstance(args_list[pos], sp.Symbol)
+                    and args_list[pos].name == gname):
+                pos += 1
+                continue
+            flat = self._flatten_arg_group(group)
+            arg0 = args_list[pos] if pos < len(args_list) else None
+            if isinstance(arg0, (sp.NDimArray, sp.MatrixBase, list, tuple)):
+                arr = list(sp.flatten(arg0))
+                if len(arr) != len(flat):
+                    return None
+                for declared, actual in zip(flat, arr):
+                    if declared != actual:
+                        subs[declared] = actual
+                pos += 1
+                continue
+            if pos + len(flat) > len(args_list):
+                return None
+            for declared, actual in zip(flat, args_list[pos:pos + len(flat)]):
+                if declared != actual:
+                    subs[declared] = actual
+            pos += len(flat)
+        if pos != len(args_list):
+            return None
+        return subs
+
+    def _resolve_opaque_calls(self, expr, _depth=0, _stack=()):
+        """Inline registered-function calls found in ``expr`` (recursively —
+        a spliced body may itself consume registered functions), leaving
+        every non-resolvable call untouched.  Structure-preserving: array
+        containers are rebuilt element-wise with their shape; replacements
+        run under ``sp.evaluate(False)`` so the splice is a pure structural
+        rewrite (no ``Max``/ordering re-evaluation — same guard as the numpy
+        ``_lower_opaque_kernels`` seam, REQ-189)."""
+        reg = self._resolve_opaque_registry()
+        if not reg or _depth > self._RESOLVE_MAX_DEPTH:
+            return expr
+        if isinstance(expr, (list, tuple)):
+            return type(expr)(
+                self._resolve_opaque_calls(e, _depth, _stack) for e in expr)
+        if isinstance(expr, sp.NDimArray):
+            flat = [self._resolve_opaque_calls(e, _depth, _stack)
+                    for e in sp.flatten(expr)]
+            rebuilt = sp.ImmutableDenseNDimArray(flat, expr.shape)
+            return ZArray(rebuilt) if isinstance(expr, ZArray) else rebuilt
+        if isinstance(expr, sp.MatrixBase):
+            return expr.applyfunc(
+                lambda e: self._resolve_opaque_calls(e, _depth, _stack))
+        if not isinstance(expr, sp.Basic):
+            return expr
+
+        reps = {}
+        for node in sp.postorder_traversal(expr):
+            if isinstance(node, sp.Indexed):
+                base = node.base
+                label = base.label if hasattr(base, "label") else None
+                if not isinstance(label, sp.Function):
+                    continue
+                call, kind = label, "indexed"
+            elif isinstance(node, sp.Function) and not isinstance(
+                    node, sp.Indexed):
+                call, kind = node, "call"
+            else:
+                continue
+            name = call.func.__name__
+            if name in _stack or name in self._NON_RESOLVABLE:
+                continue
+            fobj = reg.get(name)
+            if fobj is None or getattr(fobj, "definition", None) is None:
+                continue
+            subs = self._match_call_args(fobj, call.args)
+            if subs is None:
+                continue
+            defn = fobj.definition
+            flat_defn = (list(sp.flatten(defn))
+                         if hasattr(defn, "__iter__") else [defn])
+            if kind == "indexed":
+                if len(node.indices) != 1:
+                    continue
+                idx = node.indices[0]
+                if not getattr(idx, "is_Integer", False):
+                    continue
+                i = int(idx)
+                if not (0 <= i < len(flat_defn)):
+                    continue
+                body = sp.sympify(flat_defn[i])
+            else:
+                if len(flat_defn) != 1:
+                    # Array-valued bare call in scalar position — malformed;
+                    # leave it to the existing call-extraction path.
+                    continue
+                body = sp.sympify(flat_defn[0])
+            if subs:
+                with sp.evaluate(False):
+                    body = body.xreplace(subs)
+            body = self._resolve_opaque_calls(
+                body, _depth + 1, _stack + (name,))
+            reps[node] = body
+        if not reps:
+            return expr
+        with sp.evaluate(False):
+            return expr.xreplace(reps)
+
     def get_array_type(self, shape):
         """Returns the C++ type string for the array."""
         total_size = 1
@@ -378,6 +600,12 @@ class GenericCppBase(CXX11CodePrinter):
 
     def convert_expression_body(self, expr, shape, target="res"):
         """Convert expression body."""
+        if self.resolve_opaque:
+            # Inline registered-function calls BEFORE the cse pass below, so
+            # CSE sees through the call boundary (idempotent — resolved
+            # bodies contain no registry calls, so the recursive Piecewise
+            # branch re-entry is a no-op).
+            expr = self._resolve_opaque_calls(expr)
         if isinstance(expr, sp.Piecewise):
             return self._print_piecewise_structure(expr, shape, target)
         flat_expr = (
@@ -710,6 +938,14 @@ class OutParamCodePrinter(GenericCppBase):
 
     # ── Language hooks ───────────────────────────────────────────────
 
+    def _print_Abs(self, expr):
+        """Route ``sympy.Abs`` through the subclass ``c_functions`` map
+        (``Math.abs`` for JS, ``abs`` for GLSL): the inherited C99
+        ``_print_Abs`` emits ``fabs``, which exists in NEITHER language.
+        Latent until the ``numerical_flux`` face-wavespeed row put a
+        ``max(|λ_i|)`` reduction into an executed JS kernel."""
+        return self.c_functions["Abs"](self, expr.args[0])
+
     def _temp_decl(self, lhs, rhs):
         """Declaration line for one CSE temporary.  Default is a
         JS-style ``const``; GLSL overrides to pick ``bool`` / ``float``."""
@@ -752,6 +988,8 @@ class OutParamCodePrinter(GenericCppBase):
         """Convert an expression into a body that writes ``target`` — the
         function's out-parameter array.  No local declaration, no
         ``return``."""
+        if self.resolve_opaque:
+            expr = self._resolve_opaque_calls(expr)
         if isinstance(expr, sp.Piecewise):
             return self._print_piecewise_structure(expr, shape, target)
 

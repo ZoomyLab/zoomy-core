@@ -628,10 +628,13 @@ class DAESolver(Solver):
                 Qaux_L[b_row] = b_L_all[f]
                 Qaux_R[b_row] = b_R_all[f]
 
+            # ``numerical_flux`` returns ``[ flux(n) | lambda_max(1) ]`` —
+            # slice off the trailing face wave-speed row (driver-local dt
+            # enabler; this solver's dt comes from its own eigenvalue bound).
             num_flux = np.asarray(
                 nflux(Q_L, Q_R, Qaux_L, Qaux_R, p, normal),
                 dtype=float,
-            ).ravel()
+            ).ravel()[:n_state]
             fluct = np.asarray(
                 nfluct(Q_L, Q_R, Qaux_L, Qaux_R, p, normal),
                 dtype=float,

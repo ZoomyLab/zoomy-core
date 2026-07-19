@@ -941,9 +941,14 @@ class HyperbolicSolver(Solver):
                 fluct = np.asarray(runtime_numerics.numerical_fluctuations(
                     qA, qB, qauxA, qauxB, parameters, n_f), dtype=float
                 ).reshape(2 * n_vars, -1)
+                # ``numerical_flux`` returns ``[ flux(n) | lambda_max(1) ]``
+                # — (n_vars + 1) rows.  The trailing face wave-speed row is
+                # the driver-local dt enabler; this solver derives its dt per
+                # CELL via ``compute_max_abs_eigenvalue``, so the row is
+                # sliced off here.
                 num_flux = np.asarray(runtime_numerics.numerical_flux(
                     qA, qB, qauxA, qauxB, parameters, n_f), dtype=float
-                ).reshape(n_vars, -1)
+                ).reshape(n_vars + 1, -1)[:n_vars]
                 Dp = fluct[:n_vars]
                 Dm = fluct[n_vars:]
                 np.add.at(dQ.T, iA_int,
@@ -977,7 +982,7 @@ class HyperbolicSolver(Solver):
                 ).reshape(2 * n_vars, -1)
                 num_flux = np.asarray(runtime_numerics.numerical_flux(
                     qA, qB, qauxI, qauxR, parameters, n_f), dtype=float
-                ).reshape(n_vars, -1)
+                ).reshape(n_vars + 1, -1)[:n_vars]
                 Dm = fluct[n_vars:]
                 np.add.at(dQ.T, iInner_bnd,
                           (-(num_flux + Dm) * fv_bnd / cvInner_bnd).T)
@@ -1004,7 +1009,7 @@ class HyperbolicSolver(Solver):
                         runtime_numerics.numerical_flux(
                             qA, qB, qauxA, qauxB, parameters, n
                         ), dtype=float,
-                    ).reshape(-1)
+                    ).reshape(-1)[:n_vars]
                     Dp = fluct[:n_vars]
                     Dm = fluct[n_vars:]
                     dQ[:, iA_int[fi]] -= (num_flux + Dm) * fv_int[fi] / cvA_int[fi]
@@ -1028,7 +1033,7 @@ class HyperbolicSolver(Solver):
                         runtime_numerics.numerical_flux(
                             qA, qB, qauxA, qauxR, parameters, n
                         ), dtype=float,
-                    ).reshape(-1)
+                    ).reshape(-1)[:n_vars]
                     Dm = fluct[n_vars:]
                     dQ[:, iInner_bnd[bi]] -= (num_flux + Dm) * fv_bnd[bi] / cvInner_bnd[bi]
 

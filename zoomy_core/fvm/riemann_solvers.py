@@ -251,17 +251,51 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
             normal=self.normal,
         )
 
-        # Build each face definition ONCE.  The two legacy names and the
+        # Build each face definition ONCE.  The registered names and the
         # fused ``numerical_face`` are registered from the *same* expression
         # objects, so the fused kernel is a repack of the legacy ones — never
         # a re-derivation.  Registering a cached definition is byte-identical
         # to registering the bound method (``register_symbolic_function``
-        # calls it exactly once either way), so ``numerical_face`` is purely
-        # additive: existing backends that never ask for it are unaffected.
+        # calls it exactly once either way).
         flux = self.numerical_flux()
         fluctuations = self.numerical_fluctuations()
 
-        self.register_symbolic_function("numerical_flux", lambda: flux, sig)
+        # The REGISTERED ``numerical_flux`` carries the face wave speed as an
+        # EXTRA trailing row — layout ``[ flux(n) | lambda_max(1) ]`` of shape
+        # ``(n_variables + 1, 1)``:
+        #
+        #   rows 0 .. n-1 : the numerical flux (unchanged),
+        #   row  n        : ``face_max_abs_eigenvalue`` on the RAW
+        #                   (un-reconstructed) face states — the Rusanov/CFL
+        #                   speed a driver needs for its LOCAL dt (each cell
+        #                   derives dt from the λ_max of its own face fluxes;
+        #                   one min-reduction), and by construction the same
+        #                   block the non-reconstructing schemes already build
+        #                   for their dissipation, so CSE dedups it for free.
+        #
+        # NO back-compat shim: every consumer unpacks the (n+1, 1) layout.
+        # ``numerical_fluctuations`` is unchanged.
+        lambda_max = self.face_max_abs_eigenvalue(
+            self.variables_minus,
+            self.variables_plus,
+            self.aux_variables_minus,
+            self.aux_variables_plus,
+            self.parameters,
+            self.normal,
+        )
+        flux_rows = list(sp.flatten(flux))
+        if len(flux_rows) != self.n_variables:
+            raise ValueError(
+                f"numerical_flux: expected {self.n_variables} flux rows, got "
+                f"{len(flux_rows)} (shape {getattr(flux, 'shape', None)})."
+            )
+        flux_with_speed = ZArray(flux_rows + [lambda_max]).reshape(
+            self.n_variables + 1, 1
+        )
+
+        self.register_symbolic_function(
+            "numerical_flux", lambda: flux_with_speed, sig
+        )
         self.register_symbolic_function(
             "numerical_fluctuations", lambda: fluctuations, sig
         )

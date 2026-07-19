@@ -92,6 +92,15 @@ def _normal(dim):
     return np.array([1.0] + [0.0] * (dim - 1))
 
 
+def _num_flux(scheme_rt, qL, qR, aux, p, n):
+    """Evaluate the registered ``numerical_flux`` and unpack its
+    ``[ flux(n) | lambda_max(1) ]`` layout — returns ``(flux_rows, lam)``."""
+    out = np.asarray(
+        scheme_rt.numerical_flux(qL, qR, aux, aux, p, n), dtype=float
+    ).reshape(-1)
+    return out[:-1], out[-1]
+
+
 def _state(dim, h, u, v=0.0):
     if dim == 1:
         return np.array([h, h * u])
@@ -99,13 +108,18 @@ def _state(dim, h, u, v=0.0):
 
 
 def test_hll_consistency(swe):
-    """numerical_flux(q, q) == exact physical normal flux."""
+    """numerical_flux(q, q) == exact physical normal flux; the trailing
+    row is the face max-abs eigenvalue (== the one-state wave speed when
+    both face states coincide)."""
     dim, aux, p = swe["dim"], swe["aux"], swe["p"]
     n = _normal(dim)
     q = _state(dim, h=2.0, u=0.7, v=-0.3)
     expect = _phys_flux_n(swe["mrt"], q, aux, p, n)
-    got = np.asarray(swe["hll"].numerical_flux(q, q, aux, aux, p, n), dtype=float)
+    got, lam = _num_flux(swe["hll"], q, q, aux, p, n)
     np.testing.assert_allclose(got, expect, rtol=1e-9, atol=1e-9)
+    lam_local = float(np.asarray(
+        swe["hll"].local_max_abs_eigenvalue(q, aux, p, n), dtype=float))
+    np.testing.assert_allclose(lam, lam_local, rtol=1e-12)
 
 
 def test_hllc_consistency(swe):
@@ -114,7 +128,7 @@ def test_hllc_consistency(swe):
     n = _normal(dim)
     q = _state(dim, h=1.3, u=-0.5, v=0.9)
     expect = _phys_flux_n(swe["mrt"], q, aux, p, n)
-    got = np.asarray(swe["hllc"].numerical_flux(q, q, aux, aux, p, n), dtype=float)
+    got, _lam = _num_flux(swe["hllc"], q, q, aux, p, n)
     np.testing.assert_allclose(got, expect, rtol=1e-9, atol=1e-9)
 
 
@@ -126,9 +140,7 @@ def test_supersonic_right_is_left_flux(swe):
     qR = _state(dim, h=0.4, u=15.0, v=-2.0)
     expect = _phys_flux_n(swe["mrt"], qL, aux, p, n)
     for scheme in ("hll", "hllc"):
-        got = np.asarray(
-            swe[scheme].numerical_flux(qL, qR, aux, aux, p, n), dtype=float
-        )
+        got, _lam = _num_flux(swe[scheme], qL, qR, aux, p, n)
         np.testing.assert_allclose(got, expect, rtol=1e-7, atol=1e-7,
                                    err_msg=f"{scheme} supersonic-right")
 
@@ -141,9 +153,7 @@ def test_supersonic_left_is_right_flux(swe):
     qR = _state(dim, h=0.4, u=-15.0, v=-2.0)
     expect = _phys_flux_n(swe["mrt"], qR, aux, p, n)
     for scheme in ("hll", "hllc"):
-        got = np.asarray(
-            swe[scheme].numerical_flux(qL, qR, aux, aux, p, n), dtype=float
-        )
+        got, _lam = _num_flux(swe[scheme], qL, qR, aux, p, n)
         np.testing.assert_allclose(got, expect, rtol=1e-7, atol=1e-7,
                                    err_msg=f"{scheme} supersonic-left")
 
@@ -155,10 +165,9 @@ def test_subsonic_jump_is_finite(swe):
     qL = _state(dim, h=2.0, u=0.4, v=0.1)
     qR = _state(dim, h=1.0, u=0.8, v=-0.2)
     for scheme in ("hll", "hllc"):
-        got = np.asarray(
-            swe[scheme].numerical_flux(qL, qR, aux, aux, p, n), dtype=float
-        )
+        got, lam = _num_flux(swe[scheme], qL, qR, aux, p, n)
         assert np.all(np.isfinite(got)), f"{scheme} produced non-finite flux"
+        assert np.isfinite(lam), f"{scheme} produced non-finite lambda_max"
 
 
 def test_rotational_antisymmetry(swe):
@@ -169,14 +178,13 @@ def test_rotational_antisymmetry(swe):
     qL = _state(dim, h=2.0, u=0.4, v=0.1)
     qR = _state(dim, h=1.0, u=0.8, v=-0.2)
     for scheme in ("hll", "hllc"):
-        fwd = np.asarray(
-            swe[scheme].numerical_flux(qL, qR, aux, aux, p, n), dtype=float
-        )
-        rev = np.asarray(
-            swe[scheme].numerical_flux(qR, qL, aux, aux, p, -n), dtype=float
-        )
+        fwd, lam_f = _num_flux(swe[scheme], qL, qR, aux, p, n)
+        rev, lam_r = _num_flux(swe[scheme], qR, qL, aux, p, -n)
         np.testing.assert_allclose(fwd, -rev, rtol=1e-7, atol=1e-7,
                                    err_msg=f"{scheme} antisymmetry")
+        # The face wave speed is orientation-INVARIANT (a max of |lambda|).
+        np.testing.assert_allclose(lam_f, lam_r, rtol=1e-12,
+                                   err_msg=f"{scheme} lambda_max symmetry")
 
 
 def test_hllc_contact_preserves_normal_momentum_flux():
@@ -197,8 +205,8 @@ def test_hllc_contact_preserves_normal_momentum_flux():
     qR = np.array([h, h * un, h * -1.2])
     fL = _phys_flux_n(mrt, qL, aux, p, n)
 
-    got_hllc = np.asarray(hllc.numerical_flux(qL, qR, aux, aux, p, n), dtype=float)
-    got_hll = np.asarray(hll.numerical_flux(qL, qR, aux, aux, p, n), dtype=float)
+    got_hllc, _ = _num_flux(hllc, qL, qR, aux, p, n)
+    got_hll, _ = _num_flux(hll, qL, qR, aux, p, n)
     # Mass flux + normal-momentum flux are shared by both physical states.
     np.testing.assert_allclose(got_hllc[:2], fL[:2], rtol=1e-7, atol=1e-7)
     # HLL smears the contact -> its tangential-momentum flux differs from HLLC.
