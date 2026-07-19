@@ -6,15 +6,25 @@ from zoomy_core.systemmodel.system_model import (
     register_function_slot,
 )
 from zoomy_core.systemmodel.operations import (
+    OPERATOR_SLOTS,
+    map_operator_slots,
+    normalize_face_normal,
     register_aux,
     regularize_pow,
+    regularize_depth_direct,
+    regularize_depth_aux,
     kp_hinv,
 )
 
 __all__ = [
     "SystemModel",
     "register_function_slot",
+    "OPERATOR_SLOTS",
+    "map_operator_slots",
+    "normalize_face_normal",
     "register_aux",
     "regularize_pow",
+    "regularize_depth_direct",
+    "regularize_depth_aux",
     "kp_hinv",
 ]

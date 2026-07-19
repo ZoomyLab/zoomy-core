@@ -326,6 +326,49 @@ class NumericalSystemModel(SystemModel):
     # per-backend solver mode.
     source_treatment: str = "explicit"
 
+    # ── REQ-194 depth-law axes (all default to TODAY'S behaviour) ──
+    #
+    # Four independent construction-time knobs so a parameter study over the
+    # depth law is a pure loop with no code edit per run (see
+    # ``zoomy_core.numerics.depth_law_study.build_nsm``).  Every default below
+    # reproduces what shipped before this REQ: ``depth_regularization=None``
+    # keeps the legacy ``desingularize_hinv()`` as the sole depth default, and
+    # the other three are off.  Nothing here changes an existing consumer's
+    # emitted code unless that consumer opts in.
+    #
+    # Which reciprocal path regularizes the depth:
+    #   None       — LEGACY ``desingularize_hinv()`` (hinv aux at wet_dry_eps);
+    #   "aux"      — ``regularize_depth_aux()``    (hinv aux at regularization_eps);
+    #   "direct"   — ``regularize_depth_direct()`` (KP inlined, no aux row);
+    #   "none"     — no depth regularization at all (bare 1/h everywhere).
+    # "aux" and "direct" are mutually exclusive BY CONSTRUCTION here (one
+    # string, one path); the operations enforce it on the system too.
+    depth_regularization: Optional[str] = None
+    # The REGULARIZATION scale of the selected path — its OWN quantity, never
+    # ``wet_dry_eps`` (a wet/dry state-classification threshold at a different
+    # scale).  Conflating the two is what put ``h/(h + 1e-2)`` on the celerity.
+    # Read only when ``depth_regularization`` is "aux"/"direct".
+    regularization_eps: float = 1e-2
+    # How the SPECTRUM is treated by that path: "regularize" (swept like every
+    # other operator slot) or "exclude" (keeps the exact 1/h).  Separable for
+    # SWE — with a normalized normal the celerity carries no reciprocal — but
+    # NOT for SME, whose spectrum is ``hinv·(n0·q_0 ± n0·√(g·h³ + q_1²))``.
+    # Which is right is what the study measures; neither is baked in.
+    eigenvalue_treatment: str = "regularize"
+    # Wet/dry eigenvalue treatment, independent of the three knobs above:
+    #   None      — neither op;
+    #   "power"   — ``guard_eigenvalue_powers()`` (Max(.,0) under fractional
+    #               powers of h; always-safe, idempotent, no dry zeroing);
+    #   "gate"    — ``gate_eigenvalues_dry()`` (dry conditional; carries the
+    #               power guard internally per REQ-74/REQ-181);
+    #   "both"    — the explicit composition of the two, which REQ-181 pins as
+    #               byte-identical to "gate" alone (the guard is idempotent).
+    eigenvalue_guard: Optional[str] = None
+    # Impose |n| = 1 on the face normal before anything else runs.  A fact
+    # about the normal (every mesh normalises it), but it rewrites the emitted
+    # expression tree of every model that carries one, so it is opt-in.
+    normalize_normal: bool = False
+
     # ── SystemModel identity bridge ───────────────────────────────
     @property
     def sm(self) -> "SystemModel":
@@ -394,13 +437,81 @@ class NumericalSystemModel(SystemModel):
         * the presence of a depth state ``h`` — non-shallow-water systems
           (no ``h``) get nothing.
 
-        Non-default behaviour still rides on opt-in :attr:`extra_operations`."""
-        if not self._is_transport_system():
+        Non-default behaviour still rides on opt-in :attr:`extra_operations`.
+
+        REQ-194 adds four construction-time axes on top, each defaulting to
+        today's behaviour so a caller that passes nothing gets exactly
+        ``[desingularize_hinv()]`` as before.  The ORDER below is load-bearing:
+
+        1. :func:`normalize_face_normal` (``normalize_normal=True``) — must run
+           BEFORE any reciprocal rewrite, since it is what splits the celerity
+           out of the spectrum's common denominator; afterwards the split can no
+           longer happen because the reciprocal is already opaque.
+        2. the depth regularization selected by :attr:`depth_regularization`.
+        3. the eigenvalue guard selected by :attr:`eigenvalue_guard` — after the
+           regularization, because it wraps whatever reciprocal step 2 left in
+           the spectrum.
+        """
+        from zoomy_core.systemmodel.operations import (
+            desingularize_hinv,
+            gate_eigenvalues_dry,
+            guard_eigenvalue_powers,
+            normalize_face_normal,
+            regularize_depth_aux,
+            regularize_depth_direct,
+        )
+
+        ops = []
+        if self.normalize_normal:
+            ops.append(normalize_face_normal())
+
+        # The depth ops are gated on:
+        #  * ``_is_transport_system`` — the Chorin pressure/corrector
+        #    sub-systems share the same ``h``-bearing state but are NOT
+        #    transport (no flux/NCP); they must stay clean, and
+        #  * the presence of a depth state ``h`` — non-shallow-water systems
+        #    (no ``h``) get nothing.
+        depth = (self._is_transport_system()
+                 and any(str(s) == "h" for s in self.state))
+        if depth:
+            ops.extend(self._depth_regularization_operations(
+                desingularize_hinv, regularize_depth_aux,
+                regularize_depth_direct))
+            ops.extend(self._eigenvalue_guard_operations(
+                guard_eigenvalue_powers, gate_eigenvalues_dry))
+        return ops
+
+    def _depth_regularization_operations(self, legacy, aux, direct) -> list:
+        """The op(s) implementing :attr:`depth_regularization`."""
+        choice = self.depth_regularization
+        if choice is None:
+            return [legacy()]
+        if choice == "none":
             return []
-        if not any(str(s) == "h" for s in self.state):
+        if choice == "aux":
+            return [aux(self.regularization_eps,
+                        eigenvalues=self.eigenvalue_treatment)]
+        if choice == "direct":
+            return [direct(self.regularization_eps,
+                           eigenvalues=self.eigenvalue_treatment)]
+        raise ValueError(
+            f"depth_regularization={choice!r} is not a legal path; expected "
+            "None (legacy desingularize_hinv), 'aux', 'direct' or 'none'.")
+
+    def _eigenvalue_guard_operations(self, power, gate) -> list:
+        """The op(s) implementing :attr:`eigenvalue_guard`."""
+        choice = self.eigenvalue_guard
+        if choice is None:
             return []
-        from zoomy_core.systemmodel.operations import desingularize_hinv
-        return [desingularize_hinv()]
+        if choice == "power":
+            return [power()]
+        if choice == "gate":
+            return [gate()]
+        if choice == "both":
+            return [power(), gate()]
+        raise ValueError(
+            f"eigenvalue_guard={choice!r} is not a legal guard; expected "
+            "None, 'power', 'gate' or 'both'.")
 
     def derive(self) -> "NumericalSystemModel":
         """Run the operation pipeline on this NSM in place and return ``self``.
@@ -412,6 +523,49 @@ class NumericalSystemModel(SystemModel):
         for op in self.default_operations() + list(self.extra_operations):
             self.apply(op)
         return self
+
+    # ── operations reach the already-built numerics too ───────────
+
+    def apply(self, operation, *, name=None, description=None):
+        """Apply a system operation, then REFRESH every :class:`Numerics`
+        already built from this NSM (REQ-194).
+
+        ``Numerics.__init__`` registers ``numerical_flux`` /
+        ``numerical_fluctuations`` / ``local_max_abs_eigenvalue`` as ``Function``
+        objects whose ``definition`` is a VALUE snapshot of the NSM's operators
+        taken at construction time.  There is no back-reference, so an operation
+        applied AFTER :meth:`build_numerics` provably could not reach them:
+        ``gate_eigenvalues_dry()`` changed ``nsm.eigenvalues`` and left
+        ``local_max_abs_eigenvalue`` byte-identical.
+
+        Re-running ``_initialize_functions()`` re-reads the (live) NSM through
+        the numerics' own definitions, so the registered functions inherit every
+        operation — whenever it was applied.  Numerics instances are held
+        WEAKLY: a solver that drops its numerics does not keep it alive.
+
+        The usual ``from_system_model`` → ``derive`` order builds no numerics
+        yet, so this is a no-op on the normal path and cannot change existing
+        behaviour; it only closes the window for a caller that applies an
+        operation after asking for numerics.
+        """
+        out = super().apply(operation, name=name, description=description)
+        self._refresh_built_numerics()
+        return out
+
+    def _refresh_built_numerics(self) -> None:
+        """Re-register the symbolic functions of every live numerics built from
+        this NSM.  No-op when none were built yet."""
+        refs = getattr(self, "_built_numerics", None)
+        if not refs:
+            return
+        alive = []
+        for ref in refs:
+            numerics = ref()
+            if numerics is None:
+                continue
+            alive.append(ref)
+            numerics._initialize_functions()
+        self._built_numerics = alive
 
     # ── Constructors ──────────────────────────────────────────────
 
@@ -446,6 +600,11 @@ class NumericalSystemModel(SystemModel):
         additional_systems: Optional[list] = None,
         scaled_q_indices: Optional[list] = None,
         source_treatment: str = "explicit",
+        depth_regularization: Optional[str] = None,
+        regularization_eps: float = 1e-2,
+        eigenvalue_treatment: str = "regularize",
+        eigenvalue_guard: Optional[str] = None,
+        normalize_normal: bool = False,
     ) -> "NumericalSystemModel":
         """Build an NSM from a :class:`SystemModel` (or a :class:`Model`,
         auto-promoted via :meth:`SystemModel.from_model`).
@@ -461,6 +620,21 @@ class NumericalSystemModel(SystemModel):
               wave-free dry domain steps at this value, not a magic floor)
             - ``extra_operations`` → ``[]`` (opt-in system ops run by
               :meth:`derive`, e.g. ``[desingularize_hinv()]``)
+            - ``depth_regularization`` → ``None`` (legacy
+              ``desingularize_hinv()``; ``"aux"`` / ``"direct"`` / ``"none"``
+              select a REQ-194 study path)
+            - ``regularization_eps`` → ``1e-2`` (read only by the study paths;
+              NOT ``wet_dry_eps``)
+            - ``eigenvalue_treatment`` → ``"regularize"`` (``"exclude"`` keeps
+              the exact ``1/h`` in the spectrum)
+            - ``eigenvalue_guard`` → ``None`` (``"power"`` / ``"gate"`` /
+              ``"both"``)
+            - ``normalize_normal`` → ``False`` (``True`` imposes ``|n| = 1``
+              before every other operation)
+
+        The last five are the REQ-194 depth-law axes; every default reproduces
+        pre-REQ behaviour.  Sweeping them is what
+        :func:`zoomy_core.numerics.depth_law_study.build_nsm` wraps.
 
         LSQ polynomial degree is **always** auto-derived (from
         ``sm.aux_registry`` plus any ``additional_systems``) — it is
@@ -534,6 +708,16 @@ class NumericalSystemModel(SystemModel):
             list(scaled_q_indices) if scaled_q_indices is not None
             else None)
         sm.source_treatment = source_treatment
+        # REQ-194 depth-law axes — set BEFORE ``derive()`` so
+        # ``default_operations()`` can read them.  Every default reproduces the
+        # pre-REQ behaviour (legacy ``desingularize_hinv()``, no guard, no
+        # normal normalization), so a caller that passes none of them sees no
+        # change at all.
+        sm.depth_regularization = depth_regularization
+        sm.regularization_eps = regularization_eps
+        sm.eigenvalue_treatment = eigenvalue_treatment
+        sm.eigenvalue_guard = eigenvalue_guard
+        sm.normalize_normal = normalize_normal
         # Run the operation pipeline (default_operations() + extra_operations)
         # on the now-promoted NSM.  Phase A1: default_operations() is empty, so
         # this is a no-op unless the caller opted in via ``extra_operations``.
@@ -584,11 +768,21 @@ class NumericalSystemModel(SystemModel):
         when set — the Audusse-HR variants (``PositiveRusanov`` family)
         use it to control which state rows are rescaled by ``h*/h`` at
         face states.  Default (``None``) lets the Riemann class fall
-        back to its own heuristic (excluding only ``h`` and ``b``)."""
+        back to its own heuristic (excluding only ``h`` and ``b``).
+
+        The instance is REGISTERED (weakly) on this NSM so any operation
+        applied later refreshes its registered functions — see :meth:`apply`."""
+        import weakref
         if self.scaled_q_indices is not None:
-            return self.riemann(self.sm,
-                                scaled_q_indices=self.scaled_q_indices)
-        return self.riemann(self.sm)
+            numerics = self.riemann(self.sm,
+                                    scaled_q_indices=self.scaled_q_indices)
+        else:
+            numerics = self.riemann(self.sm)
+        refs = getattr(self, "_built_numerics", None)
+        if refs is None:
+            refs = self._built_numerics = []
+        refs.append(weakref.ref(numerics))
+        return numerics
 
     def build_runtime_numpy(self):
         """Lambdify ``sm`` into a runtime model the NumPy solvers

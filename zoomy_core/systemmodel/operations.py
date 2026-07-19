@@ -11,6 +11,24 @@ They replace the per-case "system surgery" a model wrapper used to hand-roll
 full-length ``update_aux_variables``, call ``refresh_derived_operators``).  Each
 operation owns its own refresh, so callers chain them and never touch the
 derived-operator slots by hand.
+
+SCOPING RULE (REQ-194).  The operations added for the depth-law study route
+their rewrite through :func:`map_operator_slots`, which applies to **ALL**
+operator slots (:data:`OPERATOR_SLOTS`) by DEFAULT.  An operation that must not
+touch a slot declares an explicit ``exclude=(...)`` with a stated reason, and a
+name that is not a member of the registry RAISES.  Opt OUT, never opt in —
+dropping a slot from coverage is then a deliberate, visible decision rather than
+an omission.  (The predecessor was a closed hard-coded list of 14 slot names
+iterated with ``getattr(sm, nm, None)``, so ``interpolate_to_3d`` kept a bare
+``hu/h`` and the boundary-condition kernels were never reached at all —
+silently.)
+
+The LEGACY pair :func:`register_aux` + :func:`regularize_pow` (and their
+composition :func:`desingularize_hinv`, which is still the NSM depth default) is
+deliberately left on its old closed list so every backend that already opted
+into it keeps emitting byte-identical code.  The study paths
+(:func:`regularize_depth_direct` / :func:`regularize_depth_aux`) are the swept
+ones.
 """
 from __future__ import annotations
 
@@ -21,8 +39,13 @@ import sympy as sp
 from zoomy_core.misc.misc import ZArray
 
 __all__ = [
+    "OPERATOR_SLOTS",
+    "map_operator_slots",
+    "normalize_face_normal",
     "register_aux",
     "regularize_pow",
+    "regularize_depth_direct",
+    "regularize_depth_aux",
     "kp_hinv",
     "desingularize_hinv",
     "desingularize_positivity",
@@ -50,6 +73,21 @@ _DEFAULT_WET_DRY_EPS = 1e-8
 _WAVESPEED_H_FLOOR = 1e-14
 
 
+# REGULARIZATION epsilon (REQ-194) — a DIFFERENT QUANTITY at a DIFFERENT SCALE
+# from the wet/dry threshold above, and deliberately its OWN knob.  It is the
+# depth below which the desingularized reciprocal is allowed to depart from the
+# exact ``1/h``.  It must never be conflated with ``wet_dry_eps``: borrowing the
+# wet/dry threshold as a regularization scale is what put ``h/(h + 1e-2)`` on
+# the celerity in the first attempt at this REQ.
+#
+# The default is the user's instruction for the parameter study — start near the
+# old working state (``wet_dry_eps = 1e-2`` for SWE / Malpasset) so the first
+# sweep point reproduces roughly what shipped, then vary it.  It is a STUDY
+# default on the new study ops only; the legacy ``desingularize_hinv`` path
+# still reads ``wet_dry_eps`` and is untouched.
+_DEFAULT_REGULARIZATION_EPS = 1e-2
+
+
 # Transcendental nodes whose ARGUMENT must never be touched by the
 # ``regularize_pow`` ``1/h -> hinv`` sweep — an ``h`` inside ``log(z/h)`` is
 # not a multiplicative factor of a denominator and must stay ``h``.
@@ -61,6 +99,317 @@ _TRANSCENDENTAL = (
     sp.asinh, sp.acosh, sp.atanh,
     sp.erf, sp.erfc,
 )
+
+
+# ── The operator-slot registry ─────────────────────────────────────────────
+#
+# EVERY symbolic slot an NSM operation may rewrite, in lowering order.  This is
+# the DEFAULT scope of the swept operations (see the module docstring).
+#
+# NOT in the registry, and why:
+#   * ``initial_conditions`` / ``aux_initial_conditions`` — initial DATA
+#     (``Constant`` objects / user callables), not operators.  There is no
+#     symbolic tree to rewrite, and rewriting initial data would change the
+#     problem rather than its discretisation.
+#   * ``state_update`` — a scheme NAME (``str``), not an expression.
+#   * ``position`` / ``normal`` / ``parameters`` / ``state`` — symbol
+#     containers, not operators.
+OPERATOR_SLOTS = (
+    # primaries (the PDE operators)
+    "flux",
+    "hydrostatic_pressure",
+    "nonconservative_matrix",
+    "source",
+    "source_explicit",
+    "mass_matrix",
+    "diffusion_matrix",
+    "diffusion_matrix_explicit",
+    # derived operators (lazily materialized; see ``map_operator_slots``)
+    "quasilinear_matrix",
+    "eigenvalues",
+    "source_jacobian_wrt_variables",
+    "source_jacobian_wrt_aux_variables",
+    # per-cell maps
+    "update_variables",
+    "update_aux_variables",
+    # well-balanced reconstruction pair
+    "reconstruction_variables",
+    "state_from_reconstruction",
+    # 3-D lift / projection pair
+    "interpolate_to_3d",
+    "project_from_3d",
+    # boundary kernels (``basefunction.Function``; definition may be Piecewise)
+    "boundary_conditions",
+    "aux_boundary_conditions",
+    "boundary_gradients",
+)
+
+
+#: Slots of :data:`OPERATOR_SLOTS` that carry a ``Function`` KERNEL — a
+#: ``(definition, args)`` pair whose ``args`` Zstruct is the lowering signature.
+KERNEL_SLOTS = (
+    "boundary_conditions",
+    "aux_boundary_conditions",
+    "boundary_gradients",
+)
+
+
+def _is_kernel(obj) -> bool:
+    """True for a :class:`zoomy_core.model.basefunction.Function` kernel — a
+    named ``(definition, args)`` pair rather than a bare operator array."""
+    return (hasattr(obj, "definition") and hasattr(obj, "args")
+            and not isinstance(obj, sp.Basic))
+
+
+def _sync_kernel_aux_signature(sm) -> None:
+    """Re-bind the ``aux_variables`` group of every boundary-kernel signature to
+    the CURRENT ``sm.aux_state``.
+
+    A boundary kernel is lowered against a FROZEN signature: the runtime
+    flattener reads ``Qaux`` positionally using the symbols listed in
+    ``args.aux_variables``, and the compiled lambda's parameters come from the
+    same list.  Registering a new aux grows the aux vector, so without this
+    re-bind a kernel that afterwards mentions the new aux (which it now can —
+    the study sweep reaches the boundary kernels) would carry an UNBOUND symbol:
+    the flattener never extracts the new ``Qaux`` slot and the generated code
+    closes over a bare sympy ``Symbol``.
+
+    Names are attached with ``setattr`` rather than ``Zstruct(**names)`` so aux
+    whose names are not Python identifiers (VAM's ``\\hat{\\sigma}_1``) survive;
+    only ORDER and COUNT matter to the flattener."""
+    from zoomy_core.misc.misc import Zstruct
+    for slot in KERNEL_SLOTS:
+        kernel = getattr(sm, slot, None)
+        if kernel is None:
+            continue
+        args = getattr(kernel, "args", None)
+        if (args is None or not hasattr(args, "contains")
+                or not args.contains("aux_variables")):
+            continue
+        aux_z = Zstruct()
+        for s in sm.aux_state:
+            setattr(aux_z, str(s), s)
+        aux_z._symbolic_name = getattr(
+            args.aux_variables, "_symbolic_name", None)
+        new_args = Zstruct()
+        for key in args.keys():
+            setattr(new_args, key,
+                    aux_z if key == "aux_variables" else getattr(args, key))
+        new_args._symbolic_name = getattr(args, "_symbolic_name", None)
+        setattr(sm, slot, type(kernel)(
+            name=kernel.name, definition=kernel.definition, args=new_args))
+
+
+def _rebuild_like(M, flat):
+    """Rebuild the array ``M`` from its flat scalar entries."""
+    return type(M)(flat).reshape(*M.shape)
+
+
+def _row_of(shape, idx: int) -> int:
+    """Row index of flat position ``idx`` in a row-major array of ``shape``."""
+    stride = 1
+    for s in shape[1:]:
+        stride *= int(s)
+    return idx // max(stride, 1)
+
+
+def _rewrite_container(obj, rewrite, skip_rows=()):
+    """Apply ``rewrite`` to every scalar of an operator container.
+
+    Handles the three shapes a slot can take: an array (``ZArray`` /
+    ``MatrixBase`` / ``NDimArray``), a plain ``list``/``tuple``, or a bare sympy
+    expression (e.g. the ``Piecewise`` a boundary-condition kernel carries).
+    ``skip_rows`` leaves the listed ROWS untouched (used for the self-reference
+    guard on ``update_aux_variables``).
+
+    Returns ``(changed, new_obj)``.
+    """
+    if obj is None:
+        return False, obj
+    if isinstance(obj, (sp.NDimArray, sp.MatrixBase)):
+        flat = list(sp.flatten(obj))
+        skip = set(skip_rows)
+        out = [
+            e if _row_of(obj.shape, i) in skip else rewrite(sp.sympify(e))
+            for i, e in enumerate(flat)
+        ]
+        changed = any(a != b for a, b in zip(flat, out))
+        return changed, (_rebuild_like(obj, out) if changed else obj)
+    if isinstance(obj, (list, tuple)):
+        flat = list(sp.flatten(obj))
+        out = [rewrite(sp.sympify(e)) for e in flat]
+        changed = any(a != b for a, b in zip(flat, out))
+        return changed, (type(obj)(out) if changed else obj)
+    if isinstance(obj, sp.Basic):
+        out = rewrite(obj)
+        return out != obj, out
+    return False, obj
+
+
+def map_operator_slots(sm, rewrite, *, exclude=(), skip_rows=None) -> dict:
+    """Apply ``rewrite(expr) -> expr`` to EVERY slot in :data:`OPERATOR_SLOTS`.
+
+    This is the single sweep the study operations route through, so coverage is
+    a property of the REGISTRY, not of each operation's private wish-list.
+
+    ``exclude`` — slot names this operation must not touch.  Every name must be
+    a member of :data:`OPERATOR_SLOTS`; a typo RAISES rather than silently
+    widening coverage, which is exactly the failure mode the old closed list
+    had.  ``skip_rows`` — ``{slot: (row, …)}`` rows left untouched inside an
+    otherwise-swept slot.
+
+    The lazy ``quasilinear_matrix`` is force-materialized FIRST, before any
+    primary is written, so the derived operator is frozen from the CLEAN
+    primaries and then substituted (never recomputed from an already-rewritten
+    flux — that is what would drop the exact ``∂(q²/h)/∂h = −q²/h²`` term).
+
+    Returns a ``{slot: "rewritten" | "unchanged" | "absent" | "excluded"}``
+    coverage report.
+    """
+    exclude = tuple(exclude)
+    unknown = [s for s in exclude if s not in OPERATOR_SLOTS]
+    if unknown:
+        raise KeyError(
+            f"map_operator_slots: unknown slot(s) in exclude={exclude}: "
+            f"{unknown}.  Every exclusion must name a member of "
+            f"OPERATOR_SLOTS ({list(OPERATOR_SLOTS)}).")
+    excluded = set(exclude)
+    skip_rows = skip_rows or {}
+
+    # Freeze the lazy derived operator from the clean primaries first.
+    _ = sm.quasilinear_matrix
+
+    report = {}
+    for slot in OPERATOR_SLOTS:
+        if slot in excluded:
+            report[slot] = "excluded"
+            continue
+        obj = getattr(sm, slot, None)
+        if obj is None:
+            report[slot] = "absent"
+            continue
+        rows = skip_rows.get(slot, ())
+        if _is_kernel(obj):
+            changed, new_def = _rewrite_container(obj.definition, rewrite, rows)
+            if changed:
+                # Build a NEW kernel: the ``Function`` object is SHARED with the
+                # source Model (``sm.boundary_conditions is
+                # model._boundary_conditions``), so mutating it in place would
+                # rewrite the upstream (possibly cached) Model too.
+                setattr(sm, slot, type(obj)(
+                    name=obj.name, definition=new_def, args=obj.args))
+        else:
+            changed, new_obj = _rewrite_container(obj, rewrite, rows)
+            if changed:
+                setattr(sm, slot, new_obj)
+        report[slot] = "rewritten" if changed else "unchanged"
+    return report
+
+
+# ── unit face normal ───────────────────────────────────────────────────────
+
+def _unit_normal_rewrite(normal_syms):
+    """Return ``rewrite(expr)`` imposing ``|n| = 1`` on the face normal.
+
+    The face normal is a unit vector BY DEFINITION — every mesh in the project
+    normalises it (``mesh_util._face_normals_*`` divide by ``np.linalg.norm``;
+    in 1-D ``n0 = ±1``).  sympy has no way to know that, so it carries
+    ``√(n0² + n1²)`` symbolically, which holds the 2-D spectrum over a common
+    denominator and blocks every subsequent simplification::
+
+        (√g·h^{3/2}·√(n0²+n1²) + hu·n0 + hv·n1) / h
+
+    Imposing the relation and re-expanding splits it into the physical form::
+
+        √(g·h) + hu·n0/h + hv·n1/h
+
+    — after which ``1/h`` sits ONLY on the momentum terms and the celerity
+    ``√(g·h)`` is structurally separate, so a later ``1/h`` regularization can
+    never reach (and never damp) the wave speed.
+
+    NB this separation is a property of the SWE spectrum, NOT a general fact.
+    The SME spectrum is ``hinv·(n0·q_0 ± n0·√(g·h³ + q_1²))``: there the
+    reciprocal multiplies the celerity and ``√(g·h³ + q_1²)`` does not factor,
+    so normalising the normal does NOT take the regularization off the wave
+    speed.  Which of the two behaviours the eigenvalues should get is the open
+    question this machinery exists to measure — see the ``eigenvalues=`` axis of
+    :func:`regularize_depth_direct` / :func:`regularize_depth_aux`.
+
+    Rewrite rules, valid for ANY dimension:
+
+    * ``(Σ_d n_d²)**k → 1``  for every exponent ``k`` (covers ``√(n0²+n1²)``,
+      ``(n0²+n1²)^{3/2}``, ``1/(n0²+n1²)``, …);
+    * the bare node ``Σ_d n_d² → 1``;
+    * 1-D, where ``Σ n_d² = n0²`` collapses under sympy's own power algebra:
+      ``n0**k → n0**(k mod 2)`` for integer ``k ∉ {0, 1}``, and ``|n0| → 1``.
+
+    ``sp.expand`` afterwards is what makes the simplification FIRE (and is the
+    only post-processing needed — ``powsimp`` / ``cancel`` are no-ops here: with
+    ``g`` positive and ``h`` nonnegative, ``√g·√h`` IS sympy's canonical form of
+    ``√(g·h)``, same ``srepr``).  It runs only on entries the relation actually
+    changed, so a normal-free operator costs nothing.
+    """
+    n = list(normal_syms)
+    nsq = sp.Add(*[nd ** 2 for nd in n])
+    one_d = len(n) == 1
+
+    def _is_unit_pow(x):
+        if not isinstance(x, sp.Pow):
+            return False
+        if not one_d and x.base == nsq:
+            return True
+        return (one_d and x.base == n[0]
+                and x.exp.is_Integer and int(x.exp) not in (0, 1))
+
+    def _unit_pow_value(x):
+        if one_d and x.base == n[0]:
+            return n[0] if int(x.exp) % 2 else sp.S.One
+        return sp.S.One
+
+    def _is_unit_abs(x):
+        return one_d and isinstance(x, sp.Abs) and x.args[0] == n[0]
+
+    def _rewrite(e):
+        e = sp.sympify(e)
+        if not e.has(*n):
+            return e
+        out = e.replace(_is_unit_pow, _unit_pow_value)
+        if one_d:
+            out = out.replace(_is_unit_abs, lambda x: sp.S.One)
+        else:
+            out = out.xreplace({nsq: sp.S.One})
+        return sp.expand(out) if out != e else e
+
+    return _rewrite
+
+
+def normalize_face_normal(*, exclude=()):
+    """Operation: impose ``|n| = 1`` as a system-level fact (REQ-194).
+
+    See :func:`_unit_normal_rewrite` for the rewrite rules and why this must run
+    BEFORE any ``1/h`` regularization: for SWE it is what separates the celerity
+    ``√(g·h)`` from the ``1/h`` of the momentum terms, and therefore what keeps
+    the celerity exact once the reciprocal is desingularized.
+
+    Default scope is every slot in :data:`OPERATOR_SLOTS` — the relation is a
+    fact about the face normal, so it holds wherever the normal appears
+    (spectrum, Riemann-facing operators, wall-mirror boundary kernels …).
+
+    NOT an NSM default: it changes the emitted expression tree of every model
+    that carries a normal, so it is opted into per construction
+    (``normalize_normal=True``), never switched on globally by this REQ.
+    """
+    def _op(sm):
+        n = list(sm.normal.values()) if sm.normal is not None else []
+        if not n:
+            return
+        _op.coverage = map_operator_slots(
+            sm, _unit_normal_rewrite(n), exclude=exclude)
+
+    _op.name = "normalize_face_normal"
+    _op.description = "impose |n| = 1 on the face normal"
+    _op.coverage = {}
+    return _op
 
 
 # ── KP-desingularized inverse depth ────────────────────────────────────────
@@ -111,6 +460,63 @@ _PRIMARY_OPERATORS = (
     "diffusion_matrix",
     "diffusion_matrix_explicit",
 )
+
+
+def _pow_rewrite(hs, inv):
+    """Return ``rewrite(expr)`` replacing every ``hs**(-n)`` (``n > 0``) by
+    ``inv**n``, where ``inv`` is the replacement for ``1/hs``.
+
+    ``inv`` may be a bare Symbol (the ``hinv`` AUX path) or a whole expression
+    (the DIRECT path, where the Kurganov–Petrova form is substituted inline).
+    Factored out of :func:`regularize_pow` so the legacy op and the study ops
+    (:func:`regularize_depth_direct` / :func:`regularize_depth_aux`) share ONE
+    definition of what "rewrite the reciprocal" means and can only differ in
+    WHERE they apply it.
+
+    The rewrite factors the maximal multiplicative power of ``hs`` out of a
+    negative-power base — ``hs**(-n)``, ``(hs**p·f)**(-n)`` AND the expanded
+    ``(Σ hs·…)**(-n)`` Add.  Transcendental nodes are returned WHOLE (never
+    descended), so an ``hs`` that lives only inside a transcendental argument
+    (``log(z/hs)``) is never rewritten — only a genuine multiplicative ``hs``
+    factor becomes ``inv``.
+
+    ``inv`` is NOT re-scanned: the KP form itself contains the negative power
+    ``(h⁴ + max(h, eps)⁴)**(-1/2)``, whose base carries no multiplicative ``h``,
+    so descending into it would be a no-op anyway — but not descending makes
+    that a structural guarantee rather than a coincidence.
+    """
+    def _h_multiplicity(base):
+        """Multiplicity of ``hs`` as a genuine MULTIPLICATIVE factor of
+        ``base`` — ``p`` such that ``base / hs**p`` is ``hs``-free.  Returns 0
+        when ``hs`` is not a factor, e.g. it only appears inside a
+        transcendental arg (``log(z/hs)``) or in a sum with no common ``hs``
+        (``hs + 1``): those must be left untouched.  ``sp.factor`` pulls the
+        common ``hs`` out of an EXPANDED denominator (the RoughWall
+        ``-h·(…)²`` form) so its multiplicity is readable from
+        ``as_powers_dict``."""
+        base = sp.sympify(base)
+        if not base.has(hs):
+            return 0
+        e = sp.factor(base).as_powers_dict().get(hs, sp.S.Zero)
+        return int(e) if e.is_Integer and e > 0 else 0
+
+    def _rw(e):
+        if isinstance(e, _TRANSCENDENTAL):
+            return e
+        if isinstance(e, sp.Pow) and e.exp.is_number and e.exp.is_negative:
+            p = _h_multiplicity(e.base)
+            if p > 0:
+                # base = q·hs**p (q hs-free) ⇒ base**e = q**e·inv**(-p·e).
+                # Clean ``hs**(-n)`` ⇒ q == 1 ⇒ byte-identical to a plain
+                # ``inv**(-exp)`` rewrite.
+                q = sp.cancel(e.base / hs ** p)
+                return _rw(q) ** e.exp * inv ** (-p * e.exp)
+            return _rw(e.base) ** e.exp
+        if e.args:
+            return e.func(*[_rw(a) for a in e.args])
+        return e
+
+    return lambda e: _rw(sp.sympify(e))
 
 
 def _resolve_state_symbol(sm, field: Union[str, sp.Symbol]) -> sp.Symbol:
@@ -253,48 +659,13 @@ def regularize_pow(field: Union[str, sp.Symbol], aux_name: str):
         hs = _resolve_state_symbol(sm, field)
         aux = _resolve_aux_symbol(sm, aux_name)
 
-        def _h_multiplicity(base):
-            """Multiplicity of ``h`` as a genuine MULTIPLICATIVE factor of
-            ``base`` — ``p`` such that ``base / h**p`` is h-free.  Returns 0
-            when ``h`` is not a factor, e.g. it only appears inside a
-            transcendental arg (``log(z/h)``) or in a sum with no common
-            ``h`` (``h + 1``): those must be left untouched.  ``sp.factor``
-            pulls the common ``h`` out of an EXPANDED denominator (the
-            RoughWall ``-h·(…)²`` form) so its multiplicity is readable from
-            ``as_powers_dict``."""
-            base = sp.sympify(base)
-            if not base.has(hs):
-                return 0
-            e = sp.factor(base).as_powers_dict().get(hs, sp.S.Zero)
-            return int(e) if e.is_Integer and e > 0 else 0
-
+        # ``inv`` is the replacement for ``1/h``: the desingularized ``aux``
+        # (``hinv``) for the flux/source/NCP operators, but the plain floored
+        # inverse ``1/Max(1e-14, h)`` for the EIGENVALUE / wave-speed (REQ-82 —
+        # see ``_WAVESPEED_H_FLOOR``).  See :func:`_pow_rewrite` for the
+        # rewrite rules themselves.
         def _rw(e, inv):
-            # Recursive rewrite of ``field**(-n) -> inv**n``, factoring the
-            # maximal multiplicative power of ``h`` out of a negative-power
-            # base (``h**(-n)``, ``(h**p·f)**(-n)`` AND the expanded
-            # ``(Σ h·…)**(-n)`` Add).  ``inv`` is the replacement for ``1/h``:
-            # the desingularized ``aux`` (``hinv``) for the flux/source/NCP
-            # operators, but the plain floored inverse ``1/Max(1e-14, h)`` for
-            # the EIGENVALUE / wave-speed (REQ-82 — see ``_WAVESPEED_H_FLOOR``).
-            # Transcendental nodes are returned WHOLE (never descended), so an
-            # ``h`` that lives only inside a transcendental arg (``log(z/h)``)
-            # is never rewritten — only a genuine multiplicative ``h`` factor
-            # becomes ``inv``.
-            if isinstance(e, _TRANSCENDENTAL):
-                return e
-            if (isinstance(e, sp.Pow) and e.exp.is_number
-                    and e.exp.is_negative):
-                p = _h_multiplicity(e.base)
-                if p > 0:
-                    # base = q·h**p (q h-free) ⇒ base**e = q**e·inv**(-p·e).
-                    # Clean ``h**(-n)`` ⇒ q==1 ⇒ byte-identical to the old
-                    # ``inv**(-exp)`` rewrite.
-                    q = sp.cancel(e.base / hs ** p)
-                    return _rw(q, inv) ** e.exp * inv ** (-p * e.exp)
-                return _rw(e.base, inv) ** e.exp
-            if e.args:
-                return e.func(*[_rw(a, inv) for a in e.args])
-            return e
+            return _pow_rewrite(hs, inv)(e)
 
         # 1. Force-materialize the lazy derived operators from the CLEAN
         #    primaries (``quasilinear_matrix`` is a lazy property; touching it
@@ -378,6 +749,270 @@ def desingularize_hinv(mode="kp"):
 
     _op.name = "desingularize_hinv"
     _op.description = f"KP 1/h desingularization (mode={mode!r})"
+    return _op
+
+
+# ── REQ-194 depth-law study: two regularization PATHS, one KP definition ───
+#
+# Both paths desingularize the SAME reciprocal with the SAME Kurganov–Petrova
+# form :func:`kp_hinv` — there is exactly ONE definition of the regularized
+# ``1/h`` in this module, and neither ``1/(h + eps)`` nor ``1/max(eps, h)``
+# exists as an alternative.  They differ ONLY in where that form lands:
+#
+#   * DIRECT — the KP expression is substituted inline wherever ``h**(-n)``
+#     appears.  No aux row, no extra state; the regularization is visible in
+#     every operator and its ``h``-derivative is exact wherever a Jacobian was
+#     frozen before the substitution.
+#   * AUX    — the reciprocal is promoted to an ``hinv`` aux row whose update
+#     rule IS the KP expression, and the operators then carry ``hinv**n``.  One
+#     named place holds the regularization; the operators stay small and
+#     ``hinv`` is an INDEPENDENT symbol to the CAS.
+#
+# They are MUTUALLY EXCLUSIVE.  Applying both is an error, not a
+# double-regularization: the aux path would rewrite ``h**(-n)`` that the direct
+# path has already replaced by a KP expression (leaving a half-converted system
+# whose ``hinv`` row and inline forms disagree), and nothing downstream could
+# tell which reciprocal a given operator is using.
+#
+# NEITHER is a default.  ``default_operations()`` still returns the legacy
+# ``desingularize_hinv()``; these are selected per construction so a sweep is a
+# pure loop over the axes (see ``zoomy_core.numerics.depth_law_study``).
+
+#: Attribute stamped on a SystemModel by whichever depth-regularization path ran.
+_DEPTH_REGULARIZATION_ATTR = "_depth_regularization_applied"
+
+#: Legal values of the ``eigenvalues=`` axis shared by both paths.
+_EIGENVALUE_TREATMENTS = ("regularize", "exclude")
+
+
+def _regularization_eps(sm, override=None):
+    """Resolve the REGULARIZATION epsilon (never the wet/dry threshold).
+
+    ``override`` wins; else a model-declared ``regularization_eps`` parameter
+    (so a case can keep it run-time tunable); else
+    :data:`_DEFAULT_REGULARIZATION_EPS`.
+
+    ``wet_dry_eps`` is deliberately NOT consulted.  It is a wet/dry
+    state-CLASSIFICATION threshold at a different scale (1e-2 m for SWE), and
+    reusing it as a regularization scale is what put ``h/(h + 1e-2)`` on the
+    celerity — a 50% loss of ``√(g·h)`` at a 1 cm depth.  Keeping the two
+    quantities separate is the whole point of this knob; see
+    :func:`_wet_dry_eps` for the other one."""
+    if override is not None:
+        return sp.sympify(override)
+    params = getattr(sm, "parameters", None)
+    if params is not None and params.contains("regularization_eps"):
+        return params.regularization_eps
+    return sp.Float(_DEFAULT_REGULARIZATION_EPS)
+
+
+def _claim_depth_regularization(sm, tag: str) -> None:
+    """Record that ``tag`` regularized the depth on ``sm``; raise if another
+    path (or the same one twice) already did.
+
+    Mutual exclusion is enforced on the SYSTEM, not by convention in the
+    caller, so composing the two ops by hand — ``sm.apply(direct);
+    sm.apply(aux)`` — fails loudly instead of silently producing a system whose
+    operators disagree about what ``1/h`` means."""
+    prev = getattr(sm, _DEPTH_REGULARIZATION_ATTR, None)
+    if prev is not None:
+        raise ValueError(
+            f"depth regularization already applied to this system by "
+            f"{prev!r}; refusing to also apply {tag!r}.  The DIRECT and AUX "
+            f"paths are mutually exclusive — pick ONE per system (they "
+            f"regularize the same reciprocal, so applying both would leave "
+            f"the operators disagreeing about what 1/h means).  Build a "
+            f"fresh SystemModel to try the other path.")
+    setattr(sm, _DEPTH_REGULARIZATION_ATTR, tag)
+
+
+def _eigenvalue_exclusion(eigenvalues: str) -> tuple:
+    """Translate the ``eigenvalues=`` axis into a ``map_operator_slots``
+    exclusion tuple.
+
+    ``"regularize"`` — the spectrum is swept like every other slot, so the
+    reciprocal in ``λ`` is the desingularized one.  For SWE (with the face
+    normal normalised) the celerity ``√(g·h)`` carries no reciprocal at all, so
+    only the advective ``u·n`` is affected.  For SME it is NOT separable —
+    ``λ = hinv·(n0·q_0 ± n0·√(g·h³ + q_1²))`` — so the regularization multiplies
+    the celerity too.
+
+    ``"exclude"`` — the spectrum keeps the EXACT ``1/h``.  This is the honest
+    form of the historical carve-out.  The carve-out as it shipped used a
+    floored inverse ``1/max(1e-14, h)``; that is a floor on the depth, which is
+    forbidden, and it is also the worst of the options at a draining face
+    (``hu = 1e-3`` at ``h → 0`` gives ``|u| = 1e11``).  Excluding the slot keeps
+    the wave speed exact where the model is wet and leaves the dry limit to the
+    (independent) eigenvalue guard axis, instead of trading a singularity for a
+    floor.
+
+    Which of the two is right is exactly what the study measures; neither is
+    baked in here."""
+    if eigenvalues not in _EIGENVALUE_TREATMENTS:
+        raise ValueError(
+            f"eigenvalues={eigenvalues!r} is not a legal treatment; expected "
+            f"one of {list(_EIGENVALUE_TREATMENTS)}.")
+    return ("eigenvalues",) if eigenvalues == "exclude" else ()
+
+
+def _assert_no_forward_aux_reference(sm, aux, aux_row: int, name: str) -> None:
+    """Fail loudly if an aux row EVALUATED BEFORE ``aux`` now reads it.
+
+    ``register_aux`` APPENDS the reciprocal, so its row is last and the per-cell
+    solver — which writes ``update_aux_variables`` top-down as a prefix of
+    ``Qaux`` — computes every other row first.  That is fine as long as no
+    earlier row references it.  But the sweep rewrites ``update_aux_variables``
+    like every other slot, so a model whose aux row genuinely carries a
+    ``1/h`` BEFORE the reciprocal's row would come out reading a stale
+    (previous-step) value: numerically plausible, silently wrong, and
+    indistinguishable from a physics result in a parameter study.
+
+    No model in the tree does this today (the derivative aux are identity
+    passthroughs filled by the LSQ walk), so this never fires — it exists so
+    that if one ever does, the study stops instead of quietly measuring
+    garbage.  The fix would be to order the aux vector, not to drop the sweep.
+    """
+    uav = getattr(sm, "update_aux_variables", None)
+    if uav is None:
+        return
+    offenders = [
+        str(s) for i, s in enumerate(sm.aux_state[:uav.shape[0]])
+        if i < aux_row and sp.sympify(uav[i, 0]).has(aux)
+    ]
+    if offenders:
+        raise ValueError(
+            f"regularize_depth_aux: aux row(s) {offenders} are evaluated "
+            f"BEFORE '{name}' (row {aux_row}) but now reference it, so they "
+            f"would read a stale value each step.  Order the aux vector so "
+            f"'{name}' precedes its consumers.")
+
+
+def regularize_depth_direct(eps=None, *, field: str = "h",
+                            eigenvalues: str = "regularize", exclude=()):
+    """Operation: substitute the KP reciprocal INLINE wherever ``1/field**n``
+    appears — the DIRECT path of the REQ-194 depth-law study.
+
+    Every ``field**(-n)`` in every slot of :data:`OPERATOR_SLOTS` becomes
+    ``kp_hinv(field, eps)**n``.  No aux row is registered and no state is added:
+    the regularized reciprocal is written out in place.
+
+    ``eps`` is the REGULARIZATION scale (see :func:`_regularization_eps`),
+    default :data:`_DEFAULT_REGULARIZATION_EPS`.  It is NOT the wet/dry
+    threshold — do not pass ``wet_dry_eps`` here.
+
+    ``eigenvalues`` selects the spectrum's treatment: ``"regularize"`` (swept
+    like every other slot) or ``"exclude"`` (keeps the exact ``1/h``).  See
+    :func:`_eigenvalue_exclusion`.
+
+    ``exclude`` drops further slots from the sweep; the default is empty on
+    purpose (opt OUT, never opt in).  A name that is not in
+    :data:`OPERATOR_SLOTS` raises.
+
+    FREEZE-THEN-SUBSTITUTE.  :func:`map_operator_slots` materializes the lazy
+    ``quasilinear_matrix`` from the CLEAN primaries before the first write, so
+    the flux Jacobian holds the exact ``∂(q²/h)/∂h = −q²/h²`` and that term
+    becomes ``−q²·kp²`` rather than being recomputed (and lost) from an
+    already-substituted flux.
+
+    Mutually exclusive with :func:`regularize_depth_aux` — see
+    :func:`_claim_depth_regularization`.
+    """
+    # Validated HERE, not inside ``_op``: the axes are a construction-time
+    # choice, so a bad value must fail when the op is built, before it has
+    # claimed the depth regularization on a system it then fails to rewrite.
+    excl = _eigenvalue_exclusion(eigenvalues) + tuple(exclude)
+
+    def _op(sm):
+        h = _resolve_state_symbol(sm, field)
+        e = _regularization_eps(sm, eps)
+        _claim_depth_regularization(sm, "direct")
+        inv = kp_hinv(h, e)
+        _op.eps = e
+        _op.coverage = map_operator_slots(sm, _pow_rewrite(h, inv),
+                                          exclude=excl)
+
+    _op.name = "regularize_depth_direct"
+    _op.description = (
+        f"inline KP 1/{field} (eps={'default' if eps is None else eps}, "
+        f"eigenvalues={eigenvalues!r})")
+    _op.coverage = {}
+    _op.eps = None
+    return _op
+
+
+def regularize_depth_aux(eps=None, *, name: str = "hinv", field: str = "h",
+                         eigenvalues: str = "regularize", exclude=()):
+    """Operation: promote ``1/field**n`` to an aux row carrying the KP
+    reciprocal — the AUX path of the REQ-194 depth-law study.
+
+    Registers the aux ``name`` whose ``update_aux_variables`` row IS
+    ``kp_hinv(field, eps)``, then sweeps every slot of :data:`OPERATOR_SLOTS`
+    rewriting ``field**(-n) → name**n``.  The operators therefore carry a single
+    opaque symbol and the regularization lives in exactly one row.
+
+    Same ``eps`` / ``eigenvalues`` / ``exclude`` axes as
+    :func:`regularize_depth_direct`, and the same freeze-then-substitute
+    discipline — which matters MORE here: ``name`` is an INDEPENDENT symbol, so
+    a recomputed ``∂/∂h`` of a flux already holding ``q²·hinv`` would be ``0``
+    and the ``−u²`` wave-speed term would vanish outright.  Chain-ruling it back
+    through ``∂hinv/∂h`` would instead inject ``Heaviside``/``DiracDelta`` into
+    every Jacobian entry.  So the derived operators are frozen from the clean
+    primaries and substituted, never refreshed.
+
+    The only carve-out is a ROW-level self-reference guard rather than a slot
+    exclusion: the ``update_aux_variables`` row that DEFINES ``name`` is left
+    alone, since rewriting it would produce the tautology ``hinv = hinv`` and
+    lose the formula entirely.
+
+    When the model already declares the aux (e.g. MalpassetSWE), it must carry a
+    REAL formula — a bare identity passthrough raises rather than letting the
+    swept operators read an uncomputed slot.
+
+    Mutually exclusive with :func:`regularize_depth_direct`.
+    """
+    # Validated at construction time — see :func:`regularize_depth_direct`.
+    excl = _eigenvalue_exclusion(eigenvalues) + tuple(exclude)
+
+    def _op(sm):
+        h = _resolve_state_symbol(sm, field)
+        e = _regularization_eps(sm, eps)
+        _claim_depth_regularization(sm, "aux")
+        _op.eps = e
+
+        if not any(str(s) == name for s in sm.aux_state):
+            sm.apply(register_aux(name, kp_hinv(h, e), positive=True))
+            # The aux VECTOR grew, so every kernel lowered against it must see
+            # the new layout — otherwise the sweep below (which DOES reach the
+            # boundary kernels) could write the new aux into a kernel whose
+            # frozen signature never binds it.
+            _sync_kernel_aux_signature(sm)
+        else:
+            i = next(i for i, s in enumerate(sm.aux_state) if str(s) == name)
+            uav = sm.update_aux_variables
+            if (uav is None or i >= uav.shape[0]
+                    or sp.sympify(uav[i, 0]) == sm.aux_state[i]):
+                raise ValueError(
+                    f"regularize_depth_aux: aux '{name}' is declared in "
+                    f"aux_state but ``update_aux_variables`` gives it no "
+                    f"formula (identity passthrough).  The operators are about "
+                    f"to read it as 1/{field}; give the model an "
+                    f"``update_aux_variables`` row for '{name}', or drop the "
+                    f"declaration and let this operation register it.")
+
+        aux = _resolve_aux_symbol(sm, name)
+        aux_row = [i for i, s in enumerate(sm.aux_state) if s == aux]
+        _op.coverage = map_operator_slots(
+            sm, _pow_rewrite(h, aux), exclude=excl,
+            skip_rows={"update_aux_variables": aux_row})
+        _assert_no_forward_aux_reference(sm, aux, aux_row[0], name)
+
+    _op.name = "regularize_depth_aux"
+    _op.description = (
+        f"1/{field}**n -> aux '{name}'**n, KP row "
+        f"(eps={'default' if eps is None else eps}, "
+        f"eigenvalues={eigenvalues!r})")
+    _op.coverage = {}
+    _op.eps = None
     return _op
 
 

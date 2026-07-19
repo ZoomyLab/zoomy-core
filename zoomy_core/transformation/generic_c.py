@@ -1416,6 +1416,17 @@ class GenericCppModel(GenericCppBase):
                 name,
                 "the SystemModel carries no symbolic initial state; IC is "
                 "case-side (case directory / settings.json).")
+        if n == 0:
+            # An EMPTY target vector (a system with no aux at all) has no IC
+            # kernel to emit.  ``Constant.get_definition`` ignores the requested
+            # length and hands back a 1-entry array, which then reshaped to
+            # ``(0,)`` and raised ``Expecting reshape size to 1 but got
+            # prod((0,)) = 0`` from inside sympy.  Every SHIPPED depth NSM
+            # carries at least the ``hinv`` aux, so nothing reached this before
+            # the REQ-194 study paths, which deliberately build aux-free systems
+            # (``depth_regularization`` = "direct" / "none").
+            return self._doc_note(
+                name, "the system has no aux variables; nothing to initialize.")
         X = sp.Array([sp.Symbol(f"_ICX{i}", real=True) for i in range(3)])
         params = list(sm.parameters.values())
         expr = ic.get_definition(X, sp.Array(params), n)
@@ -1656,6 +1667,7 @@ class GenericCppModel(GenericCppBase):
         # have no gradQ dof — treat as 0 rather than crashing.
         n_dof_gradQ = self._n_dof_gradq()
         has_diffusion = self._detect_has_diffusion()
+        has_ncp = self._detect_has_nonconservative_product()
         has_free_surface = self._detect_has_free_surface()
 
         lines.extend(
@@ -1673,6 +1685,12 @@ class GenericCppModel(GenericCppBase):
                 f"    static constexpr double dt_max = {float(sm.dt_max)};",
                 f"    static constexpr int n_dof_gradQ = {n_dof_gradQ};",
                 f"    static constexpr bool has_diffusion = {'true' if has_diffusion else 'false'};",
+                # REQ-194 item (3): the NCP structure is known at CODEGEN time —
+                # a model whose ``nonconservative_matrix`` is structurally zero
+                # can never contribute a path-integral fluctuation.  Emitted as
+                # a compile-time constant so a driver can specialise on it, the
+                # same way ``has_diffusion`` gates the diffusion path.
+                f"    static constexpr bool has_nonconservative_product = {'true' if has_ncp else 'false'};",
                 f"    static constexpr bool has_free_surface = {'true' if has_free_surface else 'false'};",
             ]
         )
@@ -1708,6 +1726,30 @@ class GenericCppModel(GenericCppBase):
             if "diffusion_matrix" not in self.model.functions.keys():
                 return False
             expr = self.model.functions.diffusion_matrix.definition
+        # Flatten the expression and check if every element is zero
+        if hasattr(expr, "__iter__"):
+            return not all(sp.simplify(e) == 0 for e in sp.flatten(expr))
+        return sp.simplify(expr) != 0
+
+    def _detect_has_nonconservative_product(self):
+        """Check whether the model's nonconservative_matrix is non-trivial
+        (not all zeros) — REQ-194 item (3).
+
+        Same shape as :meth:`_detect_has_diffusion`: declarative models keep
+        ``nonconservative_matrix`` on the SystemModel, legacy Models expose it
+        as a ``functions`` entry.  A structurally-zero NCP means the
+        path-integral fluctuation term ``∫A(Q)dQ`` is identically zero for
+        EVERY face, which is a property of the model and so is decidable here
+        rather than at runtime.
+        """
+        if self.sm is not None:
+            expr = getattr(self.sm, "nonconservative_matrix", None)
+            if expr is None:
+                return False
+        else:
+            if "nonconservative_matrix" not in self.model.functions.keys():
+                return False
+            expr = self.model.functions.nonconservative_matrix.definition
         # Flatten the expression and check if every element is zero
         if hasattr(expr, "__iter__"):
             return not all(sp.simplify(e) == 0 for e in sp.flatten(expr))
