@@ -46,9 +46,11 @@ The axes
                   above: ``None`` / ``"power"`` / ``"gate"`` / ``"both"``.
 
 ``normalize_normal``  impose ``|n| = 1`` before anything else.  Default ``True``
-                  here (it is a fact about the normal, and it is what lets the
+                  (it is a fact about the normal, and it is what lets the
                   celerity separate at all), but exposed so the sweep can turn
-                  it off and measure what it actually buys.
+                  it off and measure what it actually buys.  Since REQ-208
+                  item (2) the NSM defaults to ``True`` as well, so this entry
+                  point and ``from_system_model`` no longer disagree.
 
 Usage
 -----

@@ -282,14 +282,32 @@ def test_sweep_reaches_the_slots_the_old_list_missed():
                for v in report.values())
 
 
-# ── (7) shipped defaults are untouched ────────────────────────────────────
+# ── (7) shipped defaults ──────────────────────────────────────────────────
 
-def test_nsm_defaults_are_unchanged_by_this_req():
-    """A caller that passes none of the new axes gets exactly what shipped:
-    the legacy ``desingularize_hinv()`` and nothing else.  Every REQ-194 axis
-    defaults OFF, so no existing backend's emitted code moves."""
+def test_nsm_regularization_defaults_are_unchanged_by_this_req():
+    """A caller that passes none of the REGULARIZATION axes still gets the
+    legacy ``desingularize_hinv()``: ``depth_regularization``,
+    ``eigenvalue_guard`` and ``eigenvalue_treatment`` all keep pre-REQ-194
+    behaviour, so no existing backend's regularization moves.
+
+    ``normalize_face_normal`` now leads the list: REQ-208 item (2) flipped
+    ``normalize_normal`` to default True.  That is the one REQ-194 axis which
+    deliberately DOES move emitted code — it is a fact about the mesh (every
+    ``_face_normals_*`` builder divides by ``np.linalg.norm``), and leaving it
+    opt-in made it unreachable, since the flag is set at NSM construction
+    inside each backend's case code and no case ever passed it.
+    """
     for build in (_swe(1), _swe(2), _sme(1)):
         nsm = NumericalSystemModel.from_system_model(
             SystemModel.from_model(build()))
+        names = [getattr(op, "name", None) for op in nsm.default_operations()]
+        assert names == ["normalize_face_normal", "desingularize_hinv"], names
+
+
+def test_normal_normalization_is_opt_out_able():
+    """The REQ-208 default is a default, not a hard-wiring."""
+    for build in (_swe(1), _swe(2), _sme(1)):
+        nsm = NumericalSystemModel.from_system_model(
+            SystemModel.from_model(build()), normalize_normal=False)
         names = [getattr(op, "name", None) for op in nsm.default_operations()]
         assert names == ["desingularize_hinv"], names

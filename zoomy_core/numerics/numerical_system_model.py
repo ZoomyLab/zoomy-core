@@ -47,6 +47,38 @@ _OPERATOR_ATTRS = (
 )
 
 
+def numerics_fluctuations_are_zero(numerics) -> bool:
+    """THE REQ-209 criterion: is ``numerics``' built ``numerical_fluctuations``
+    structurally zero — i.e. does this system compute NO fluctuation term?
+
+    Sole owner of the test, so the NSM property and every printer decide the
+    same question the same way.  It reads the BUILT face kernel, never the
+    model's ``nonconservative_matrix``: those two disagree in both directions
+    (see :attr:`NumericalSystemModel.fluctuations_are_zero`).
+
+    **UNKNOWN collapses to False** ("assume a fluctuation").  Skipping a real
+    fluctuation term is silently-wrong physics; a spurious one costs a branch.
+    So only a PROVEN structural zero returns True — an absent slot, an empty
+    definition, or any entry sympy cannot decide (``is_zero`` returning
+    ``None``) all read as False.  The predecessor detector conflated "slot
+    absent" with "slot proven zero"; that conflation is the bug this replaces.
+    """
+    import sympy as sp
+    definition = getattr(
+        getattr(getattr(numerics, "functions", None),
+                "numerical_fluctuations", None),
+        "definition", None)
+    if definition is None:
+        return False
+    try:
+        entries = list(sp.flatten(definition))
+    except TypeError:
+        entries = [definition]
+    if not entries:
+        return False
+    return all(sp.sympify(e).is_zero is True for e in entries)
+
+
 def _op_flat(arr):
     """Flat list of scalar entries of an operator array (ZArray / MatrixBase /
     nested list), or ``[]`` for non-array operands."""
@@ -364,10 +396,26 @@ class NumericalSystemModel(SystemModel):
     #   "both"    — the explicit composition of the two, which REQ-181 pins as
     #               byte-identical to "gate" alone (the guard is idempotent).
     eigenvalue_guard: Optional[str] = None
-    # Impose |n| = 1 on the face normal before anything else runs.  A fact
-    # about the normal (every mesh normalises it), but it rewrites the emitted
-    # expression tree of every model that carries one, so it is opt-in.
-    normalize_normal: bool = False
+    # Impose |n| = 1 on the face normal before anything else runs.
+    #
+    # REQ-208 item (2) flipped this ON by default.  It is a FACT, not a
+    # modelling choice: every face normal in the project is normalised at
+    # construction — ``mesh_util._face_normals_2d`` :112,
+    # ``_face_normals_3d`` :138, ``_face_normals_wface`` :155 and
+    # ``base_mesh`` :321 all divide by ``np.linalg.norm``, and in 1-D
+    # ``n0 = ±1``.  Carrying ``√(n0²+n1²)`` symbolically was therefore pure
+    # overhead AND actively harmful: it holds the 2-D spectrum over a common
+    # denominator, so a later ``1/h`` regularization reaches (and damps) the
+    # celerity that ought to be structurally separate from it.
+    #
+    # It was opt-in only because it rewrites the emitted expression tree.
+    # That made the flag unreachable in practice: it is set at NSM
+    # construction, which lives in each backend's case code, so no case ever
+    # passed it and the face kernels kept recomputing ``√g·|n|`` in all three
+    # of them.  ``depth_law_study.build_nsm`` already defaulted it True, so
+    # the two entry points disagreed.  Pass ``normalize_normal=False`` to
+    # recover the old expression trees.
+    normalize_normal: bool = True
 
     # ── SystemModel identity bridge ───────────────────────────────
     @property
@@ -416,6 +464,97 @@ class NumericalSystemModel(SystemModel):
             if any(sp.sympify(e) != 0 for e in sp.flatten(M)):
                 return True
         return False
+
+    # ── emitted-numerics predicate (REQ-209) ──────────────────────
+
+    def _probe_numerics(self):
+        """A :class:`Numerics` instance over THIS NSM, for interrogating the
+        built face kernels.
+
+        Prefers one that is already live (every instance from
+        :meth:`build_numerics` is registered weakly), so the common case —
+        a printer that already holds its numerics — costs nothing.  When
+        none is live, one is built ONCE and kept: caching the numerics
+        OBJECT is safe where caching a derived boolean is not, because
+        :meth:`apply` re-registers the functions of every built numerics,
+        so the cached probe tracks later operations instead of going stale.
+
+        Only an EXACT ``type(n) is self.riemann`` match is reused: the
+        Riemann hierarchy is deep (``PositiveNonconservativeRusanov`` is-a
+        ``PositiveRusanov``), and a superclass instance answers a different
+        question than the class this NSM was built with.
+
+        Returns ``None`` when this NSM carries no Riemann class at all
+        (``riemann`` is an ``Optional`` field, so a directly-constructed NSM
+        that never passed through :meth:`from_system_model` can have none).
+        There is then no emitted face kernel to interrogate, which the
+        criterion reads as UNKNOWN → "has a fluctuation".
+        """
+        if self.riemann is None:
+            return None
+        for ref in (getattr(self, "_built_numerics", None) or []):
+            numerics = ref()
+            if numerics is not None and type(numerics) is self.riemann:
+                return numerics
+        probe = getattr(self, "_fluctuation_probe", None)
+        if probe is None or type(probe) is not self.riemann:
+            probe = self._fluctuation_probe = self.build_numerics()
+        return probe
+
+    @property
+    def fluctuations_are_zero(self) -> bool:
+        """True iff the BUILT ``numerical_fluctuations`` is structurally zero
+        — i.e. this system computes NO fluctuation term as emitted (REQ-209).
+
+        This is a property of the **(model × Riemann-solver × current
+        representation)** triple, NOT of the model's
+        ``nonconservative_matrix``, and it is deliberately re-read on every
+        access rather than cached.  Both halves of that sentence were
+        MEASURED, and both directions of the naive model-only test are wrong:
+
+        * **A non-zero model NCP does not imply a fluctuation.**  2-D SWE
+          carries ``B[hu][b] = B[hv][b] = g·h`` (bed slope, because ``b`` is
+          in the state), yet under :class:`PositiveRusanov` all eight emitted
+          entries are literal zero.  Note the mechanism, because it is not
+          the one the name suggests: ``PositiveRusanov`` does not take a path
+          integral over ``B`` at all — its fluctuation is the Audusse
+          consistency term ``S̃ = P_raw − P*`` built from
+          ``hydrostatic_pressure``.  The hand-built ``SWE`` model states its
+          operators directly and lumps ``g·h²/2`` into ``flux``, leaving the
+          ``hydrostatic_pressure`` slot ZERO — so ``S̃`` is structurally
+          ABSENT, not cancelling.  (Derived models put ``P = g·h²/2`` in the
+          P slot, and their ``S̃`` is alive: SME×PositiveRusanov is
+          well-balanced; the hand-built SWE×PositiveRusanov is NOT
+          well-balanced standalone — measured ``d(hu)/dt = 1.77`` on a
+          sloping-bed lake at rest — and relies on a driver-side bed-source
+          pair, cf. REQ-210/211.)  The model NCP is not merely a poor proxy
+          here; it is a different operator.  Deciding from it would block
+          the conservative fast path on a system that is conservative as
+          emitted.
+          ⚠ ``fluctuations_are_zero == True`` therefore does NOT mean
+          "needs no bed treatment" — it means exactly and only that no
+          fluctuation term is computed.
+        * **A zero model NCP does not imply no fluctuation.**  ``Rusanov`` /
+          ``HLL`` / ``HLLC`` never override ``numerical_fluctuations`` and so
+          inherit the identically-zero base, while the nonconservative
+          variants build one out of the same model.
+
+        The same ``PositiveRusanov`` cancellation is also model-specific, so
+        the answer cannot be keyed on the Riemann class either: it holds for
+        SWE (0/8 entries non-zero) but not for SME (2/8) or VAM (2/16),
+        whose richer pressure rows leave a residue.
+
+        The value also moves with the REPRESENTATION, which is why it is not
+        cached: ``RemoveNonDiagonalH`` CREATES a fluctuation and
+        ``HydrostaticReconstruction`` erases one, and both arrive through
+        :meth:`apply` long after construction.
+
+        The criterion itself lives in :func:`numerics_fluctuations_are_zero`
+        so that a printer holding its OWN numerics can apply the same test to
+        that object — one criterion, one implementation, no re-derivation at
+        the call sites (REQ-209).
+        """
+        return numerics_fluctuations_are_zero(self._probe_numerics())
 
     def default_operations(self) -> list:
         """Return the system operations applied to EVERY NSM by
@@ -604,7 +743,7 @@ class NumericalSystemModel(SystemModel):
         regularization_eps: float = 1e-2,
         eigenvalue_treatment: str = "regularize",
         eigenvalue_guard: Optional[str] = None,
-        normalize_normal: bool = False,
+        normalize_normal: bool = True,
     ) -> "NumericalSystemModel":
         """Build an NSM from a :class:`SystemModel` (or a :class:`Model`,
         auto-promoted via :meth:`SystemModel.from_model`).
@@ -629,11 +768,13 @@ class NumericalSystemModel(SystemModel):
               the exact ``1/h`` in the spectrum)
             - ``eigenvalue_guard`` → ``None`` (``"power"`` / ``"gate"`` /
               ``"both"``)
-            - ``normalize_normal`` → ``False`` (``True`` imposes ``|n| = 1``
-              before every other operation)
+            - ``normalize_normal`` → ``True`` (imposes ``|n| = 1`` before
+              every other operation; REQ-208 item (2) — ``False`` recovers
+              the pre-REQ expression trees)
 
-        The last five are the REQ-194 depth-law axes; every default reproduces
-        pre-REQ behaviour.  Sweeping them is what
+        The last five are the REQ-194 depth-law axes; every default except
+        ``normalize_normal`` reproduces pre-REQ behaviour.  Sweeping them is
+        what
         :func:`zoomy_core.numerics.depth_law_study.build_nsm` wraps.
 
         LSQ polynomial degree is **always** auto-derived (from

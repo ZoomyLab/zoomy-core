@@ -135,10 +135,20 @@ def test_single_gate_and_composition_equal_old_combined():
         assert _srepr(sm) == ref, "[guard, gate] != old combined op"
 
 
-# (d) NSM default_operations == [desingularize_hinv()] only -------------------
+# (d) NO eigenvalue guard in the NSM defaults ---------------------------------
 
-def test_nsm_default_operations_is_desingularize_only():
+def test_nsm_default_operations_carry_no_eigenvalue_guard():
+    """REQ-181: "we do not make this eigenvalues guard a default" — neither
+    ``guard_eigenvalue_powers`` nor ``gate_eigenvalues_dry`` may appear
+    unless the caller opts in via ``eigenvalue_guard=``.
+
+    The depth default is still ``desingularize_hinv``; ``normalize_face_normal``
+    joined the list in REQ-208 item (2) and is unrelated to the guard question
+    this test pins.
+    """
     for build in (_build_swe, lambda: _build_sme(1)):
         nsm = NumericalSystemModel.from_system_model(build())
         names = [getattr(op, "name", None) for op in nsm.default_operations()]
-        assert names == ["desingularize_hinv"], names
+        assert "guard_eigenvalue_powers" not in names, names
+        assert "gate_eigenvalues_dry" not in names, names
+        assert names == ["normalize_face_normal", "desingularize_hinv"], names

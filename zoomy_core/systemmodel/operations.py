@@ -395,9 +395,14 @@ def normalize_face_normal(*, exclude=()):
     fact about the face normal, so it holds wherever the normal appears
     (spectrum, Riemann-facing operators, wall-mirror boundary kernels …).
 
-    NOT an NSM default: it changes the emitted expression tree of every model
-    that carries a normal, so it is opted into per construction
-    (``normalize_normal=True``), never switched on globally by this REQ.
+    An NSM DEFAULT since REQ-208 item (2) (``normalize_normal=True``).  It
+    changes the emitted expression tree of every model carrying a normal,
+    which is why it started opt-in — but the relation is a fact about the
+    mesh, not a modelling choice (every ``_face_normals_*`` builder divides
+    by ``np.linalg.norm``), and being opt-in made it unreachable: the flag is
+    set at NSM construction inside each backend's case code, so no case ever
+    passed it and all three face kernels kept recomputing ``√g·|n|``.
+    Construct with ``normalize_normal=False`` to opt back out.
     """
     def _op(sm):
         n = list(sm.normal.values()) if sm.normal is not None else []

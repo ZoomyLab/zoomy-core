@@ -10,7 +10,10 @@ import itertools
 import textwrap
 from zoomy_core.misc import misc as misc
 from zoomy_core.misc.misc import Zstruct, ZArray
-from zoomy_core.numerics.numerical_system_model import to_numerical_system_model
+from zoomy_core.numerics.numerical_system_model import (
+    numerics_fluctuations_are_zero,
+    to_numerical_system_model,
+)
 
 # =========================================================================
 #  1. HELPER FUNCTIONS
@@ -1667,7 +1670,6 @@ class GenericCppModel(GenericCppBase):
         # have no gradQ dof — treat as 0 rather than crashing.
         n_dof_gradQ = self._n_dof_gradq()
         has_diffusion = self._detect_has_diffusion()
-        has_ncp = self._detect_has_nonconservative_product()
         has_free_surface = self._detect_has_free_surface()
 
         lines.extend(
@@ -1685,12 +1687,22 @@ class GenericCppModel(GenericCppBase):
                 f"    static constexpr double dt_max = {float(sm.dt_max)};",
                 f"    static constexpr int n_dof_gradQ = {n_dof_gradQ};",
                 f"    static constexpr bool has_diffusion = {'true' if has_diffusion else 'false'};",
-                # REQ-194 item (3): the NCP structure is known at CODEGEN time —
-                # a model whose ``nonconservative_matrix`` is structurally zero
-                # can never contribute a path-integral fluctuation.  Emitted as
-                # a compile-time constant so a driver can specialise on it, the
-                # same way ``has_diffusion`` gates the diffusion path.
-                f"    static constexpr bool has_nonconservative_product = {'true' if has_ncp else 'false'};",
+                # REQ-209: TRUE iff the BUILT ``numerical_fluctuations`` is
+                # structurally zero, i.e. no fluctuation term is computed for
+                # any face — so a driver may skip the fluctuation evaluation
+                # and its D± gather entirely, the same way ``has_diffusion``
+                # gates the diffusion path.
+                #
+                # READ from the NSM, never re-derived here (the predecessor
+                # ``_detect_has_nonconservative_product`` asked the MODEL's
+                # ``nonconservative_matrix`` and got 2-D SWE + PositiveRusanov
+                # backwards).  Note this makes it a property of the NSM's
+                # RIEMANN choice as well as its model: a raw Model promoted at
+                # this printer's front door carries the NSM default
+                # (``NonconservativeRusanov``), which answers ``false`` — the
+                # conservative direction.  ``Numerics.H`` carries the same
+                # constant, decided by the same property.
+                f"    static constexpr bool fluctuations_are_zero = {'true' if self.sm.fluctuations_are_zero else 'false'};",
                 f"    static constexpr bool has_free_surface = {'true' if has_free_surface else 'false'};",
             ]
         )
@@ -1731,29 +1743,13 @@ class GenericCppModel(GenericCppBase):
             return not all(sp.simplify(e) == 0 for e in sp.flatten(expr))
         return sp.simplify(expr) != 0
 
-    def _detect_has_nonconservative_product(self):
-        """Check whether the model's nonconservative_matrix is non-trivial
-        (not all zeros) — REQ-194 item (3).
-
-        Same shape as :meth:`_detect_has_diffusion`: declarative models keep
-        ``nonconservative_matrix`` on the SystemModel, legacy Models expose it
-        as a ``functions`` entry.  A structurally-zero NCP means the
-        path-integral fluctuation term ``∫A(Q)dQ`` is identically zero for
-        EVERY face, which is a property of the model and so is decidable here
-        rather than at runtime.
-        """
-        if self.sm is not None:
-            expr = getattr(self.sm, "nonconservative_matrix", None)
-            if expr is None:
-                return False
-        else:
-            if "nonconservative_matrix" not in self.model.functions.keys():
-                return False
-            expr = self.model.functions.nonconservative_matrix.definition
-        # Flatten the expression and check if every element is zero
-        if hasattr(expr, "__iter__"):
-            return not all(sp.simplify(e) == 0 for e in sp.flatten(expr))
-        return sp.simplify(expr) != 0
+    # ``_detect_has_nonconservative_product`` lived here (REQ-194 item 3) and
+    # is DELETED, not moved: it keyed on the model's ``nonconservative_matrix``
+    # and its own docstring claimed the fluctuation term was "a property of the
+    # model and so is decidable here".  REQ-209 measured that premise false in
+    # both directions, so the question now has exactly one answer-holder —
+    # ``NumericalSystemModel.fluctuations_are_zero``, which interrogates the
+    # BUILT ``numerical_fluctuations``.  Printers READ it; they never re-derive.
 
     def _n_dof_gradq(self):
         """Number of gradient-variable dof, or 0 when the model has no
@@ -1878,6 +1874,24 @@ class GenericCppNumerics(GenericCppBase):
                 tpl,
                 f"struct {self._wrapper_name} {{",
                 f"    static constexpr int n_dof_q = {self.n_dof_q};",
+                # REQ-209: TRUE iff the BUILT ``numerical_fluctuations`` is
+                # structurally zero — no fluctuation term is computed for any
+                # face, so a driver may skip the fluctuation evaluation and
+                # its D± gather entirely.
+                #
+                # This is the constant's PRIMARY home.  It is a property of
+                # the (model × Riemann-solver) PAIR, and ``Numerics.H`` is
+                # precisely that pair's artifact — ``Model.H`` describes the
+                # model alone and can only answer for whichever Riemann class
+                # its NSM happened to carry.
+                #
+                # The shared criterion is applied to ``self.numerics`` — the
+                # very object being printed — rather than read off the NSM
+                # property, which probes whichever numerics the NSM has to
+                # hand.  Same single implementation either way; this way the
+                # constant provably describes THIS header.
+                f"    static constexpr bool fluctuations_are_zero = "
+                f"{'true' if numerics_fluctuations_are_zero(self.numerics) else 'false'};",
             ]
         )
         return "\n".join(lines)
