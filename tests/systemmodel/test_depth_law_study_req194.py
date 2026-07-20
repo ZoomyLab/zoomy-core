@@ -39,6 +39,11 @@ from zoomy_core.systemmodel.operations import (
     regularize_depth_direct,
 )
 from zoomy_core.systemmodel.system_model import SystemModel
+
+# PARKED under the REQ-194 study tag (approved spec §3): shipped bits are
+# pinned by N01; this study scaffolding is excluded from EVERY tier and runs
+# only via an explicit `-m study`.  Dies when the study closes.
+pytestmark = [pytest.mark.systemmodel, pytest.mark.study]
 from zoomy_core.transformation.generic_c import GenericCppModel
 
 

@@ -1,65 +1,68 @@
-# zoomy_core test tiers
+# zoomy_core test suite (approved refactor, 2026-07-19 final v3)
 
-The suite is **tiered** so the default run is a fast pre-publish gate. Two
-opt-in tiers hold the expensive tests; both are **deselected by default**
-(`conftest.py`), and the markers are registered in `pyproject.toml` so nothing
-warns.
+Two layers guard the core:
 
-| tier | marker | what it holds |
-|------|--------|---------------|
-| **default (small)** | *(none)* | everything cheap on a warm cache, incl. the 1-step "small twins" of every large march |
-| **large** | `@pytest.mark.large` | real time-march / simulation tests (VAM/ML-VAM dam-break DAE Chorin solves, multi-step MOOD/positivity marches, Σ-3D refinement studies, lake-at-rest well-balancing marches) |
-| **rederive** | `@pytest.mark.rederive` | tests that clear/bypass the derivation cache or force a fresh derivation of a heavy family (double-moment SME, cold-cache `sm_cache` builds, VAM-3D/ML-VAM pressure operators) |
+1. **Goldens** — 25 checked-in text snapshots under `tests/goldens/`
+   (16 model + 3 systemmodel + 3 NSM + 2 printer + 1 numpy solver), verbatim
+   normalized `describe()`/emit of the DERIVED systems (SWE = SME(level=0)
+   composition, never hand-built; model goldens derive **no-cache**).
+   Regenerate with `python scripts/regen_goldens.py`; review = `git diff`.
+   A regen touching more than one family requires the rederive tier green
+   first (**re-bless protocol** — a golden detects CHANGE, not WRONGNESS;
+   `tests/model/test_model_references.py` is the truth anchor).
+2. **Exceptions** — 8 runtime-semantic files + 1 IMEX smoke pinning what
+   goldens are structurally blind to (inverse maps, cache staleness, dry-state
+   meaning, runtime BCs, MOOD positivity, kernel values, VAM→SME limit).
 
-Every `large` march has a **1-step twin** in the default tier: identical setup,
-exactly one timestep, asserting the cheap invariants (finite, `h >= 0`, bounded
-mass change) — a real regression canary at ~seconds cost. The twins **add**
-coverage; the large tests keep their full assertions.
+## Markers
 
-## Fast-verify — the ONE entry point
+| marker | meaning |
+|---|---|
+| `gate` | T1 membership: 6 model goldens + 7 structure/emit/solver + 24 runtime smalls (~37 fns) |
+| `small` / `large` | size tags; `large` = real marches, deselected by default |
+| `rederive` | cold-cache / fresh-derivation truth checks; deselected by default |
+| `model` `systemmodel` `nsm` `printer` `solver` | area tags (verify.py scoping) |
+| `fusion_wip` | transitional REQ-188 fusion seam (test_resolve_opaque) |
+| `study` | parked REQ-194 study scaffolding — excluded from EVERY tier, only `-m study` runs it |
 
-`scripts/verify.py` is the single "is this change ok?" gate: it runs the default
-(small) tier, prints the **wall-clock time**, and exits non-zero on failure
-(so a git hook / CI can gate on it). Target: **≤ 2 minutes on a warm cache**.
+All markers are registered in `pyproject.toml`; nothing may warn.
+
+## Tiers / commands
 
 ```bash
-micromamba run -n zoomy python scripts/verify.py            # full small tier + wall time
-micromamba run -n zoomy python scripts/verify.py --changed  # only tests for changed subdirs
-micromamba run -n zoomy python scripts/verify.py -k sme -x   # extra args pass to pytest
+# T1 gate, scoped to the areas your diff touches (fallback: all areas)
+micromamba run -n zoomy python scripts/verify.py
+micromamba run -n zoomy python scripts/verify.py --all-areas   # full gate, < 5 min
+
+# T2 feature tier: ALL small + large + rederive (golden re-bless validator)
+micromamba run -n zoomy python scripts/verify.py --tier feature
+
+# raw pytest equivalents
+pytest tests/ -q -m gate                          # full gate
+pytest tests/ -q -m "gate and (model or nsm)"     # scoped gate
+pytest tests/ -q                                  # all smalls (default tiering)
+pytest tests/ -q --run-large --run-rederive       # T2 by hand
+pytest tests/ -q -m rederive                      # rederive tier alone
 ```
 
-The small tier assumes a **warm derivation cache** (the shipped `_prebuilt` set +
-the REQ-163 `sm_cache`). Every default-tier structural build — including the
-`SME(dim=3)` and `VAM(dim=3)` specs that `test_sme_2d` / `test_vam_2d` / the
-`fvm` elliptic-BC + wet-dry Chorin tests build — is in `_prebuilt`, so a fresh
-checkout is warm. After a `CACHE_VERSION` bump or a derivation/builder edit,
-**regenerate first** (otherwise the first run pays the cold symbolic cost):
+T3 (full) = T2 + backend regression suites + container integration — lives
+outside this repo; run only after discussing with the user.
+
+## Cache expectations
+
+Non-golden tests assume a WARM derivation cache (shipped `_prebuilt` +
+REQ-163 `sm_cache`).  Model goldens always derive fresh (no-cache) by spec.
+After a `CACHE_VERSION` bump or derivation/builder edit:
 
 ```bash
 python -m zoomy_core.systemmodel.build_prebuilt_cache
 ```
 
-## Commands
+## Time canary
 
-```bash
-# default (small) tier — the pre-publish gate; seconds-to-a-couple-of-minutes
-micromamba run -n zoomy pytest tests/ -q
-
-# add the time-march tier
-micromamba run -n zoomy pytest tests/ -q --run-large
-
-# add the cold-cache / fresh-derivation tier
-micromamba run -n zoomy pytest tests/ -q --run-rederive
-
-# everything
-micromamba run -n zoomy pytest tests/ -q --run-large --run-rederive
-
-# address a tier directly (an explicit -m overrides the auto-deselection)
-micromamba run -n zoomy pytest tests/ -q -m large
-micromamba run -n zoomy pytest tests/ -q -m rederive
-```
-
-Run the `large` and `rederive` tiers on demand (before a release, or when
-touching the solvers / derivation machinery). The warm derivation cache is
-assumed for the default tier; cache re-evaluation happens case-by-case via
-`--run-rederive`.
+`tests/numerics/test_nsm_goldens.py::test_n02_time_canary` compares ONE
+CPU-time run of the N02 derive+build+lower seam against
+`tests/goldens/n02_time_baseline.json` (threshold 1.5x; catches the ~7x
+factor_terms blowup class).  Re-baseline via
+`python scripts/regen_goldens.py --baseline` (auto-refreshed on a full regen);
+the canary skips on hosts other than the one that recorded the baseline.

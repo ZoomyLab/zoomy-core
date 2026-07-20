@@ -31,6 +31,8 @@ from zoomy_core.mesh import BaseMesh
 import zoomy_core.model.initial_conditions as IC
 from zoomy_core.systemmodel.system_model import SystemModel
 
+pytestmark = [pytest.mark.model, pytest.mark.solver]
+
 NC, XMAX, T_END, CFL = 100, 20.0, 1.5, 0.9
 PAR = {"lambda_s": 0.5, "nu": 1e-3}
 H0, AMP, SIG = 0.5, 0.05, 3.0
@@ -83,6 +85,8 @@ def _vam_dt(sol):
                          sol._sim_compute_max_abs_eigenvalue)), 5e-3)
 
 
+@pytest.mark.small
+@pytest.mark.gate
 def test_vam1_sme1_long_wave_one_step_twin(one_hyperbolic_step):
     """Default-tier canary: identical smooth-hump SME + VAM(Chorin) setup, ONE
     step each.  The O(mu) agreement holds only after real evolution, so the

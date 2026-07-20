@@ -30,6 +30,10 @@ from zoomy_core.fvm.riemann_solvers import (
 )
 from zoomy_core.transformation.to_amrex import AmrexNumerics
 
+# Transitional keep (approved spec §1d): active REQ-188 Riemann-fusion seam.
+# Sunset into P01/P02 once fusion lands and the goldens emit the fused form.
+pytestmark = [pytest.mark.printer, pytest.mark.small, pytest.mark.fusion_wip]
+
 
 def _cse_ops(rows):
     temps, red = sp.cse([sp.sympify(r) for r in rows],

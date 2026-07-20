@@ -22,8 +22,23 @@ Both tiers are DESELECTED by default and re-enabled per tier:
 An explicit ``-m`` expression (e.g. ``-m large``) takes over selection
 entirely and disables this auto-deselection, so the tiers stay directly
 addressable.
+
+Additionally (approved test-refactor spec 2026-07-19, final v3):
+
+* ``@pytest.mark.gate``  — T1 pre-publish gate membership; ``scripts/verify.py``
+  runs ``-m gate`` scoped to the touched areas.
+* area tags ``model`` / ``systemmodel`` / ``nsm`` / ``printer`` / ``solver``.
+* ``@pytest.mark.study`` — parked study scaffolding (REQ-194 depth-law study);
+  excluded from EVERY tier, runs only via an explicit ``-m study``.
+* ``tests/goldens/`` holds the checked-in golden snapshots + ``goldenlib``;
+  its path is injected below so every test file can ``import goldenlib``.
 """
+import pathlib
+import sys
+
 import pytest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "goldens"))
 
 
 def pytest_addoption(parser):
@@ -69,12 +84,12 @@ def pytest_collection_modifyitems(config, items):
         return
     run_large = config.getoption("--run-large")
     run_rederive = config.getoption("--run-rederive")
-    if run_large and run_rederive:
-        return
 
     selected, deselected = [], []
     for item in items:
-        drop = (("large" in item.keywords and not run_large)
+        # ``study`` is parked: excluded from EVERY tier (only -m study runs it).
+        drop = ("study" in item.keywords
+                or ("large" in item.keywords and not run_large)
                 or ("rederive" in item.keywords and not run_rederive))
         (deselected if drop else selected).append(item)
 

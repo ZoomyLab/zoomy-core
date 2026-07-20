@@ -33,6 +33,13 @@ from zoomy_core.numerics.numerical_system_model import (
 )
 from zoomy_core.transformation.generic_c import CppModel, CppNumerics
 
+import pytest
+
+# Post-spec keep (REQ-209 landed after the 2026-07-19 refactor spec): the
+# fluctuations_are_zero flag is decided from the BUILT numerics and read by
+# printers — no golden pins the (model x Riemann) decision table.
+pytestmark = [pytest.mark.nsm, pytest.mark.small]
+
 
 def _nsm(model, riemann):
     return NumericalSystemModel.from_model(

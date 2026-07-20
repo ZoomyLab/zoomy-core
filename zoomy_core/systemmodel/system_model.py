@@ -1837,10 +1837,17 @@ class SystemModel:
         # ``sp.Function("b")``) are candidates for promotion to aux state.
         # Filter via ``sp.AppliedUndef`` which is precisely "user-defined
         # function application".
+        # NOTE: ``.atoms()`` returns a SET whose iteration order is str-hash
+        # (PYTHONHASHSEED) dependent — it decided the aux row order and made
+        # the derived layout (and every emitted backend arg list) vary from
+        # process to process.  Iterate in ``default_sort_key`` order so the
+        # aux ordering is canonical and the golden snapshots are stable.
         function_atoms = {}     # name → [atoms]
         for M in matrices:
             for entry in _iter_entries(M):
-                for atom in sp.sympify(entry).atoms(sp.core.function.AppliedUndef):
+                for atom in sorted(
+                        sp.sympify(entry).atoms(sp.core.function.AppliedUndef),
+                        key=sp.default_sort_key):
                     name = atom.func.__name__
                     if name in state_names:
                         continue
@@ -1858,7 +1865,8 @@ class SystemModel:
         limit_atoms = {}   # (target_name, multi_index_tuple, scheme) → [atoms]
         for M in matrices:
             for ent in _iter_entries(M):
-                for atom in sp.sympify(ent).atoms(_limit_fn):
+                for atom in sorted(sp.sympify(ent).atoms(_limit_fn),
+                                   key=sp.default_sort_key):
                     inner = atom.args[0]
                     scheme = str(atom.args[1])
                     if not isinstance(inner, sp.Derivative):
@@ -1894,7 +1902,8 @@ class SystemModel:
                 limited_inner_atoms.add(a.args[0])
         for M in matrices:
             for entry in _iter_entries(M):
-                for d in sp.sympify(entry).atoms(sp.Derivative):
+                for d in sorted(sp.sympify(entry).atoms(sp.Derivative),
+                                key=sp.default_sort_key):
                     if d in limited_inner_atoms:
                         continue
                     target = d.args[0]

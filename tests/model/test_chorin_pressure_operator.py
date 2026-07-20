@@ -23,6 +23,10 @@ import sympy as sp
 from zoomy_core.model.models.vam import VAM
 from zoomy_core.model.models.ml_vam import MLVAM
 
+# R4 (approved spec §1c): wholesale rederive — operator-vs-matrix-free
+# self-consistency, run on re-baseline / by tag, zero default-gate cost.
+pytestmark = [pytest.mark.systemmodel, pytest.mark.rederive]
+
 
 def _row_scalar(smp, i):
     src = smp.source

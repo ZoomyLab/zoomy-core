@@ -31,6 +31,8 @@ from zoomy_core.model.models.vam import VAM
 from zoomy_core.model.models.ml_vam import MLVAM
 from zoomy_core.systemmodel.system_model import SystemModel
 
+pytestmark = [pytest.mark.model, pytest.mark.small, pytest.mark.gate]
+
 _PROFILE = ("b", "h", "u", "v", "w", "p")
 
 
@@ -97,7 +99,7 @@ def _roundtrip_worst(model, hval=1.7, bval=0.3, layer_split=0.43):
     (VAM(level=1, dimension=2), "VAM(1)"),
     (MLVAM(n_layers=2, level=1, dimension=2), "MLVAM(2,1)"),
 ])
-def test_project_inverts_interpolate(model, label):
+def test_roundtrip_identity(model, label):
     """``project_from_3d ∘ interpolate_to_3d`` recovers every conserved moment
     to round-off — the ``×h`` factor and the exact discrete-Gram projection.
 
@@ -107,9 +109,17 @@ def test_project_inverts_interpolate(model, label):
     assert worst <= 1e-10, f"{label}: round-trip error {worst:.2e} > 1e-10"
 
 
-def test_momentum_row_carries_h_factor():
-    """A constant-``u = U``, depth-``h`` column projects to the CONSERVED
-    momentum ``q_0 = h·U`` — not the bare mean ``U``."""
+def test_physics_pins():
+    """The three physical pins of the interpolate/project pair (spec E1):
+
+    * ``q_0 = h·U`` — a constant-``u = U`` depth-``h`` column projects to the
+      CONSERVED momentum, not the bare mean ``U`` (the ×h family);
+    * VAM: total pressure vanishes at the free surface (``p(ζ=1) = 0``) and
+      the bottom-KBC vertical velocity satisfies ``w(0) = u(0)·∂_x b``;
+    * REQ-108: the SME projection is baked on VOF-style CELL-CENTRE nodes
+      ``(j+1/2)/N_z`` (never the endpoint convention that broke coupling).
+    """
+    # -- q0 = h*U ----------------------------------------------------------
     sm = SystemModel.from_model(SME(level=0, dimension=2))
     P = [sp.sympify(e) for e in sp.flatten(sm.project_from_3d)]
     P3h = sp.Symbol("P3_h", real=True)
@@ -121,12 +131,7 @@ def test_momentum_row_carries_h_factor():
     assert q0 == pytest.approx(hval * U, abs=1e-10)  # h·U, NOT U
     assert q0 != pytest.approx(U, abs=1e-6)
 
-
-def test_vam_pressure_split_in_interpolate():
-    """VAM's reconstructed pressure (slot 5) is the TOTAL pressure: the
-    hydrostatic ρ g h (1−ζ) split plus the non-hydrostatic modal part, which
-    vanishes at the free surface ζ=1 (the p(ζ=1)=0 closure), and the bottom-KBC
-    vertical velocity (slot 4) satisfies w(0)=u(0)·∂_x b."""
+    # -- VAM pressure split + bottom KBC ------------------------------------
     from zoomy_core import coords as C
     zeta = sp.Symbol("zeta", real=True)
     interp = VAM(level=1, dimension=2).interpolate_to_3d()
@@ -139,17 +144,7 @@ def test_vam_pressure_split_in_interpolate():
     u0 = sp.simplify(interp[2].subs(zeta, 0))
     assert sp.simplify(w0 - u0 * sp.Derivative(b, C.x)) == 0
 
-
-def test_sme_projection_on_cell_center_exchange_nodes():
-    """REQ-108: the SME projection is baked on VOF-style CELL-CENTRE nodes
-    ``(j+1/2)/N_z`` (uniform weights) — NOT endpoint-inclusive ``j/(N-1)`` +
-    trapezoidal — so it coincides with the coupling exchange grid (the preCICE
-    map is the identity) and the ``project∘interpolate`` round-trip is exact on a
-    column sampled at ``(j+1/2)/N_z``.  Endpoint nodes mismatched the exchange
-    grid and tipped a dam-break transmission into a reflecting solution.  The
-    round-trip exactness itself is covered by ``test_project_inverts_interpolate``
-    (which samples each row at exactly the nodes it references); this pins the
-    node CONVENTION so it cannot silently regress to endpoints."""
+    # -- REQ-108 cell-centre nodes ------------------------------------------
     model = SME(level=1, dimension=2)
     N_z = int(model.project_nz)
     P = [sp.sympify(e) for e in sp.flatten(SystemModel.from_model(model).project_from_3d)]

@@ -19,6 +19,10 @@ import time
 import pytest
 import sympy as sp
 
+# R3 (approved spec §1c): sole TensorSeparationOfVariables + disk-persist
+# coverage; every test below is individually @pytest.mark.rederive already.
+pytestmark = [pytest.mark.model]
+
 from zoomy_core import coords as C
 import zoomy_core.derivatives as d
 from zoomy_core.model.derivation import (
