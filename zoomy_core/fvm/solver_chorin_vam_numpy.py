@@ -255,6 +255,20 @@ def _pad_to_square(sm: SystemModel) -> SystemModel:
     new_M    = _pad_rank2(sm.mass_matrix, n_st)
     new_E    = _pad_rank1(sm.eigenvalues) if sm.eigenvalues is not None else None
 
+    # cid=50: the split stages arrive here ALREADY swept by the NSM default
+    # operations (split_for_pressure_structural routes every stage through
+    # ``to_numerical_system_model``), so their derived operators were
+    # FROZEN-then-substituted (``−q²/h² → −q²·hinv²``; see
+    # ``regularize_pow``).  Carry them through the padding — letting the
+    # padded copy recompute them from the swept primaries would drop the
+    # exact ``∂(q²/h)/∂h`` terms (``hinv`` is an independent symbol) and
+    # corrupt every wavespeed.  The same goes for ``update_aux_variables``
+    # (aux-indexed, no padding needed): dropping it would leave the ``hinv``
+    # aux row at 0 and zero every reconstructed velocity.
+    new_SJV  = _pad_rank2(sm.source_jacobian_wrt_variables, n_st)
+    new_SJA  = _pad_rank2(sm.source_jacobian_wrt_aux_variables,
+                          len(sm.aux_state))
+
     sm_square = SystemModel(
         time=sm.time,
         space=list(sm.space),
@@ -268,6 +282,8 @@ def _pad_to_square(sm: SystemModel) -> SystemModel:
         source=new_S,
         mass_matrix=new_M,
         eigenvalues=new_E,
+        source_jacobian_wrt_variables=new_SJV,
+        source_jacobian_wrt_aux_variables=new_SJA,
         equation_to_state_index=list(range(n_st)),
         boundary_conditions=sm.boundary_conditions,
         aux_boundary_conditions=sm.aux_boundary_conditions,
@@ -275,10 +291,18 @@ def _pad_to_square(sm: SystemModel) -> SystemModel:
         initial_conditions=sm.initial_conditions,
         aux_initial_conditions=sm.aux_initial_conditions,
         update_variables=sm.update_variables,
+        update_aux_variables=sm.update_aux_variables,
         reconstruction_variables=sm.reconstruction_variables,
         state_from_reconstruction=sm.state_from_reconstruction,
     )
     sm_square.aux_registry = list(getattr(sm, "aux_registry", []) or [])
+    sm_square.aux_input_registry = list(
+        getattr(sm, "aux_input_registry", []) or [])
+    # Frozen flux Jacobian (see the cid=50 note above): pad the stage's
+    # materialized quasilinear cache row-wise so the padded copy NEVER
+    # re-materializes it from the swept flux.
+    if getattr(sm, "_quasilinear_matrix", None) is not None:
+        sm_square.quasilinear_matrix = _pad_rank3(sm._quasilinear_matrix)
     sm_square.equation_names = (
         [sm.equation_names[src_of_dest[i]] if i in src_of_dest
          else f"_pad_{i}"

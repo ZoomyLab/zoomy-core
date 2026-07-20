@@ -6,7 +6,7 @@
 stages: [('predictor', 'hyperbolic'), ('pressure', 'elliptic'), ('corrector', 'pointwise')]
 
 == stage predictor ==
-class: SystemModel
+class: NumericalSystemModel
 state: [Symbol('b'), Symbol('h'), Symbol('q_0'), Symbol('q_1'), Symbol('r_0'), Symbol('r_1'), Symbol('P_0'), Symbol('P_1')]
 aux_state: [Symbol('b_x'), Symbol('q_1_x'), Symbol('dbdx'), Symbol('hinv')]
 parameters: [g, rho, nu, lambda_s]
@@ -76,7 +76,7 @@ aux_registry:
   {atom=Derivative(Symbol('q_1'), Tuple(Symbol('x'), Integer(1))), aux_symbol=Symbol('q_1_x'), kind='derivative', multi_index=(1,), name='q_1_x', row=1, state_index=3, target_kind='state', target_name='q_1'}
 
 == stage pressure ==
-class: SystemModel
+class: NumericalSystemModel
 state: [Symbol('b'), Symbol('h'), Symbol('q_0'), Symbol('q_1'), Symbol('r_0'), Symbol('r_1'), Symbol('P_0'), Symbol('P_1')]
 aux_state: [Symbol('b_x'), Symbol('q_1_x'), Symbol('dbdx'), Symbol('hinv'), Symbol('P_0_x'), Symbol('P_0_x_x'), Symbol('P_1_x'), Symbol('P_1_x_x'), Symbol('b_x_x'), Symbol('h_x'), Symbol('h_x_x'), Symbol('q_0_x')]
 parameters: [g, rho, nu, lambda_s]
@@ -148,7 +148,7 @@ aux_registry:
   {atom=Derivative(Symbol('P_1'), Tuple(Symbol('x'), Integer(2))), aux_symbol=Symbol('P_1_x_x'), kind='derivative', multi_index=(2,), name='P_1_x_x', row=7, state_index=7, target_kind='state', target_name='P_1'}
 
 == stage corrector ==
-class: SystemModel
+class: NumericalSystemModel
 state: [Symbol('b'), Symbol('h'), Symbol('q_0'), Symbol('q_1'), Symbol('r_0'), Symbol('r_1'), Symbol('P_0'), Symbol('P_1')]
 aux_state: [Symbol('P_0_x'), Symbol('b_x'), Symbol('h_x'), Symbol('P_1_x')]
 parameters: [g, rho, nu, lambda_s]

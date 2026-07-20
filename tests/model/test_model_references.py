@@ -322,7 +322,15 @@ def test_vam1_chorin_split_matches_escalante_projection(vam1, vam_reference):
 
 def test_vam1_predictor_is_pressure_zeroed_full_rows(vam1, vam_reference):
     """SM_pred row-by-row == the full system at P=0 (term content AND source
-    sign — a double sign flip here once anti-damped the predictor friction)."""
+    sign — a double sign flip here once anti-damped the predictor friction).
+
+    The identity is asserted in the WET LIMIT ``hinv ≡ 1/h``: since cid=50 the
+    splitter routes every stage through the NSM default-operation sweep, so
+    the predictor's reciprocal depths are the KP-desingularized ``hinv`` aux
+    (== ``1/h`` for ``h ≥ eps``) rather than a bare ``1/h``.  The substitution
+    must happen ON THE OPERATORS, before residual reconstruction — ``hinv``
+    is an aux Symbol, so the reconstructed outer ``∂_x`` would otherwise
+    treat it as constant and drop the ``−q²·h_x/h²`` chain term."""
     model, sm = vam1
     split = model.chorin_split()
     rv = sm.reconstruct_residuals()
@@ -330,8 +338,20 @@ def test_vam1_predictor_is_pressure_zeroed_full_rows(vam1, vam_reference):
     Fn = vam_reference["Fn"]
     zero_P = {Fn("P_0"): 0, Fn("P_1"): 0}
 
-    pred_rv = split.SM_pred.reconstruct_residuals()
-    for k, nm in enumerate(split.SM_pred.equation_names):
+    pred = split.SM_pred          # local split — safe to rewrite in place
+    h = next(s for s in pred.state if str(s) == "h")
+    hinv_wet = {a: 1 / h for a in pred.aux_state if str(a) == "hinv"}
+    if hinv_wet:
+        for slot in ("flux", "hydrostatic_pressure",
+                     "nonconservative_matrix", "source", "mass_matrix"):
+            M = getattr(pred, slot, None)
+            if M is not None:
+                flat = [sp.sympify(e).xreplace(hinv_wet)
+                        for e in sp.flatten(M)]
+                setattr(pred, slot, type(M)(flat).reshape(*M.shape))
+
+    pred_rv = pred.reconstruct_residuals()
+    for k, nm in enumerate(pred.equation_names):
         sname = nm[len("pred_"):]
         expected = sp.expand(
             sp.sympify(rv[names.index(sname)]).subs(zero_P).doit())

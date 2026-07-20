@@ -1441,6 +1441,37 @@ def split_for_pressure_structural(sm, pressure_vars, dt):
                        f"{[state_names[i] for i in corr_e2s]}",
     })
 
+    # ── cid=50: the NSM default-operation sweep must reach EVERY stage ──
+    # The stages above are (re)built from the RAW residuals, so no rewrite
+    # applied to the PARENT can reach them (sympy slots are rebound, never
+    # mutated).  Backends that consume the split directly (amrex / foam
+    # ``write_chorin_*_headers`` print ``split.SM_*`` verbatim, bypassing the
+    # ``to_numerical_system_model`` front door) therefore emitted a bare,
+    # unregularized ``Pow(h, -2)`` in the predictor quasilinear / source
+    # Jacobians; on a dry-bed case the numerical eigenvalue kernel receives a
+    # non-finite matrix at ``h = 0``, returns ``+inf``, and the CFL min pins
+    # ``dt = 0`` at step 1.  Fix: route every stage through the SAME front
+    # door the parent uses, so the NSM default operations —
+    # ``normalize_face_normal`` + the KP ``desingularize_hinv`` (with its
+    # internal eigenvalue ``eps_h`` floor) — reach each stage exactly as they
+    # reach the parent.  The ``_is_transport_system`` gate decides per stage:
+    # the predictor (a real flux system) is swept; the elliptic pressure /
+    # pointwise corrector stages carry no wavespeeds and stay clean by design.
+    #
+    # Promotion is IN PLACE (the NSM is-a SystemModel; ``from_system_model``
+    # re-classes the instance), so the ``SM_pred is stages[0].sm`` identity
+    # holds, and each stage freeze-materializes its OWN quasilinear matrix
+    # from its raw operators before the substitution (never recomputed from
+    # the swept flux — that would drop the exact ``∂(q²/h)/∂h = −q²/h²``
+    # wavespeed term; see ``regularize_pow``).  A later
+    # ``from_system_model(...)`` on a stage (the numpy/jax solvers re-promote
+    # at setup) is idempotent: ``hinv`` is already registered and no bare
+    # negative depth power remains to rewrite.
+    from zoomy_core.numerics.numerical_system_model import (  # lazy: no cycle
+        to_numerical_system_model)
+    for _stage_sm in (SM_pred, SM_press, SM_corr):
+        to_numerical_system_model(_stage_sm)
+
     return SplitForPressureResult(
         SM_pred=SM_pred, SM_press=SM_press, SM_corr=SM_corr)
 
