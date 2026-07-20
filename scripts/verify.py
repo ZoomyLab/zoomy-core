@@ -50,6 +50,9 @@ _SRC_AREA = {
     "transformation": {"printer"},
     "fvm": {"solver"},
     "mesh": {"solver"},
+    # the solver Procedure/Statement IR: consumed by BOTH walker families
+    # (C-family printer -> 'printer', python ProcedureBuilder -> 'solver').
+    "solver": {"printer", "solver"},
 }
 # tests/<subdir> -> area(s).  tests/transformation also hosts the runtime
 # kernel contract (area 'solver'), so it maps to both.
@@ -60,6 +63,7 @@ _TEST_AREA = {
     "transformation": {"printer", "solver"},
     "fvm": {"solver"},
     "analysis": {"model"},
+    "solver_ir": {"printer", "solver"},
 }
 
 

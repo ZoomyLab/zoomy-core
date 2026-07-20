@@ -11,7 +11,12 @@ golden — holding a NORMALIZED snapshot of a derived object:
 * systemmodel goldens — ``from_model`` freeze / Chorin splits;
 * NSM goldens        — ``NumericalSystemModel`` incl. numerics knobs and the
                        built face-kernel definitions;
-* printer goldens    — the full emitted source (verbatim).
+* printer goldens    — the full emitted source (verbatim);
+* procedure goldens  — the solver Procedure/Statement IR walked to C-family
+                       text (``Q01``); the shared example procedures are built
+                       by ``solver_procedure_examples`` so the golden and the
+                       python-``ProcedureBuilder`` execution tests check the
+                       SAME IR.
 
 Normalization: canonical ``srepr`` per entry (symbols print NAME-ONLY —
 assumptions are pinned once per symbol from the deduced ``assumptions0`` in a
@@ -713,6 +718,136 @@ def build_n03_sme_gate_guard():
                       "+ gate_eigenvalues_dry (opt-in)", with_numerics=False)
 
 
+# ── solver Procedure/Statement IR (Q01) ────────────────────────────────────
+#
+# The example procedures are shared by the golden (C text) and the execution
+# tests (python builder), so both walkers are checked against ONE IR — a
+# divergence between the two families shows up as a test failure, not as a
+# backend surprise.
+
+def solver_procedure_examples():
+    """Three design-faithful solver blocks exercising all five statement
+    kinds: ``solver_dt_pass`` (ForEachFace + an opaque ``eigenvalues`` call in
+    expression position), ``solver_reduce_dt`` (IfStatic on the ``coupled``
+    build flag — D7's dt_window/t_end exclusivity — plus Piecewise and a
+    Min-reduction) and ``solver_march`` (the one While, with a post-loop
+    ``solver_write_fields`` Call).
+
+    Returns the UNRESOLVED procedures; ``solver_reduce_dt`` must be
+    ``.resolve({"coupled": ...})``-d before either walker accepts it.
+    """
+    from zoomy_core.solver import Assign, Call, ForEachFace, IfStatic, Procedure, While
+
+    f = sp.Symbol("f")
+    lam_lo, lam_hi = sp.IndexedBase("lam_lo_f"), sp.IndexedBase("lam_hi_f")
+    inradius = sp.IndexedBase("inradius_f")
+    Q, Qaux, p_, nrm = sp.symbols("Q Qaux p face_normal")
+    dt, dt_max, dt_window = sp.symbols("dt dt_max dt_window")
+    lam, dt_f = sp.symbols("lam dt_f")
+    time, t_end, iteration, i_snap = sp.symbols(
+        "time t_end iteration i_snapshot")
+    # CFL law: 1-D 0.9.  A literal here, never a runtime knob.
+    cfl = sp.Rational(9, 10)
+    eps = sp.Rational(1, 10**12)
+
+    dt_pass = Procedure(
+        name="solver_dt_pass",
+        args=("variables", "aux_variables", "parameters", "face_cells",
+              "face_normal", "n_faces", "lam_lo_f", "lam_hi_f"),
+        doc=("v6 §1: dt is computed BEFORE the flux loop.  Stores the two "
+             "wave-speed bounds per face; the eigenvalues slot stays an "
+             "opaque backend kernel (_NON_RESOLVABLE)."),
+        stmts=(
+            ForEachFace("f", "n_faces", body=(
+                Assign("c_own", sp.IndexedBase("face_cells")[2 * f],
+                       ctype="int"),
+                Assign("lam_lo_f[f]",
+                       sp.Function("eigenvalues")(0, Q, Qaux, p_, nrm,
+                                                  sp.Symbol("c_own")),
+                       declare=False),
+                Assign("lam_hi_f[f]",
+                       sp.Function("eigenvalues")(1, Q, Qaux, p_, nrm,
+                                                  sp.Symbol("c_own")),
+                       declare=False),
+            )),
+        ),
+    )
+
+    reduce_dt = Procedure(
+        name="solver_reduce_dt",
+        args=("lam_lo_f", "lam_hi_f", "inradius_f", "n_faces", "dt_max",
+              "dt_window"),
+        returns="dt",
+        doc=("D7: dt_window REPLACES the t_end clamp in coupled mode — never "
+             "min-combined (that combination is a measured preCICE abort).  "
+             "The choice is a BUILD-time IfStatic, not a runtime branch.  An "
+             "all-dry domain yields dt = dt_max: zeroed lambda drops out of "
+             "the min rather than spinning at dt = 0."),
+        stmts=(
+            IfStatic("coupled",
+                     then=(Assign("dt", dt_window),),
+                     otherwise=(Assign("dt", dt_max),)),
+            ForEachFace("f", "n_faces", body=(
+                Assign("lam", sp.Max(abs(lam_lo[f]), abs(lam_hi[f]))),
+                Assign("dt_f", sp.Piecewise(
+                    (dt_max, lam < eps),
+                    (cfl * inradius[f] / sp.Max(lam, eps), True))),
+                Assign("dt", sp.Min(dt, dt_f), declare=False),
+            )),
+        ),
+    )
+
+    march = Procedure(
+        name="solver_march",
+        args=("variables", "aux_variables", "t_end", "dt", "write_interval"),
+        doc=("The ONE While in the design.  Carry = the march state; the "
+             "final write is the post-loop shell block."),
+        stmts=(
+            Assign("time", sp.Integer(0)),
+            Assign("iteration", sp.Integer(0), ctype="int"),
+            Assign("i_snapshot", sp.Integer(0), ctype="int"),
+            While(time < t_end,
+                  carry=("time", "iteration", "i_snapshot"),
+                  body=(
+                      Assign("time", time + dt, declare=False),
+                      Assign("iteration", iteration + 1, declare=False),
+                      Assign("i_snapshot", sp.Piecewise(
+                          (i_snap + 1,
+                           time >= (i_snap + 1) * sp.Symbol("write_interval")),
+                          (i_snap, True)), declare=False),
+                  )),
+            Call("solver_write_fields",
+                 args=("variables", "aux_variables", "time", "i_snapshot")),
+        ),
+    )
+    return {"solver_dt_pass": dt_pass, "solver_reduce_dt": reduce_dt,
+            "solver_march": march}
+
+
+def build_q01_procedure_c():
+    """Q01: the C-family walker over the shared example procedures — both
+    resolutions of the ``coupled`` build flag emitted, so the golden also
+    pins that IfStatic really disappears (no runtime branch in either)."""
+    from zoomy_core.transformation.procedure_c import CProcedurePrinter
+    ex = solver_procedure_examples()
+    printer = CProcedurePrinter()
+    parts = ["== Q01 solver Procedure IR -> C family ==",
+             printer.print_procedure(ex["solver_dt_pass"]).rstrip()]
+    for coupled in (False, True):
+        parts.append(f"-- solver_reduce_dt resolved with coupled={coupled} --")
+        parts.append(printer.print_procedure(
+            ex["solver_reduce_dt"].resolve({"coupled": coupled})).rstrip())
+    parts.append(printer.print_procedure(ex["solver_march"]).rstrip())
+    body = "\n\n".join(parts) + "\n"
+    # The build flag must not survive into CODE (doc comments may name it):
+    # an IfStatic is resolved away, never lowered to a runtime branch.
+    code_lines = [ln for ln in body.splitlines()
+                  if not ln.lstrip().startswith(("//", "--", "=="))]
+    assert not any("coupled" in ln for ln in code_lines), (
+        "a build-time branch leaked into C source")
+    return body
+
+
 # ── printer goldens (full emitted source, default options) ────────────────
 
 def build_p01_foam_vam():
@@ -870,6 +1005,8 @@ GOLDENS = {
     # printer goldens
     "p01_foam_vam":        (build_p01_foam_vam, "printer", "gate"),
     "p02_generic_c_sme":   (build_p02_generic_c_sme, "printer", "gate"),
+    # solver-IR golden (the Procedure/Statement IR, C-family walker)
+    "q01_procedure_c":     (build_q01_procedure_c, "procedure", "gate"),
     # solver golden
     "x01_numpy_wb_solver": (build_x01_numpy_wb_solver, "solver", "gate"),
 }

@@ -14,6 +14,7 @@ from zoomy_core.numerics.numerical_system_model import (
     numerics_fluctuations_are_zero,
     to_numerical_system_model,
 )
+from zoomy_core.solver.arg_slots import SOLVER_ARG_MAPPING, SOLVER_DECL_KINDS
 
 # =========================================================================
 #  1. HELPER FUNCTIONS
@@ -121,6 +122,16 @@ class GenericCppBase(CXX11CodePrinter):
         "source": "source_term",
         "dt": "dt",
         "dx": "dx",
+        # ── march-level slots (solver-unification design) ────────────────
+        # The solver-block vocabulary (MeshRT fields, the stored face arrays,
+        # Q0, a_stage, troubled, i_snapshot, dt_max, dt_window) is declared
+        # ONCE in ``zoomy_core.solver.arg_slots`` and merged in here so the
+        # whole C family (dmplex / amrex / openfoam) spells it identically.
+        # Purely ADDITIVE: every key the kernel signatures above already use
+        # keeps its existing spelling, so no emitted operator signature moves.
+        **{k: v for k, v in SOLVER_ARG_MAPPING.items()
+           if k not in ("variables", "aux_variables", "parameters", "p",
+                        "normal", "position", "time", "distance", "dt")},
     }
 
     c_functions = {
@@ -851,6 +862,53 @@ struct SimpleArray {
         """Get variable declaration."""
         return f"const T* {variable_name}"
 
+    def _sm_arg_decl(self, key):
+        """C++ declaration for one argument, given its already-mapped C
+        spelling (pointer form: ``const T* Q``; ``dt`` is the one scalar
+        argument).  Backends with a different calling convention override
+        this.
+
+        Lives on the BASE (moved up from ``GenericCppModel``, behaviour
+        identical) so the solver-block walker
+        (:mod:`zoomy_core.transformation.procedure_c`) reuses one declaration
+        table with the operator-kernel emitters instead of forking a second.
+        """
+        if key in ("dt", "time"):
+            # REQ-185: ``time`` (like ``dt``) is a scalar by-value argument.
+            return f"const {self.real_type} {key}"
+        if key == "column":
+            # the resolved interface column ``column[N_z][n_fields]`` the
+            # depth→moment projection reduces (2-D sampled profile).
+            return f"const {self.real_type}* const* {key}"
+        # March-level slots (solver-unification design): declaration follows
+        # the slot's STORAGE KIND, so a written face array (``T* Fface``) and
+        # a read-only mesh array (``const T* face_area``) never collide.
+        # Reached only for spellings the kernel signatures do not use — the
+        # per-cell/per-face operator emission is byte-identical.
+        kind = SOLVER_DECL_KINDS.get(key)
+        if kind is not None:
+            return self._decl_for_kind(kind, key)
+        return f"const {self.real_type}* {key}"
+
+    def _decl_for_kind(self, kind, name):
+        """One C++ parameter declaration from a solver storage kind
+        (:mod:`zoomy_core.solver.arg_slots`).  Split out so the solver-block
+        walker can pick the kind per PROCEDURE (a face array is ``T*`` in the
+        block that writes it, ``const T*`` in the blocks that read it) without
+        forking a second declaration table."""
+        return {
+            "scalar_real": f"const {self.real_type} {name}",
+            "scalar_int": f"const int {name}",
+            "const_real_ptr": f"const {self.real_type}* {name}",
+            "real_ptr": f"{self.real_type}* {name}",
+            "const_int_ptr": f"const int* {name}",
+            "int_ptr": f"int* {name}",
+        }[kind]
+
+    def _sm_signature(self, args):
+        """Kernel/procedure parameter list from an ordered arg-key list."""
+        return ",\n        ".join(self._sm_arg_decl(a) for a in args)
+
     def wrap_function_signature(self, name, args_str, body_str, shape):
         """Wrap function signature."""
         qualifier = "PORTABLE_FN " if self.gpu_enabled else ""
@@ -1247,23 +1305,6 @@ class GenericCppModel(GenericCppBase):
                 smap[s] = self.format_accessor(
                     self.ARG_MAPPING.get("position", "X"), i)
         return smap
-
-    def _sm_arg_decl(self, key):
-        """C++ declaration for one operator-kernel argument (pointer
-        form: ``const T* Q``; ``dt`` is the one scalar argument).  Backends
-        with a different calling convention override this."""
-        if key in ("dt", "time"):
-            # REQ-185: ``time`` (like ``dt``) is a scalar by-value argument.
-            return f"const {self.real_type} {key}"
-        if key == "column":
-            # the resolved interface column ``column[N_z][n_fields]`` the
-            # depth→moment projection reduces (2-D sampled profile).
-            return f"const {self.real_type}* const* {key}"
-        return f"const {self.real_type}* {key}"
-
-    def _sm_signature(self, args):
-        """Operator-kernel parameter list from an ordered arg-key list."""
-        return ",\n        ".join(self._sm_arg_decl(a) for a in args)
 
     def _kernel_with_symbol_map(self, name, expr, shape, args, smap):
         """Emit one kernel from a symbolic expression with ``smap`` pushed for
