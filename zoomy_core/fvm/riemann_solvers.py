@@ -260,41 +260,32 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         flux = self.numerical_flux()
         fluctuations = self.numerical_fluctuations()
 
-        # The REGISTERED ``numerical_flux`` carries the face wave speed as an
-        # EXTRA trailing row — layout ``[ flux(n) | lambda_max(1) ]`` of shape
-        # ``(n_variables + 1, 1)``:
+        # The REGISTERED ``numerical_flux`` is the flux and NOTHING else —
+        # shape ``(n_variables, 1)``.  It briefly carried an EXTRA trailing
+        # ``face_max_abs_eigenvalue`` row (REQ-212) so a driver could take its
+        # local dt straight off the face kernel; the approved v6 solver design
+        # removes it again.  Eigenvalues are now produced at the STEP HEAD by
+        # a dedicated dt_pass that stores two scalars per face, so no consumer
+        # has to unpack a wave speed out of a flux.
         #
-        #   rows 0 .. n-1 : the numerical flux (unchanged),
-        #   row  n        : ``face_max_abs_eigenvalue`` on the RAW
-        #                   (un-reconstructed) face states — the Rusanov/CFL
-        #                   speed a driver needs for its LOCAL dt (each cell
-        #                   derives dt from the λ_max of its own face fluxes;
-        #                   one min-reduction), and by construction the same
-        #                   block the non-reconstructing schemes already build
-        #                   for their dissipation, so CSE dedups it for free.
+        # That extra row was never actually consumable: every hand-written
+        # backend header indexes the result FLAT as ``F[i]`` over n rows
+        # (zoomy_foam/numerics.H, numerics_o2.H), UFL dots it against an
+        # n-component test function (zoomy_firedrake), and jax subtracts it
+        # from an (n, nfaces) residual — only zoomy_amrex was adapted, and it
+        # was told the ``n_dof_q + 1`` accommodation was temporary.
         #
-        # NO back-compat shim: every consumer unpacks the (n+1, 1) layout.
         # ``numerical_fluctuations`` is unchanged.
-        lambda_max = self.face_max_abs_eigenvalue(
-            self.variables_minus,
-            self.variables_plus,
-            self.aux_variables_minus,
-            self.aux_variables_plus,
-            self.parameters,
-            self.normal,
-        )
         flux_rows = list(sp.flatten(flux))
         if len(flux_rows) != self.n_variables:
             raise ValueError(
                 f"numerical_flux: expected {self.n_variables} flux rows, got "
                 f"{len(flux_rows)} (shape {getattr(flux, 'shape', None)})."
             )
-        flux_with_speed = ZArray(flux_rows + [lambda_max]).reshape(
-            self.n_variables + 1, 1
-        )
+        flux_only = ZArray(flux_rows).reshape(self.n_variables, 1)
 
         self.register_symbolic_function(
-            "numerical_flux", lambda: flux_with_speed, sig
+            "numerical_flux", lambda: flux_only, sig
         )
         self.register_symbolic_function(
             "numerical_fluctuations", lambda: fluctuations, sig

@@ -158,10 +158,18 @@ def _phys_flux_n(mrt, q, aux, p, n):
 
 
 def _num_flux(scheme_rt, qL, qR, aux, p, n):
-    out = np.asarray(
+    """``numerical_flux`` is the flux ALONE (n rows) — the trailing
+    face-wavespeed row of REQ-212 was removed by the v6 solver design.  The
+    face speed is still pinned here, read from its surviving home: the last
+    row of the fused ``numerical_face`` kernel ([flux | D+ | D- | lambda])."""
+    flux = np.asarray(
         scheme_rt.numerical_flux(qL, qR, aux, aux, p, n), dtype=float
     ).reshape(-1)
-    return out[:-1], out[-1]
+    face = np.asarray(
+        scheme_rt.numerical_face(qL, qR, aux, aux, p, n), dtype=float
+    ).reshape(-1)
+    assert face.shape[0] == 3 * flux.shape[0] + 1
+    return flux, face[-1]
 
 
 def _state(dim, h, u, v=0.0):

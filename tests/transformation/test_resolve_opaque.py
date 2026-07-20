@@ -2,10 +2,12 @@
 
 Both on DERIVED models (SME / VAM families), per the test policy:
 
-* ITEM 1 — the registered ``numerical_flux`` returns
-  ``[ flux(n) | lambda_max(1) ]`` of shape ``(n+1, 1)``; the trailing row is
-  ``face_max_abs_eigenvalue`` on the RAW face states (the driver-local dt
-  enabler).
+* ITEM 1 — the registered ``numerical_flux`` returns the FLUX ALONE, shape
+  ``(n, 1)``.  It briefly carried a trailing ``face_max_abs_eigenvalue`` row
+  (REQ-212); the approved v6 solver design removed it — wave speeds come from
+  the step-head dt_pass, and every backend header indexes the flux flat over
+  n rows.  The fused ``numerical_face`` kernel still carries lambda_max as its
+  own last row; that layout is unchanged.
 * ITEM 2 — ``resolve_opaque`` (printer option, default OFF):
   OFF emits registered-function calls exactly as today; ON inlines the
   registered symbolic definition into the consuming expression before the
@@ -58,20 +60,24 @@ def _consumer(num):
                  num.parameters, num.normal)
     rows = (list(sp.flatten(num.call["numerical_flux"](*call_args)))
             + list(sp.flatten(num.call["numerical_fluctuations"](*call_args))))
-    consumer = ZArray(rows).reshape(3 * num.n_variables + 1, 1)
+    consumer = ZArray(rows).reshape(3 * num.n_variables, 1)
     return Function(name="face_pair",
                     args=num.functions["numerical_flux"].args,
                     definition=consumer)
 
 
-# ── ITEM 1: the (n+1, 1) numerical_flux layout ───────────────────────
+# ── ITEM 1: the (n, 1) numerical_flux layout — flux ONLY ─────────────
 
 
-def test_numerical_flux_layout_and_wavespeed_row(sme_numerics):
+def test_numerical_flux_carries_no_wavespeed_row(sme_numerics):
+    """The registered kernel is the flux and nothing else, and its rows are
+    the scheme's own ``numerical_flux()`` verbatim.  The wave speed lives in
+    the fused ``numerical_face`` kernel and in the step-head dt_pass — never
+    appended to the flux a backend indexes flat."""
     nsm, num = sme_numerics
     n = num.n_variables
     defn = num.functions["numerical_flux"].definition
-    assert defn.shape == (n + 1, 1)
+    assert defn.shape == (n, 1)
 
     rt = num.to_runtime_numpy()
     p = np.array(list(nsm.parameter_values.values()), dtype=float)
@@ -87,12 +93,23 @@ def test_numerical_flux_layout_and_wavespeed_row(sme_numerics):
     out = np.asarray(
         rt.numerical_flux(qL, qR, auxL, auxR, p, nrm), dtype=float
     ).reshape(-1)
-    assert out.shape[0] == n + 1
+    assert out.shape[0] == n
+
+    # PHYSICS: the emitted rows are the scheme's flux, unshifted.  A dropped
+    # or re-ordered row would move mass into momentum here.
+    ref = np.asarray(
+        num.to_runtime_numpy().numerical_face(
+            qL, qR, auxL, auxR, p, nrm), dtype=float
+    ).reshape(-1)
+    np.testing.assert_allclose(out, ref[:n], rtol=1e-12)
+
+    # and the wave speed is still reachable — as the LAST row of the fused
+    # face kernel, which is where the packed layout documents it.
     lamL = float(np.asarray(
         rt.local_max_abs_eigenvalue(qL, auxL, p, nrm), dtype=float))
     lamR = float(np.asarray(
         rt.local_max_abs_eigenvalue(qR, auxR, p, nrm), dtype=float))
-    np.testing.assert_allclose(out[n], max(lamL, lamR), rtol=1e-12)
+    np.testing.assert_allclose(ref[3 * n], max(lamL, lamR), rtol=1e-12)
 
 
 # ── ITEM 2: resolve_opaque OFF / ON ──────────────────────────────────
@@ -124,10 +141,14 @@ def test_resolve_opaque_inlines_and_matches_fused_silo(sme_numerics):
     assert len(resolved) == len(ref)
     assert all(a == b for a, b in zip(resolved, ref))
 
-    # fusion parity: one consumer silo == the old fused numerical_face silo
+    # fusion parity: one consumer silo == the old fused numerical_face silo.
+    # Compare like with like — the consumer is [flux | D+ | D-] (3n rows),
+    # while numerical_face appends lambda_max as row 3n, so that trailing row
+    # is excluded here rather than inflating the reference op count.
+    n_face = 3 * num.n_variables
     ops_on = _cse_ops(resolved)
     ops_face = _cse_ops(
-        list(sp.flatten(num.functions["numerical_face"].definition)))
+        list(sp.flatten(num.functions["numerical_face"].definition))[:n_face])
     assert ops_on == ops_face
 
 
