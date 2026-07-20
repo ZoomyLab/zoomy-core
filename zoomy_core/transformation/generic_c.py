@@ -1522,17 +1522,17 @@ class GenericCppModel(GenericCppBase):
         n_eq, n_state, n_aux = sm.n_equations, len(sm.state), len(sm.aux_state)
         blocks = []
 
-        uv = getattr(sm, "update_variables", None)
-        if uv is not None and len(sp.flatten(uv)) > 0:
-            blocks.append(self._sm_kernel(
-                "update_variables", uv, (len(sp.flatten(uv)),),
-                self._operator_arg_keys("update_variables"),
-            ))
-        else:
-            blocks.append(self._doc_note(
-                "update_variables",
-                "no pointwise state remap on this SystemModel; the solver "
-                "leaves Q unchanged after the transport step."))
+        # ALWAYS emitted, identity when the slot is empty.  A conditional
+        # symbol is not an ABI: callers (foam's zoomyFoam.C:352) invoke
+        # update_variables unconditionally, and the slot is None for every
+        # model without a per-cell remap — with the wet/dry cap off by
+        # default that includes derived SME(level=0).  A doc-note here left
+        # such a model uncompilable.
+        uv = sp.Array(sp.flatten(sm.update_variables_or_identity()))
+        blocks.append(self._sm_kernel(
+            "update_variables", uv, (len(uv),),
+            self._operator_arg_keys("update_variables"),
+        ))
 
         blocks.extend(self._emit_update_aux_variables())
         return blocks

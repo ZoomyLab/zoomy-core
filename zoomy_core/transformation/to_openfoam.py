@@ -378,10 +378,12 @@ class FoamSystemModelPrinter(GenericCppBase):
         # REQ-40 (c): the per-cell ``update_variables(Q, Qaux, p, dt)`` — for a
         # full model the state remap (h-clamp); for a corrector sub-system the
         # closed-form projection ``U_k ← U_k − dt/M_kk · T_u[k](P)`` (one entry
-        # per row, scattered to ``equation_to_state_index``).  Emitted whenever
-        # the SystemModel carries a non-trivial update.
-        if sm.update_variables is not None and len(sp.flatten(sm.update_variables)) > 0:
-            blocks.append(self._emit_update_variables())
+        # per row, scattered to ``equation_to_state_index``).  ALWAYS emitted:
+        # the slot is ``None`` for any model without a per-cell remap — which,
+        # with the wet/dry cap off by default, includes derived SME(level=0) —
+        # and zoomyFoam.C:352 calls Model::update_variables unconditionally.
+        # ``update_variables_or_identity`` supplies the documented identity.
+        blocks.append(self._emit_update_variables())
 
         blocks.extend(self._emit_reconstruction_kernels())
 
@@ -571,11 +573,12 @@ class FoamSystemModelPrinter(GenericCppBase):
 
     def _emit_update_variables(self):
         """Emit the per-cell ``update_variables(Q, Qaux, p, dt) -> List[n]``
-        from ``sm.update_variables``.  For a full model the values are the
-        whole state remap; for a corrector sub-system one updated value per
-        row, in the order of ``equation_to_state_index``."""
+        from ``sm.update_variables_or_identity()``.  For a full model the values
+        are the whole state remap; for a corrector sub-system one updated value
+        per row, in the order of ``equation_to_state_index``; for a model with
+        no remap at all the identity (``Q`` unchanged)."""
         sm = self.sm
-        uv = sp.Array(sp.flatten(sm.update_variables))
+        uv = sp.Array(sp.flatten(sm.update_variables_or_identity()))
         n = len(uv)
         return self._kernel(
             "update_variables", uv, (n,),

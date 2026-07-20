@@ -787,6 +787,33 @@ class SystemModel:
         v._symbolic_name = "Q"
         return v
 
+    def update_variables_or_identity(self) -> ZArray:
+        """``update_variables`` with the documented ``None ⇒ identity`` fallback
+        MADE EXPLICIT — always an ``(n_eq, 1)`` expression, never ``None``.
+
+        Row ``i`` of the identity is ``state[equation_to_state_index[i]]``, i.e.
+        exactly "leave Q alone", which is what the numpy runtime already does
+        when it sees ``None`` (``solver_numpy._apply_update_variables`` returns
+        Q unchanged).  This is the seam the C-family printers emit from, so the
+        generated ABI carries the symbol even for a model with no per-cell
+        remap.
+
+        Why the ABI must not be conditional: the wet/dry cap is OFF by default,
+        so a derived SME(level=0) has ``update_variables = None`` — and foam's
+        hand-written ``zoomyFoam.C:352`` calls ``Model::update_variables(...)``
+        unconditionally.  Emitting the symbol only when the slot is non-empty
+        made every capless model fail to compile with "'update_variables' is
+        not a member of 'Model'".  Callers must not have to know whether a
+        model happens to clamp.
+        """
+        if (self.update_variables is not None
+                and len(sp.flatten(self.update_variables)) > 0):
+            return self.update_variables
+        e2s = list(self.equation_to_state_index)
+        return _to_zarray(
+            sp.Array([self.state[e2s[i]] for i in range(self.n_equations)])
+        ).reshape(self.n_equations, 1)
+
     @property
     def aux_variables(self) -> Zstruct:
         """Zstruct view ``name → aux Symbol`` (mirrors ``Model.aux_variables``)."""

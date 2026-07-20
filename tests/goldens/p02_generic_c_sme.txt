@@ -249,9 +249,19 @@ struct Model {
     return res;
     }
 
-    // update_variables: NOT emitted from the SystemModel (provide solver-side).
-    //   no pointwise state remap on this SystemModel; the solver
-    //   leaves Q unchanged after the transport step.
+    PORTABLE_FN static inline SimpleArray<T, 4> update_variables(
+        const double* Q,
+        const double* Qaux,
+        const double* p,
+        const double dt)
+    {
+    SimpleArray<T, 4> res;
+    res[0] = Q[0];
+    res[1] = Q[1];
+    res[2] = Q[2];
+    res[3] = Q[3];
+    return res;
+    }
 
     PORTABLE_FN static inline SimpleArray<T, 5> update_aux_variables(
         const double* Q,
