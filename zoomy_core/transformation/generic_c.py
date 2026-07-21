@@ -1846,6 +1846,11 @@ class GenericCppModel(GenericCppBase):
         sm = self.sm
         if sm is None:
             return []
+        # No BCs declared → no BC kernels to emit (``n_boundary_tags`` is 0 and
+        # the solver never dispatches one).  Previously unreachable: the build
+        # cache leaked another case's attached BCs onto every model.
+        if getattr(sm, "boundary_conditions", None) is None:
+            return []
         blocks = [
             self._emit_bc_kernel("boundary_conditions", sm.boundary_conditions)
         ]
@@ -1904,7 +1909,13 @@ class GenericCppModel(GenericCppBase):
         # declarative Model's own ``parameters`` may be empty; the lowered
         # operators and BCs reference the SystemModel parameters).
         if sm is not None:
-            bc_names = sorted(sm._bc_source.boundary_conditions_list_dict.keys())
+            # A model may legitimately declare NO boundary conditions — the
+            # emitted interface then carries zero tags.  (This used to crash:
+            # every SystemModel appeared to have a ``_bc_source`` only because
+            # the build cache was serving another case's attached BCs.)
+            bc_src = getattr(sm, "_bc_source", None)
+            bc_names = ([] if bc_src is None
+                        else sorted(bc_src.boundary_conditions_list_dict.keys()))
             param_keys = list(sm.parameters.keys())
             param_vals = list(sm.parameter_values.values())
             dimension = sm.dimension
