@@ -35,9 +35,12 @@ def _dam_ic(xv):
 
 sm.initial_conditions = IC.UserFunction(function=_dam_ic)
 sm.aux_initial_conditions = IC.Constant(constants=lambda n: np.zeros(n))
-# closed box: reflect BOTH horizontal momentum modes q_0(idx2), q_1(idx3)
-wall = Wall(tag="left", momentum_field_indices=[[2], [3]])
-wall_r = Wall(tag="right", momentum_field_indices=[[2], [3]])
+# closed box. The momentum groups are DERIVED from the model (one group per
+# vector-valued moment; members are that moment's components across the
+# horizontal directions), so this is correct in any dimension and at any
+# level without pinning indices.
+wall = Wall(tag="left")
+wall_r = Wall(tag="right")
 bcs = BoundaryConditions([wall, wall_r])
 sm.attach_boundary_conditions(bcs)
 
