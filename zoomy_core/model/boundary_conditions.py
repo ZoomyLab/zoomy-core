@@ -655,18 +655,109 @@ class CharacteristicFarField(Characteristic):
         return target
 
 
-class CharacteristicWall(Characteristic):
+def derive_momentum_field_indices(sm):
+    """DERIVE the wall's momentum index groups from the model's OWN variable
+    registry, so no caller has to know the state layout.
+
+    The registry is ``sm.interpolate_to_3d`` — the canonical
+    ``[b, h, u, v, w, p](ζ)`` lift that every derived family registers.  Row 0
+    is ``b`` and row 1 is ``h`` (the GEOMETRY slots, never momentum); rows 2
+    and 3 are the horizontal velocities ``u`` and ``v``.  The state entries a
+    velocity row depends on — minus the geometry slots — ARE that direction's
+    momentum components, **in state order**, so position ``j`` means the same
+    moment / layer in every direction.
+
+    Returns the groups in the convention :class:`Wall` consumes: a list of
+    index groups, each group one VECTOR across the horizontal directions
+    (``[[q_x_0, q_y_0], [q_x_1, q_y_1], …]``), i.e. the transpose of the
+    per-direction lists.  A 1-D model yields singleton groups.
+
+    Raises with the model's own state printed if the registry is missing or
+    the per-direction lists are ragged — guessing an index layout is exactly
+    the failure this function exists to remove.
+    """
+    rows = getattr(sm, "interpolate_to_3d", None)
+    if rows is None:
+        raise RuntimeError(
+            "Wall: cannot derive momentum_field_indices — this SystemModel "
+            "registers no 'interpolate_to_3d' (the [b,h,u,v,w,p] lift).  Pin "
+            "the groups explicitly, e.g. Wall(momentum_field_indices=[[2,3]]).")
+    rows = list(rows)
+    state = list(sm.state)
+    if len(rows) < 3:
+        raise RuntimeError(
+            f"Wall: interpolate_to_3d has only {len(rows)} rows — no "
+            "horizontal velocity row to derive momentum slots from.")
+    geom = set()
+    for slot in (0, 1):                      # b, h → geometry, never momentum
+        geom |= {i for i, s in enumerate(state)
+                 if s in sympy.sympify(rows[slot]).free_symbols}
+    per_direction = []
+    for slot in (2, 3):                      # u, v → horizontal directions
+        if slot >= len(rows):
+            break
+        free = sympy.sympify(rows[slot]).free_symbols
+        idx = [i for i, s in enumerate(state) if s in free and i not in geom]
+        if idx:
+            per_direction.append(idx)
+    if not per_direction:
+        raise RuntimeError(
+            "Wall: no horizontal velocity row of interpolate_to_3d depends on "
+            f"any non-geometry state slot; state = {[str(s) for s in state]}.")
+    n = len(per_direction[0])
+    if any(len(g) != n for g in per_direction):
+        raise RuntimeError(
+            f"Wall: ragged momentum groups {per_direction} for state "
+            f"{[str(s) for s in state]} — the x and y rows do not carry the "
+            "same number of moments, so they cannot be paired into vectors.  "
+            "Pin momentum_field_indices explicitly for this model.")
+    if len(set(sum(per_direction, []))) != n * len(per_direction):
+        raise RuntimeError(
+            f"Wall: momentum groups {per_direction} share state slots between "
+            "directions (tensorial/rotated ansatz) — pin "
+            "momentum_field_indices explicitly for this model.")
+    return [list(t) for t in zip(*per_direction)]
+
+
+class _DerivedMomentumIndices:
+    """Mixin: ``momentum_field_indices=None`` means DERIVE (ruling 9396582 —
+    pinned-only, derive otherwise).  An explicit pin always wins."""
+
+    def resolve(self, sm):
+        sup = getattr(super(), "resolve", None)
+        if sup is not None:
+            sup(sm)
+        if self.momentum_field_indices is None:
+            self.momentum_field_indices = derive_momentum_field_indices(sm)
+        return self
+
+    def _require_indices(self):
+        if self.momentum_field_indices is None:
+            raise RuntimeError(
+                f"{type(self).__name__}(tag={self.tag!r}) is unresolved: "
+                "momentum_field_indices is None and no SystemModel was "
+                "attached.  Attach via SystemModel.attach_boundary_conditions "
+                "(or call .resolve(sm)), or pin the groups explicitly.")
+        return self.momentum_field_indices
+
+
+class CharacteristicWall(_DerivedMomentumIndices, Characteristic):
     """Wall built from the characteristic tool: the target is the MIRROR
     state (normal momentum reflected); only its incoming content is imposed,
     which enforces u·n → 0 at the face without over-specifying the outgoing
-    fields."""
+    fields.
 
-    momentum_field_indices = param.List(default=[[1, 2]])
+    ``momentum_field_indices`` defaults to ``None`` = DERIVE from the model's
+    variable registry at resolve time (see
+    :func:`derive_momentum_field_indices`).  An explicit pin wins.
+    """
+
+    momentum_field_indices = param.List(default=None, allow_None=True)
 
     def target_state(self, time, X, dX, Q, Qaux, parameters, normal):
         q = ZArray(Q)
         out = ZArray(Q)
-        for indices in self.momentum_field_indices:
+        for indices in self._require_indices():
             dim = len(indices)
             n_vec = Matrix(normal[:dim])
             momentum = Matrix([q[k] for k in indices])
@@ -720,9 +811,22 @@ class CharacteristicReflective(BoundaryCondition):
         return out
 
 
-class Wall(BoundaryCondition):
-    """Wall. (class)."""
-    momentum_field_indices = param.List(default=[[1, 2]])
+class Wall(_DerivedMomentumIndices, BoundaryCondition):
+    """Free-slip / partially-permeable wall.
+
+    ``momentum_field_indices`` is a list of index GROUPS, each group one
+    momentum VECTOR across the mesh's horizontal directions
+    (``[[q_x_0, q_y_0], [q_x_1, q_y_1], …]``).  It defaults to ``None``, which
+    means DERIVE the groups from the model's own variable registry at resolve
+    time — see :func:`derive_momentum_field_indices`.  An explicit pin always
+    wins, for models with no registry (hand-built) or an exotic layout.
+
+    The former default ``[[1, 2]]`` was correct only for the hand-built SWE
+    layout ``[h, hu, hv]``; on the derived layout ``[b, h, q…]`` it selected
+    the DEPTH as the first momentum component (ShapeError in 1-D, and in 2-D a
+    silently negative ghost depth at a lake at rest against a wall).
+    """
+    momentum_field_indices = param.List(default=None, allow_None=True)
     permeability = param.Number(default=0.0)
     wall_slip = param.Number(default=1.0)
     blending = param.Number(default=0.0)
@@ -732,11 +836,12 @@ class Wall(BoundaryCondition):
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
         """Compute boundary condition."""
         q = ZArray(Q)
-        dim = len(self.momentum_field_indices[0])
+        groups = self._require_indices()
+        dim = len(groups[0])
         n_vec = Matrix(normal[:dim])
         out = ZArray(Q)
         momentum_list_wall = []
-        for indices in self.momentum_field_indices:
+        for indices in groups:
             momentum = Matrix([q[k] for k in indices])
             normal_momentum_coef = momentum.dot(n_vec)
             transverse_momentum = momentum - normal_momentum_coef * n_vec
@@ -745,9 +850,7 @@ class Wall(BoundaryCondition):
                 - (1 - self.permeability) * normal_momentum_coef * n_vec
             )
             momentum_list_wall.append(momentum_wall)
-        for indices, momentum_wall in zip(
-            self.momentum_field_indices, momentum_list_wall
-        ):
+        for indices, momentum_wall in zip(groups, momentum_list_wall):
             for i, idx in enumerate(indices):
                 out[idx] = (1 - self.blending) * momentum_wall[i] + self.blending * q[
                     idx
@@ -757,7 +860,7 @@ class Wall(BoundaryCondition):
     def face_state(self, Q_face, Qaux_face, normal, parameters):
         """Wall: reflect normal momentum component of the reconstructed face value."""
         Q_wall = Q_face.copy()
-        for indices in self.momentum_field_indices:
+        for indices in self._require_indices():
             dim = len(indices)
             n_vec = normal[:dim]
             mom = np.array([Q_face[k] for k in indices], dtype=float)
@@ -776,7 +879,7 @@ class Wall(BoundaryCondition):
         """
         Q_inner = np.asarray(Q_inner, dtype=float)
         Q_wall = Q_inner.copy()
-        for indices in self.momentum_field_indices:
+        for indices in self._require_indices():
             dim = len(indices)
             n_vec = np.asarray(normal[:dim], dtype=float)
             mom = np.array([Q_inner[k] for k in indices], dtype=float)
