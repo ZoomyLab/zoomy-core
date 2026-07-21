@@ -42,17 +42,37 @@ _LAZY = {
     "assert_procedure_bodies", "required_procedure_gaps",
 }
 
+#: The emitted march lives one level up from the IR and pulls in the NSM, so
+#: it is deferred for the same reason ``external`` is.
+_LAZY_MARCH = {
+    "MARCH_FLAGS", "MarchProgram", "TABLEAUS", "TABLEAU_EULER",
+    "TABLEAU_SSPRK2", "build_hyperbolic_step", "build_march",
+    "build_should_write", "emit_march", "flags_from_nsm", "tableau_for",
+}
+
+_LAZY_CONSTANTS = {
+    "ConstantResolutionError", "EPS_H_FALLBACK", "MarchConstants",
+    "WRITE_EPS", "eigen_wave_speed_floor", "kp_eps", "march_constants",
+}
+
 
 def __getattr__(name):
-    """Defer the ``external`` module until first use (see the module note)."""
+    """Defer the ``external`` / ``march`` modules until first use (see the
+    module note)."""
     if name in _LAZY:
         from zoomy_core.solver import external
         return getattr(external, name)
+    if name in _LAZY_MARCH:
+        from zoomy_core.solver import march
+        return getattr(march, name)
+    if name in _LAZY_CONSTANTS:
+        from zoomy_core.solver import constants
+        return getattr(constants, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__():
-    return sorted(set(globals()) | _LAZY)
+    return sorted(set(globals()) | _LAZY | _LAZY_MARCH | _LAZY_CONSTANTS)
 
 
 __all__ = [
@@ -63,4 +83,9 @@ __all__ = [
     "ForEachFace", "IfStatic", "Procedure", "ProcedureNameError", "Statement",
     "While", "check_procedure_name", "require_resolved", "split_target",
     "written_names",
+    "MARCH_FLAGS", "MarchProgram", "TABLEAUS", "TABLEAU_EULER",
+    "TABLEAU_SSPRK2", "build_hyperbolic_step", "build_march",
+    "build_should_write", "emit_march", "flags_from_nsm", "tableau_for",
+    "ConstantResolutionError", "EPS_H_FALLBACK", "MarchConstants",
+    "WRITE_EPS", "eigen_wave_speed_floor", "kp_eps", "march_constants",
 ]

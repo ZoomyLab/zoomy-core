@@ -109,6 +109,98 @@ REQUIRED_PROCEDURES = {
                   "recompute included.  STRICT no-op when coupling is "
                   "inactive.")),
         _decl("solver_coupling_finalize", doc="Tear the participant down."),
+
+        # ── the v6 march bodies (zoomy_core.solver.march) ────────────────
+        # Signatures are stated in the doc rather than in ``args``: these
+        # blocks pass march-local intermediates (bf_values, Q_L/Q_R, lim_grad,
+        # cell_term, the emitted constants) that are NOT march-scale argument
+        # slots and must not be forced into the slot vocabulary just to be
+        # declarable.  The doc text is the contract a backend implements.
+        _decl("solver_dt_pass", doc=(
+            "(Q, Qaux, p, c_eps_h) -> (lam_lo_f, lam_hi_f), each (n_faces,). "
+            "Evaluate the eigenvalues slot at the CELL states on BOTH sides "
+            "of every face and store the two signed wave-speed bounds.  v6 "
+            "§1: this runs at the STEP HEAD, before any stage; the flux pass "
+            "no longer returns a lambda row.  ``c_eps_h`` is the emitted "
+            "wave-speed floor (REQ-82): a backend whose eigenvalue kernel "
+            "already carries ``max(eps_h, h)`` (core's ``regularize_pow`` "
+            "bakes it in) accepts and ignores it; one that does not MUST "
+            "apply it here rather than restate the number.")),
+        _decl("solver_reduce_dt", doc=(
+            "(lam_lo_f, lam_hi_f, inradius_f, n_faces, c_cfl, "
+            "c_cfl_dimension, c_cfl_degree_factor, c_dt_max, clamp) "
+            "-> dt.  dt <= c_cfl * 2r / (c_cfl_dimension * "
+            "c_cfl_degree_factor * |lam|max) per face, minimised over faces, "
+            "then capped by c_dt_max and by the single ``clamp`` (t_remaining "
+            "XOR dt_window — D7, never min-combined).  A wave-free face has "
+            "|lam|max == 0 and a local limit of +inf: it drops OUT of the "
+            "minimum instead of imposing a floor (REQ-190).  Every bound is "
+            "an EMITTED named constant; no float literal may appear.")),
+        _decl("solver_apply_dt_floor", doc=(
+            "(dt, c_dt_floor) -> dt.  Only ever called when the ``dt_floor`` "
+            "build flag is ON, which it is NOT by default: the sanctioned "
+            "march has no floor, only the FATAL guard.")),
+        _decl("solver_assert_dt_admissible", doc=(
+            "(dt, lam_lo_f, lam_hi_f, inradius_f, time, iteration) -> dt.  "
+            "FATAL when dt <= 0 or non-finite: ABORT with a diagnostic naming "
+            "the offending face.  Never a silent spin, never a dt-halving "
+            "retry, never a CFL reduction.")),
+        _decl("solver_assert_march_progress", doc=(
+            "(time, iteration, dt, t_end) -> ().  The SECOND honesty guard: a "
+            "dt that collapses towards zero while staying strictly positive "
+            "is invisible to the dt guard.  ABORT on a step-count bound with "
+            "a diagnostic; this is a reported FINDING about the scheme.")),
+        _decl("solver_stage_base", doc=(
+            "(Q) -> Q0.  Snapshot the stage base: the state the residual is "
+            "evaluated at, kept for the Shu-Osher average AND for the MOOD "
+            "rollback.  Q0 never spans a regrid (D4).")),
+        _decl("solver_clear_troubled", doc=(
+            "(Q) -> troubled, an all-false (n_cells,) mask starting the "
+            "step's accumulation.")),
+        _decl("solver_merge_troubled", doc=(
+            "(troubled, troubled_stage) -> troubled.  Elementwise OR of two "
+            "cell masks.  Declared as a body because the IR carries no "
+            "elementwise boolean-array operator.")),
+        _decl("solver_reconstruct", doc=(
+            "(Q, Qaux, bf_values, o1) -> (Q_L, Q_R, lim_grad).  Face-state "
+            "reconstruction; ``lim_grad`` is the LIMITED cell gradient or a "
+            "null handle at order 1.  ``o1`` truthy forces the "
+            "piecewise-constant object — that is the whole-step order-1 MOOD "
+            "redo, and the reason the order-1 path needs no separate code. "
+            "The reconstruction object owns the limiter and any "
+            "well-balanced / positivity variable change.")),
+        _decl("solver_cell_ncp", doc=(
+            "(Q, Qaux, p, lim_grad) -> cell_term.  Amendment 10: the "
+            "cell-interior non-conservative integral, WB-critical at order "
+            ">= 2.  No |cell| division — the volume factor cancels against "
+            "the per-unit-volume residual.")),
+        _decl("solver_no_cell_term", doc=(
+            "(Q) -> cell_term, the additive identity.  The ``interior_ncp`` "
+            "build flag selects between this and solver_cell_ncp, so the "
+            "gather pass has ONE shape and no runtime null test.")),
+        _decl("solver_flux_pass", doc=(
+            "(Q, Qaux, p, t_stage, Q_L, Q_R) -> (Fface, Dp, Dm), each "
+            "(n_state, n_faces) and STORED.  Each face is evaluated exactly "
+            "ONCE.  The boundary Q_R is recomputed from the RECONSTRUCTED "
+            "inner face state at t_stage (amendment 11); at a periodic seam "
+            "it is the partner cell's state (REQ-116).  v6: NO lambda row.")),
+        _decl("solver_gather_update", doc=(
+            "(Q0, Fface, Dp, Dm, dt, beta, cell_term, Qaux, p, t_stage) -> "
+            "(Q_cand, troubled).  Q_cand = Q0 + beta*dt*(-div(F+D) + "
+            "cell_term + source), with the troubled flags written in the same "
+            "pass (the fused detection).  ``troubled`` is h < c_mood_h_bound "
+            "(strict 0) or any non-finite component — DETECTED, never "
+            "repaired in place.")),
+        _decl("solver_update_variables", doc=(
+            "(Q, Qaux, p, time, dt) -> Q.  The model's per-cell "
+            "update_variables slot; the IDENTITY when the model declares "
+            "none, which is exactly the case for the cap-free derived SWE.")),
+        _decl("solver_update_aux", doc=(
+            "(Q, Qaux, p, time, dt) -> Qaux.  The algebraic aux map (e.g. the "
+            "KP-desingularised hinv at c_kp_eps) followed by the LSQ-gradient "
+            "rows of the aux registry.  The algebraic write is FULL-LENGTH: a "
+            "prefix write silently mis-places rows and degenerates SME(>=1) "
+            "to SWE.")),
     )
 }
 
