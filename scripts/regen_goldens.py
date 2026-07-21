@@ -57,10 +57,14 @@ def main(argv=None) -> int:
             print(f"no golden matches {args.names}", file=sys.stderr)
             return 2
     families = set()
+    # EVERY golden regenerates COLD, not just the model goldens.  A golden must
+    # record the state of the SOURCE, never the state of whoever's build cache
+    # happened to be warm when it was blessed.
     for name in selected:
         builder, family, _tier = goldenlib.GOLDENS[name]
         t0 = time.time()
-        body = builder()
+        with goldenlib.no_cache():
+            body = builder()
         path = goldenlib.write_golden(name, body)
         families.add(family)
         print(f"regen {name:28s} [{family}] {time.time() - t0:7.1f}s "

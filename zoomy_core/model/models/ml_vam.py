@@ -53,6 +53,7 @@ from zoomy_core.model.derivation.projection import Integrate
 from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
 from zoomy_core.model.derivation.closure import GaussQuadrature
 from zoomy_core.model.operations import Multiply, ProductRule, KinematicBC
+from zoomy_core.model.models.walls import register_free_slip_wall
 from zoomy_core.systemmodel import SystemModel
 
 t, x, y, z = C.t, C.x, C.y, C.z
@@ -76,6 +77,15 @@ class MLVAM(BaseModel):
         "transfer scheme (MeanInterface/UpwindInterface). Default interface "
         "scheme is the mean; empty stress leaves tau UNCLOSED."))
 
+    def default_parameter_values(self) -> dict:
+        # ``l_j`` — the N-1 free interface-position fractions; uniform layers
+        # by default.  Depends on ``n_layers``, hence a method, not a dict.
+        N = int(self.n_layers)
+        values = {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0}
+        for j in range(1, N):
+            values[f"l_{j}"] = 1.0 / N
+        return values
+
     def derive_model(self):
         N = int(self.n_layers)
         Nu = int(self.level)
@@ -92,12 +102,15 @@ class MLVAM(BaseModel):
         def sname(xd, ell):
             return f"tau_{ell}" if dim == 2 else f"tau_{CN[xd]}z_{ell}"
         MOM = [f"momentum_{CN[xd]}" for xd in horiz]
-        values = {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0}
-        for j in range(1, N):
-            values[f"l_{j}"] = 1.0 / N
-        user_vals = getattr(self, "parameter_values", None)
-        if user_vals is not None and hasattr(user_vals, "items"):
-            values.update({k: float(v) for k, v in user_vals.items()})
+        values = self.default_parameter_values()
+        # NOTE: the user's ``parameters=`` numbers are NOT merged here.  The
+        # derivation is built on the DEFAULTS, so both caches keyed on the
+        # symbolic identity (the spec-keyed derivation memo and the REQ-163
+        # SystemModel cache — neither of which keys on values) hold entries
+        # that are a pure function of their key.  The instance's numbers are
+        # applied to the built SystemModel afterwards, per build, by
+        # ``model_builders._attach_runtime_data``.  Values are free symbols
+        # through the whole derivation, so this changes no operator.
 
         b = sp.Function("b", real=True)(t, *horiz)
         hl = [sp.Function(f"h_{ell}", positive=True)(t, *horiz)
@@ -590,6 +603,16 @@ class MLVAM(BaseModel):
             for k in range(Nu + 1):
                 proj[P_mod[ell - 1][k]] = rows[k]
         m.project_rows = proj
+
+        # model-derived free-slip wall — the SAME geometric statement as VAM /
+        # ML-SME: reflect only the NORMAL component of each (layer, mode)
+        # horizontal momentum vector.  The vertical r and pressure P modes are
+        # scalars under a horizontal wall normal and extrapolate.  ML-VAM had
+        # NO wall registration at all: FromModel(definition="wall") raised.
+        register_free_slip_wall(
+            m, ([q_mod[ell][xd][k] for xd in horiz]
+                for ell in range(1, N + 1)
+                for k in range(Nu + 1)))
 
         m.bed = b
         m.ht = ht

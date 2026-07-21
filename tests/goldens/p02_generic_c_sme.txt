@@ -45,8 +45,8 @@ struct Model {
     static constexpr bool has_free_surface = true;
     static constexpr int idx_b = 0;
     static constexpr int idx_h = 1;
-    static constexpr int n_boundary_tags = 2;
-    static const std::vector<std::string> get_boundary_tags() { return { "left", "right" }; }
+    static constexpr int n_boundary_tags = 0;
+    static const std::vector<std::string> get_boundary_tags() { return {  }; }
     static const std::vector<std::string> parameter_names() { return { "g", "rho", "nu", "lambda_s", "e_x" }; }
     static const std::vector<T> default_parameters() { return { 9.81, 1.0, 0.0, 0.0, 0.0 }; }
     PORTABLE_FN static inline SimpleArray<T, 4> flux_x(
@@ -453,16 +453,12 @@ struct Model {
         const T time,
         const T dX)
     {
-    if (bc_idx == 0 || bc_idx == 1) {
-        SimpleArray<T, 4> res;
-        res[0] = Q[0];
-        res[1] = Q[1];
-        res[2] = Q[2];
-        res[3] = Q[3];
-        return res;
-    }
-    SimpleArray<T, 4> default_res = {0};
-    return default_res;
+    SimpleArray<T, 4> res;
+    res[0] = Q[0];
+    res[1] = Q[1];
+    res[2] = Q[2];
+    res[3] = Q[3];
+    return res;
     }
 
     PORTABLE_FN static inline SimpleArray<T, 4> aux_boundary_conditions(
@@ -475,16 +471,12 @@ struct Model {
         const T time,
         const T dX)
     {
-    if (bc_idx == 0 || bc_idx == 1) {
-        SimpleArray<T, 4> res;
-        res[0] = Qaux[0];
-        res[1] = Qaux[1];
-        res[2] = Qaux[2];
-        res[3] = Qaux[3];
-        return res;
-    }
-    SimpleArray<T, 4> default_res = {0};
-    return default_res;
+    SimpleArray<T, 4> res;
+    res[0] = Q[0];
+    res[1] = Q[1];
+    res[2] = Q[2];
+    res[3] = Q[3];
+    return res;
     }
 
 };

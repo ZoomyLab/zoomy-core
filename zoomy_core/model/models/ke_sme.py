@@ -73,21 +73,29 @@ class KESME(SME):
         params.setdefault("quadrature_order", 6)
         super().__init__(**params)
 
+    def default_parameter_values(self) -> dict:
+        return {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0, "e_x": 0.0,
+                "C_mu": 0.09, "C_1": 1.44, "C_2": 1.92,
+                "sigma_k": 1.0, "sigma_e": 1.3,
+                # wall-function ε bed BC (weak/penalty): ε(0) → C_μ^{3/4}
+                # k(0)^{3/2}/(κ z_p); kappa & z_p the log-law constant & wall
+                # reference height; eps_wall_penalty the relaxation rate.
+                "kappa": 0.41, "z_p": 0.05, "eps_wall_penalty": 50.0}
+
     def derive_model(self):
         """COPY of SME.derive_model with the k, ε transport equations added and
         projected through the same pipeline (see module docstring)."""
         Nu = int(self.level)
         Nk = int(self.turbulence_level)
-        values = {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0, "e_x": 0.0,
-                  "C_mu": 0.09, "C_1": 1.44, "C_2": 1.92,
-                  "sigma_k": 1.0, "sigma_e": 1.3,
-                  # wall-function ε bed BC (weak/penalty): ε(0) → C_μ^{3/4}
-                  # k(0)^{3/2}/(κ z_p); kappa & z_p the log-law constant & wall
-                  # reference height; eps_wall_penalty the relaxation rate.
-                  "kappa": 0.41, "z_p": 0.05, "eps_wall_penalty": 50.0}
-        user_vals = getattr(self, "parameter_values", None)
-        if user_vals is not None and hasattr(user_vals, "items"):
-            values.update({k: float(v) for k, v in user_vals.items()})
+        values = self.default_parameter_values()
+        # NOTE: the user's ``parameters=`` numbers are NOT merged here.  The
+        # derivation is built on the DEFAULTS, so both caches keyed on the
+        # symbolic identity (the spec-keyed derivation memo and the REQ-163
+        # SystemModel cache — neither of which keys on values) hold entries
+        # that are a pure function of their key.  The instance's numbers are
+        # applied to the built SystemModel afterwards, per build, by
+        # ``model_builders._attach_runtime_data``.  Values are free symbols
+        # through the whole derivation, so this changes no operator.
         from zoomy_core.model.models.equations import (
             Mass, Momentum, moment_scaling, small_slope_scaling)
         from zoomy_core.model.models.material import ClosureState

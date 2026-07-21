@@ -34,6 +34,7 @@ from zoomy_core.model.derivation.projection import Integrate
 from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
 from zoomy_core.model.derivation.closure import GaussQuadrature
 from zoomy_core.model.operations import Multiply, ProductRule, KinematicBC
+from zoomy_core.model.models.walls import register_free_slip_wall
 from zoomy_core.systemmodel import SystemModel
 
 t, x, y, z = C.t, C.x, C.y, C.z
@@ -59,12 +60,20 @@ class VAM(BaseModel):
         "traction corrections) — the shallow form.  False keeps the slope-aware "
         "tractions."))
 
+    def default_parameter_values(self) -> dict:
+        return {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0}
+
     def derive_model(self):
         Nu = int(self.level)
-        values = {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0}
-        user_vals = getattr(self, "parameter_values", None)
-        if user_vals is not None and hasattr(user_vals, "items"):
-            values.update({k: float(v) for k, v in user_vals.items()})
+        values = self.default_parameter_values()
+        # NOTE: the user's ``parameters=`` numbers are NOT merged here.  The
+        # derivation is built on the DEFAULTS, so both caches keyed on the
+        # symbolic identity (the spec-keyed derivation memo and the REQ-163
+        # SystemModel cache — neither of which keys on values) hold entries
+        # that are a pure function of their key.  The instance's numbers are
+        # applied to the built SystemModel afterwards, per build, by
+        # ``model_builders._attach_runtime_data``.  Values are free symbols
+        # through the whole derivation, so this changes no operator.
         from zoomy_core.model.models.equations import (
             Mass, MomentumNonHydrostatic, small_slope_scaling,
             add_inplane_viscous, package_viscous)
@@ -348,6 +357,18 @@ class VAM(BaseModel):
                 for kk in range(Nu + 1):
                     getattr(m, mn)[kk].expr = package_viscous(
                         getattr(m, mn)[kk].expr, m.parameters.nu, states, list(horiz))
+
+        # 6f — model-derived free-slip wall.  A lateral wall normal is
+        # HORIZONTAL (n_x, n_y, 0), so the geometric statement
+        # ``q_i → q_i − 2 n (n·q_i)`` acts on the horizontal momentum VECTOR of
+        # each moment i; the vertical moments r_i and the pressure modes P_i are
+        # scalars with respect to that normal (n·ẑ = 0) and extrapolate, as do
+        # h and b.  One registration serves every wall orientation — including
+        # oblique faces — because the n_d are the canonical face-normal symbols
+        # FromModel substitutes per face.  See ``models/walls.py``.
+        vam_q_heads = [getattr(m.functions, qn).head for qn in QNAME]
+        register_free_slip_wall(
+            m, ([qh(i, t, *horiz) for qh in vam_q_heads] for i in range(Nu + 1)))
 
         # 7 — vertical reconstruction → interpolate (field order [b,h,u,v,w,p];
         # v at index 3 only in dim=3).  The modal profiles assembled in §6b/§6c

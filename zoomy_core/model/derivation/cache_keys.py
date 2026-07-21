@@ -31,7 +31,19 @@ from zoomy_core.model.derivation.basis_cache import _basis_fingerprint
 
 # Bump when the derivation pipeline changes in a way that invalidates every
 # cached entry (new op semantics, changed extraction, etc.).
-CACHE_VERSION = "v7"   # v7: REQ-188 — the SystemModel cache key now hashes the
+CACHE_VERSION = "v8"   # v8: the cached SystemModel is now stored RUNTIME-FREE —
+#                              parameter VALUES blanked, BC/IC kernels and their
+#                              source objects dropped (sm_cache.strip_runtime_state)
+#                              — and refilled on EVERY build from the model's own
+#                              ``default_parameter_values`` | overrides.  Before
+#                              this, two models differing only in the key-excluded
+#                              ``parameters=`` / ``boundary_conditions=`` shared a
+#                              key and the FIRST build's numbers and BCs were served
+#                              to the second (a default SME was handed nu=1e-3 and
+#                              bc_tags ['left','right'] it never declared).  Bump
+#                              invalidates every v7 entry incl. the shipped
+#                              _prebuilt, two of which carried nu=0.1/lambda_s=0.5.
+#                        v7: REQ-188 — the SystemModel cache key now hashes the
 #                              FULL source of every class in the model's MRO
 #                              (sm_cache.cache_key) instead of only derive_model,
 #                              so a case-local operator override (e.g. RainSWE.source)

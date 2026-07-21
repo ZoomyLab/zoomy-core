@@ -38,9 +38,13 @@ def default_models():
     # each uncached, which is the residual default-tier floor.  Ship them so the
     # tests hit the warm cache.  Closures/parameters MUST match the test spec
     # verbatim (they are part of ``model_spec_key``; parameter VALUES are not).
+    # NOTE: no ``parameters=`` here.  Values are not part of the key and are no
+    # longer baked into the entry either (the artifact stores the model's
+    # DEFAULTS and the case's numbers are attached per build) — the shipped
+    # cache used to carry this spec's nu=0.1 / lambda_s=0.5 to every user.
     for lvl in (1, 2):
         yield f"sme-l{lvl}-3d", lambda lvl=lvl: SME(
-            level=lvl, dimension=3, parameters={"nu": 0.1, "lambda_s": 0.5},
+            level=lvl, dimension=3,
             closures=[Newtonian(), NavierSlip(), StressFree()])
     yield "vam-l1-3d-navierslip", lambda: VAM(
         level=1, dimension=3, closures=[NavierSlip(), StressFree()])
@@ -68,6 +72,14 @@ def main() -> int:
             model = make()
             sm = build_system_model(model)
             key = sm_cache.cache_key(model, _BUILDERS[model._system_model_kind])
+            # A shipped entry obeys the same contract as a user-dir one: the
+            # SYMBOLIC identity only.  ``build_system_model`` has already
+            # attached this instance's BCs/ICs to the object it returned, so
+            # strip them back off before pickling — otherwise every user gets
+            # this script's boundary conditions and initial conditions baked in
+            # (and ``sm_cache.fetch`` refuses to serve the entry at all).
+            sm_cache.strip_runtime_state(sm)
+            sm_cache.assert_no_runtime_state(sm, "prebuilt")
             (out / f"{key}.pkl").write_bytes(pickle.dumps(sm))
             print(f"  {label:14s} -> {key[:12]}…  ({time.time()-t0:.1f}s)")
             n_ok += 1

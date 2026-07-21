@@ -162,19 +162,72 @@ def fetch(key: str | None):
     if blob is None:
         return None
     try:
-        return pickle.loads(blob)
+        sm = pickle.loads(blob)
     except Exception:
         _MEMORY.pop(key, None)   # corrupt / stale-format entry: rebuild
         return None
+    assert_no_runtime_state(sm, "fetch")
+    return sm
+
+
+# ── Runtime state: never part of a cache ENTRY ──────────────────────────────
+# The key is the model's SYMBOLIC identity: parameter VALUES, BCs and ICs are
+# deliberately excluded (REQ-163 — the numbers stay free symbols end-to-end, so
+# a parameter sweep must not rebuild).  A built SystemModel nevertheless CARRIES
+# the compiled BC/IC kernels.  Pickling it whole made the two disagree: two
+# models differing only in ``boundary_conditions=`` hash to the SAME key, so the
+# first build's BCs were served to every later one — in-process AND, via the
+# user-dir tier, in every later process.  The repair is to make the stored
+# ARTIFACT match the key: drop the BC/IC state before pickling and re-attach it
+# from the model on EVERY build (``model_builders._attach_runtime_data``, run on
+# the cache-hit and the fresh-build path alike).
+#
+# Parameter VALUES are handled one level up rather than here: the entry keeps
+# the model's DEFAULTS (a pure function of the key — see
+# ``Model.default_parameter_values``) and the instance's overrides are applied
+# on top per build.  Widening the key to cover the numbers instead would give
+# one entry per numeric value and destroy the point of REQ-163.
+_RUNTIME_ATTRS = (
+    "boundary_conditions", "boundary_gradients", "aux_boundary_conditions",
+    "_bc_source", "_aux_bc_source",
+    "initial_conditions", "aux_initial_conditions",
+)
+
+
+def strip_runtime_state(sm):
+    """Blank every instance-runtime field on ``sm`` in place (see above)."""
+    for attr in _RUNTIME_ATTRS:
+        if getattr(sm, attr, None) is not None:
+            setattr(sm, attr, None)
+    return sm
+
+
+def assert_no_runtime_state(sm, where: str) -> None:
+    """HARD-FAIL guard: a cache entry carrying runtime state must be impossible
+    to write and impossible to serve.  Never a warning — a poisoned entry is
+    silent and survives across processes."""
+    for attr in _RUNTIME_ATTRS:
+        if getattr(sm, attr, None) is not None:
+            raise AssertionError(
+                f"SystemModel cache ({where}): entry carries runtime state "
+                f"{attr!r}. Cache entries are keyed on the SYMBOLIC identity "
+                f"only — BC/IC are re-attached per build, so a baked-in one is "
+                f"served to models that never declared it.")
 
 
 def store(key: str | None, sm) -> None:
     if key is None or not _enabled():   # uncacheable model: never persist
         return
     try:
-        blob = pickle.dumps(sm)
+        entry = pickle.loads(pickle.dumps(sm))   # never mutate the caller's sm
     except Exception:
         return                    # unpicklable exotic model: memory-only skip
+    strip_runtime_state(entry)
+    assert_no_runtime_state(entry, "store")
+    try:
+        blob = pickle.dumps(entry)
+    except Exception:
+        return
     _MEMORY[key] = blob
     try:
         d = _user_dir()

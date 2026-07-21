@@ -305,11 +305,19 @@ def test_wall_is_normal_aware_2d():
     """
     from zoomy_core.model.models.swe import SWE
     from zoomy_core.model.models.ml_sme import MLSME
+    from zoomy_core.model.models.ml_vam import MLVAM
 
+    # VAM / ML-VAM registered NO wall at all until the lateral-wall frame was
+    # wired into their derivations: FromModel(definition="wall") raised
+    # KeyError on every VAM.  Their vertical (r) and pressure (P) moments are
+    # scalars under a HORIZONTAL wall normal and must pass through untouched —
+    # only the horizontal momentum vector of each moment reflects.
     for build in (lambda **k: SWE(dimension=2, **k),
                   lambda **k: SME(level=0, dimension=3, **k),
                   lambda **k: SME(level=1, dimension=3, **k),
-                  lambda **k: MLSME(n_layers=2, level=0, dimension=3, **k)):
+                  lambda **k: MLSME(n_layers=2, level=0, dimension=3, **k),
+                  lambda **k: VAM(level=1, dimension=3, **k),
+                  lambda **k: MLVAM(n_layers=2, level=1, dimension=3, **k)):
         sm = SystemModel.from_model(build())
         bc = FromModel(tag="left", definition="wall").resolve(sm)
         names = [str(s) for s in sm.state]

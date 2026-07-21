@@ -81,8 +81,8 @@ project_from_3d[3,0] = Add(Mul(Integer(-1), Float('0.088807189542483664', precis
 boundary_specs:
   wall: 2 -> Add(Mul(Integer(-1), Integer(2), Pow(Symbol('n0'), Integer(2)), Symbol('q_0')), Symbol('q_0'))
   wall: 3 -> Add(Mul(Integer(-1), Integer(2), Pow(Symbol('n0'), Integer(2)), Symbol('q_1')), Symbol('q_1'))
-bc_tags: ['left', 'right']
-bc_kernel: Piecewise(ExprCondPair(ImmutableDenseNDimArray(Tuple(Symbol('b'), Symbol('h'), Symbol('q_0'), Symbol('q_1')), Tuple(Integer(4))), Or(Equality(Symbol('bc_idx'), Integer(0)), Equality(Symbol('bc_idx'), Integer(1)))))
+bc_tags: []
+bc_kernel: ImmutableDenseNDimArray(Tuple(Symbol('b'), Symbol('h'), Symbol('q_0'), Symbol('q_1')), Tuple(Integer(4)))
 aux_registry:
   {atom=None, aux_symbol=Symbol('dq1dx'), kind='derivative', multi_index=(1,), name='dq1dx', row=0, state_index=3, target_kind='state', target_name='q_1'}
   {atom=None, aux_symbol=Symbol('dq0dx'), kind='derivative', multi_index=(1,), name='dq0dx', row=1, state_index=2, target_kind='state', target_name='q_0'}

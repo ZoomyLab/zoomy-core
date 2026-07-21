@@ -53,8 +53,6 @@ def build_sme(model) -> SystemModel:
     sm = SystemModel.from_model(m, Q=qs, canonical_source=model)
     m.apply({HydrostaticPressure(pf): pf})   # un-tag: leave derivation clean
     model._register_hswme_spectrum(sm)
-    resolve_and_attach(sm, model.boundary_conditions,
-                       aux_bcs=model.aux_boundary_conditions)
     return sm
 
 
@@ -76,8 +74,6 @@ def build_vam(model) -> SystemModel:
     m.apply({pf: HydrostaticPressure(pf)})
     sm = SystemModel.from_model(m, Q=[*qs, *P_modes], canonical_source=model)
     m.apply({HydrostaticPressure(pf): pf})   # un-tag: leave derivation clean
-    resolve_and_attach(sm, model.boundary_conditions,
-                       aux_bcs=model.aux_boundary_conditions)
     return sm
 
 
@@ -86,8 +82,6 @@ def build_mlswe(model) -> SystemModel:
     m = model.derivation
     sm = SystemModel.from_model(
         m, Q=[m.bed, m.ht, *m.q_l])
-    resolve_and_attach(sm, model.boundary_conditions,
-                       aux_bcs=model.aux_boundary_conditions)
     return sm
 
 
@@ -96,8 +90,6 @@ def build_mlsme(model) -> SystemModel:
     m = model.derivation
     sm = SystemModel.from_model(
         m, Q=[m.bed, m.ht, *m.q_flat], canonical_source=model)
-    resolve_and_attach(sm, model.boundary_conditions,
-                       aux_bcs=model.aux_boundary_conditions)
     return sm
 
 
@@ -107,8 +99,6 @@ def build_mlvam(model) -> SystemModel:
     sm = SystemModel.from_model(
         m, Q=[m.bed, m.ht, *m.q_flat, *m.r_flat, *m.P_flat],
         canonical_source=model)
-    resolve_and_attach(sm, model.boundary_conditions,
-                       aux_bcs=model.aux_boundary_conditions)
     return sm
 
 
@@ -125,9 +115,19 @@ def build_sigma3d(model) -> SystemModel:
     m.apply({pf: HydrostaticPressure(pf)})
     sm = SystemModel.from_model(m, Q=qs, canonical_source=model)
     m.apply({HydrostaticPressure(pf): pf})   # un-tag: leave derivation clean
-    # CLOSURE → ζ-FACE-BC REDUCTION: the user states the bed/surface conditions
-    # as physical closures; here the reduction emits them as ordinary solver BCs
-    # on the ζ-faces (combined with the user's horizontal BCs).
+    # (the ζ-face BC reduction runs in ``_runtime_bcs`` — BCs are attached on
+    #  BOTH the cache-hit and the fresh-build path, never inside a builder)
+    return sm
+
+
+def _sigma3d_runtime_bcs(model, sm):
+    """CLOSURE → ζ-FACE-BC REDUCTION: the user states the bed/surface conditions
+    as physical closures; here the reduction emits them as ordinary solver BCs
+    on the ζ-faces (combined with the user's horizontal BCs).
+
+    Runtime, not build-time: ``_vertical_face_bcs`` needs the built ``sm``, but
+    the result embeds the case's BCs and must therefore be re-derived for the
+    instance rather than served out of the cache."""
     user = model.boundary_conditions
     if user is None:
         horiz_bcs = [Extrapolation(tag="left"), Extrapolation(tag="right")]
@@ -135,9 +135,7 @@ def build_sigma3d(model) -> SystemModel:
         horiz_bcs = list(user)
     else:
         horiz_bcs = list(user.boundary_conditions_list)
-    all_bcs = horiz_bcs + model._vertical_face_bcs(sm)
-    resolve_and_attach(sm, all_bcs, aux_bcs=model.aux_boundary_conditions)
-    return sm
+    return horiz_bcs + model._vertical_face_bcs(sm)
 
 
 # ── KESME ────────────────────────────────────────────────────────────────────
@@ -174,6 +172,19 @@ _BUILDERS = {
 }
 
 
+# Per-kind hook for BCs that the BUILDER can only phrase against the built
+# ``sm`` (today: sigma3d's ζ-face reduction).  Everything else uses the model's
+# own BC list.  Registered here so BC attachment has exactly ONE home.
+_RUNTIME_BCS = {"sigma3d": _sigma3d_runtime_bcs}
+
+# Kinds whose builder used to call ``resolve_and_attach`` UNCONDITIONALLY — an
+# EMPTY BC container still produced the trivial identity BC kernel, and the
+# goldens record it.  ``swe`` is the exception: its BCs ride the REQ-87
+# ``_coupling_bcs`` promotion inside ``_from_model_impl``, which attaches only
+# when there is something to attach.
+_ALWAYS_ATTACH_BCS = frozenset(_BUILDERS) - {"swe"}
+
+
 def build_system_model(model) -> SystemModel:
     """Dispatch on ``model._system_model_kind`` to the matching builder.
 
@@ -183,6 +194,14 @@ def build_system_model(model) -> SystemModel:
     build entirely and returns a fresh, safely-mutable object.  Parameter
     VALUES are not part of the identity (free symbols end-to-end).  Disable
     with ``ZOOMY_DERIVATION_CACHE=0``; force ``ZOOMY_DERIVATION_REBUILD=1``.
+
+    Cache HIT and fresh BUILD are the SAME code path: the entry is stored
+    runtime-free (``sm_cache.strip_runtime_state``) and
+    :func:`_attach_runtime_data` fills the instance's parameter values and BCs
+    onto the result either way.  A warm run and ``ZOOMY_DERIVATION_CACHE=0``
+    must therefore agree byte-for-byte — that equality is the invariant the
+    cache owes the tree, and it is gated by
+    ``tests/systemmodel/test_cache_runtime_isolation.py``.
     """
     kind = model._system_model_kind
     try:
@@ -192,22 +211,60 @@ def build_system_model(model) -> SystemModel:
             f"unknown _system_model_kind {kind!r} on {type(model).__name__}")
     from zoomy_core.systemmodel import sm_cache
     key = sm_cache.cache_key(model, builder)
-    cached = sm_cache.fetch(key)
-    if cached is not None:
-        _attach_runtime_data(model, cached)
-        return cached
-    sm = builder(model)
-    sm_cache.store(key, sm)
+    sm = sm_cache.fetch(key)
+    if sm is None:
+        sm = builder(model)
+        # The entry must be a pure function of the KEY.  The declarative
+        # families already derive on their defaults; the hand-built models
+        # build ``parameter_values`` from the INSTANCE, so reset those to the
+        # class defaults before the entry is written.
+        _reset_parameter_defaults(model, sm)
+        sm_cache.store(key, sm)           # stores a BC/IC-stripped copy
+        sm_cache.strip_runtime_state(sm)  # ... and the fresh object matches it
+    _attach_runtime_data(model, sm)
     return sm
 
 
-def _attach_runtime_data(model, sm) -> None:
-    """Re-attach the INSTANCE's runtime data to a cache-fetched SystemModel.
+def _write_parameter_values(sm, vals) -> None:
+    """Write ``vals`` BY NAME into ``sm``'s own parameter container.
 
-    BCs/ICs embed parameter values and case choices — they are deliberately
-    NOT part of the cache identity.  ``resolve_and_attach`` replaces any
-    BCs the entry was built with; ICs are plain field assignments."""
+    Never replace the container: the lambdified kernels index the parameter
+    vector positionally, so its ordering and length must be preserved.  Names
+    the sm does not declare are ignored (a hand-built model's table can be a
+    superset once closures have been resolved out)."""
+    tgt = getattr(sm, "parameter_values", None)
+    if tgt is None or not hasattr(tgt, "keys"):
+        return
+    for k in tgt.keys():
+        if k in vals:
+            tgt[k] = float(vals[k])
+
+
+def _reset_parameter_defaults(model, sm) -> None:
+    """Reset ``sm``'s parameter values to the model's CASE-FREE defaults."""
+    _write_parameter_values(sm, model.default_parameter_values())
+
+
+def _attach_runtime_data(model, sm) -> None:
+    """Attach the INSTANCE's runtime data to a runtime-free SystemModel.
+
+    Parameter VALUES, BCs and ICs are deliberately NOT part of the cache
+    identity — values stay free symbols through the whole derivation (REQ-163)
+    and BCs/ICs are case data.  The cache therefore stores entries with those
+    fields BLANK and this function is the single place that fills them, on the
+    cache-hit path and the fresh-build path alike.
+
+    It is TOTAL, not a patch-up: the entry it is handed carries the model's
+    DEFAULTS and no BCs at all, so applying the instance's overrides on top is
+    a full rebuild of the runtime state — and the BC slots stay CLEARED when
+    the model declares no BCs, instead of inheriting someone else's.
+    """
     from zoomy_core.model.boundary_conditions import resolve_and_attach
+    # ── parameter values: defaults (already on the entry) | overrides ────
+    pv = getattr(model, "parameter_values", None)
+    if pv is not None and hasattr(pv, "items"):
+        _write_parameter_values(sm, {str(k): v for k, v in pv.items()})
+    # ── boundary conditions ─────────────────────────────────────────────
     # Two BC homes (REQ-87): production models POP the constructor
     # ``boundary_conditions=`` into ``_coupling_bcs`` (their param is then a
     # fresh EMPTY default — do not let it shadow the real one); declarative
@@ -220,31 +277,19 @@ def _attach_runtime_data(model, sm) -> None:
                    else getattr(bc, "boundary_conditions_list", None))
         return bc if entries else None
 
-    bcs = (_nonempty(getattr(model, "_coupling_bcs", None))
-           or _nonempty(getattr(model, "boundary_conditions", None)))
+    kind = getattr(model, "_system_model_kind", None)
+    hook = _RUNTIME_BCS.get(kind)
+    if hook is not None:
+        bcs = _nonempty(hook(model, sm))
+    else:
+        bcs = (_nonempty(getattr(model, "_coupling_bcs", None))
+               or _nonempty(getattr(model, "boundary_conditions", None)))
+        if bcs is None and kind in _ALWAYS_ATTACH_BCS:
+            # an EMPTY (but present) container still builds the identity kernel
+            bcs = getattr(model, "boundary_conditions", None)
     if bcs is not None:
         resolve_and_attach(
             sm, bcs, aux_bcs=getattr(model, "aux_boundary_conditions", None))
+    # ── initial conditions ──────────────────────────────────────────────
     for field in ("initial_conditions", "aux_initial_conditions"):
-        val = getattr(model, field, None)
-        if val is not None:
-            setattr(sm, field, val)
-    # Parameter VALUES are runtime solver inputs (the whole point of keeping
-    # them out of the cache identity) — the fetched entry carries the
-    # BUILD-TIME numbers.  Update BY NAME inside the sm's own container: the
-    # lambdified kernels index the parameter vector positionally, so the sm's
-    # ordering/length must be preserved (never replace the container).
-    pv = getattr(model, "parameter_values", None)
-    tgt = getattr(sm, "parameter_values", None)
-    if pv is not None and tgt is not None:
-        names = pv.keys() if hasattr(pv, "keys") else ()
-        for k in names:
-            val = pv[k] if hasattr(pv, "__getitem__") else getattr(pv, k)
-            try:
-                if hasattr(tgt, "__setitem__"):
-                    if not hasattr(tgt, "keys") or k in tgt.keys():
-                        tgt[k] = val
-                elif hasattr(tgt, k):
-                    setattr(tgt, k, val)
-            except (KeyError, TypeError):
-                pass
+        setattr(sm, field, getattr(model, field, None))

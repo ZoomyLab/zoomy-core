@@ -249,7 +249,18 @@ _FUNCTION_SLOTS: Dict[str, str] = {
     "interpolate": "interpolate_to_3d",
     "project": "project_from_3d",
     "reconstruction": "reconstruction_variables",
+    # per-cell state remap (the optional wet/dry momentum cap) — see
+    # ``zoomy_core.model.models.closures.apply_state_closures``.
+    "state_update": "update_variables",
 }
+
+# Slots whose UNREGISTERED rows are the IDENTITY, not zero.  Both are
+# state-shaped maps ``Q -> Q``: a row nobody wrote must pass its own state
+# entry through.  Defaulting these to zero would silently annihilate every
+# unwritten row — for ``update_variables`` that means zeroing ``h`` and ``b``,
+# which is exactly the h-destroying behaviour the user law forbids.
+_IDENTITY_DEFAULT_SLOTS = frozenset({"reconstruction_variables",
+                                     "update_variables"})
 
 
 def register_function_slot(group_name: str, sm_attr: str) -> None:
@@ -420,9 +431,10 @@ def _attach_function_groups(sm, model, canonical_source=None) -> None:
         # CANONICAL-PROFILE slots, not state slots) or state FIELDS, resolved
         # to their state slot — so registrations never hard-code the layout.
         comps = {_state_slot(k): rhs for k, rhs in comps.items()}
-        if attr == "reconstruction_variables":
+        if attr in _IDENTITY_DEFAULT_SLOTS:
             # state-shaped map; unregistered slots default to the IDENTITY
-            # (reconstruct the conservative entry itself), never to zero.
+            # (reconstruct / pass through the conservative entry itself),
+            # never to zero.
             vec = list(sm.state)
         else:
             vec = [sp.S.Zero] * (max(comps) + 1)

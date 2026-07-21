@@ -88,14 +88,22 @@ class Sigma3D(BaseModel):
         "to [Newtonian(), NavierSlip(), StressFree()] (slip + viscous; the friction "
         "magnitude is set by the parameters nu / lambda_s)."))
 
+    def default_parameter_values(self) -> dict:
+        return {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0, "e_x": 0.0}
+
     def derive_model(self):
         if int(self.dimension) != 2:
             raise NotImplementedError(
                 "Sigma3D: only dimension=2 (t,x,z) is wired today.")
-        values = {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0, "e_x": 0.0}
-        user_vals = getattr(self, "parameter_values", None)
-        if user_vals is not None and hasattr(user_vals, "items"):
-            values.update({k: float(v) for k, v in user_vals.items()})
+        values = self.default_parameter_values()
+        # NOTE: the user's ``parameters=`` numbers are NOT merged here.  The
+        # derivation is built on the DEFAULTS, so both caches keyed on the
+        # symbolic identity (the spec-keyed derivation memo and the REQ-163
+        # SystemModel cache — neither of which keys on values) hold entries
+        # that are a pure function of their key.  The instance's numbers are
+        # applied to the built SystemModel afterwards, per build, by
+        # ``model_builders._attach_runtime_data``.  Values are free symbols
+        # through the whole derivation, so this changes no operator.
         from zoomy_core.model.models.equations import (Mass, Momentum)
 
         m = DModel(coords=(t, x, z), parameters=values)
