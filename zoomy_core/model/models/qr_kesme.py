@@ -90,37 +90,29 @@ class QRKESME(SME):
         params.setdefault("quadrature_order", 6)
         super().__init__(**params)
 
-    def default_parameter_values(self) -> dict:
-        return {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0, "e_x": 0.0,
-                "C_mu": 0.09, "C_1": 1.44, "C_2": 1.92,
-                "sigma_k": 1.0, "sigma_e": 1.3,
-                # realizability floors (model-level, BEFORE GaussQuadrature):
-                # ε → ε+eps_min, k → k+k_min in every singular denominator, so
-                # quadrature integrates smooth integrands and the modal source
-                # has no near-zero denominators (the low-turbulence singularity
-                # cannot be guarded post-quadrature — the denominators are then
-                # high-degree polynomials no fixed floor can match).
-                "eps_min": 0.0, "k_min": 0.0,
-                # wall-function bed BC (weak/penalty) on the q-r variables:
-                # sk(0) → √(u_*²/√C_μ),  se(0) → √(u_*³/(κ z_p)); kappa & z_p
-                # the log-law constant & wall reference height, eps_wall_penalty
-                # the relaxation rate.
-                "kappa": 0.41, "z_p": 0.05, "eps_wall_penalty": 50.0}
-
     def derive_model(self):
         """COPY of SME.derive_model with the sk=√k, se=√ε transport equations
         added and projected through the same pipeline (see module docstring)."""
         Nu = int(self.level)
         Nk = int(self.turbulence_level)
-        values = self.default_parameter_values()
-        # NOTE: the user's ``parameters=`` numbers are NOT merged here.  The
-        # derivation is built on the DEFAULTS, so both caches keyed on the
-        # symbolic identity (the spec-keyed derivation memo and the REQ-163
-        # SystemModel cache — neither of which keys on values) hold entries
-        # that are a pure function of their key.  The instance's numbers are
-        # applied to the built SystemModel afterwards, per build, by
-        # ``model_builders._attach_runtime_data``.  Values are free symbols
-        # through the whole derivation, so this changes no operator.
+        values = {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0, "e_x": 0.0,
+                  "C_mu": 0.09, "C_1": 1.44, "C_2": 1.92,
+                  "sigma_k": 1.0, "sigma_e": 1.3,
+                  # realizability floors (model-level, BEFORE GaussQuadrature):
+                  # ε → ε+eps_min, k → k+k_min in every singular denominator, so
+                  # quadrature integrates smooth integrands and the modal source
+                  # has no near-zero denominators (the low-turbulence singularity
+                  # cannot be guarded post-quadrature — the denominators are then
+                  # high-degree polynomials no fixed floor can match).
+                  "eps_min": 0.0, "k_min": 0.0,
+                  # wall-function bed BC (weak/penalty) on the q-r variables:
+                  # sk(0) → √(u_*²/√C_μ),  se(0) → √(u_*³/(κ z_p)); kappa & z_p
+                  # the log-law constant & wall reference height, eps_wall_penalty
+                  # the relaxation rate.
+                  "kappa": 0.41, "z_p": 0.05, "eps_wall_penalty": 50.0}
+        user_vals = getattr(self, "parameter_values", None)
+        if user_vals is not None and hasattr(user_vals, "items"):
+            values.update({k: float(v) for k, v in user_vals.items()})
         from zoomy_core.model.models.equations import (
             Mass, Momentum, moment_scaling, small_slope_scaling)
         from zoomy_core.model.models.material import ClosureState

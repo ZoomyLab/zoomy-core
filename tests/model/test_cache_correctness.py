@@ -39,7 +39,10 @@ _h = sp.Function("h")(sp.Symbol("t"), sp.Symbol("x"))
 def cache_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("ZOOMY_CACHE_DIR", str(tmp_path))
     monkeypatch.delenv("ZOOMY_DERIVATION_REBUILD", raising=False)
-    monkeypatch.delenv("ZOOMY_DERIVATION_CACHE", raising=False)
+    # These are the CACHE tests, so they enable the cache EXPLICITLY rather
+    # than inheriting the ambient default (OFF during model development).
+    # A cache test that relies on the default is testing the default.
+    monkeypatch.setenv("ZOOMY_DERIVATION_CACHE", "1")
     from zoomy_core.systemmodel import sm_cache
     sm_cache._MEMORY.clear()
     return tmp_path

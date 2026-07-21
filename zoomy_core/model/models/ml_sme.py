@@ -74,15 +74,6 @@ class MLSME(BaseModel):
         "``project_from_3d`` Galerkin reduction (trapezoid, O(N_z^-2)); see "
         "SME.project_nz.  Each layer reduces its own sub-column to moments."))
 
-    def default_parameter_values(self) -> dict:
-        # ``l_j`` — the N-1 free interface-position fractions; uniform layers
-        # by default.  Depends on ``n_layers``, hence a method, not a dict.
-        N = int(self.n_layers)
-        values = {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0}
-        for j in range(1, N):
-            values[f"l_{j}"] = 1.0 / N
-        return values
-
     def derive_model(self):
         N = int(self.n_layers)
         # per-layer moment order: int → uniform (byte-identical to before);
@@ -109,15 +100,12 @@ class MLSME(BaseModel):
                     else rf"\hat{{{HNAME[xd]}}}_{ell}")
         def sname(xd, ell):
             return f"tau_{ell}" if dim == 2 else f"tau_{CN[xd]}z_{ell}"
-        values = self.default_parameter_values()
-        # NOTE: the user's ``parameters=`` numbers are NOT merged here.  The
-        # derivation is built on the DEFAULTS, so both caches keyed on the
-        # symbolic identity (the spec-keyed derivation memo and the REQ-163
-        # SystemModel cache — neither of which keys on values) hold entries
-        # that are a pure function of their key.  The instance's numbers are
-        # applied to the built SystemModel afterwards, per build, by
-        # ``model_builders._attach_runtime_data``.  Values are free symbols
-        # through the whole derivation, so this changes no operator.
+        values = {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0}
+        for j in range(1, N):
+            values[f"l_{j}"] = 1.0 / N
+        user_vals = getattr(self, "parameter_values", None)
+        if user_vals is not None and hasattr(user_vals, "items"):
+            values.update({k: float(v) for k, v in user_vals.items()})
 
         b = sp.Function("b", real=True)(t, *horiz)
         hl = [sp.Function(f"h_{ell}", positive=True)(t, *horiz)

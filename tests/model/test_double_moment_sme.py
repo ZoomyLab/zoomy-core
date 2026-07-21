@@ -375,9 +375,11 @@ def test_dm_nu0_reduces_to_width_rows():
 
 
 @pytest.mark.rederive
-def test_dm_pipeline_second_invocation_is_cache_hit():
+def test_dm_pipeline_second_invocation_is_cache_hit(monkeypatch):
     """REQ-142: a 2nd identical pipeline call is a HIT — the minutes-long
     symbolic body does NOT re-run (asserted on the wrapped-body call count)."""
+    # cache tests enable the cache explicitly; the ambient default is OFF
+    monkeypatch.setenv("ZOOMY_DERIVATION_CACHE", "1")
     clear_derivation_cache(derive_dm_cached)
     derive_dm_cached.stats.hits = 0
     derive_dm_cached.stats.misses = 0
@@ -402,6 +404,8 @@ def test_dm_pipeline_persists_across_sessions(tmp_path, monkeypatch):
     store cleared) re-loads them from disk WITHOUT re-running the symbolic body."""
     from zoomy_core.model.derivation import derivation_cache as dc
     monkeypatch.setenv("ZOOMY_CACHE_DIR", str(tmp_path))
+    # cache tests enable the cache explicitly; the ambient default is OFF
+    monkeypatch.setenv("ZOOMY_DERIVATION_CACHE", "1")
     clear_derivation_cache(close_dm_cached)
     _close_calls["n"] = 0
     close_dm_cached.stats.hits = 0

@@ -60,20 +60,12 @@ class VAM(BaseModel):
         "traction corrections) — the shallow form.  False keeps the slope-aware "
         "tractions."))
 
-    def default_parameter_values(self) -> dict:
-        return {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0}
-
     def derive_model(self):
         Nu = int(self.level)
-        values = self.default_parameter_values()
-        # NOTE: the user's ``parameters=`` numbers are NOT merged here.  The
-        # derivation is built on the DEFAULTS, so both caches keyed on the
-        # symbolic identity (the spec-keyed derivation memo and the REQ-163
-        # SystemModel cache — neither of which keys on values) hold entries
-        # that are a pure function of their key.  The instance's numbers are
-        # applied to the built SystemModel afterwards, per build, by
-        # ``model_builders._attach_runtime_data``.  Values are free symbols
-        # through the whole derivation, so this changes no operator.
+        values = {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0}
+        user_vals = getattr(self, "parameter_values", None)
+        if user_vals is not None and hasattr(user_vals, "items"):
+            values.update({k: float(v) for k, v in user_vals.items()})
         from zoomy_core.model.models.equations import (
             Mass, MomentumNonHydrostatic, small_slope_scaling,
             add_inplane_viscous, package_viscous)

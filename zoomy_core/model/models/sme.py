@@ -87,29 +87,24 @@ class SME(BaseModel):
         "column height the coupling supplies.  Trapezoid is O(N_z^-2); raise "
         "``project_nz`` for a tighter inverse."))
 
-    def default_parameter_values(self) -> dict:
+    def derive_model(self):
+        """Build the declarative SME model (stored as ``self.derivation``) and
+        register the vertical reconstruction.  Called by the base ``__init__``."""
+        Nu = int(self.level)
         # nu (kinematic viscosity) and lambda_s (Navier slip) are MODEL
         # PARAMETERS — default 0 (inviscid / free-slip); override values via
         # ``SME(level, parameters={"lambda_s": 0.5, ...})``.
         # e_x: downslope gravity component (K&T eq 4.7 "hg(e_x - ...)") -
         # the INCLINE body force; with e_x = sin(theta) and a FLAT bed the
         # model is an exact infinite incline (periodic-domain friendly)
-        return {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0,
-                "e_x": 0.0}
-
-    def derive_model(self):
-        """Build the declarative SME model (stored as ``self.derivation``) and
-        register the vertical reconstruction.  Called by the base ``__init__``."""
-        Nu = int(self.level)
-        values = self.default_parameter_values()
-        # NOTE: the user's ``parameters=`` numbers are NOT merged here.  The
-        # derivation is built on the DEFAULTS, so both caches keyed on the
-        # symbolic identity (the spec-keyed derivation memo and the REQ-163
-        # SystemModel cache — neither of which keys on values) hold entries
-        # that are a pure function of their key.  The instance's numbers are
-        # applied to the built SystemModel afterwards, per build, by
-        # ``model_builders._attach_runtime_data``.  Values are free symbols
-        # through the whole derivation, so this changes no operator.
+        values = {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0,
+                  "e_x": 0.0}
+        # the base __init__ has already split the user's parameters= dict
+        # into the Zstruct ``self.parameter_values`` — merge those numeric
+        # overrides over the defaults.
+        user_vals = getattr(self, "parameter_values", None)
+        if user_vals is not None and hasattr(user_vals, "items"):
+            values.update({k: float(v) for k, v in user_vals.items()})
         from zoomy_core.model.models.equations import (
             Mass, Momentum, moment_scaling, small_slope_scaling,
             add_inplane_viscous, package_viscous)
@@ -335,18 +330,6 @@ class SME(BaseModel):
         for qh in q_heads:
             m.reconstruction_rows.update(
                 {qh(i, t, *horiz): qh(i, t, *horiz) / h for i in range(Nu + 1)})
-
-        # 12b — OPTIONAL state-hygiene closures (``update_variables``).  A
-        # ``closes="state"`` closure (WetDryCap) registers the per-cell
-        # momentum remap here; with none in the list NOTHING is registered and
-        # the SystemModel keeps ``update_variables is None`` (cap-free), which
-        # every capless test asserts on.  Momentum rows only — h and b are not
-        # written, so they default to the identity and stay RAW.
-        from zoomy_core.model.models.closures import apply_state_closures
-        apply_state_closures(
-            self.closures, m, h,
-            [qh(i, t, *horiz) for qh in q_heads for i in range(Nu + 1)],
-            bed=b)
 
         # 13 — project (inverse of interpolate): the Integral-FREE, fixed-node
         # Galerkin reduction q_{d,i} = h·α_i of the sampled column.  N_z uniform

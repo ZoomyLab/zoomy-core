@@ -183,35 +183,6 @@ class Model(param.Parameterized, SymbolicRegistrar):
     dimension = param.Integer(default=1)
     disable_differentiation = param.Boolean(default=False)
 
-    def default_parameter_values(self) -> dict:
-        """Numeric parameter DEFAULTS — the values with NO case overrides applied.
-
-        This is what a build keyed on the model's SYMBOLIC identity is allowed
-        to carry.  Parameter values are deliberately excluded from that key
-        (REQ-163: they stay free symbols end-to-end), so a cached derivation /
-        SystemModel that carried a CASE's numbers would serve them to every
-        other model sharing the key.  Both cached objects are therefore built
-        on these defaults, and the instance's ``parameters=`` overrides are
-        applied afterwards, per build, by
-        ``model_builders._attach_runtime_data``.
-
-        The declarative families OVERRIDE this (some entries — the ML ``l_j``
-        layer thicknesses — depend on ``n_layers``, so it cannot be a plain
-        class dict) and build their inner ``DModel`` from it.  Stress closures
-        contribute their own defaults through ``m.parameter(name, default)``
-        during that build.
-
-        The default implementation covers the HAND-BUILT models: their defaults
-        are declared in the CLASS ``parameters`` dict — note ``type(self)``, not
-        ``self``, because ``__init__`` merges the user's overrides into the
-        instance copy.
-        """
-        p_def = getattr(type(self), "parameters", None)
-        if not isinstance(p_def, dict):
-            return {}
-        return {k: float(v)
-                for k, v in extract_parameter_defaults(p_def).items()}
-
     # ── General Gauss-Legendre quadrature order (REQ-160) ──────────────
     # BASE-LEVEL capability inherited by EVERY moment model: any Galerkin
     # integral with no closed form (non-polynomial material closures —
@@ -383,9 +354,9 @@ class Model(param.Parameterized, SymbolicRegistrar):
             self.derive_model()
             return
         import os
-        from zoomy_core.model.derivation.cache_keys import model_spec_key
-        cache_on = os.environ.get(
-            "ZOOMY_DERIVATION_CACHE", "1").strip() not in {"0", "false", "no"}
+        from zoomy_core.model.derivation.cache_keys import (
+            model_spec_key, derivation_cache_enabled)
+        cache_on = derivation_cache_enabled()
         rebuild = os.environ.get(
             "ZOOMY_DERIVATION_REBUILD", "").strip() in {"1", "true", "yes"}
         key = model_spec_key(self)

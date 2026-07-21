@@ -23,27 +23,33 @@ symbol and the result srepr'd, so ``lambda qi: qi/h`` keys as ``"__probe__/h"``
 from __future__ import annotations
 
 import hashlib
+import os
 
 import sympy as sp
 
 from zoomy_core.model.derivation.basisfunctions import Basisfunction
 from zoomy_core.model.derivation.basis_cache import _basis_fingerprint
 
+
+def derivation_cache_enabled() -> bool:
+    """THE switch for every derivation-caching tier — import it, never re-read
+    the environment variable locally.
+
+    There are three independent stores (``basemodel._DERIVATION_MODEL_CACHE``,
+    ``derivation.derivation_cache``, ``systemmodel.sm_cache``).  They each used
+    to read ``$ZOOMY_DERIVATION_CACHE`` with their own hard-coded default, so
+    flipping "the" default flipped only one of them and the other two silently
+    kept serving — which is how a default ``SME()`` was handed the nu=1e-3 of
+    an ``SME(parameters=...)`` built earlier in the same process.
+
+    Default OFF while the models are under development (user, 2026-07-21):
+    every build derives from source.  Flip to "1" once the model layer settles."""
+    return os.environ.get(
+        "ZOOMY_DERIVATION_CACHE", "0").strip() not in {"0", "false", "no"}
+
 # Bump when the derivation pipeline changes in a way that invalidates every
 # cached entry (new op semantics, changed extraction, etc.).
-CACHE_VERSION = "v8"   # v8: the cached SystemModel is now stored RUNTIME-FREE —
-#                              parameter VALUES blanked, BC/IC kernels and their
-#                              source objects dropped (sm_cache.strip_runtime_state)
-#                              — and refilled on EVERY build from the model's own
-#                              ``default_parameter_values`` | overrides.  Before
-#                              this, two models differing only in the key-excluded
-#                              ``parameters=`` / ``boundary_conditions=`` shared a
-#                              key and the FIRST build's numbers and BCs were served
-#                              to the second (a default SME was handed nu=1e-3 and
-#                              bc_tags ['left','right'] it never declared).  Bump
-#                              invalidates every v7 entry incl. the shipped
-#                              _prebuilt, two of which carried nu=0.1/lambda_s=0.5.
-#                        v7: REQ-188 — the SystemModel cache key now hashes the
+CACHE_VERSION = "v7"   # v7: REQ-188 — the SystemModel cache key now hashes the
 #                              FULL source of every class in the model's MRO
 #                              (sm_cache.cache_key) instead of only derive_model,
 #                              so a case-local operator override (e.g. RainSWE.source)

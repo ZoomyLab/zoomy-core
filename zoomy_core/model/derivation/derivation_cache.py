@@ -52,6 +52,14 @@ logger = logging.getLogger(__name__)
 _STORE: dict[str, dict[str, object]] = {}
 
 
+def _cache_enabled() -> bool:
+    """This tier keys on the derivation call arguments, which do NOT include
+    the model's numeric parameter values, so a warm store serves the FIRST
+    build's numbers to every later build of the same shape."""
+    from zoomy_core.model.derivation.cache_keys import derivation_cache_enabled
+    return derivation_cache_enabled()
+
+
 def _persist_dir() -> Path:
     """The on-disk derivation-cache directory (cross-session tier).
 
@@ -144,6 +152,10 @@ def derivation_cache(fn=None, *, version=0, verify=False, persist=False):
 
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
+            if not _cache_enabled():
+                stats.misses += 1
+                stats.calls += 1
+                return func(*args, **kwargs)
             key = _call_key(source, args, kwargs, version)
             store = _STORE[fid]
             if key in store:

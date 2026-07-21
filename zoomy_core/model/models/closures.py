@@ -133,17 +133,6 @@ class Closure(Operation):
     def register(self, model):
         """Register-or-query the parameters this closure needs (override)."""
 
-    def parameter_defaults(self) -> dict:
-        """``{name: default}`` for every parameter :meth:`register` declares.
-
-        The model's ``default_parameter_values`` must be able to answer for
-        EVERY parameter the derivation ends up declaring — a closure that
-        registers ``n`` / ``wetdry_u_max`` inside ``derive_model`` adds names
-        the model class never listed, and a cache-fetched SystemModel then has
-        no number to refill them with.  Default ``{}`` (a closure that
-        registers nothing); override alongside :meth:`register`."""
-        return {}
-
     def check(self, model):
         """Assert every required field is present in the model."""
         have = set(model.functions.keys())
@@ -557,138 +546,6 @@ class StressFree(Closure):
         return {"normal": None, "tangent": [sp.S.Zero for _ in s.tangents]}
 
 
-# ── state-hygiene closures (the ``update_variables`` slot) ─────────────────
-# A DIFFERENT closure family: these do not close a stress, they declare the
-# per-cell state remap the solver applies once per step (the SystemModel
-# ``update_variables`` slot).  ``closes = "state"``, so
-# ``apply_stress_closures`` registers/checks them and then ignores them; the
-# model calls :func:`apply_state_closures` to collect their rows.
-
-
-def apply_state_closures(closures, m, depth, momentum, bed=None):
-    """Register every ``closes == "state"`` closure's per-cell remap as the
-    derivation function group ``"state_update"`` (→ ``SystemModel.
-    update_variables``).
-
-    ``depth`` is the depth field, ``momentum`` the list of momentum (moment)
-    fields, ``bed`` the bathymetry field if the model carries one.  Rows the
-    closures do NOT write default to the IDENTITY at extraction time, so ``h``
-    and ``b`` pass through RAW unless a closure deliberately writes them —
-    nothing here may floor or clip a depth.
-
-    Returns True iff any state closure wrote a row (so the model can leave the
-    slot unregistered — hence ``update_variables is None`` — when none did).
-    """
-    rows: dict = {}
-    for c in closures or ():
-        if getattr(c, "closes", None) != "state":
-            continue
-        c.register(m)
-        rows.update(c.state_update(m, depth, list(momentum), bed))
-    for field, expr in rows.items():
-        m.register_group("state_update", field, expr)
-    return bool(rows)
-
-
-class WetDryCap(Closure):
-    """OPTIONAL wet/dry momentum limiter on the ``update_variables`` slot.
-
-    OFF BY DEFAULT — it is not in any model's default closure list; a case
-    opts in explicitly, and everything it needs is an adjustable model
-    parameter (``wetdry_u_max`` / ``wetdry_h_min``), because the right value
-    is application-dependent.
-
-    IT IS NOT AN ``h`` FLOOR.  It writes the MOMENTUM rows only; ``h`` and
-    ``b`` are left RAW (they are not registered, so they default to the
-    identity).  A cell that is dry stays exactly dry, and a cell whose depth
-    is small keeps that depth — only the momentum it is allowed to carry is
-    bounded.
-
-    Two modes, both of which the user named:
-
-    ``mode="velocity"`` (default)
-        Cap the VELOCITY: ``|q_i| <= h·u_max``, i.e.
-        ``q_i := max(−h·u_max, min(q_i, h·u_max))``.  Inert wherever the flow
-        is slower than ``u_max`` — in particular exactly inert at rest
-        (``q = 0``), so it cannot break well-balancing — and it collapses to
-        ``q_i = 0`` as ``h → 0`` continuously, with no threshold at all.
-
-    ``mode="zero"``
-        Zero the momentum below a depth: ``q_i := q_i·r(h)`` with the
-        Min/Max ramp ``r = min(max((h − h_min)/h_min, 0), 1)`` — EXACTLY zero
-        for ``h <= h_min``, EXACTLY unchanged for ``h >= 2·h_min``, Lipschitz
-        in between.  A hard step would lower as a Heaviside/sign, which not
-        every backend prints; the ramp uses Min/Max only.
-
-    ``mode="both"``
-        Zero below ``h_min`` first, then cap the velocity.
-
-    Why this exists (MEASURED, jax SWASHES Ritter, order 2, N=100): the emitted
-    reconstruction puts the PRIMITIVE velocity on the momentum row, and the
-    free-surface row can hand a front face a depth ~1e4× the cell mean, so a
-    near-dry cell's ``u = q/h`` is AMPLIFIED onto the face instead of damped.
-    The wave speed then runs away, the adaptive dt collapses from 7.7e-02 to
-    1.9e-06 within 40 steps at t ≈ 1.32 and the march NaNs.  Bounding the
-    velocity the cell may carry removes the amplification at its source
-    WITHOUT touching the depth.
-
-    The numbers are emitted as model parameters, never as backend literals:
-    ``SME(..., closures=[..., WetDryCap()], parameters={"wetdry_u_max": 1.0})``.
-    """
-    closes = "state"; requires = ()
-
-    MODES = ("velocity", "zero", "both")
-
-    def __init__(self, mode="velocity", u_max=1.0, h_min=1e-6, name=None):
-        super().__init__(name=name)
-        if mode not in self.MODES:
-            raise ValueError(
-                f"WetDryCap mode must be one of {self.MODES}, got {mode!r}")
-        self.mode = str(mode)
-        self.u_max = float(u_max)
-        self.h_min = float(h_min)
-
-    def register(self, m):
-        # DEFAULTS only — a value passed via ``parameters={...}`` on the model
-        # already exists and wins (``Model.parameter`` is register-or-query),
-        # which is what makes the cap adjustable per case without touching the
-        # derivation.
-        if self.mode in ("velocity", "both"):
-            m.parameter("wetdry_u_max", self.u_max)
-        if self.mode in ("zero", "both"):
-            m.parameter("wetdry_h_min", self.h_min)
-
-    def parameter_defaults(self) -> dict:
-        d = {}
-        if self.mode in ("velocity", "both"):
-            d["wetdry_u_max"] = self.u_max
-        if self.mode in ("zero", "both"):
-            d["wetdry_h_min"] = self.h_min
-        return d
-
-    def expression(self, s):
-        raise NotImplementedError(
-            "WetDryCap is a STATE closure — it writes the update_variables "
-            "slot via state_update(), not a stress component.")
-
-    def state_update(self, m, depth, momentum, bed=None):
-        """``{momentum_field: capped expression}`` — momentum rows ONLY."""
-        rows = {}
-        for q in momentum:
-            e = q
-            if self.mode in ("zero", "both"):
-                h_min = m.parameter("wetdry_h_min", self.h_min)
-                ramp = sp.Min(sp.Max((depth - h_min) / h_min, sp.S.Zero),
-                              sp.S.One)
-                e = e * ramp
-            if self.mode in ("velocity", "both"):
-                u_max = m.parameter("wetdry_u_max", self.u_max)
-                q_max = depth * u_max
-                e = sp.Max(-q_max, sp.Min(e, q_max))
-            rows[q] = e
-        return rows
-
-
 # ── interface-transfer closures (multilayer) ───────────────────────────────
 # The shared transfer velocity u* at an INTERNAL layer interface — the
 # numerical scheme for the advection trace exchanged across the interface.
@@ -796,7 +653,6 @@ def swe_closure_state(model):
 
 
 __all__ = ["Closure", "ClosureState", "apply_stress_closures",
-           "apply_state_closures", "WetDryCap",
            "apply_layer_stress_closures", "interface_closure",
            "Newtonian", "KEpsilonViscosity", "QRViscosity", "NavierSlip", "RoughWall",
            "WallFunctionBed",
