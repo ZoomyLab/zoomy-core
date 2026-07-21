@@ -11,6 +11,7 @@ import textwrap
 from zoomy_core.misc import misc as misc
 from zoomy_core.misc.misc import Zstruct, ZArray
 from zoomy_core.numerics.numerical_system_model import (
+    implicit_stage_mode,
     numerics_fluctuations_are_zero,
     to_numerical_system_model,
 )
@@ -1982,6 +1983,16 @@ class GenericCppModel(GenericCppBase):
                 # conservative direction.  ``Numerics.H`` carries the same
                 # constant, decided by the same property.
                 f"    static constexpr bool fluctuations_are_zero = {'true' if self.sm.fluctuations_are_zero else 'false'};",
+                # Which implicit-stage path this system needs, decided in the
+                # NSM (``implicit_stage_mode``) exactly like the flux-mode
+                # selection above.  A backend READS this; it must never
+                # re-derive the choice from its own view of the slots, which is
+                # how ``fluctuations_are_zero``'s predecessor diverged.
+                # "local_source" licenses the per-cell fast path; "coupled"
+                # means ONE global implicit stage solve carrying every implicit
+                # operator — never two.
+                f'    static constexpr const char* implicit_mode = '
+                f'"{implicit_stage_mode(self.sm)}";',
                 f"    static constexpr bool has_free_surface = {'true' if has_free_surface else 'false'};",
             ]
         )

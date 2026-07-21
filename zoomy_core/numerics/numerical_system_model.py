@@ -79,6 +79,144 @@ def numerics_fluctuations_are_zero(numerics) -> bool:
     return all(sp.sympify(e).is_zero is True for e in entries)
 
 
+# ── implicit-stage mode identification ────────────────────────────────────
+#
+# The user's ruling: ``implicit_source`` and ``implicit_diffusion`` collapse
+# into ONE implicit stage solve, so the scheme is a genuine IMEX-ARK rather
+# than a Lie split — WITH a fast path for the case where the implicit operator
+# is purely a LOCAL SOURCE (cell-local, no neighbour coupling), which is then
+# N independent small nonlinear solves instead of one global system.  And:
+# "the identification of which path we take should be happening in the Zoomy
+# core, hence the numerical system model stage."
+#
+# So the identification lives here, next to ``fluctuations_are_zero``, and
+# follows exactly that precedent: derived from the BUILT operators, never
+# declared by hand, re-read rather than cached, and emitted to the printers.
+
+#: No implicit stage at all — the implicit slots are structurally empty.
+IMPLICIT_MODE_NONE = "none"
+#: FAST PATH.  The implicit operator is a cell-local source: no entry reaches
+#: a neighbour cell, so the stage is N independent small nonlinear solves.
+IMPLICIT_MODE_LOCAL_SOURCE = "local_source"
+#: ONE global implicit stage solve — an implicit diffusion / elliptic operator
+#: couples neighbours, or the implicit source itself reads a non-local aux.
+IMPLICIT_MODE_COUPLED = "coupled"
+
+#: ``aux_registry`` kinds whose value is computed from a STENCIL over
+#: neighbouring cells (LSQ gradients, limited gradients).  An implicit
+#: operator that reads one of these is not cell-local, however "source"-shaped
+#: it looks — this is the same distinction ``_linearize_source`` already makes
+#: when it drops the ∂aux/∂Q channel for derivative aux ("a non-local
+#: derivative cannot be inverted per cell").  Every other kind ("function", a
+#: closure evaluated pointwise from the local state) IS local.
+_NONLOCAL_AUX_KINDS = frozenset({"derivative", "limited_derivative"})
+
+
+def _operator_is_live(arr) -> bool:
+    """Does operator ``arr`` carry any entry that is not a PROVEN zero?
+
+    UNKNOWN counts as LIVE, the same asymmetry ``numerics_fluctuations_are_zero``
+    uses: an entry sympy cannot decide might be a real term, and silently
+    dropping a real implicit term is wrong physics, while a spurious one costs
+    only work.
+    """
+    import sympy as sp
+    for e in _op_flat(arr):
+        try:
+            if sp.sympify(e).is_zero is not True:
+                return True
+        except (sp.SympifyError, TypeError):
+            return True                       # undecidable ⇒ assume live
+    return False
+
+
+def _nonlocal_aux_symbols(sm) -> set:
+    """The aux Symbols whose value depends on NEIGHBOUR cells.
+
+    Read off ``sm.aux_registry`` — the structured record the SystemModel builds
+    when it exposes derivative atoms as aux rows — so this is a property of the
+    BUILT aux vector, not a name-matching heuristic on ``"_x"`` suffixes.
+
+    UNKNOWN collapses to "everything is non-local": when the registry has never
+    been derived (``None``) we cannot prove any aux is cell-local, so every aux
+    symbol in ``aux_state`` is returned and an implicit source that touches aux
+    at all reports COUPLED.  That is the safe direction — the global stage
+    solve is always correct, the fast path is correct only when locality is
+    PROVEN.
+    """
+    import sympy as sp
+    registry = getattr(sm, "aux_registry", None)
+    aux_state = list(getattr(sm, "aux_state", ()) or ())
+    if registry is None:
+        return {sp.sympify(a) for a in aux_state}
+    out = set()
+    for entry in registry:
+        if entry.get("kind") not in _NONLOCAL_AUX_KINDS:
+            continue
+        symbol = entry.get("aux_symbol")
+        if symbol is None:
+            name = entry.get("name")
+            symbol = sp.Symbol(name, real=True) if name else None
+        if symbol is not None:
+            out.add(sp.sympify(symbol))
+    return out
+
+
+def implicit_stage_mode(nsm) -> str:
+    """THE criterion: which implicit-stage path does ``nsm`` need?
+
+    Returns one of :data:`IMPLICIT_MODE_NONE`,
+    :data:`IMPLICIT_MODE_LOCAL_SOURCE`, :data:`IMPLICIT_MODE_COUPLED`.
+
+    Sole owner of the question, so the NSM property and every printer decide it
+    the same way (the ``fluctuations_are_zero`` precedent, whose defect-2 was
+    two answer-holders that diverged).
+
+    The decision reads the OPERATORS, in this order:
+
+    1. **Implicit diffusion is coupled, full stop.**  ``diffusion_matrix`` is
+       the ``implicit_diffusion``-tagged slot; a live one is a second-derivative
+       operator, which reaches neighbours by construction.  Gated on
+       ``diffusion.enabled`` because that flag is what decides whether the
+       diffusion stage runs at all.
+    2. **A live implicit source that reads a non-local aux is coupled too.**
+       ``source`` is the ``implicit_source``-tagged slot.  "Source" names where
+       a term sits in the equation, NOT its stencil: a source that reads an LSQ
+       gradient row couples cells exactly as a diffusion operator does, and
+       inverting it per cell would be wrong.  This is the case a
+       declared-by-hand flag gets wrong, which is why the mode is derived.
+    3. **Otherwise a live implicit source is the LOCAL fast path** — every
+       entry is a function of this cell's state and pointwise aux, so the stage
+       is N independent small nonlinear solves.
+    4. **Nothing live ⇒ no implicit stage.**
+
+    Note what falls out of rule 1 + rule 2: a model with BOTH implicit
+    diffusion and an implicit source reports ``coupled`` — ONE stage solve
+    carrying both operators, never two separate solves.  The Lie split the
+    user ruled against is not representable in this vocabulary.
+    """
+    if _operator_is_live(getattr(nsm, "diffusion_matrix", None)):
+        diffusion = getattr(nsm, "diffusion", None)
+        if diffusion is None or bool(getattr(diffusion, "enabled", True)):
+            return IMPLICIT_MODE_COUPLED
+
+    source = getattr(nsm, "source", None)
+    if not _operator_is_live(source):
+        return IMPLICIT_MODE_NONE
+
+    import sympy as sp
+    nonlocal_aux = _nonlocal_aux_symbols(nsm)
+    if nonlocal_aux:
+        for e in _op_flat(source):
+            try:
+                expr = sp.sympify(e)
+            except (sp.SympifyError, TypeError):
+                return IMPLICIT_MODE_COUPLED      # undecidable ⇒ assume coupled
+            if expr.free_symbols & nonlocal_aux:
+                return IMPLICIT_MODE_COUPLED
+    return IMPLICIT_MODE_LOCAL_SOURCE
+
+
 def _op_flat(arr):
     """Flat list of scalar entries of an operator array (ZArray / MatrixBase /
     nested list), or ``[]`` for non-array operands."""
@@ -555,6 +693,36 @@ class NumericalSystemModel(SystemModel):
         the call sites (REQ-209).
         """
         return numerics_fluctuations_are_zero(self._probe_numerics())
+
+    @property
+    def implicit_mode(self) -> str:
+        """Which implicit-stage path this system needs — ``"none"``,
+        ``"local_source"`` (the cell-local FAST PATH) or ``"coupled"`` (ONE
+        global implicit stage solve).
+
+        The user's ruling is that ``implicit_source`` and
+        ``implicit_diffusion`` are not two separate solves but one implicit
+        stage of a genuine IMEX-ARK, with a fast path when the implicit
+        operator happens to be purely a local source — and that "the
+        identification of which path we take should be happening in the Zoomy
+        core, hence the numerical system model stage", exactly like the
+        existing flux-mode selection.  This property is that identification.
+
+        Like :attr:`fluctuations_are_zero` it is DERIVED FROM THE OPERATORS and
+        deliberately re-read on every access rather than cached: the implicit
+        slots move under :meth:`apply` (an operation that introduces a
+        gradient-aux dependence into the source turns a local fast path into a
+        coupled one), and a cached string goes stale in both directions.
+
+        The criterion itself lives in :func:`implicit_stage_mode` so a printer
+        can apply the same test to the object it is printing — one criterion,
+        one implementation, no re-derivation at the call sites.
+
+        ⚠ This selects the SOLVE STRUCTURE, not the physics.  ``"coupled"`` says
+        the implicit operator reaches neighbouring cells; it says nothing about
+        stiffness, and it is never a licence to run two stages.
+        """
+        return implicit_stage_mode(self)
 
     def default_operations(self) -> list:
         """Return the system operations applied to EVERY NSM by
