@@ -74,6 +74,58 @@ EPS_H_FALLBACK = 1e-14
 #: comparison guard on the snapshot stamp, not a physical scale.
 WRITE_EPS = 1e-14
 
+# ── elliptic (projection / pressure) solve constants ───────────────────────
+#
+# Same law as the march constants above: a backend must not carry its own
+# float beside the elliptic solve.  Both numbers below were forced by a
+# MEASUREMENT on the VAM order-2 Richardson triple (n = 64/128/256):
+#
+#   * ``pressure_maxit`` counts RESTARTS of a Krylov space of size ``restart``,
+#     so raising it does NOTHING once the restarted iteration stagnates — the
+#     n=128 elliptic residual was identical to seven digits at 1x / 4x / 16x
+#     the iteration budget.
+#   * the residual of the FIXED restart=20 space grows under refinement,
+#     9.8e-14 -> 1.4e-4 -> 9.6e-3 across the triple, so the pressure error is
+#     set by the SOLVER, not by the discretisation.  The observed order of the
+#     P rows was negative (P_0 -1.604, P_1 -1.867) while every conservative row
+#     converged (h +0.900, q_0 +0.270, q_1 +1.187, r_0 +1.063, r_1 +0.338).
+#
+# A fixed restart is therefore not a tuning choice but a silent degradation:
+# the elliptic operator's condition number is O(1/h^2), and restarted GMRES
+# has no convergence theory on a non-symmetric, UNPRECONDITIONED operator of
+# growing condition number.  Full (non-restarted) GMRES does: it terminates in
+# at most ``n`` steps.  So the default restart SCALES WITH THE PROBLEM — it is
+# the full space, capped only by the Krylov-basis memory ceiling.
+
+#: Default relative/absolute tolerance of the elliptic (pressure) solve.
+ELLIPTIC_RTOL = 1e-10
+
+#: Floor of the emitted restart.  Below this the Krylov space is too small to
+#: carry even a smooth mode; it is a floor, never a default.
+ELLIPTIC_RESTART_MIN = 20
+
+#: Krylov-basis memory ceiling, in vectors.  ``restart`` vectors of length
+#: ``n`` cost ``restart * n`` doubles, so the cap bounds the basis at
+#: ``ELLIPTIC_RESTART_CAP * n``.  Above the cap the solve is restarted again —
+#: and a system that large needs a PRECONDITIONER, not a bigger basis; that is
+#: a reported limitation, not something the default may hide.
+ELLIPTIC_RESTART_CAP = 1000
+
+
+def elliptic_restart(n_unknowns: int) -> int:
+    """The GMRES restart for an elliptic block with ``n_unknowns`` unknowns.
+
+    ``min(n, CAP)`` bounded below by ``MIN``: the FULL Krylov space (no
+    restart, hence guaranteed termination in <= n steps) until the basis
+    reaches the memory ceiling.  The point is that it MOVES with ``n`` — a
+    constant here is the defect this replaces.
+    """
+    n = int(n_unknowns)
+    if n < 1:
+        raise ConstantResolutionError(
+            f"elliptic block size must be >= 1, got {n_unknowns!r}")
+    return max(ELLIPTIC_RESTART_MIN, min(n, ELLIPTIC_RESTART_CAP))
+
 
 class ConstantResolutionError(ValueError):
     """A march constant could not be resolved unambiguously from the NSM."""
@@ -201,7 +253,7 @@ class MarchConstants:
 #: emitted as the integer ``0`` where it is compared against a float depth).
 _REAL_VALUED = frozenset({
     "c_mood_h_bound", "c_kp_eps", "c_eps_h", "c_cfl", "c_dt_max",
-    "c_write_eps", "c_dt_floor",
+    "c_write_eps", "c_dt_floor", "c_elliptic_tol",
 })
 
 
@@ -255,5 +307,47 @@ def march_constants(nsm, *, cfl: float, dimension: int, degree: int = 0,
         "c_write_eps": "constants.WRITE_EPS (drift-free write gate)",
         "c_dt_floor": ("OFF (user law: no dt floor, the guard is FATAL)"
                        if dt_floor is None else "caller override"),
+    }
+    return MarchConstants(values=values, provenance=provenance)
+
+
+def elliptic_constants(*, n_unknowns: int,
+                       tol: Optional[float] = None,
+                       restart: Optional[int] = None) -> MarchConstants:
+    """Resolve the EMITTED constants of an elliptic (projection) solve.
+
+    ``n_unknowns`` is the size of the elliptic block — for the VAM Chorin
+    pressure stage, ``n_pressure_modes * n_cells``.  It is REQUIRED, because
+    the whole point of this resolver is that the restart is a function of the
+    problem size (see :func:`elliptic_restart`); a caller that cannot say how
+    big its block is cannot get a default.
+
+    ``tol`` / ``restart`` are caller overrides and are reported as such in the
+    provenance, so an override is visible rather than indistinguishable from
+    the resolved default.
+    """
+    if tol is not None and not (float(tol) > 0.0):
+        raise ConstantResolutionError(
+            f"elliptic tolerance must be > 0, got {tol!r}")
+    if restart is not None and int(restart) < 1:
+        raise ConstantResolutionError(
+            f"elliptic restart must be >= 1, got {restart!r}")
+
+    resolved_restart = (elliptic_restart(n_unknowns) if restart is None
+                        else min(int(restart), int(n_unknowns)))
+    values = {
+        "c_elliptic_tol": float(ELLIPTIC_RTOL if tol is None else tol),
+        "c_elliptic_restart": int(resolved_restart),
+    }
+    provenance = {
+        "c_elliptic_tol": (
+            "constants.ELLIPTIC_RTOL"
+            if tol is None or float(tol) == ELLIPTIC_RTOL
+            else "caller override"),
+        "c_elliptic_restart": (
+            f"constants.elliptic_restart(n={int(n_unknowns)}) "
+            f"= max({ELLIPTIC_RESTART_MIN}, min(n, {ELLIPTIC_RESTART_CAP}))"
+            if restart is None else
+            f"caller override, clamped to n={int(n_unknowns)}"),
     }
     return MarchConstants(values=values, provenance=provenance)

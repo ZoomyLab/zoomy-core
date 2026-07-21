@@ -36,6 +36,7 @@ from zoomy_core.mesh import ensure_lsq_mesh
 from zoomy_core.systemmodel.system_model import SystemModel, _to_zarray
 from zoomy_core.numerics import NumericalSystemModel
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel
+from zoomy_core.solver.constants import ELLIPTIC_RTOL, elliptic_constants
 from zoomy_core.misc.logger_config import logger
 from zoomy_core.misc.misc import Zstruct, ZArray
 
@@ -355,11 +356,35 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
     """
 
     pressure_tol = param.Number(
-        default=1e-10, bounds=(0, None),
-        doc="Linear-solver tolerance for the elliptic pressure block")
+        default=ELLIPTIC_RTOL, bounds=(0, None),
+        doc=("Linear-solver tolerance for the elliptic pressure block.  "
+             "Defaults to the EMITTED ``c_elliptic_tol`` "
+             "(:data:`zoomy_core.solver.constants.ELLIPTIC_RTOL`) — mandate "
+             "6a: the number lives in the emitted set, not beside the "
+             "``gmres`` call."))
     pressure_maxit = param.Integer(
         default=500, bounds=(1, None),
-        doc="Maximum iterations for the elliptic pressure solve")
+        doc=("Maximum OUTER iterations of the elliptic pressure solve.  Read "
+             "this together with :attr:`pressure_restart`: scipy's ``maxiter`` "
+             "counts RESTARTS of a Krylov space of size ``restart``, so this "
+             "knob buys nothing once the restarted iteration stagnates "
+             "(measured: at n=128 the residual was identical to seven digits "
+             "at 1x / 4x / 16x this budget).  The lever is ``restart``."))
+    pressure_restart = param.Integer(
+        default=None, allow_None=True, bounds=(1, None),
+        doc=("GMRES restart — the dimension of the Krylov space rebuilt each "
+             "outer iteration, and the ACTUAL convergence lever for this "
+             "block (measured; see ``pressure_maxit``).  ``None`` (default) "
+             "resolves it from the problem size via the emitted "
+             ":func:`zoomy_core.solver.constants.elliptic_restart`, i.e. the "
+             "FULL space up to a memory cap.  A FIXED restart silently "
+             "degrades with every refinement: the elliptic operator's "
+             "condition number is O(1/h^2) and this solve is "
+             "unpreconditioned, so at a fixed restart=20 the residual grew "
+             "9.8e-14 -> 1.4e-4 -> 9.6e-3 across n = 64/128/256 and the "
+             "pressure rows of the VAM Richardson triple carried NEGATIVE "
+             "observed orders while every conservative row converged.  Pin "
+             "an integer only to reproduce that degradation deliberately."))
     time_order = param.Integer(
         default=1, bounds=(1, 2),
         doc=("Order of the time integration.  1: single pred-press-corr "
@@ -467,6 +492,11 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         # relative residual ‖b − A x‖/‖b‖ of the pressure solve.  ``None``
         # until the first pressure step runs.
         self.last_elliptic_rel_resid = None
+        # The restart the last pressure solve actually ran with, after the
+        # size-dependent resolution.  Surfaced because a restart that silently
+        # differs from the one the user thinks is in force is exactly the
+        # failure this parameter exists to end.  ``None`` until the first solve.
+        self.last_elliptic_restart = None
 
         # Declared per-pressure-mode Dirichlet BCs for the elliptic stage
         # (REQ-174).  ``None`` ⇒ no pressure mode carries a Dirichlet, so the
@@ -1168,6 +1198,17 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
                 R[cm] = p_mat[cm] - press_dir["cell_value"][cm]
             return R.ravel()
 
+        # Emitted elliptic constants (mandate 6a).  The restart is RESOLVED
+        # FROM ``N`` — the size of THIS pressure block — so it moves with the
+        # mesh instead of sitting at a literal beside the ``gmres`` call.
+        # Resolved before the early exit so the ‖b‖ gate below compares
+        # against the same emitted tolerance the solve will use.
+        ell = elliptic_constants(n_unknowns=N, tol=self.pressure_tol,
+                                 restart=self.pressure_restart)
+        c_elliptic_tol = ell.values["c_elliptic_tol"]
+        c_elliptic_restart = ell.values["c_elliptic_restart"]
+        self.last_elliptic_restart = c_elliptic_restart
+
         # Data forcing: ``b = R(P = 0)``.  Pure data — no P enters.
         b = _residual(np.zeros(N))
 
@@ -1177,7 +1218,7 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         # and returns garbage.  Skip the solve and return P = warm-start
         # (which is the correct answer for ‖b‖ ≈ 0).
         b_norm = float(np.linalg.norm(b))
-        if b_norm < self.pressure_tol:
+        if b_norm < c_elliptic_tol:
             self._sim_Q = Q              # Q[e2s] unchanged (still p0)
             # ‖b‖ ≈ 0 ⇒ P is already the exact solution (warm start).
             self.last_elliptic_rel_resid = 0.0
@@ -1202,9 +1243,10 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
             p0 = Q[e2s, :].ravel()                      # warm start
             p_new, info = gmres(
                 A, -b, x0=p0,
-                rtol=self.pressure_tol,
-                atol=self.pressure_tol,    # absolute floor — survives tiny ‖b‖
+                rtol=c_elliptic_tol,
+                atol=c_elliptic_tol,       # absolute floor — survives tiny ‖b‖
                 maxiter=self.pressure_maxit,
+                restart=c_elliptic_restart,
             )
 
         # Elliptic-stage residual contract (REQ-173 / jax's binding
@@ -1217,11 +1259,22 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
         # One extra matvec; pure function of p_new, so state is unchanged.
         rel_resid = float(np.linalg.norm(-b - apply_A(p_new)) / b_norm)
         self.last_elliptic_rel_resid = rel_resid
-        if info != 0 or rel_resid > max(1e-6, 10.0 * self.pressure_tol):
+        if info != 0 or rel_resid > max(1e-6, 10.0 * c_elliptic_tol):
+            # Name the RESTART, not just the iteration count: ``maxiter``
+            # counts restarts of a size-``restart`` space, so "raise maxiter"
+            # is the wrong advice and was measured to change nothing.  The
+            # budget actually spent is ``restart * maxiter`` matvecs.
             logger.warning(
                 "Chorin pressure elliptic stage did not fully converge "
-                "(info=%s, rel_resid=%.3e, ‖b‖=%.3e)",
-                info, rel_resid, b_norm,
+                "(info=%s, rel_resid=%.3e, ‖b‖=%.3e, tol=%.3e; "
+                "restart=%d x maxiter=%d ~ %d matvecs on a block of N=%d).  "
+                "This solve is UNPRECONDITIONED and its condition number is "
+                "O(1/h^2): raising pressure_maxit does not help, raising "
+                "pressure_restart does.  restart provenance: %s",
+                info, rel_resid, b_norm, c_elliptic_tol,
+                c_elliptic_restart, self.pressure_maxit,
+                c_elliptic_restart * self.pressure_maxit, N,
+                ell.provenance["c_elliptic_restart"],
             )
         Q[e2s, :] = p_new.reshape(nP, nc)
         self._sim_Q = Q
