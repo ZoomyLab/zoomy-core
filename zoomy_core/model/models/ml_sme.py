@@ -36,6 +36,7 @@ from zoomy_core.model.derivation.closure import GaussQuadrature
 from zoomy_core.model.derivation.projection import Integrate
 from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
 from zoomy_core.model.operations import Multiply, ProductRule, KinematicBC
+from zoomy_core.model.models.walls import register_free_slip_wall
 from zoomy_core.systemmodel import SystemModel
 
 t, x, y, z = C.t, C.x, C.y, C.z
@@ -410,6 +411,15 @@ class MLSME(BaseModel):
                 for k in range(levels[ell - 1] + 1):
                     proj[q_mod[ell][xd][k]] = rows[k]
         m.project_rows = proj
+
+        # model-derived free-slip wall (the SAME geometric statement as SME:
+        # reflect only the NORMAL component of each layer/mode momentum
+        # vector).  ML-SME had NO wall registration at all before — a
+        # ``FromModel(definition="wall")`` on an ML-SME simply raised.
+        register_free_slip_wall(
+            m, ([q_mod[ell][xd][k] for xd in horiz]
+                for ell in range(1, N + 1)
+                for k in range(levels[ell - 1] + 1)))
 
         m.bed = b
         m.ht = ht

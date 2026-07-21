@@ -549,6 +549,14 @@ class FromModel(BoundaryCondition):
                 f"register_group('boundary:{self.definition}', index, expr).")
         self.prescribe_fields = dict(specs[self.definition])
         self._state_syms = list(sm.state)
+        # A model-derived boundary is a GEOMETRIC statement: a wall reflects
+        # the NORMAL component and leaves the tangential one alone, so the
+        # registered expression carries the face-normal symbols ``n_d`` just
+        # like every normal-projected operator.  Capture them here exactly as
+        # ``Characteristic.resolve`` does; without this substitution the n_d
+        # survive as free symbols and the only registration that can be
+        # written is a normal-BLIND full reversal.
+        self._normal_syms = list(sm.normal.values()) if sm.normal else []
         return self
 
     def compute_boundary_condition(self, time, X, dX, Q, Qaux, parameters, normal):
@@ -558,10 +566,13 @@ class FromModel(BoundaryCondition):
                 f"FromModel(tag={self.tag!r}, definition={self.definition!r}) "
                 "is unresolved — attach it via "
                 "SystemModel.attach_boundary_conditions (or call .resolve(sm)).")
+        Qv = ZArray(Q)
         Qout = ZArray(Q)
-        smap = {s: Qout[i] for i, s in enumerate(self._state_syms)}
+        smap = {s: Qv[i] for i, s in enumerate(self._state_syms)}
+        for i, ns in enumerate(getattr(self, "_normal_syms", None) or []):
+            smap[ns] = normal[i]
         for k, expr in self.prescribe_fields.items():
-            Qout[k] = sympy.sympify(expr).subs(smap)
+            Qout[k] = sympy.sympify(expr).xreplace(smap)
         return Qout
 
 

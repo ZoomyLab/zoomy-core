@@ -36,6 +36,7 @@ from zoomy_core.model.derivation.projection import Integrate          # abstract
 from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
 from zoomy_core.model.operations import Multiply, ProductRule, KinematicBC
 from zoomy_core.model.operations import Integrate as IntegrateZ       # vertical (pressure) integral
+from zoomy_core.model.models.walls import register_free_slip_wall
 from zoomy_core.systemmodel import SystemModel
 
 t, x, y, z = C.t, C.x, C.y, C.z
@@ -317,11 +318,12 @@ class SME(BaseModel):
         interp[5] = rho * g * h * (1 - zeta)
         m.interpolate_rows = interp
 
-        # 11 — model-derived lateral wall BC: mirror u(ζ) → −u(ζ) flips EVERY
-        # moment of EVERY direction; h, b extrapolate.
-        for qh in q_heads:
-            for i in range(Nu + 1):
-                m.register_group("boundary:wall", qh(i, t, *horiz), -qh(i, t, *horiz))
+        # 11 — model-derived free-slip wall: each MOMENT is a horizontal
+        # VECTOR (one component per direction), so the ghost reflects only the
+        # NORMAL part, q_i → q_i − 2 n (n·q_i), and keeps the tangential part.
+        # h, b (and any scalar field) extrapolate.  See ``models/walls.py``.
+        register_free_slip_wall(
+            m, ([qh(i, t, *horiz) for qh in q_heads] for i in range(Nu + 1)))
 
         # 12 — WB reconstruction: limit η = b+h and the modal velocities q_d/h.
         m.reconstruction_rows = {h: b + h}

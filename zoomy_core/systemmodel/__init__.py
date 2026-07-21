@@ -4,6 +4,7 @@ via :meth:`SystemModel.from_model`."""
 from zoomy_core.systemmodel.system_model import (
     SystemModel,
     register_function_slot,
+    face_normal_symbols,
 )
 from zoomy_core.systemmodel.operations import (
     OPERATOR_SLOTS,
@@ -19,6 +20,7 @@ from zoomy_core.systemmodel.operations import (
 __all__ = [
     "SystemModel",
     "register_function_slot",
+    "face_normal_symbols",
     "OPERATOR_SLOTS",
     "map_operator_slots",
     "normalize_face_normal",

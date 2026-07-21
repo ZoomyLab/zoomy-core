@@ -59,6 +59,17 @@ from zoomy_core.misc.misc import Zstruct, ZArray
 # it when a split sub-system baked ``dt`` in as a model PARAMETER (the dt symbol
 # would then be a duplicate lambdify argument) — a lowering-SYNTAX constraint,
 # not a signature difference (handled in ``NumpyRuntimeModel``).
+def face_normal_symbols(n_dim):
+    """The canonical outward face-normal symbols ``n0 … n_{n_dim-1}``.
+
+    ONE definition of the name/ordering convention, shared by the
+    ``SystemModel.normal`` Zstruct and by every DERIVATION that needs to write
+    a geometric (normal-aware) relation — e.g. a model-registered free-slip
+    wall, which reflects only the normal component of the momentum vector.
+    """
+    return [sp.Symbol(f"n{d}", real=True) for d in range(int(n_dim))]
+
+
 _V, _A, _P, _N, _T, _DT, _X = (
     "variables", "aux_variables", "parameters",
     "normal", "time", "dt", "position")
@@ -739,8 +750,7 @@ class SystemModel:
             self.equation_to_state_index = list(range(self.n_equations))
         if self.normal is None:
             self.normal = Zstruct(
-                **{f"n{d}": sp.Symbol(f"n{d}", real=True)
-                   for d in range(self.n_dim)}
+                **{str(n): n for n in face_normal_symbols(self.n_dim)}
             )
             self.normal._symbolic_name = "n"
         if self.parameter_values is None:
@@ -1314,8 +1324,8 @@ class SystemModel:
         # One normal component per horizontal direction — ``space`` length is
         # ``n_dim`` (1 for the usual SME, 2 for the dimension-agnostic
         # ``dimension=3`` map-view model).
-        normal = Zstruct(**{f"n{d}": sp.Symbol(f"n{d}", real=True)
-                            for d in range(len(ops["space"]))})
+        normal = Zstruct(**{str(n): n for n in
+                            face_normal_symbols(len(ops["space"]))})
         normal._symbolic_name = "n"
         sm = cls(
             aux_state=ops["aux_state"],
@@ -3421,6 +3431,7 @@ class InvertMassMatrix:
 
 
 __all__ = [
+    "face_normal_symbols",
     "SystemModel",
     "SystemModelRow",
     "SystemModelDescription",

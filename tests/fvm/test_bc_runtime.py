@@ -248,17 +248,22 @@ def test_periodic_idempotent_and_wrap(one_hyperbolic_step):
 @pytest.mark.gate
 def test_wall_mass_twin(one_hyperbolic_step):
     """The wall is DEFINED in the derivation (register_group('boundary:wall'))
-    and accessed via FromModel: the ghost is the exact mirror state (every
-    moment flips, b/h extrapolate), so a closed-box dam break conserves mass to
-    1e-10 after a real step."""
+    and accessed via FromModel: the ghost REFLECTS the momentum vector about
+    the face, ``q -> q - 2 n (n.q)`` — in 1-D (n0 = +/-1) that is the mirror
+    state ``-q`` for every moment, with b/h extrapolating; so a closed-box dam
+    break conserves mass to 1e-10 after a real step.  Asserted on the ghost
+    with the face normal SUBSTITUTED (the physics), not on the un-evaluated
+    n0-carrying expression tree."""
     sm = SystemModel.from_model(SME(
         closures=[Newtonian(), NavierSlip(), StressFree()], level=2))
     bc = FromModel(tag="left", definition="wall").resolve(sm)
-    ghost = bc.compute_boundary_condition(
-        sm.time, sm.position, None, sm.variables,
-        sm.aux_variables, sm.parameters, sm.normal)
     b, h, q0, q1, q2 = sm.state
-    assert list(ghost) == [b, h, -q0, -q1, -q2]
+    for n0 in (1, -1):                       # both outward orientations
+        ghost = bc.compute_boundary_condition(
+            sm.time, sm.position, None, sm.variables,
+            sm.aux_variables, sm.parameters, [n0])
+        assert [sp.expand(g) for g in ghost] == [b, h, -q0, -q1, -q2], (
+            f"1-D wall ghost wrong for n0={n0}: {list(ghost)}")
 
     # closed-box 1-step mass twin
     nc, hL, hR = 50, 2.0, 1.0
@@ -282,6 +287,68 @@ def test_wall_mass_twin(one_hyperbolic_step):
     assert np.all(np.isfinite(h_row)) and h_row.min() > 0.0
     mass0 = (hL + hR) / 2 * 2.0
     assert abs(h_row.sum() * (2.0 / nc) - mass0) < 1e-10 * mass0, "wall leaks mass"
+
+
+@pytest.mark.small
+@pytest.mark.gate
+def test_wall_is_normal_aware_2d():
+    """The model-registered wall is a FREE-SLIP wall in 2-D: it reflects only
+    the NORMAL component of every momentum moment and leaves the TANGENTIAL
+    one untouched.
+
+    Before the FromModel normal substitution the registered wall was a
+    normal-BLIND full reversal (q_d -> -q_d in EVERY direction), which
+    destroyed the tangential momentum of any flow running along the wall
+    (measured: 94% of q_t lost over 0.5 s).  Asserted EXACTLY (= 0), on the
+    ghost, for an axis-aligned AND an oblique face — the oblique face is the
+    one a per-direction ``wall_x``/``wall_y`` spec could never represent.
+    """
+    from zoomy_core.model.models.swe import SWE
+    from zoomy_core.model.models.ml_sme import MLSME
+
+    for build in (lambda **k: SWE(dimension=2, **k),
+                  lambda **k: SME(level=0, dimension=3, **k),
+                  lambda **k: SME(level=1, dimension=3, **k),
+                  lambda **k: MLSME(n_layers=2, level=0, dimension=3, **k)):
+        sm = SystemModel.from_model(build())
+        bc = FromModel(tag="left", definition="wall").resolve(sm)
+        names = [str(s) for s in sm.state]
+        xi = [i for i, s in enumerate(names) if s == "hu" or "_x" in s]
+        yi = [i for i, s in enumerate(names) if s == "hv" or "_y" in s]
+        assert xi and len(xi) == len(yi), names
+        p = np.zeros(len(list(sm.parameters)))
+        X = np.zeros(3)
+
+        def ghost(Q, n):
+            return np.array([float(v) for v in bc.compute_boundary_condition(
+                0.0, X, X, np.asarray(Q, float), np.zeros(1), p, np.asarray(n))])
+
+        # (a) axis-aligned wall n=(1,0), flow purely tangential (+y)
+        Q = np.zeros(len(names)); Q[1] = 2.0
+        for i in yi:
+            Q[i] = 1.0
+        g = ghost(Q, [1.0, 0.0])
+        assert max(abs(g[i] - Q[i]) for i in yi) == 0.0, \
+            f"{names}: wall destroyed the TANGENTIAL momentum -> {g}"
+        assert max(abs(g[i] + Q[i]) for i in xi) == 0.0, \
+            f"{names}: wall did not reflect the NORMAL momentum -> {g}"
+        assert g[1] == Q[1], f"{names}: h must extrapolate at a wall -> {g}"
+
+        # (b) oblique wall n=(1,1)/sqrt2, flow tangential to it: ghost == inner
+        r = np.sqrt(0.5)
+        Qo = np.zeros(len(names)); Qo[1] = 2.0
+        for i in xi:
+            Qo[i] = r
+        for i in yi:
+            Qo[i] = -r
+        assert np.abs(ghost(Qo, [r, r]) - Qo).max() == 0.0, \
+            f"{names}: oblique free-slip wall is not transparent to tangential flow"
+
+        # (c) lake at rest against the wall: h through, q stays zero
+        Qr = np.zeros(len(names)); Qr[1] = 2.0
+        gr = ghost(Qr, [0.0, 1.0])
+        assert gr[1] == Qr[1] and np.abs(gr[2:]).max() == 0.0, \
+            f"{names}: lake at rest is not preserved at a wall -> {gr}"
 
 
 # ── Chorin elliptic/predictor BC consumption (REQ-174 / 174c) ───────────────

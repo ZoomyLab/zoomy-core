@@ -15,10 +15,12 @@ exactly.  Both ride the standard function-group slots
 
 Boundary definitions (``FromModel(tag=…, definition=…)``):
 
-- ``wall_x`` / ``wall_y``: mirror of the x- / y-momentum (a wall mirror
-  flips the NORMAL momentum; the direction is encoded in the name since
-  a state-component spec cannot see the face normal),
-- ``wall``: alias of ``wall_x`` (the 1D convention),
+- ``wall``: free-slip wall — reflects ONLY the normal component of the
+  momentum vector, ``q → q − 2 n (n·q)``, and leaves the tangential
+  component untouched.  Written in the face-normal symbols ``n_d``, which
+  ``FromModel`` substitutes per face, so ONE definition serves every wall
+  orientation (there are no direction-specific ``wall_x``/``wall_y``
+  variants any more — they were the workaround for the missing normal),
 - ``inflow``: prescribed depth/discharge via the model parameters
   ``h_in`` / ``q_in`` (transverse momentum zero, bed extrapolates).
 """
@@ -31,7 +33,8 @@ from zoomy_core.misc.misc import ZArray
 from zoomy_core.model.basemodel import merge_parameter_overrides
 from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
 from zoomy_core.model.derivative_workflow import StructuredDerivativeModel
-from zoomy_core.systemmodel.system_model import SystemModel
+from zoomy_core.systemmodel.system_model import (
+    SystemModel, face_normal_symbols)
 
 __all__ = ["SWE"]
 
@@ -226,12 +229,19 @@ class SWE(StructuredDerivativeModel):
                        norm=lambda _k: P3h)[0]}
         # WB primitive map: limit η = b+h and the velocities
         recon = {h: b + h, hu: hu / h}
+        # free-slip wall: reflect the momentum VECTOR about the face,
+        # q_ghost = q - 2 n (n·q).  In 1-D n0 = ±1 ⇒ the familiar -hu; in 2-D
+        # the tangential component is preserved exactly (a normal-blind
+        # -hu/-hv would destroy it).  ``FromModel`` binds n_d per face.
+        nrm = face_normal_symbols(self.dimension)
+        qvec = [hu] + ([self.Q.hv] if self.dimension == 2 else [])
+        qn = sum(nd * qd for nd, qd in zip(nrm, qvec))
+        wall = {qd: qd - 2 * nd * qn for nd, qd in zip(nrm, qvec)}
         groups = {
             "interpolate": interp,
             "project": project,
             "reconstruction": recon,
-            "boundary:wall":   {hu: -hu},
-            "boundary:wall_x": {hu: -hu},
+            "boundary:wall":   wall,
             "boundary:inflow": {h: p.h_in, hu: p.q_in},
         }
         if self.dimension == 2:
@@ -242,7 +252,6 @@ class SWE(StructuredDerivativeModel):
                 nodes, weights, [P3v(nd) for nd in nodes],
                 norm=lambda _k: P3h)[0]
             recon[hv] = hv / h
-            groups["boundary:wall_y"] = {hv: -hv}
             groups["boundary:inflow"][hv] = sp.S.Zero
         return groups
 

@@ -25,10 +25,8 @@ pytestmark = [pytest.mark.solver]
 def _make_solver(positivity, nx=8, cfl=0.45, t_end=0.1, ic="slab", H=1.0):
     """Closed-box (wall) 2-D SWE dry dam break, order-2, given positivity."""
     sm = SystemModel.from_model(SWE(dimension=2, boundary_conditions=BoundaryConditions(
-        [FromModel(tag="left", definition="wall_x"),
-         FromModel(tag="right", definition="wall_x"),
-         FromModel(tag="bottom", definition="wall_y"),
-         FromModel(tag="top", definition="wall_y")])))
+        [FromModel(tag=t, definition="wall")
+         for t in ("left", "right", "bottom", "top")])))
     n_state = len(sm.state)              # [b, h, hu, hv]
 
     def _ic(x):
