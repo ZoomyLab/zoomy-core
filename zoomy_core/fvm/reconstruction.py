@@ -534,9 +534,11 @@ class LSQMUSCLReconstruction:
         u : ndarray, shape (n_cells,)
             Inner-cell field values.
         u_bf : ndarray, shape (n_boundary_faces,), optional
-            Boundary-face values from the BC kernel.  When the mesh
-            has boundary-face neighbours and ``u_bf`` is ``None``,
-            extrapolation is used (face value = inner-cell value).
+            GHOST values from the BC kernel (the kernel applied to the
+            inner cell state).  NOT face values — see the note in the
+            body.  When the mesh has boundary-face neighbours and
+            ``u_bf`` is ``None``, extrapolation is used (ghost = inner
+            cell).
 
         Returns (dim, nc).
         """
@@ -562,13 +564,31 @@ class LSQMUSCLReconstruction:
                           else np.full_like(bf, u_i, dtype=float))
                 # The virtual boundary neighbour sits at the GHOST-CELL
                 # offset ``2·(face - cell)`` (see
-                # ``least_squares_reconstruction_local``), so its delta
-                # is the ghost delta ``u_ghost - u_cell = 2·(u_face -
-                # u_cell)``.  Using the bare face delta caps the
-                # boundary gradient at 1st order for a linear field.
-                # For extrapolation (``u_bf is None``) ``u_bf_i = u_i``,
-                # so this stays 0 — the Neumann-zero ghost = inner cell.
-                u_bf_delta = np.where(bf >= 0, 2.0 * (u_bf_i - u_i), 0.0)
+                # ``least_squares_reconstruction_local``), so the value
+                # carried there must be the GHOST value — and that is
+                # exactly what ``u_bf`` is on this path: the FVM flux
+                # operator fills ``bf_values`` by applying the BC kernel
+                # to the INNER CELL state, and every kernel returns a
+                # ghost state (Wall/CharacteristicWall return the mirror
+                # ``q → −q``; FromData returns ``2·u_face − u_cell``;
+                # Extrapolation returns the inner cell).  The delta is
+                # therefore the bare ``u_ghost − u_cell``.
+                #
+                # Lifting it a SECOND time by ``2·(u_bf − u_i)`` — the
+                # "ghost = 2·face − cell" lift, correct only for FACE
+                # values — put ``−3·q_0`` at the ghost instead of the
+                # true mirror ``−q_0``, freezing the wall-normal
+                # momentum slope at a 7/6 error that did not converge
+                # (rate 0.00 at N=20..320).  ``zoomy_jax`` (mesh.py:113)
+                # already consumes ghost values undoubled; this is the
+                # numpy path catching up with the shared convention.
+                #
+                # NOTE: ``lsq_reconstruction._resolve_u_boundary_face``
+                # is a DIFFERENT entry point whose documented contract
+                # is FACE values, so it keeps its ``2·u_face − u_cell``
+                # lift.  For extrapolation (``u_bf is None``)
+                # ``u_bf_i = u_i``, so this stays 0 either way.
+                u_bf_delta = np.where(bf >= 0, u_bf_i - u_i, 0.0)
                 delta_u = np.concatenate([u_cells, u_bf_delta])
             else:
                 delta_u = u_cells
@@ -765,9 +785,10 @@ class LSQMUSCLReconstruction:
         linear stencil, hence smooth (C∞) in ``Q``.
 
         ``bf_face_values`` (n_vars, n_boundary_faces) come from the
-        BC kernel and are threaded into the LSQ stencil whenever the
-        mesh carries boundary-face neighbours.  Without it the LSQ
-        falls back to inner-cell extrapolation."""
+        BC kernel applied to the INNER CELL state, i.e. they are GHOST
+        states (see ``_lsq_gradient``), and are threaded into the LSQ
+        stencil whenever the mesh carries boundary-face neighbours.
+        Without it the LSQ falls back to inner-cell extrapolation."""
         grads = np.zeros((n_vars, self.dim, self._nc))
         for v in range(n_vars):
             u_bf = (bf_face_values[v] if bf_face_values is not None

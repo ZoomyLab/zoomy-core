@@ -134,9 +134,15 @@ def least_squares_reconstruction_local(
     cell-centered derivative is boundary-aware.  This is the
     ghost-cell-free analogue of "apply boundary_operator then take
     the gradient": the boundary face is a first-class entity in the
-    mesh, sampled at distance ``|face_center − cell_center|`` (= dx/2
-    in 1D, vs. dx for the legacy ghost-cell convention), so the
-    boundary-face stencil is also tighter and more accurate.
+    mesh.
+
+    The virtual sampling POSITION is the GHOST-CELL offset
+    ``2·(face_center − cell_center)`` (= dx in 1-D) — see the ``dX``
+    assembly below — so the VALUE carried there must be a GHOST value.
+    (An earlier revision of this docstring claimed the sample sat at
+    ``|face_center − cell_center|`` = dx/2; the code has always used
+    2·, and a caller trusting the dx/2 claim placed a face value at a
+    ghost position.)
 
     Stencil selection
     -----------------
