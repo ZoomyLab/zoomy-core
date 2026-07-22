@@ -433,15 +433,23 @@ def kp_hinv(h, eps):
         sm.apply(regularize_pow(h, "hinv"))
 
     Works symbolically (``h`` a sympy expression) or numerically (``h`` a
-    numpy/jax array).  The numerator uses ``Max(h, 0)`` so a transient negative-h
-    cell cannot flip ``hinv`` negative (which would wrong-sign ``u = q·hinv`` and
-    the wet/dry-front wavespeeds).
+    numpy/jax array).
+
+    THE NUMERATOR IS BARE ``h`` — no ``Max(h, 0)`` (user ruling, 2026-07-22).
+    It used to carry that clamp so a transient negative-h cell could not flip
+    ``hinv`` negative and wrong-sign ``u = q·hinv``.  That treats a symptom: the
+    scheme is required to be positive BY CONSTRUCTION, and "by construction"
+    excludes clamping and excludes reshaping denominators.  A cell reaching
+    h < 0 means the scheme is not positivity-preserving, and THAT is the bug —
+    so ``hinv`` now goes negative and the failure is loud instead of masked.
+    Only KP's DENOMINATOR scale ``Max(h, eps)`` remains: the single sanctioned
+    exception, whose numerator still vanishes at h = 0.
     """
     if isinstance(h, sp.Basic) or isinstance(eps, sp.Basic):
         Max, sqrt = sp.Max, sp.sqrt
     else:
         Max, sqrt = max, (lambda x: x ** 0.5)
-    return sqrt(2) * Max(h, 0) / sqrt(h ** 4 + Max(h, eps) ** 4)
+    return sqrt(2) * h / sqrt(h ** 4 + Max(h, eps) ** 4)
 
 
 # ── PHYSICAL operator slots a 1/h→hinv substitution must sweep ─────────────

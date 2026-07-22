@@ -1974,7 +1974,15 @@ class SystemModel:
         # ── Function entries first (so derivative entries can ─────
         # reference them by row in the registry). ──────────────────
         for name, atoms in function_atoms.items():
-            sym = sp.Symbol(name, real=True)
+            # Mints from a real field HEAD, so it inherits the declared
+            # assumptions — it has to agree with what ``system_extract`` minted
+            # for the same field, or the two compare unequal while printing
+            # identically.
+            from zoomy_core.model.derivation.system_extract import (
+                head_assumptions)
+            _probe = next(iter(atoms), None)
+            sym = sp.Symbol(name, **(head_assumptions(_probe)
+                                     if _probe is not None else {"real": True}))
             for a in atoms:
                 sub_dict[a] = sym
             row = n_aux_before + len(new_syms)
@@ -2182,7 +2190,11 @@ class SystemModel:
         for a in atoms:
             name = a.func.__name__
             if name not in name_to_sym:
-                name_to_sym[name] = sp.Symbol(name, real=True)
+                # from a field HEAD → inherit its declared assumptions, so this
+                # agrees with the symbol ``system_extract`` minted for it.
+                from zoomy_core.model.derivation.system_extract import (
+                    head_assumptions)
+                name_to_sym[name] = sp.Symbol(name, **head_assumptions(a))
             sub_dict[a] = name_to_sym[name]
             aux_function_map[name_to_sym[name]] = a
 

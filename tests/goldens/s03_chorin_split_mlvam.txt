@@ -131,7 +131,7 @@ update_aux_variables[7,0] = Symbol('dq_10dx')
 update_aux_variables[8,0] = Symbol('dq_20dx')
 update_aux_variables[9,0] = Symbol('dhdx')
 update_aux_variables[10,0] = Symbol('0_x')
-update_aux_variables[11,0] = Mul(Pow(Integer(2), Rational(1, 2)), Pow(Add(Pow(Symbol('h'), Integer(4)), Pow(Max(Float('1.0e-8', precision=53), Symbol('h')), Integer(4))), Rational(-1, 2)), Max(Integer(0), Symbol('h')))
+update_aux_variables[11,0] = Mul(Pow(Integer(2), Rational(1, 2)), Symbol('h'), Pow(Add(Pow(Symbol('h'), Integer(4)), Pow(Max(Float('1.0e-8', precision=53), Symbol('h')), Integer(4))), Rational(-1, 2)))
 reconstruction_variables: None
 state_from_reconstruction: None
 interpolate_to_3d: None

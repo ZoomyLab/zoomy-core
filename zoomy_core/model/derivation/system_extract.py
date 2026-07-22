@@ -100,15 +100,58 @@ def _field_name(field):
     return getattr(head, "__name__", str(head))
 
 
+#: Sign predicates a model author can DECLARE on a Function head, strongest
+#: first.  Exactly ONE is re-asserted on the extracted Symbol and sympy derives
+#: the rest of the closure — asserting the derived predicates too (nonzero,
+#: negative=False, …) over-specifies the symbol and sympy rejects it.
+_SIGN_PREDICATES = ("zero", "positive", "negative",
+                    "nonnegative", "nonpositive", "nonzero")
+
+
+def head_assumptions(field) -> dict:
+    """The assumption closure DECLARED on a field's Function head.
+
+    Models state physical facts on the head — ``h = sp.Function("h",
+    positive=True)(t, *horiz)`` in models/sme.py — and that statement has to
+    survive into the SystemModel, because the SystemModel is where the ANALYTIC
+    quantities are computed and the CAS needs the constraint to do its job:
+    with ``h > 0`` sympy collapses ``sqrt(h**5)/h**2`` to ``sqrt(h)``; without
+    it the identity is FALSE (it fails for negative h), so no amount of
+    ``simplify`` can reach it.
+
+    Hard-coding ``real=True`` here dropped positivity one layer too early and
+    froze the SME spectrum as ``sqrt(g)*n0*sqrt(h**5)/h**2``.  The tell:
+    PARAMETERS never had the problem (``g`` keeps ``positive=True``), which is
+    why ``sqrt(g*h**5)`` half-factored — g escaped the radical, h could not.
+
+    Only DECLARED fields inherit.  Derived aux (``h_x``, ``q_0_x__lsq``) is
+    minted from a *generated* name, not from a head, and must NOT inherit: the
+    gradient of a positive quantity is not positive.
+
+    Assumptions are dropped again at the SystemModel → NumericalSystemModel
+    boundary, where the numerical guards live."""
+    head = field.func if hasattr(field, "func") else field
+    out = {"real": True}                  # every state field is real-valued
+    for k in _SIGN_PREDICATES:
+        if getattr(head, f"is_{k}", None) is True:
+            out[k] = True
+            break
+    return out
+
+
 def _state_symbol(field):
     """The state/aux Symbol for a modal field — ``q(0, t, x) → q_0``,
     ``h(t, x) → h``, ``aw(2, t, x) → aw_2``.  The leading integer mode index
-    (if any) becomes a ``_k`` suffix; bare scalar fields keep their name."""
+    (if any) becomes a ``_k`` suffix; bare scalar fields keep their name.
+
+    Carries the head's DECLARED assumptions through — see
+    :func:`head_assumptions`."""
     name = _field_name(field)
     args = getattr(field, "args", ())
+    assumptions = head_assumptions(field)
     if args and getattr(args[0], "is_Integer", False):
-        return sp.Symbol(f"{name}_{int(args[0])}", real=True)
-    return sp.Symbol(name, real=True)
+        return sp.Symbol(f"{name}_{int(args[0])}", **assumptions)
+    return sp.Symbol(name, **assumptions)
 
 
 def _collect_fields(expr, param_names):

@@ -9,7 +9,7 @@ aux_state: [Symbol('dq_x0dx'), Symbol('dhdx'), Symbol('dq_y0dy'), Symbol('dhdy')
 parameters: [g, rho, nu, lambda_s, e_x, n]
 symbol_assumptions:
   b : {complex, extended_real, finite, hermitian, real}
-  h : {complex, extended_real, finite, hermitian, real}
+  h : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
   q_x_0 : {complex, extended_real, finite, hermitian, real}
   q_y_0 : {complex, extended_real, finite, hermitian, real}
   dq_x0dx : {complex, extended_real, finite, hermitian, real}
@@ -53,8 +53,8 @@ source[3,0] = Mul(Integer(-1), Symbol('g'), Pow(Symbol('h'), Rational(-4, 3)), P
 source_explicit: None
 eigenvalues: shape=(4, 1)
 eigenvalues[1,0] = Mul(Pow(Symbol('h'), Integer(-1)), Add(Mul(Symbol('n0'), Symbol('q_x_0')), Mul(Symbol('n1'), Symbol('q_y_0'))))
-eigenvalues[2,0] = Mul(Pow(Symbol('h'), Integer(-2)), Add(Mul(Pow(Symbol('g'), Rational(1, 2)), Pow(Add(Pow(Symbol('n0'), Integer(2)), Pow(Symbol('n1'), Integer(2))), Rational(1, 2)), Pow(Pow(Symbol('h'), Integer(5)), Rational(1, 2))), Mul(Symbol('h'), Symbol('n0'), Symbol('q_x_0')), Mul(Symbol('h'), Symbol('n1'), Symbol('q_y_0'))))
-eigenvalues[3,0] = Mul(Pow(Symbol('h'), Integer(-2)), Add(Mul(Integer(-1), Pow(Symbol('g'), Rational(1, 2)), Pow(Add(Pow(Symbol('n0'), Integer(2)), Pow(Symbol('n1'), Integer(2))), Rational(1, 2)), Pow(Pow(Symbol('h'), Integer(5)), Rational(1, 2))), Mul(Symbol('h'), Symbol('n0'), Symbol('q_x_0')), Mul(Symbol('h'), Symbol('n1'), Symbol('q_y_0'))))
+eigenvalues[2,0] = Mul(Pow(Symbol('h'), Integer(-1)), Add(Mul(Integer(-1), Pow(Symbol('g'), Rational(1, 2)), Pow(Symbol('h'), Rational(3, 2)), Pow(Add(Pow(Symbol('n0'), Integer(2)), Pow(Symbol('n1'), Integer(2))), Rational(1, 2))), Mul(Symbol('n0'), Symbol('q_x_0')), Mul(Symbol('n1'), Symbol('q_y_0'))))
+eigenvalues[3,0] = Mul(Pow(Symbol('h'), Integer(-1)), Add(Mul(Pow(Symbol('g'), Rational(1, 2)), Pow(Symbol('h'), Rational(3, 2)), Pow(Add(Pow(Symbol('n0'), Integer(2)), Pow(Symbol('n1'), Integer(2))), Rational(1, 2))), Mul(Symbol('n0'), Symbol('q_x_0')), Mul(Symbol('n1'), Symbol('q_y_0'))))
 update_variables: None
 update_aux_variables: None
 reconstruction_variables: shape=(4,)

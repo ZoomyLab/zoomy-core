@@ -9,7 +9,7 @@ aux_state: [Symbol('b_x'), Symbol('h_x'), Symbol('q_0_x'), Symbol('q_1_x'), Symb
 parameters: [g, rho, nu, lambda_s, e_x]
 symbol_assumptions:
   b : {complex, extended_real, finite, hermitian, real}
-  h : {complex, extended_real, finite, hermitian, real}
+  h : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
   q_0 : {complex, extended_real, finite, hermitian, real}
   q_1 : {complex, extended_real, finite, hermitian, real}
   b_x : {complex, extended_real, finite, hermitian, real}
@@ -57,8 +57,8 @@ source[3,0] = Add(Mul(Integer(4), Symbol('h_x'), Symbol('nu*q_1/h_x')), Mul(Inte
 source_explicit: None
 eigenvalues: shape=(4, 1)
 eigenvalues[1,0] = Mul(Pow(Symbol('h'), Integer(-1)), Symbol('n0'), Symbol('q_0'))
-eigenvalues[2,0] = Mul(Pow(Symbol('h'), Integer(-1)), Add(Mul(Symbol('n0'), Symbol('q_0')), Mul(Symbol('n0'), Pow(Add(Mul(Symbol('g'), Pow(Symbol('h'), Integer(3))), Pow(Symbol('q_1'), Integer(2))), Rational(1, 2)))))
-eigenvalues[3,0] = Mul(Pow(Symbol('h'), Integer(-1)), Add(Mul(Symbol('n0'), Symbol('q_0')), Mul(Integer(-1), Symbol('n0'), Pow(Add(Mul(Symbol('g'), Pow(Symbol('h'), Integer(3))), Pow(Symbol('q_1'), Integer(2))), Rational(1, 2)))))
+eigenvalues[2,0] = Mul(Pow(Symbol('h'), Integer(-1)), Add(Mul(Symbol('n0'), Symbol('q_0')), Mul(Integer(-1), Symbol('n0'), Pow(Add(Mul(Symbol('g'), Pow(Symbol('h'), Integer(3))), Pow(Symbol('q_1'), Integer(2))), Rational(1, 2)))))
+eigenvalues[3,0] = Mul(Pow(Symbol('h'), Integer(-1)), Add(Mul(Symbol('n0'), Symbol('q_0')), Mul(Symbol('n0'), Pow(Add(Mul(Symbol('g'), Pow(Symbol('h'), Integer(3))), Pow(Symbol('q_1'), Integer(2))), Rational(1, 2)))))
 update_variables: None
 update_aux_variables: None
 reconstruction_variables: shape=(4,)

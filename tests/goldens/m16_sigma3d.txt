@@ -9,7 +9,7 @@ aux_state: [Symbol('U'), Symbol('\\tilde{tau_xx}'), Symbol('omega'), Symbol('\\t
 parameters: [g, rho, nu, lambda_s, e_x]
 symbol_assumptions:
   b : {complex, extended_real, finite, hermitian, real}
-  h : {complex, extended_real, finite, hermitian, real}
+  h : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
   mom : {complex, extended_real, finite, hermitian, real}
   U : {complex, extended_real, finite, hermitian, real}
   \tilde{tau_xx} : {complex, extended_real, finite, hermitian, real}

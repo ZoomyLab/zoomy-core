@@ -9,7 +9,7 @@ aux_state: [Symbol('\\hat{\\sigma}_1'), Symbol('\\hat{\\sigma}_2'), Symbol('b_x'
 parameters: [g, rho, nu, lambda_s]
 symbol_assumptions:
   b : {complex, extended_real, finite, hermitian, real}
-  h : {complex, extended_real, finite, hermitian, real}
+  h : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
   q_0 : {complex, extended_real, finite, hermitian, real}
   q_1 : {complex, extended_real, finite, hermitian, real}
   r_0 : {complex, extended_real, finite, hermitian, real}

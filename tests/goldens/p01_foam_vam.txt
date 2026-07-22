@@ -371,7 +371,7 @@ inline Foam::List<Foam::scalar> interpolate_to_3d_at(
     const Foam::List<Foam::scalar>& p,
     const Foam::scalar& z)
 {
-    Foam::scalar t0 = (1.0 / Foam::pow(Q[1], 1));
+    Foam::scalar t0 = (1.0 / Foam::pow(h, 1));
     Foam::scalar t1 = Q[2]*t0;
     Foam::scalar t2 = Q[3]*t0;
     Foam::scalar t3 = Qaux[2]*t1;
@@ -382,11 +382,11 @@ inline Foam::List<Foam::scalar> interpolate_to_3d_at(
     Foam::scalar t8 = 6*Foam::pow(z, 2);
     auto res = Foam::List<Foam::scalar>(6, 0.0);
     res[0] = Q[0];
-    res[1] = Q[1];
+    res[1] = h;
     res[2] = t1 + 2*t2*z - t2;
     res[3] = 0;
     res[4] = -t3*t5 + t3*t8 + t3 + t4*t5 - t4*t8 - t4 + t5*t6 - t6*t8 + t7*t8 - 4*t7*z;
-    res[5] = -Q[6]*t8 + 6*Q[6]*z - Q[7]*t8 + 8*Q[7]*z - 2*Q[7] - p[0]*Q[1]*p[1]*z + p[0]*Q[1]*p[1];
+    res[5] = -Q[6]*t8 + 6*Q[6]*z - Q[7]*t8 + 8*Q[7]*z - 2*Q[7] - p[0]*h*p[1]*z + p[0]*h*p[1];
     return res;
 }
 
@@ -487,8 +487,8 @@ inline void update_aux_variables(
     numerics::compute_derivative(*Qaux[1], *Q[3], 1, 0, 0, mesh);
     // Qaux[2] (dbdx) = D^(1,) Q[0]
     numerics::compute_derivative(*Qaux[2], *Q[0], 1, 0, 0, mesh);
-    // Qaux[3] (hinv) = sqrt(2)*Max(0, h)/sqrt(h**4 + Max(1.0e-8, h)**4)  (algebraic closure)
-    *Qaux[3] = Foam::pow((Foam::scalar)2, 1.0/2.0)*Foam::max((Foam::scalar)0, *Q[1])/Foam::pow(Foam::pow(*Q[1], 4) + Foam::pow(Foam::max((Foam::scalar)1.0e-8, *Q[1]), 4), 1.0/2.0);
+    // Qaux[3] (hinv) = sqrt(2)*h/sqrt(h**4 + Max(1.0e-8, h)**4)  (algebraic closure)
+    *Qaux[3] = Foam::pow((Foam::scalar)2, 1.0/2.0)**Q[1]/Foam::pow(Foam::pow(*Q[1], 4) + Foam::pow(Foam::max((Foam::scalar)1.0e-8, *Q[1]), 4), 1.0/2.0);
 }
 } // namespace Model
 

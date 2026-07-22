@@ -22,7 +22,7 @@ symbol_assumptions:
   b_x : {complex, extended_real, finite, hermitian, real}
   q_1_x : {complex, extended_real, finite, hermitian, real}
   dbdx : {complex, extended_real, finite, hermitian, real}
-  hinv : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
+  hinv : {complex, extended_real, finite, hermitian, real}
   g : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
   rho : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
   nu : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
@@ -63,7 +63,7 @@ update_aux_variables: shape=(4, 1)
 update_aux_variables[0,0] = Symbol('b_x')
 update_aux_variables[1,0] = Symbol('q_1_x')
 update_aux_variables[2,0] = Symbol('dbdx')
-update_aux_variables[3,0] = Mul(Pow(Integer(2), Rational(1, 2)), Pow(Add(Pow(Symbol('h'), Integer(4)), Pow(Max(Float('1.0e-8', precision=53), Symbol('h')), Integer(4))), Rational(-1, 2)), Max(Integer(0), Symbol('h')))
+update_aux_variables[3,0] = Mul(Pow(Integer(2), Rational(1, 2)), Symbol('h'), Pow(Add(Pow(Symbol('h'), Integer(4)), Pow(Max(Float('1.0e-8', precision=53), Symbol('h')), Integer(4))), Rational(-1, 2)))
 reconstruction_variables: None
 state_from_reconstruction: None
 interpolate_to_3d: None
@@ -92,7 +92,7 @@ symbol_assumptions:
   b_x : {complex, extended_real, finite, hermitian, real}
   q_1_x : {complex, extended_real, finite, hermitian, real}
   dbdx : {complex, extended_real, finite, hermitian, real}
-  hinv : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
+  hinv : {complex, extended_real, finite, hermitian, real}
   P_0_x : {complex, extended_real, finite, hermitian, real}
   P_0_x_x : {complex, extended_real, finite, hermitian, real}
   P_1_x : {complex, extended_real, finite, hermitian, real}
@@ -125,7 +125,7 @@ update_aux_variables: shape=(12, 1)
 update_aux_variables[0,0] = Symbol('b_x')
 update_aux_variables[1,0] = Symbol('q_1_x')
 update_aux_variables[2,0] = Symbol('dbdx')
-update_aux_variables[3,0] = Mul(Pow(Integer(2), Rational(1, 2)), Pow(Add(Pow(Symbol('h'), Integer(4)), Pow(Max(Float('1.0e-8', precision=53), Symbol('h')), Integer(4))), Rational(-1, 2)), Max(Integer(0), Symbol('h')))
+update_aux_variables[3,0] = Mul(Pow(Integer(2), Rational(1, 2)), Symbol('h'), Pow(Add(Pow(Symbol('h'), Integer(4)), Pow(Max(Float('1.0e-8', precision=53), Symbol('h')), Integer(4))), Rational(-1, 2)))
 update_aux_variables[4,0] = Symbol('P_0_x')
 update_aux_variables[5,0] = Symbol('P_0_x_x')
 update_aux_variables[6,0] = Symbol('P_1_x')

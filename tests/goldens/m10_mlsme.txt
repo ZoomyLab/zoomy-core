@@ -9,7 +9,7 @@ aux_state: [Symbol('q_1_0_x'), Symbol('q_2_0_x')]
 parameters: [g, rho, nu, lambda_s, l_1]
 symbol_assumptions:
   b : {complex, extended_real, finite, hermitian, real}
-  h : {complex, extended_real, finite, hermitian, real}
+  h : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
   q_1_0 : {complex, extended_real, finite, hermitian, real}
   q_1_1 : {complex, extended_real, finite, hermitian, real}
   q_2_0 : {complex, extended_real, finite, hermitian, real}
