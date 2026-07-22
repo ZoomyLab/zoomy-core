@@ -54,7 +54,166 @@ _SIGN_PREDICATES = ("zero", "positive", "negative",
 
 
 def _carries_sign_assumption(sym) -> bool:
+    """Does this Symbol carry a DECLARED sign predicate?"""
     return any(getattr(sym, f"is_{k}", None) is True for k in _SIGN_PREDICATES)
+
+
+def _numerical_symbol_map(sm) -> dict:
+    """Every STATE / AUX symbol carrying an assumption -> its bare twin.
+
+    PARAMETERS ARE DELIBERATELY EXCLUDED (user ruling, 2026-07-22).  ``g > 0``
+    is a physical fact and no numerical guard is ever written against ``g``, so
+    it cannot be deleted as a tautology -- the hazard is state-only.  The NSM
+    invariant is therefore "no STATE or AUX symbol carries a sign predicate",
+    with parameters exempt."""
+    import sympy as sp
+    pool = list(getattr(sm, "state", []) or []) + \
+        list(getattr(sm, "aux_state", []) or [])
+    return {s: sp.Symbol(str(s), real=True)
+            for s in pool
+            if isinstance(s, sp.Symbol) and _carries_sign_assumption(s)}
+
+
+def _rename(obj, mapping):
+    """Substitute ``mapping`` through sympy content and plain containers."""
+    import sympy as sp
+    if obj is None or isinstance(obj, (str, bytes, bool, int, float, complex)):
+        return obj
+    if isinstance(obj, sp.Symbol):
+        return mapping.get(obj, obj)
+    if hasattr(obj, "xreplace"):
+        try:
+            return obj.xreplace(mapping)
+        except Exception:
+            pass
+    if hasattr(obj, "subs"):
+        try:
+            return obj.subs(mapping)
+        except Exception:
+            return obj
+    if isinstance(obj, dict):
+        # KEYS TOO.  ``state_function_map`` is keyed BY the state symbols, so
+        # renaming only values leaves the old symbol live as a key and a lookup
+        # with the new symbol misses.
+        return {_rename(k, mapping): _rename(v, mapping) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        out = [_rename(v, mapping) for v in obj]
+        return tuple(out) if isinstance(obj, tuple) else out
+    return obj
+
+
+def _rename_kernel(kernel, mapping) -> None:
+    """Move a BC/IC ``basefunction.Function`` kernel into the new symbol space.
+
+    A kernel binds the state SEPARATELY from its body: ``args.variables`` is a
+    Zstruct holding the state symbols positionally, and the runtime flattener
+    reads ``Q`` against exactly that list.  Definition and binding must move
+    TOGETHER or the kernel reads the wrong slot -- which is what
+    ``_assert_bc_kernels_match_state`` exists to catch."""
+    if kernel is None:
+        return
+    args = getattr(kernel, "args", None)
+    if args is not None and hasattr(args, "contains"):
+        for group in ("variables", "aux_variables"):
+            if not args.contains(group):
+                continue
+            z = getattr(args, group)
+            for key in list(z.keys()):
+                val = getattr(z, key, None)
+                if val in mapping:
+                    setattr(z, key, mapping[val])
+    definition = getattr(kernel, "definition", None)
+    if definition is not None:
+        try:
+            kernel.definition = _rename(definition, mapping)
+        except Exception:
+            pass
+
+
+def construct_numerical(sm):
+    """Build the NUMERICAL twin of ``sm``: a copy whose state/aux symbols carry
+    no assumptions.  THE Model -> SystemModel -> NSM boundary.
+
+    Why this is a construction and not a repair pass.  The Model declares
+    physical facts on its field heads (``h = Function("h", positive=True)``).
+    The SystemModel MUST keep them: that is where the analytic spectrum is
+    computed and sympy needs ``h > 0`` to collapse ``sqrt(h**5)/h**2`` into
+    ``sqrt(h)``.  The NSM must NOT have them: an assumption there lets sympy
+    delete a numerical guard as a tautology.
+
+    ``from_system_model`` used to RE-CLASS the SystemModel in place
+    (``sm.__class__ = cls``), so the two layers shared one object and one symbol
+    space and the invariant had to be enforced by hunting an object graph.  That
+    is unbounded and fails SILENTLY -- a missed slot leaves a symbol that PRINTS
+    IDENTICALLY to its twin and compares unequal.  It was attempted three times:
+    a 13-name sweep missed ``reconstruction_variables``/``interpolate_to_3d``
+    and broke every foam SME emission (cid=87); a widened tuple missed ``hinv``
+    (registered by ``desingularize_hinv`` INSIDE ``derive()``, after any seam) --
+    113 sites in ML-VAM; a full type walk broke every model build.
+
+    Constructing inverts the question from "did I reach every slot?" (unbounded,
+    silent) to "did I copy every field?" (bounded, and a miss raises).  And
+    ``derive()`` then runs in NSM symbol space from the start, so anything IT
+    registers is already correct -- the ``hinv`` class of bug stops existing
+    rather than being patched.
+
+    The field set comes from ``operations.OPERATOR_SLOTS``, the canonical
+    registry with a documented "opt OUT, never opt in" rule -- never a literal
+    written here.  That registry is what contains ``interpolate_to_3d`` and
+    ``project_from_3d``; a hand-kept list is exactly how cid=87 happened, and
+    ``operations.py``'s own docstring records the same bug being made before.
+    """
+    import copy
+    from zoomy_core.systemmodel.operations import OPERATOR_SLOTS, KERNEL_SLOTS
+
+    nsm = copy.deepcopy(sm)          # measured: 11 ms SME, 59 ms VAM(1, dim=3)
+    mapping = _numerical_symbol_map(nsm)
+    if not mapping:
+        return nsm
+
+    for name in ("state", "aux_state", "state_function_map", "aux_registry") \
+            + tuple(OPERATOR_SLOTS):
+        if name in KERNEL_SLOTS or name not in nsm.__dict__:
+            continue
+        nsm.__dict__[name] = _rename(nsm.__dict__[name], mapping)
+
+    for name in KERNEL_SLOTS:
+        _rename_kernel(getattr(nsm, name, None), mapping)
+
+    # Lazy cache derived from flux/NCP.  Set to None, never delete: the property
+    # READS the attribute and a missing one raises AttributeError.
+    if "_quasilinear_matrix" in nsm.__dict__:
+        nsm.__dict__["_quasilinear_matrix"] = None
+    return nsm
+
+
+def assert_no_assumptions(sm) -> None:
+    """The NSM invariant: no STATE or AUX symbol carries a sign predicate.
+
+    Scans the built object rather than the list that was substituted -- the
+    first version of this check rescanned the very tuple it had just rewritten
+    and therefore COULD NOT FIRE, reporting success on a model with stale
+    symbols in four slots."""
+    import sympy as sp
+    from zoomy_core.systemmodel.operations import OPERATOR_SLOTS
+    names = {str(s) for s in list(getattr(sm, "state", []) or [])
+             + list(getattr(sm, "aux_state", []) or [])}
+    bad = set()
+    for attr in ("state", "aux_state", "state_function_map", "aux_registry") \
+            + tuple(OPERATOR_SLOTS):
+        val = getattr(sm, attr, None)
+        if val is None:
+            continue
+        val = getattr(val, "definition", val)
+        for s in _free_symbols_deep(val):
+            if (isinstance(s, sp.Symbol) and str(s) in names
+                    and _carries_sign_assumption(s)):
+                bad.add((attr, str(s)))
+    if bad:
+        raise AssertionError(
+            f"NSM invariant violated: {sorted(bad)} still carry assumptions. "
+            "Such a symbol prints identically to its bare twin and compares "
+            "unequal, so printers silently miss it (cid=87).")
 
 
 def _free_symbols_deep(obj):
@@ -72,128 +231,6 @@ def _free_symbols_deep(obj):
             out |= set(fs)
     return out
 
-
-def _subs_deep(obj, mapping):
-    """Apply ``mapping`` through sympy objects, arrays, lists, tuples, dicts.
-
-    Structural rather than clever: anything exposing ``subs`` is substituted,
-    containers recurse, everything else passes through.  Completeness is NOT
-    trusted to this function — it is ASSERTED by the caller."""
-    if obj is None or isinstance(obj, (str, bool, int, float)):
-        return obj
-    if hasattr(obj, "subs"):
-        try:
-            return obj.subs(mapping)
-        except Exception:
-            return obj
-    if isinstance(obj, dict):
-        return {k: _subs_deep(v, mapping) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        out = [_subs_deep(v, mapping) for v in obj]
-        return tuple(out) if isinstance(obj, tuple) else out
-    return obj
-
-
-def strip_state_assumptions(sm) -> None:
-    """THE SystemModel → NumericalSystemModel SEAM: Q, Qaux and parameters lose
-    their DECLARED assumptions here, and only here.
-
-    Design (user, 2026-07-22): the symbols whose assumptions matter are exactly
-    Q, Qaux and the parameters — there is no need to trace assumptions anywhere
-    else.  So this is ONE loop over those three collections, not a hunt across
-    the codebase.  Everything else a model mints (``P3_*`` projection
-    temporaries, ``WB_*`` twins, face normals ``n0/n1``, coordinates,
-    ``_Qf``/``_ICX`` placeholders, ``dQ_*`` gradient names) is either prefixed
-    or structural and can never collide with a declared field.
-
-    Why the seam exists.  The Model declares physical facts (``h`` positive) and
-    the SystemModel KEEPS them, because that is where the analytic spectrum is
-    computed and the CAS needs ``h > 0`` to collapse ``sqrt(h**5)/h**2`` into
-    ``sqrt(h)``.  The NSM is where the NUMERICAL operators live, and those must
-    see a bare symbol: an assumption lets sympy delete guards as tautologies.
-
-    Fails LOUDLY if incomplete.  A half-stripped model carries two symbols that
-    PRINT IDENTICALLY and compare unequal — a silent, near-undebuggable
-    corruption — so every operator and BC kernel is re-scanned afterwards."""
-    import sympy as sp
-
-    names = ("state", "aux_state") + _OPERATOR_ATTRS
-    fields = list(getattr(sm, "state", []) or []) + \
-        list(getattr(sm, "aux_state", []) or [])
-    mapping = {s: sp.Symbol(str(s), real=True)
-               for s in fields
-               if isinstance(s, sp.Symbol) and _carries_sign_assumption(s)}
-    if not mapping:
-        return
-
-    for name in names:
-        if name in sm.__dict__:
-            sm.__dict__[name] = _subs_deep(sm.__dict__[name], mapping)
-
-    # BC/IC kernels bind the state separately, in an ``args.variables`` Zstruct.
-    # Miss them and the kernel stays bound to the OLD symbols while ``sm.state``
-    # holds the new — the two then print identically and compare unequal, which
-    # is exactly what ``_assert_bc_kernels_match_state`` raises on.
-    for attr in ("boundary_conditions", "boundary_gradients",
-                 "aux_boundary_conditions"):
-        kernel = getattr(sm, attr, None)
-        if kernel is None:
-            continue
-        args = getattr(kernel, "args", None)
-        if args is not None and hasattr(args, "contains") \
-                and args.contains("variables"):
-            variables = args.variables
-            for key in list(variables.keys()):
-                val = getattr(variables, key, None)
-                if val in mapping:
-                    setattr(variables, key, mapping[val])
-        definition = getattr(kernel, "definition", None)
-        if definition is not None:
-            try:
-                kernel.definition = _subs_deep(definition, mapping)
-            except Exception:
-                pass
-
-    # The lazy quasilinear cache derives from flux/NCP — INVALIDATE (set None,
-    # never delete: the property reads the attribute and a missing one raises).
-    if "_quasilinear_matrix" in sm.__dict__:
-        sm.__dict__["_quasilinear_matrix"] = None
-
-    # Scoped to the symbols we actually mapped.  PARAMETERS deliberately keep
-    # their assumptions across the seam — ``g > 0`` is a physical fact and no
-    # guard is ever written against g, so a positive g in the spectrum is
-    # correct rather than a leak.
-    stripped = {str(s) for s in mapping}
-    survivors = set()
-    for name in names:
-        val = sm.__dict__.get(name)
-        if val is None:
-            continue
-        for sym in _free_symbols_deep(val):
-            if (isinstance(sym, sp.Symbol) and str(sym) in stripped
-                    and _carries_sign_assumption(sym)):
-                survivors.add((name, str(sym)))
-    for attr in ("boundary_conditions", "boundary_gradients",
-                 "aux_boundary_conditions"):
-        kernel = getattr(sm, attr, None)
-        if kernel is None:
-            continue
-        args = getattr(kernel, "args", None)
-        bound = []
-        if args is not None and hasattr(args, "contains") \
-                and args.contains("variables"):
-            bound = list(args.variables.values())
-        for sym in list(bound) + list(
-                _free_symbols_deep(getattr(kernel, "definition", None))):
-            if (isinstance(sym, sp.Symbol) and str(sym) in stripped
-                    and _carries_sign_assumption(sym)):
-                survivors.add((attr, str(sym)))
-    if survivors:
-        raise AssertionError(
-            "strip_state_assumptions: assumptions SURVIVED the SystemModel -> "
-            f"NumericalSystemModel seam in {sorted(survivors)}. The NSM's "
-            "numerical operators are UNSOUND on an assumption-carrying symbol "
-            "— sympy deletes guards as tautologies. Extend the loop above.")
 
 
 def numerics_fluctuations_are_zero(numerics) -> bool:
@@ -1105,17 +1142,15 @@ class NumericalSystemModel(SystemModel):
         if not isinstance(sm, SystemModel):
             sm = SystemModel.from_model(sm)
             source_specs = getattr(sm, "derivative_specs", source_specs)
-        # THE ASSUMPTION SEAM runs FIRST — before the staleness check and
-        # before any numerics touch the operators.  Order matters: the BC
-        # kernels are built from an assumption-free ``variables`` Zstruct while
-        # extraction gives ``sm.state`` the declared assumptions, so the two
-        # sides are skewed until the state is stripped back to bare.  Stripping
-        # first is what makes them agree; asserting first reports a mismatch
-        # whose two lists print identically.
-        strip_state_assumptions(sm)
-        for sub in (additional_systems or []):
-            if isinstance(sub, SystemModel):
-                strip_state_assumptions(sub)
+        # THE BOUNDARY.  Build the numerical twin instead of relabelling the
+        # symbolic one: from here down we work on ``sm``, which is a COPY whose
+        # state/aux symbols carry no assumptions.  The caller's SystemModel is
+        # left untouched and still carries its declared facts, which is what the
+        # analytic layer needs.  See :func:`construct_numerical`.
+        sm = construct_numerical(sm)
+        additional_systems = [construct_numerical(sub)
+                              if isinstance(sub, SystemModel) else sub
+                              for sub in (additional_systems or [])] or None
         _assert_bc_kernels_match_state(sm)
         for sub in (additional_systems or []):
             if isinstance(sub, SystemModel):

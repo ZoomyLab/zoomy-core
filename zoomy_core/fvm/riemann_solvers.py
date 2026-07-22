@@ -1308,3 +1308,46 @@ class PositiveQuasilinearRusanov(PositiveRusanov, QuasilinearRusanov):
             self.aux_variables_minus,
             self.aux_variables_plus,
         )
+
+
+class QuasilinearRoe(NonconservativeRoe):
+    """Path-conservative Roe in FULLY QUASILINEAR form.
+
+    :class:`NonconservativeRoe` inherits ``_call_model_matrix`` from
+    :class:`NonconservativeRusanov`, so its Gauss-Legendre path integral runs
+    over the ``nonconservative_matrix`` (``B`` alone) while its dissipation
+    ``|A(Q*)|dQ`` is built on the FULL quasilinear matrix via the ``eigensystem``
+    kernel.  That split is correct when the conservative part is carried by
+    ``numerical_flux`` (flux-difference + NCP + Roe viscosity), but it is NOT
+    what a characteristic INTERFACE needs: a coupling ghost built on
+    ``A = dF/dQ + B`` must face a flux whose advection term is the SAME ``A``,
+    otherwise ghost and flux disagree about what the interface transmits.
+
+    This subclass applies the :class:`QuasilinearRusanov` pattern to Roe — the
+    two changes belong together:
+
+    * ``_call_model_matrix`` -> ``quasilinear_matrix``: the path integral
+      becomes ``A_int = int_0^1 A(Q_L + s dQ) ds``, the Dal Maso-LeFloch-Murat /
+      Pares-Castro path-conservative matrix for the segment path;
+    * ``numerical_flux`` -> ``0``: ``dF/dQ`` is now INSIDE that integral, so
+      keeping a conservative flux would count it twice (and would re-introduce
+      the Rusanov ``s_max`` viscosity, which lives in
+      ``get_viscosity_identity_flux``; the fluctuation-side identity is already
+      zero, so with a zero flux the ONLY dissipation is Roe's ``|A|dQ``).
+
+    Result: ``D^- + D^+ = A_int dQ`` — the generalized Rankine-Hugoniot
+    condition for the segment path — with per-field upwinding ``R|Lambda|L``.
+    Unguarded by design (no hydrostatic reconstruction, no entropy fix): the
+    ``lambda = 0`` bed mode contributes ``|0| = 0`` exactly, and any failure of
+    a one-sided linearization is meant to be OBSERVED, not masked.
+    """
+
+    name = param.String(default="QuasilinearRoe")
+
+    def numerical_flux(self):
+        """Zero: the conservative part rides inside the path integral."""
+        return ZArray([sp.Integer(0)] * self.n_variables)
+
+    def _call_model_matrix(self):
+        """Internal helper `_call_model_matrix` — the FULL quasilinear matrix."""
+        return lambda Q, Qaux, p: self._model_eval("quasilinear_matrix", Q, Qaux, p)

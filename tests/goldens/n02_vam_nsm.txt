@@ -19,7 +19,7 @@ symbol_assumptions:
   b_x : {complex, extended_real, finite, hermitian, real}
   q_1_x : {complex, extended_real, finite, hermitian, real}
   dbdx : {complex, extended_real, finite, hermitian, real}
-  hinv : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
+  hinv : {complex, extended_real, finite, hermitian, real}
   g : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
   rho : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
   nu : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}

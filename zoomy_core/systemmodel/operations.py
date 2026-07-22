@@ -767,7 +767,15 @@ def desingularize_hinv(mode="kp"):
         h = _depth_state(sm, "desingularize_hinv")
         eps = _wet_dry_eps(sm)
         if not any(str(s) == "hinv" for s in sm.aux_state):
-            sm.apply(register_aux("hinv", kp_hinv(h, eps), positive=True))
+            # NO ``positive=True``.  It used to be declared here and it is now
+            # FALSE: the ``Max(h, 0)`` numerator clamp was removed from
+            # ``kp_hinv`` (positivity must come from the scheme, not a clamp),
+            # so ``hinv = sqrt(2)*h/sqrt(...)`` is NEGATIVE wherever h < 0.
+            # Declaring it positive let sympy simplify against a fact that does
+            # not hold, AND left an assumption-carrying symbol on the NUMERICAL
+            # side of the boundary -- 7 sites in ML-SME, 68 in VAM dim=3, 113 in
+            # ML-VAM, none of which the gate could see.
+            sm.apply(register_aux("hinv", kp_hinv(h, eps)))
         sm.apply(regularize_pow(h, "hinv"))
 
     _op.name = "desingularize_hinv"

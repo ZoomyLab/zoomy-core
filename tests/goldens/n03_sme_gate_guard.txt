@@ -16,7 +16,7 @@ symbol_assumptions:
   dq0dx : {complex, extended_real, finite, hermitian, real}
   dhdx : {complex, extended_real, finite, hermitian, real}
   dbdx : {complex, extended_real, finite, hermitian, real}
-  hinv : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
+  hinv : {complex, extended_real, finite, hermitian, real}
   g : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
   rho : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
   nu : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
@@ -60,8 +60,8 @@ update_aux_variables[4,0] = Mul(Pow(Integer(2), Rational(1, 2)), Symbol('h'), Po
 reconstruction_variables: shape=(4,)
 reconstruction_variables[0] = Symbol('b')
 reconstruction_variables[1] = Add(Symbol('b'), Symbol('h'))
-reconstruction_variables[2] = Mul(Pow(Symbol('h'), Integer(-1)), Symbol('q_0'))
-reconstruction_variables[3] = Mul(Pow(Symbol('h'), Integer(-1)), Symbol('q_1'))
+reconstruction_variables[2] = Mul(Symbol('hinv'), Symbol('q_0'))
+reconstruction_variables[3] = Mul(Symbol('hinv'), Symbol('q_1'))
 state_from_reconstruction: shape=(4,)
 state_from_reconstruction[0] = Symbol('WB_b')
 state_from_reconstruction[1] = Add(Mul(Integer(-1), Symbol('WB_b')), Symbol('WB_h'))

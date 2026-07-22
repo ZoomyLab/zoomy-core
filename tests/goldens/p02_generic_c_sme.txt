@@ -360,12 +360,11 @@ struct Model {
         const double* Qaux,
         const double* p)
     {
-    double t0 = (1.0 / std::pow(h, 1));
     SimpleArray<T, 4> res;
     res[0] = Q[0];
-    res[1] = Q[0] + h;
-    res[2] = Q[2]*t0;
-    res[3] = Q[3]*t0;
+    res[1] = Q[0] + Q[1];
+    res[2] = Qaux[4]*Q[2];
+    res[3] = Qaux[4]*Q[3];
     return res;
     }
 
@@ -389,7 +388,7 @@ struct Model {
         const double* p,
         const double* X)
     {
-    double t0 = (1.0 / std::pow(h, 1));
+    double t0 = (1.0 / std::pow(Q[1], 1));
     double t1 = Q[2]*t0;
     double t2 = Q[3]*t0;
     double t3 = t2*X[2];
@@ -397,11 +396,11 @@ struct Model {
     double t5 = Qaux[3]*t2;
     SimpleArray<T, 6> res;
     res[0] = Q[0];
-    res[1] = h;
+    res[1] = Q[1];
     res[2] = t1 - t2 + 2*t3;
     res[3] = 0;
     res[4] = Qaux[3]*t1 + Qaux[2]*t1*X[2] + 2*Qaux[2]*t2*t4 - Qaux[2]*t3 - Qaux[1]*X[2] - Qaux[0]*t4 + Qaux[0]*X[2] + 2*t5*X[2] - t5;
-    res[5] = -p[0]*h*p[1]*X[2] + p[0]*h*p[1];
+    res[5] = -p[0]*Q[1]*p[1]*X[2] + p[0]*Q[1]*p[1];
     return res;
     }
 
