@@ -293,6 +293,14 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         self.register_symbolic_function(
             "numerical_face", lambda: self.pack_face(flux, fluctuations), sig
         )
+        # Same SHAPE of signature as the face kernels (two states + aux +
+        # parameters + normal), so no printer or contract change is needed —
+        # but the pair is reinterpreted as (cell, edge) rather than the two
+        # sides of a face, and the normal points OUT of that cell.
+        self.register_symbolic_function(
+            "numerical_cell_edge_source",
+            self.numerical_cell_edge_source, sig
+        )
 
         eig_sig = Zstruct(
             Q=self.variables, Qaux=self.aux_variables, p=self.parameters, n=self.normal
@@ -508,6 +516,64 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         """Numerical fluctuations."""
         zeros = ZArray.zeros(self.n_variables)
         return ZArray([zeros, zeros])
+
+    def numerical_cell_edge_source(self):
+        """THE IN-CELL NONCONSERVATIVE TERM, per (cell, edge) pair.
+
+        A path-conservative scheme discretises ``W_t + A(W)·W_x = 0`` as
+
+            |C_i| dW_i/dt = -[ sum_j D^-(W_ij, W_ji)
+                               + int_{C_i} A(W_i(x))·grad W_i(x) dx ]
+
+        With PIECEWISE-CONSTANT data all variation of W sits in the interface
+        jumps, so the fluctuations carry the whole nonconservative product and
+        the integral is zero.  Once a RECONSTRUCTION exists the variation
+        splits in two — jumps BETWEEN cells and smooth slopes INSIDE them —
+        and the fluctuations see only the first.  This term is the second.
+
+        Omitting it is not a loss of accuracy: the missing amount is
+        ``int A·grad W ~ dx·A·grad W``, which divided by ``dx`` in the update
+        is O(1).  It deletes a term of the PDE, so the error is a CONSISTENCY
+        error and therefore dt-INDEPENDENT.  Measured on smooth, flat-bed,
+        wet-everywhere SME(level=1) — where ``B[q_1][q_1] = -q_0/h`` is the
+        only live nonconservative product — the row it feeds stalls at rate
+        1.26 while h and q_0 reach 1.73/1.78; at order 1 all three sit
+        together near 1.0.
+
+        NOT a well-balancing device.  It is required for EVERY live entry of
+        the nonconservative matrix; the bed column ``B[q_0][b] = g·h`` is
+        merely the entry whose omission is most visible (it breaks
+        lake-at-rest).  For SWE the general form below reduces exactly to
+        Audusse & Bristeau (2005) eq. (6.13),
+        ``-(g/2)(h_ij + h_i)(Z_ij - Z_i)·n_ij`` — their centred term is the
+        closed-form path integral for a ``B`` that happens to be LINEAR in the
+        state.  Ours are not (``hinv``, ``q^2/h``, moment couplings), which is
+        why the quadrature has to be the real one rather than a trapezoid.
+
+        Returns the contribution to the residual of the cell whose OUTWARD
+        normal is ``normal``.  Called once per (cell, edge) pair — twice per
+        interior face, with the two cells swapped and the normal negated.
+
+        WHY THIS IS EMITTED RATHER THAN WRITTEN IN A BACKEND (mandate 6).
+        This term already existed — as ``B(Q_c)·s_c``, hand-written inside
+        ``zoomy_jax/fvm/solver_jax.py`` and nowhere else.  Because it was never
+        exposed through the NumericalSystemModel it was invisible to
+        ``describe()``, to every golden, and to every other backend: foam,
+        amrex and firedrake silently had no interior nonconservative term at
+        all, and the one implementation that existed could not be reviewed,
+        diffed or held to a quadrature.  Diagnosing its presence took a full
+        session of measurement that reading a printed operator would have
+        answered in a minute.
+
+        A scheme decision that lives in one backend is a scheme decision
+        nobody can supervise.  Routing every LOCAL operator through the NSM is
+        what makes them fetchable, comparable and consistent across backends —
+        and only then is a convergence result attributable to the scheme
+        rather than to whichever backend the case happened to run on.
+
+        Zero on this base class: a purely conservative solver carries no
+        nonconservative product.  Overridden where ``B`` is live."""
+        return ZArray.zeros(self.n_variables)
 
 
 class Rusanov(Numerics):
@@ -916,8 +982,16 @@ class NonconservativeRusanov(Rusanov):
         """Internal helper `_call_model_matrix`."""
         return lambda Q, Qaux, p: self._model_eval("nonconservative_matrix", Q, Qaux, p)
 
-    def _compute_fluctuations(self, qL, qR, auxL, auxR, p, n):
-        """Internal helper `_compute_fluctuations`."""
+    def _path_integral_matrix(self, qL, qR, auxL, auxR, p, n):
+        """``int_0^1 A(Psi(s))·n ds`` along the segment path ``Psi(s) = qL +
+        s·(qR - qL)``, by Gauss-Legendre at ``integration_order``.
+
+        SHARED by the face fluctuations and the in-cell source
+        (:meth:`numerical_cell_edge_source`), and that sharing is REQUIRED, not
+        just tidy: well-balancing at second order comes from cancellation
+        between those two, and they are two halves of ONE nonconservative
+        product.  Discretise them with different rules and the cancellation is
+        inexact — well-balanced at order 1, silently broken at order 2."""
         xi_np, wi_np = np.polynomial.legendre.leggauss(self.integration_order)
         xi_np = 0.5 * (xi_np + 1)
         wi_np = 0.5 * wi_np
@@ -942,6 +1016,30 @@ class NonconservativeRusanov(Rusanov):
                         val += A_tensor[i, j, d] * n[d]
                     A_n[i, j] = val
             A_int += wi * A_n
+        return A_int
+
+    def numerical_cell_edge_source(self):
+        """The in-cell nonconservative term — see the base-class docstring.
+
+        ``int_{T_ij} B(W)·grad W dx = [int_0^1 B(Psi(s))·Psi'(s) ds]·(W_ij -
+        W_i)``: with a linear reconstruction ``grad W`` is constant on the
+        subcell, so it factors out and what remains is the SAME segment path
+        integral the fluctuations use — only with endpoints (cell, edge)
+        instead of (minus, plus).  Hence no dissipation term: this is an
+        integral over a smooth reconstruction, not a Riemann problem.
+
+        Vanishes identically when ``q_edge == q_cell``, i.e. at first order,
+        with no branch on the reconstruction order."""
+        qc, qe = self.variables_minus, self.variables_plus
+        auxc, auxe = self.aux_variables_minus, self.aux_variables_plus
+        A_int = self._path_integral_matrix(
+            qc, qe, auxc, auxe, self.parameters, self.normal)
+        return A_int @ (qe - qc)
+
+    def _compute_fluctuations(self, qL, qR, auxL, auxR, p, n):
+        """Internal helper `_compute_fluctuations`."""
+        dQ = qR - qL
+        A_int = self._path_integral_matrix(qL, qR, auxL, auxR, p, n)
 
         s_max = self.face_max_abs_eigenvalue(qL, qR, auxL, auxR, p, n)
 
