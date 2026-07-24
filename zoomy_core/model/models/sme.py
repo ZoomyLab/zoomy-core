@@ -175,7 +175,30 @@ class SME(BaseModel):
             zdrop[DERIV[xd](uvel[i] * w)] = 0
         mz.apply(zdrop)
         mz.apply(IntegrateZ(z, z, b + h, method="analytical"))
-        mz.apply({p.subs(z, b + h): 0})
+        # Free-surface pressure BC.  Default p(η)=0 (atmospheric).  A SURFACE
+        # closure may instead prescribe a NORMAL traction ``{"normal": n·σn}``
+        # (e.g. surface tension ``−σκ``); inject it here as p(η) so it reaches
+        # the horizontal momentum through the eliminated pressure (REQ-219).
+        # Gated on the GENERAL path only (small_slope=False).  When nothing is
+        # injected we run the ORIGINAL ``{...: 0}`` substitution VERBATIM (literal
+        # 0, not sp.S.Zero) so every existing model's derivation is byte-for-byte
+        # unchanged — the whole-expression identity matters downstream.
+        p_surf = None
+        surface_closures = [c for c in (self.closures or [])
+                            if getattr(c, "closes", None) == "surface"]
+        if surface_closures and not bool(self.small_slope):
+            s_eta = ClosureState(m.functions, params=m.parameters, h=h, x=x,
+                                 zeta=None, at=1, boundary_tag="eta",
+                                 horiz=list(horiz))
+            acc = sp.S.Zero
+            for c in surface_closures:
+                c.register(m)
+                nrm = c.traction(s_eta).get("normal")
+                if nrm is not None:
+                    acc += nrm
+            if acc != 0:
+                p_surf = acc
+        mz.apply({p.subs(z, b + h): (p_surf if p_surf is not None else 0)})
         psol = mz.solve_for(p)
         for ax in HAXES:
             getattr(m.momentum, ax).apply(psol)
