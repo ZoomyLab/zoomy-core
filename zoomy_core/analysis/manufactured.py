@@ -55,10 +55,28 @@ Usage
     # set IC = W*, aux IC = 0, add S_mms as a fixed inner-cell source, run,
     # then measure |Q_end - W_cell| under mesh refinement -> scheme order.
 
-Verified (2026-07-24) on SME(0) inviscid over a cosine bump, numpy backend:
-order-1 reconstruction → EOC 0.9, order-2 (minmod) → EOC 1.9-2.0.  The tool has
-a genuine analytic reference, so this is a real order statement, not a
-self-convergence estimate.
+Verified (2026-07-24), SME(0) inviscid, numpy backend, genuine analytic
+reference (NOT self-convergence):
+
+* spatial-residual (truncation) order, interior, monotone field so the minmod
+  limiter is inactive:  EOC = 2.000, 2.000, 2.000 — the discretization is
+  cleanly 2nd order.
+* time-evolved real run (IC = W* to 1e-16, then integrated), monotone ramp that
+  is flat at both ends (Extrapolation exact, no boundary pollution):
+  order-2 EOC = 1.99 → 2.00, order-1 EOC → 1.0.
+
+Two confounds that MASK the order if you are not careful — both surfaced here:
+
+* the minmod limiter clips smooth EXTREMA (first-order there), so a periodic
+  field with interior extrema caps at ~1.9, never a clean 2.  Use a monotone
+  field (no interior extrema) to see the true order.
+* a subcritical STEADY problem with a value-fixed (Dirichlet) boundary reads
+  ~1st order: the boundary treatment is low-order and, because information
+  travels both ways, that error propagates across the whole domain.  Use a field
+  that is flat at the boundaries (so the BC is exact) for a clean rate.
+
+Do NOT trust a lone EOC above 2 (e.g. 2.5): that is pre-asymptotic or the error
+sitting on the projection floor, not evidence of higher order.
 """
 from __future__ import annotations
 
@@ -71,6 +89,7 @@ __all__ = [
     "install_manufactured_source",
     "manufactured_source_field",
     "exact_cell_field",
+    "mms_convergence",
 ]
 
 
@@ -276,6 +295,32 @@ def manufactured_source_field(sm, exact, cell_centers, parameter_values=None,
         val = f(*args)
         out[i, :] = np.broadcast_to(np.asarray(val, float), (nc,))
     return out
+
+
+def mms_convergence(setup_run, grids, interior_frac=0.0):
+    """Fixed-time / steady MMS convergence rate — the backend-agnostic driver.
+
+    ``setup_run(nx)`` builds the model with ``S_mms`` injected, RUNS it (from
+    ``IC = W*``), and returns ``(Q_end, W_cell)`` as ``(n_rows, nx)`` arrays:
+    the evolved solution and the analytic field it is compared against.  The
+    caller owns the solver, so this works for any backend.
+
+    Returns ``dict(grids, l1, eoc)`` where ``eoc[i] = log2(l1[i-1]/l1[i])``.
+    ``interior_frac`` (e.g. 0.25) drops that fraction of cells at each end before
+    averaging — use it to separate an interior rate from boundary effects.
+
+    NOTE this measures an EVOLVED error: ``setup_run`` must actually integrate in
+    time, not just project ``W*``.  A zero (~1e-16) error means nothing ran.
+    Read the module docstring for the extremum/boundary confounds first."""
+    import numpy as np
+    l1 = []
+    for nx in grids:
+        Q, W = (np.asarray(a, float) for a in setup_run(nx))
+        d = np.abs(Q[:W.shape[0], :nx] - W[:, :nx])
+        m = int(interior_frac * nx)
+        l1.append(float(np.mean(d[:, m:nx - m] if m else d)))
+    eoc = [float(np.log2(l1[i - 1] / l1[i])) for i in range(1, len(l1))]
+    return {"grids": list(grids), "l1": l1, "eoc": eoc}
 
 
 def exact_cell_field(sm, exact, cell_centers):
