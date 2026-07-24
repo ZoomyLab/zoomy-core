@@ -800,6 +800,12 @@ class LSQMUSCLReconstruction:
         """Slope-limiter coefficients φ (n_vars, nc) — the non-smooth
         part of the reconstruction (neighbour min/max, sign branch,
         per-cell face-min)."""
+        phi = np.ones((n_vars, self._nc))
+        if self._limiter_type == "none":
+            # Unlimited: full LSQ slope on every variable.  Used for smooth
+            # verification (MMS, manufactured solutions) where limiter clipping
+            # at extrema would mask the true reconstruction order.
+            return phi
         _limiter_map = {
             "barth_jespersen": self._limit_bj,
             "venkatakrishnan": self._limit_vk,
@@ -807,7 +813,6 @@ class LSQMUSCLReconstruction:
             "van_albada": self._limit_va,
         }
         limiter_fn = _limiter_map[self._limiter_type]
-        phi = np.ones((n_vars, self._nc))
         for v in range(n_vars):
             if v in self._unlimited_indices:
                 # Skip limiting: full LSQ slope.  Used for static fields
