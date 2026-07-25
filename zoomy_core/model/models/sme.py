@@ -187,8 +187,17 @@ class SME(BaseModel):
         surface_closures = [c for c in (self.closures or [])
                             if getattr(c, "closes", None) == "surface"]
         if surface_closures and not bool(self.small_slope):
+            # at=None (BULK fields), NOT at=1 (surface trace): the free-surface
+            # normal traction (surface tension −σκ) is a GEOMETRIC function of the
+            # free surface η=b+h, and b,h are depth-averaged (no vertical
+            # dependence) so their surface value IS their bulk value.  This
+            # elimination runs BEFORE the σ-map, so there is no ζ yet; a surface
+            # trace `.at(1)` would substitute the field's LAST coordinate — which
+            # is x here — giving b(t,1)+h(t,1) (constant in x) ⇒ ∂ₓκ=0 ⇒ the
+            # surface pressure silently drops out of the momentum (REQ-219 reopen).
+            # Bulk fields keep x, so κ(x) survives into the eliminated pressure.
             s_eta = ClosureState(m.functions, params=m.parameters, h=h, x=x,
-                                 zeta=None, at=1, boundary_tag="eta",
+                                 zeta=None, at=None, boundary_tag="eta",
                                  horiz=list(horiz))
             acc = sp.S.Zero
             for c in surface_closures:
