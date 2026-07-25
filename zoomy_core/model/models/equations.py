@@ -261,6 +261,44 @@ def small_slope_scaling(model):
     return model
 
 
+def slope_aware_scaling(model, interfaces):
+    """General (slope-aware) resolution of the opaque boundary frame — the
+    COMPLEMENT of :func:`small_slope_scaling`.
+
+    Instead of sending every :func:`frame_slope` symbol to 0 (the small-slope
+    limit), resolve it to the PHYSICAL interface slope ``∂_dir(interface)``.  The
+    extraction then promotes that spatial derivative to an ordinary derivative
+    aux (``dbdx`` etc.), so NO opaque frame symbol survives to the runtime and the
+    geometrically-exact (slope-aware) model is fully lambdifiable/discretizable.
+
+    This is the always-resolve default that makes the framework hold in general;
+    ``small_slope_scaling`` is the optional stripping assumption applied on top
+    for the shallow (Kowalski & Torrilhon) reduction.  ``interfaces`` maps each
+    frame tag to its height expression, e.g. ``{"b": b, "eta": b + h}``."""
+    from zoomy_core import coords as _C
+    dirmap = {"x": _C.x, "y": _C.y}
+    subs = {}
+    for eq in model._equations.values():
+        for s in eq.expr.free_symbols:
+            name = str(s)
+            if not name.startswith("frameslope_") or s in subs:
+                continue
+            parts = name.split("_")            # frameslope_{tag}_{dir}
+            tag, dr = parts[1], parts[2]
+            if tag not in interfaces or dr not in dirmap:
+                raise ValueError(
+                    f"slope_aware_scaling: cannot resolve frame symbol {name!r} "
+                    f"(known tags {sorted(interfaces)}, dirs {sorted(dirmap)}). "
+                    "Every frame_slope must map to a physical interface slope.")
+            subs[s] = sp.Derivative(interfaces[tag], dirmap[dr])
+    if subs:
+        model.apply(subs)
+        model._history("slope_aware_scaling", "momentum",
+                       description="resolve boundary frame to the physical "
+                                   "interface slope ∂_d(interface) (slope-aware)")
+    return model
+
+
 class MomentumNonHydrostatic(Equation):
     """Non-hydrostatic momentum (VAM): the hydrostatic pressure is PRE-ABSORBED,
     so the horizontal balance carries ``g·∂_x(b+h)`` and ``p`` is only the

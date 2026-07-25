@@ -107,7 +107,7 @@ class SME(BaseModel):
             values.update({k: float(v) for k, v in user_vals.items()})
         from zoomy_core.model.models.equations import (
             Mass, Momentum, moment_scaling, small_slope_scaling,
-            add_inplane_viscous, package_viscous)
+            slope_aware_scaling, add_inplane_viscous, package_viscous)
         from zoomy_core.model.models.material import ClosureState
         from zoomy_core.model.models.closures import apply_stress_closures
 
@@ -256,10 +256,17 @@ class SME(BaseModel):
         has_bulk = apply_stress_closures(self.closures, m, axes, _state, list(horiz))
         for ax in HAXES:
             getattr(m.momentum, ax).apply(Simplify())
-        # small-slope frame resolution (tracked, removable) — n→ẑ recovers the
-        # K&T shallow traces; skip it (small_slope=False) to keep slope-aware.
+        # Boundary-frame resolution (tracked).  The opaque frame_slope symbols
+        # must NEVER survive to the runtime.  small_slope=True applies the
+        # small-slope assumption (n→ẑ, frame→0) → the K&T shallow traces
+        # (BYTE-IDENTICAL to before).  small_slope=False resolves the frame to
+        # the PHYSICAL interface slope ∂_d(interface) so the slope-aware model is
+        # fully discretizable (the framework holds in general) — was previously
+        # left opaque and unrunnable.
         if bool(self.small_slope):
             small_slope_scaling(m)
+        else:
+            slope_aware_scaling(m, {"b": b, "eta": b + h})
 
         # 6 — separation of variables: each u_i → û/v̂ (N_u), w → ŵ (N_u + 1)
         coeff_heads = [sp.Function(nm, real=True) for nm in SHAT]
