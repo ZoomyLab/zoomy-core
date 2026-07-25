@@ -114,7 +114,8 @@ class QRKESME(SME):
         if user_vals is not None and hasattr(user_vals, "items"):
             values.update({k: float(v) for k, v in user_vals.items()})
         from zoomy_core.model.models.equations import (
-            Mass, Momentum, moment_scaling, small_slope_scaling)
+            Mass, Momentum, moment_scaling, small_slope_scaling,
+            slope_aware_scaling)
         from zoomy_core.model.models.material import ClosureState
         from zoomy_core.model.models.closures import apply_stress_closures
 
@@ -238,6 +239,8 @@ class QRKESME(SME):
             getattr(m.momentum, ax).apply(Simplify())
         if bool(self.small_slope):
             small_slope_scaling(m)
+        else:
+            slope_aware_scaling(m, {"b": b, "eta": b + h})
 
         # 5b — project the sk, se equations exactly like the momentum, then close
         #      the turbulent fluxes J (bulk ν_t/σ ∂_z·, zero-Neumann at bed+surf)

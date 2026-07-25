@@ -68,7 +68,7 @@ class VAM(BaseModel):
             values.update({k: float(v) for k, v in user_vals.items()})
         from zoomy_core.model.models.equations import (
             Mass, MomentumNonHydrostatic, small_slope_scaling,
-            add_inplane_viscous, package_viscous)
+            slope_aware_scaling, add_inplane_viscous, package_viscous)
         from zoomy_core.model.models.material import ClosureState
         from zoomy_core.model.models.closures import apply_stress_closures
 
@@ -156,6 +156,8 @@ class VAM(BaseModel):
             getattr(m, mn).apply(Simplify())
         if bool(self.small_slope):
             small_slope_scaling(m)
+        else:
+            slope_aware_scaling(m, {"b": b, "eta": b + h})
 
         mz = m.momentum_z
         _project(mz); mz.apply({pp.at(1): 0}); mz.apply(Simplify())
