@@ -207,6 +207,92 @@ def reconstruct_bernoulli_level0(Qf, bstar, h_idx, b_idx, q0_idx, g,
     return xp.stack(rows, axis=0)
 
 
+def _minmod(a, b, xp):
+    """Elementwise minmod (0 on sign change), backend-agnostic."""
+    return xp.where(a * b > 0.0,
+                    xp.where(xp.abs(a) < xp.abs(b), a, b),
+                    xp.zeros_like(a))
+
+
+def make_steady_ode_slope(quasilinear_fn, source_fn, b_idx, solve_op, xp,
+                          n_state, ndim=0):
+    """Build the local-stationary-ODE slope closure ``G(U, H_x)`` for the FULLY
+    well-balanced moving-equilibrium reconstruction (Pimentel-García, HYP2022).
+
+    BACKEND-AGNOSTIC: ``quasilinear_fn(U) → A`` ``(n_eq, n_state, n_dim, nf)`` and
+    ``source_fn(U) → Sfr`` ``(n_eq, nf)`` are the EMITTED operators the caller
+    binds to its runtime (``A = J_F + B`` incl. the bed column, ``Sfr`` the
+    friction source ``-R``); ``solve_op`` is the EXISTING ``solve`` opaque linear
+    kernel (``solve_op(idx, *A_flat, *b) → (A⁻¹b)[idx]``); ``xp`` is
+    ``numpy``/``jax.numpy``.
+
+    The topography row ``b_idx`` is dropped from the invert (``b`` is passive,
+    ``b_t=0``) and its column carried to the RHS as the paper's ``S(U)·H_x``:
+
+        G_V = A_VV(U)⁻¹ ( Sfr_V(U) − A[V,b](U)·H_x )
+
+    (Zoomy ``source = −R``, so this equals the paper's ``−(J_F+B)⁻¹(S H_x + R)``
+    exactly).  The full slope has the ``b`` row set to ``H_x`` so ``b`` integrates
+    to the interface bed; returns ``(n_state, nf)``."""
+    V = [i for i in range(n_state) if i != b_idx]
+    nV = len(V)
+
+    def slope(U, hx):
+        A = quasilinear_fn(U)                         # (n_eq, n_state, ndim, nf)
+        A0 = A[:, :, ndim]                            # (n_eq, n_state, nf)
+        Sfr = source_fn(U)                            # (n_eq, nf)
+        # non-b block A_VV, bed column A_Vb, friction source S_V
+        A_flat = [A0[V[i], V[j]] for i in range(nV) for j in range(nV)]
+        rhs = [Sfr[V[i]] - A0[V[i], b_idx] * hx for i in range(nV)]
+        gV = [solve_op(k, *A_flat, *rhs) for k in range(nV)]   # reuse solve op
+        rows = []
+        vi = 0
+        for i in range(n_state):
+            if i == b_idx:
+                rows.append(hx if xp.ndim(hx) else xp.broadcast_to(hx, U[0].shape))
+            else:
+                rows.append(gV[vi]); vi += 1
+        return xp.stack(rows, axis=0)
+
+    return slope
+
+
+def moving_equilibrium_cells(Q, hx, dx, b_idx, slope, solve_steady_ode, xp,
+                             Q_left=None, Q_right=None, order=2, n_ode_iter=8):
+    """Per-cell fully-WB moving-equilibrium reconstruction (Pimentel-García eq
+    20-27), BACKEND-AGNOSTIC.
+
+    ``Q`` ``(n_state, nc)`` cell states, ``hx`` ``(nc,)`` bed gradient ``H'(x_i)``,
+    ``dx`` ``(nc,)`` cell width, ``slope(U, hx) → G`` the steady-ODE closure
+    (:func:`make_steady_ode_slope`), ``solve_steady_ode`` the opaque implicit-
+    midpoint integrator.
+
+    Returns ``(Ustar_L, Ustar_R, sigma)``:
+
+    * ``Ustar_R = U_i + (Δx/2)K_i``, ``Ustar_L = U_i − (Δx/2)K_i`` — the local
+      stationary solution extrapolated to the cell's right / left intercells
+      (paper eq 21), ``K_i = G(U_i)`` the collocation slope at the node (which is
+      the cell midpoint, so this one step needs no iteration and is WB-exact);
+    * ``sigma`` — the minmod-limited slope of the FLUCTUATION ``V=U−U*`` (paper
+      eq 27), zero at a discrete stationary state so the reconstruction reduces
+      to the pure equilibrium there (⇒ WB).  Needs the neighbour cell states
+      ``Q_left``/``Q_right`` and the neighbour-node equilibrium extensions
+      (paper eq 25/26) via ``solve_steady_ode``; ``order < 2`` returns ``0``."""
+    half = 0.5 * dx
+    K = slope(Q, hx)                                   # (n_state, nc)
+    Ustar_R = Q + half * K
+    Ustar_L = Q - half * K
+    if order < 2 or Q_left is None or Q_right is None:
+        return Ustar_L, Ustar_R, xp.zeros_like(Q)
+    G = lambda U: slope(U, hx)
+    Ustar_ip1 = solve_steady_ode(G, Q, dx, n_ode_iter)     # cell-i eq at node i+1
+    Ustar_im1 = solve_steady_ode(G, Q, -dx, n_ode_iter)    # cell-i eq at node i-1
+    V_ip1 = Q_right - Ustar_ip1                             # fluctuation, cell-i frame
+    V_im1 = Q_left - Ustar_im1
+    sigma = _minmod(-V_im1 / dx, V_ip1 / dx, xp)           # V_i = 0
+    return Ustar_L, Ustar_R, sigma
+
+
 def reconstruct(Qf, bstar, cfg):
     """Reconstruct face states Qf (n_vars, nf) to the common bed bstar (nf,).
     Dispatches on cfg['mode'] ('audusse' | 'bernoulli' | 'projected_bernoulli').

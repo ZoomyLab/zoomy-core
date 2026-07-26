@@ -224,6 +224,48 @@ def newton_solve(residual, x0, n_iter=60, tol=1e-14):
     return x
 
 
+def solve_steady_ode(slope, U0, ds, n_iter=8):
+    """Integrate one collocation step of the local stationary ODE ``U_x = G(U)``.
+
+    The higher-order opaque kernel of the FULLY well-balanced moving-equilibrium
+    reconstruction (Pimentel-García, *Fully WB Methods for the SW Linearized
+    Moment Model with Friction*, HYP2022): with friction ``R`` there is NO
+    closed form for the steady state, so the local stationary solution is
+    obtained by numerically integrating
+
+        U_x = G(U) = -(J_F(U)+B(U))_VV^{-1} (S(U)·H_x + R(U))
+
+    (the b/topography row dropped, its column carried into ``S·H_x``).  Same
+    contract as :func:`newton_solve`: the reconstruction that lives in core
+    builds the ``slope`` closure ``G`` from the EMITTED operators and the
+    existing ``solve`` linear-solve kernel; the backend runs the RK loop.
+
+    Reversible / implicit collocation — the 2-stage-equivalent **implicit
+    midpoint** (1-stage Gauss, Butcher ``[1/2|1/2 ; 1]``), the reversible RK the
+    paper requires for the well-balanced property.  Solves the endpoint
+
+        U1 = U0 + ds · G((U0+U1)/2)
+
+    by ``n_iter`` fixed-point sweeps (jit-safe fixed length; the jax twin uses
+    ``lax.scan``).  ``U0`` is ``(n_state, nf)``, ``ds`` a scalar or ``(nf,)``
+    signed step; returns the endpoint ``(n_state, nf)``.
+
+    WB-exactness: implicit midpoint is reversible, so the sequence of cell
+    averages it produces is a *discrete* stationary solution the scheme
+    preserves to the fixed-point residual — "fully well-balanced" in the paper's
+    sense (near machine precision), not "exactly WB" (which would need the
+    stationary solution in closed form).  The cell's OWN node→intercell step is
+    the exact-midpoint special case (midpoint = the cell node) and needs no
+    iteration; this kernel is the neighbour-node extension where the midpoint is
+    implicit."""
+    dsb = np.asarray(ds, dtype=float)
+    U1 = np.array(U0, dtype=float)
+    for _ in range(int(n_iter)):
+        Umid = 0.5 * (U0 + U1)
+        U1 = U0 + dsb * slope(Umid)
+    return U1
+
+
 # Backend-supplied opaque kernels (kernel_functions.REQUIRED_KERNELS).
 # ``compute_derivative`` is None here: the SOLVER injects the mesh-bound impl
 # (``mesh.compute_derivatives``) before the ``update_aux_variables`` slot is
@@ -236,6 +278,10 @@ KERNELS = {
     # Higher-order root-find (numpy-internal — the reconstruction supplies the
     # residual callable, so it is NOT a lambdify-lowered REQUIRED_KERNEL).
     "newton_solve": newton_solve,
+    # Higher-order steady-ODE integrator (moving-equilibrium WB with friction);
+    # the reconstruction supplies the slope closure, so — like newton_solve —
+    # it is NOT a lambdify-lowered REQUIRED_KERNEL.
+    "solve_steady_ode": solve_steady_ode,
     # REQ-179 compute-once lowering targets (numpy-internal, not part of the
     # cross-backend REQUIRED_KERNELS contract — like the ARITHMETIC helpers).
     "eigensystem_pack": eigensystem_pack,
