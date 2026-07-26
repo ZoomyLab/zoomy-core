@@ -194,6 +194,36 @@ def solve(idx, *args):
     return c["out"][:, int(idx)]
 
 
+def newton_solve(residual, x0, n_iter=60, tol=1e-14):
+    """Batched scalar Newton root-find of ``residual(x) = 0`` from guess ``x0``.
+
+    A backend-supplied opaque kernel in the ``eigensystem`` / ``solve`` family,
+    but a HIGHER-ORDER one: the reconstruction that lives in core builds the
+    ``residual`` closure and the initial guess, and the backend runs the
+    iteration loop (``reconstruction lives in core, backend is a loop``).  Used
+    by the moving-equilibrium (Bernoulli) WB reconstruction — at SME level 0 the
+    per-face root is the SWE specific-energy relation for the reconstructed
+    surface ``η*``.
+
+    Elementwise over the grid (each lane is an independent scalar Newton), so
+    the derivative is the per-lane slope taken by forward finite difference: the
+    residual is a black-box callable with no symbolic derivative.  Fixed max
+    ``n_iter`` with an early ‖residual‖∞ exit.  The jax twin
+    (``zoomy_jax.fvm.userfunctions.newton_solve``) is bit-for-bit the same
+    contract, using ``jax.jvp`` for the exact diagonal derivative and
+    ``lax.scan`` for the loop (no data-dependent ``while``, so it stays
+    jit/AD-safe)."""
+    x = np.array(x0, dtype=float)
+    for _ in range(int(n_iter)):
+        f = np.asarray(residual(x), dtype=float)
+        if np.max(np.abs(f)) < tol:
+            break
+        dx = 1e-8 * (np.abs(x) + 1.0)
+        fp = (np.asarray(residual(x + dx), dtype=float) - f) / dx
+        x = x - f / fp
+    return x
+
+
 # Backend-supplied opaque kernels (kernel_functions.REQUIRED_KERNELS).
 # ``compute_derivative`` is None here: the SOLVER injects the mesh-bound impl
 # (``mesh.compute_derivatives``) before the ``update_aux_variables`` slot is
@@ -203,6 +233,9 @@ KERNELS = {
     "eigensystem": eigensystem,
     "eigenvalues": eigenvalues,
     "solve": solve,
+    # Higher-order root-find (numpy-internal — the reconstruction supplies the
+    # residual callable, so it is NOT a lambdify-lowered REQUIRED_KERNEL).
+    "newton_solve": newton_solve,
     # REQ-179 compute-once lowering targets (numpy-internal, not part of the
     # cross-backend REQUIRED_KERNELS contract — like the ARITHMETIC helpers).
     "eigensystem_pack": eigensystem_pack,

@@ -115,9 +115,30 @@ def build_bernoulli_config(model, mode="bernoulli", quadrature="trapezoid", n_si
     _syms = ([sp.Symbol(str(s), real=True) for s in state]
              + [sp.Symbol(str(p), real=True) for p in pars])
 
+    # Resolve LOCAL aux into flux + pressure so the lambdified conservative flux
+    # is pure in (state, parameters).  The NSM sweeps the KP-desingularized
+    # ``hinv`` (= 1/h) into the flux via aux (``flux = [.., hinv·q₀²]``); the
+    # lambdify args are (state + parameters) only, so an unresolved ``hinv``
+    # raised ``NameError: hinv`` on the first Fc evaluation.  Each aux's own
+    # definition is ``update_aux_variables[row]``; the non-local derivative aux
+    # are IDENTITY rows (``dq0dx → dq0dx``) and are skipped (nothing to
+    # substitute).  A bare SystemModel (no NSM hinv sweep) has no aux defs → the
+    # map is empty and this is a no-op.
+    aux_subs = {}
+    _uav = getattr(model, "update_aux_variables", None)
+    _aux_state = list(getattr(model, "aux_state", []) or [])
+    if _uav is not None and _aux_state:
+        _uav_flat = list(sp.flatten(_uav))
+        for _a, _d in zip(_aux_state, _uav_flat):
+            _a, _d = sp.sympify(_a), sp.sympify(_d)
+            if _d != _a:                       # skip identity (non-local) rows
+                aux_subs[_a] = _d
+
     def _fc_rd(r, d):
-        P = sp.sympify(model.hydrostatic_pressure[r, d])
-        return P if mode == "audusse" else sp.sympify(model.flux[r, d]) + P
+        P = sp.sympify(model.hydrostatic_pressure[r, d]).xreplace(aux_subs)
+        if mode == "audusse":
+            return P
+        return sp.sympify(model.flux[r, d]).xreplace(aux_subs) + P
 
     fc_d = [sp.lambdify(_syms, [_fc_rd(r, d) for r in range(len(state))], "numpy")
             for d in range(ndim)]
@@ -146,11 +167,61 @@ def _rcumtrap(y, x):                       # row-wise cumulative trapezoid, lead
     return np.concatenate([np.zeros((y.shape[0], 1)), c], axis=1)
 
 
+def reconstruct_bernoulli_level0(Qf, bstar, h_idx, b_idx, q0_idx, g,
+                                 xp, newton_solve, n_iter=60):
+    """Level-0 (SWE) moving-equilibrium reconstruction to the common bed
+    ``bstar`` — the BACKEND-AGNOSTIC core kernel shared by numpy and jax.
+
+    With a depth-uniform velocity ``u = q/h`` the per-streamline Bernoulli head
+    collapses to the cell specific energy ``E = ½u² + g(b+h)``.  Reconstructing
+    to ``b*`` with the discharge ``q`` preserved, the new surface ``η*`` solves
+    the scalar per-face equation
+
+        q / √(2(E − g·η*))  =  η* − b*        ( = h*, since u* = q/h* )
+
+    i.e. the SWE specific-energy relation (equivalent to the cubic
+    ``g·h*³ + (g·b*−E)·h*² + ½q² = 0``, subcritical root).  The loop is the
+    backend's ``newton_solve`` opaque kernel (``xp`` = numpy | jax.numpy); the
+    residual/guess are built here, in core.  Dry / zero-discharge lanes pass
+    through (``h* = h``, bed unchanged) so their Fc jump vanishes.
+
+    Returns a NEW ``(n_vars, nf)`` array (functional — no in-place, so it is
+    valid under jax tracing): row ``h_idx → h*``, ``b_idx → b*`` (wet lanes),
+    every other row (incl. the discharge ``q0_idx``) unchanged."""
+    h = Qf[h_idx]; b = Qf[b_idx]; q = Qf[q0_idx]
+    hsafe = xp.maximum(h, 1e-12)
+    u = q / hsafe
+    E = 0.5 * u * u + g * (b + h)               # cell specific energy (head)
+
+    def residual(eta):
+        disc = xp.maximum(2.0 * (E - g * eta), 1e-14)
+        return q * disc ** -0.5 - (eta - bstar)
+
+    eta_star = newton_solve(residual, b + h, n_iter)
+    hstar = eta_star - bstar
+    wet = (h > 1e-8) & (xp.abs(q) > 1e-12)
+    h_new = xp.where(wet, hstar, h)
+    b_new = xp.where(wet, bstar, b)
+    rows = [b_new if i == b_idx else (h_new if i == h_idx else Qf[i])
+            for i in range(Qf.shape[0])]
+    return xp.stack(rows, axis=0)
+
+
 def reconstruct(Qf, bstar, cfg):
     """Reconstruct face states Qf (n_vars, nf) to the common bed bstar (nf,).
-    Dispatches on cfg['mode'] ('audusse' | 'bernoulli' | 'projected_bernoulli')."""
+    Dispatches on cfg['mode'] ('audusse' | 'bernoulli' | 'projected_bernoulli').
+
+    At level 0 the moving-equilibrium modes ('bernoulli' / 'projected_bernoulli')
+    both collapse to the SWE specific-energy root, so they route through the
+    backend-agnostic :func:`reconstruct_bernoulli_level0` (numpy + the
+    ``newton_solve`` opaque kernel) — the SAME core kernel the jax solver
+    consumes.  Level ≥ 1 keeps the σ-quadrature streamline kernels below."""
     if cfg["mode"] == "audusse":
         return _reconstruct_audusse(Qf, bstar, cfg)
+    if cfg["level"] == 0 and cfg["mode"] in ("bernoulli", "projected_bernoulli"):
+        from zoomy_core.fvm.userfunctions import newton_solve
+        return reconstruct_bernoulli_level0(
+            Qf, bstar, cfg["h"], cfg["b"], cfg["q"][0], cfg["g"], np, newton_solve)
     if cfg["mode"] == "projected_bernoulli":
         return _reconstruct_projected_bernoulli(Qf, bstar, cfg)
     return _reconstruct_bernoulli(Qf, bstar, cfg)
