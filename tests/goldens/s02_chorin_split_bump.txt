@@ -9,7 +9,7 @@ stages: [('predictor', 'hyperbolic'), ('pressure', 'elliptic'), ('corrector', 'p
 class: SystemModel
 state: [Symbol('b'), Symbol('h'), Symbol('q_0'), Symbol('q_1'), Symbol('r_0'), Symbol('r_1'), Symbol('P_0'), Symbol('P_1')]
 aux_state: [Symbol('b_x'), Symbol('q_1_x'), Symbol('dbdx'), Symbol('hinv')]
-parameters: [g, rho, nu, lambda_s]
+parameters: [g, rho, nu, lambda_s, e_x]
 symbol_assumptions:
   b : {complex, extended_real, finite, hermitian, real}
   h : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
@@ -27,7 +27,8 @@ symbol_assumptions:
   rho : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
   nu : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
   lambda_s : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
-parameter_values: {g: 9.81, rho: 1.0, nu: 0.0, lambda_s: 0.0}
+  e_x : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
+parameter_values: {g: 9.81, rho: 1.0, nu: 0.0, lambda_s: 0.0, e_x: 0.0}
 n_equations: 6  n_state: 8  n_dim: 1
 equation_names: [pred_b, pred_h, pred_q_0, pred_q_1, pred_r_0, pred_r_1]
 equation_to_state_index: [0, 1, 2, 3, 4, 5]
@@ -53,7 +54,7 @@ nonconservative_matrix[2,0,0] = Mul(Symbol('g'), Symbol('h'))
 nonconservative_matrix[3,3,0] = Mul(Integer(-1), Symbol('hinv'), Symbol('q_0'))
 nonconservative_matrix[5,3,0] = Add(Mul(Integer(-1), Rational(6, 5), Symbol('hinv'), Symbol('r_0')), Mul(Rational(1, 5), Symbol('hinv'), Symbol('r_1')))
 source: shape=(6, 1)
-source[2,0] = Add(Mul(Integer(-1), Symbol('hinv'), Symbol('lambda_s'), Symbol('q_0'), Pow(Symbol('rho'), Integer(-1))), Mul(Symbol('hinv'), Symbol('lambda_s'), Symbol('q_1'), Pow(Symbol('rho'), Integer(-1))))
+source[2,0] = Add(Mul(Symbol('e_x'), Symbol('g'), Symbol('h')), Mul(Integer(-1), Symbol('hinv'), Symbol('lambda_s'), Symbol('q_0'), Pow(Symbol('rho'), Integer(-1))), Mul(Symbol('hinv'), Symbol('lambda_s'), Symbol('q_1'), Pow(Symbol('rho'), Integer(-1))))
 source[3,0] = Add(Mul(Integer(-1), Integer(12), Pow(Symbol('hinv'), Integer(2)), Symbol('nu'), Symbol('q_1')), Mul(Integer(3), Symbol('hinv'), Symbol('lambda_s'), Symbol('q_0'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(-1), Integer(3), Symbol('hinv'), Symbol('lambda_s'), Symbol('q_1'), Pow(Symbol('rho'), Integer(-1))))
 source[5,0] = Add(Mul(Integer(-1), Rational(1, 5), Symbol('b_x'), Symbol('hinv'), Symbol('q_0'), Symbol('q_1_x')), Mul(Rational(1, 5), Symbol('b_x'), Symbol('hinv'), Symbol('q_1'), Symbol('q_1_x')))
 source_explicit: None
@@ -79,7 +80,7 @@ aux_registry:
 class: SystemModel
 state: [Symbol('b'), Symbol('h'), Symbol('q_0'), Symbol('q_1'), Symbol('r_0'), Symbol('r_1'), Symbol('P_0'), Symbol('P_1')]
 aux_state: [Symbol('b_x'), Symbol('q_1_x'), Symbol('dbdx'), Symbol('hinv'), Symbol('P_0_x'), Symbol('P_0_x_x'), Symbol('P_1_x'), Symbol('P_1_x_x'), Symbol('b_x_x'), Symbol('h_x'), Symbol('h_x_x'), Symbol('q_0_x')]
-parameters: [g, rho, nu, lambda_s]
+parameters: [g, rho, nu, lambda_s, e_x]
 symbol_assumptions:
   b : {complex, extended_real, finite, hermitian, real}
   h : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
@@ -105,7 +106,8 @@ symbol_assumptions:
   rho : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
   nu : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
   lambda_s : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
-parameter_values: {g: 9.81, rho: 1.0, nu: 0.0, lambda_s: 0.0}
+  e_x : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
+parameter_values: {g: 9.81, rho: 1.0, nu: 0.0, lambda_s: 0.0, e_x: 0.0}
 n_equations: 2  n_state: 8  n_dim: 1
 equation_names: [elliptic_P_0, elliptic_P_1]
 equation_to_state_index: [6, 7]
@@ -151,7 +153,7 @@ aux_registry:
 class: SystemModel
 state: [Symbol('b'), Symbol('h'), Symbol('q_0'), Symbol('q_1'), Symbol('r_0'), Symbol('r_1'), Symbol('P_0'), Symbol('P_1')]
 aux_state: [Symbol('P_0_x'), Symbol('b_x'), Symbol('h_x'), Symbol('P_1_x')]
-parameters: [g, rho, nu, lambda_s]
+parameters: [g, rho, nu, lambda_s, e_x]
 symbol_assumptions:
   b : {complex, extended_real, finite, hermitian, real}
   h : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
@@ -169,7 +171,8 @@ symbol_assumptions:
   rho : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
   nu : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
   lambda_s : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
-parameter_values: {g: 9.81, rho: 1.0, nu: 0.0, lambda_s: 0.0}
+  e_x : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
+parameter_values: {g: 9.81, rho: 1.0, nu: 0.0, lambda_s: 0.0, e_x: 0.0}
 n_equations: 4  n_state: 8  n_dim: 1
 equation_names: [corr_q_0, corr_q_1, corr_r_0, corr_r_1]
 equation_to_state_index: [2, 3, 4, 5]

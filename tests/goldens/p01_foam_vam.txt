@@ -15,12 +15,12 @@ namespace Model
 {
 constexpr int n_dof_q    = 8;
 constexpr int n_dof_qaux = 4;
-constexpr int n_parameters = 4;
+constexpr int n_parameters = 5;
 constexpr int dimension  = 1;
 constexpr Foam::scalar dt_max = 5.0;
 const Foam::List<Foam::word> map_boundary_tag_to_function_index{  };
-const Foam::List<Foam::word> parameter_names{ "g", "rho", "nu", "lambda_s" };
-inline Foam::List<Foam::scalar> default_parameters() { return { 9.81, 1.0, 0.0, 0.0 }; }
+const Foam::List<Foam::word> parameter_names{ "g", "rho", "nu", "lambda_s", "e_x" };
+inline Foam::List<Foam::scalar> default_parameters() { return { 9.81, 1.0, 0.0, 0.0, 0.0 }; }
 constexpr int n_precice_patches = 0;
 const Foam::List<Foam::word> precice_patch_names{  };
 const Foam::List<Foam::word> precice_mesh_names{  };
@@ -252,22 +252,23 @@ inline Foam::List<Foam::List<Foam::scalar>> source(
     const Foam::scalar dt,
     const Foam::vector& X)
 {
-    Foam::scalar t0 = (1.0 / Foam::pow(p[1], 1));
-    Foam::scalar t1 = p[3]*t0;
-    Foam::scalar t2 = Qaux[3]*Q[2];
-    Foam::scalar t3 = Qaux[3]*Q[3];
-    Foam::scalar t4 = Q[7]*t0;
-    Foam::scalar t5 = (1.0/5.0)*Qaux[0]*Qaux[1];
-    Foam::scalar t6 = 2*Qaux[3];
+    Foam::scalar t0 = Qaux[3]*Q[3];
+    Foam::scalar t1 = (1.0 / Foam::pow(p[1], 1));
+    Foam::scalar t2 = p[3]*t1;
+    Foam::scalar t3 = t0*t2;
+    Foam::scalar t4 = Qaux[3]*Q[2];
+    Foam::scalar t5 = Q[7]*t1;
+    Foam::scalar t6 = (1.0/5.0)*Qaux[0]*Qaux[1];
+    Foam::scalar t7 = 2*Qaux[3];
     auto res = Foam::List<Foam::List<Foam::scalar>>(8, Foam::List<Foam::scalar>(1, 0.0));
     res[0][0] = 0;
     res[1][0] = 0;
-    res[2][0] = Qaux[3]*p[3]*Q[3]*t0 - t1*t2;
-    res[3][0] = -12*Foam::pow(Qaux[3], 2)*p[2]*Q[3] + 3*Qaux[3]*p[3]*Q[2]*t0 - 3*t1*t3;
-    res[4][0] = -2*t4;
-    res[5][0] = 6*Q[6]*t0 - t2*t5 + t3*t5 + 6*t4;
-    res[6][0] = Q[4]*t6;
-    res[7][0] = Q[5]*t6;
+    res[2][0] = p[4]*p[0]*Q[1] - t2*t4 + t3;
+    res[3][0] = -12*Foam::pow(Qaux[3], 2)*p[2]*Q[3] + 3*Qaux[3]*p[3]*Q[2]*t1 - 3*t3;
+    res[4][0] = -2*t5;
+    res[5][0] = 6*Q[6]*t1 + t0*t6 - t4*t6 + 6*t5;
+    res[6][0] = Q[4]*t7;
+    res[7][0] = Q[5]*t7;
     return res;
 }
 

@@ -93,7 +93,10 @@ class MLVAM(BaseModel):
         def sname(xd, ell):
             return f"tau_{ell}" if dim == 2 else f"tau_{CN[xd]}z_{ell}"
         MOM = [f"momentum_{CN[xd]}" for xd in horiz]
-        values = {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0}
+        # e_x (downslope gravity component) is minted on the per-layer sub-models
+        # by MomentumNonHydrostatic via gravity_components; declare it on the
+        # assembled model too so it binds with a value (like sme/vam/ke_sme).
+        values = {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0, "e_x": 0.0}
         for j in range(1, N):
             values[f"l_{j}"] = 1.0 / N
         user_vals = getattr(self, "parameter_values", None)
@@ -442,9 +445,17 @@ class MLVAM(BaseModel):
                     for a, side, sgn in ((ell, 1, +1), (ell - 1, 0, -1)):
                         if 1 <= a <= N - 1:
                             phik = inner_basis.eval(k, side)
+                            # interface transfer is a projected coefficient
+                            # ⟨δ_interface·u*, φ_k⟩ = φ_k(side)·(…); the row was
+                            # already mass-inverted (:297), so it carries the
+                            # SAME 1/μ_k Gram-norm every other post-inversion
+                            # coefficient does (ω̃ :336/:338, flux :357) — read
+                            # off the basis, not hardcoded (REQ-79).  Without it
+                            # modes k≥1 are off by (2k+1); μ_0=1 so mode 0 is
+                            # unchanged (cid 170).
                             row = row + (sgn * phik
                                          * (_ustar(a, xd) - _trace(ell, side, xd))
-                                         * Gf[a] / rho_s)
+                                         * Gf[a] / rho_s / mus[k])
                     row = sp.expand(row).subs(G_sol)
                     # CN[x]="x" → momentum_x_ℓ_k in 1-D (byte-identical names)
                     m.add_equation(f"momentum_{CN[xd]}_{ell}_{k}",

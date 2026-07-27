@@ -333,9 +333,16 @@ class MLSME(BaseModel):
                     for a, side, sgn in ((ell, 1, +1), (ell - 1, 0, -1)):
                         if 1 <= a <= N - 1:
                             phik = inner_basis.eval(k, side)
+                            # interface transfer is a projected coefficient
+                            # ⟨δ_interface·u*, φ_k⟩ = φ_k(side)·(…); the per-layer
+                            # row was already mass-inverted (:262), so this term
+                            # carries the SAME 1/μ_k Gram-norm the projection
+                            # divides by — read off the basis, not hardcoded
+                            # (REQ-79).  Without it modes k≥1 are off by (2k+1);
+                            # μ_0=1 so mode 0 is unchanged (cid 170).
                             mom = mom + (sgn * phik
                                          * (_ustar(a, xd) - _trace(ell, side, xd))
-                                         * Gf[a] / rho_s)
+                                         * Gf[a] / rho_s / inner_basis.gram(k, k))
                     mom = sp.expand(mom).subs(G_sol)
                     enm = (f"momentum_{ell}_{k}" if dim == 2
                            else f"momentum_{CN[xd]}_{ell}_{k}")

@@ -6,7 +6,7 @@
 class: SystemModel
 state: [Symbol('b'), Symbol('h'), Symbol('q_x_0'), Symbol('q_x_1'), Symbol('q_y_0'), Symbol('q_y_1'), Symbol('r_0'), Symbol('r_1'), Symbol('P_0'), Symbol('P_1')]
 aux_state: [Symbol('b_x'), Symbol('b_y'), Symbol('q_x_1_x'), Symbol('q_y_1_y'), Symbol('dbdx'), Symbol('dbdy')]
-parameters: [g, rho, nu, lambda_s]
+parameters: [g, rho, nu, lambda_s, e_x]
 symbol_assumptions:
   b : {complex, extended_real, finite, hermitian, real}
   h : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
@@ -28,7 +28,8 @@ symbol_assumptions:
   rho : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
   nu : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
   lambda_s : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
-parameter_values: {g: 9.81, rho: 1.0, nu: 0.0, lambda_s: 0.0}
+  e_x : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
+parameter_values: {g: 9.81, rho: 1.0, nu: 0.0, lambda_s: 0.0, e_x: 0.0}
 n_equations: 10  n_state: 10  n_dim: 2
 equation_to_state_index: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 stationary_indices: [0]
@@ -88,7 +89,7 @@ nonconservative_matrix[9,0,1] = Mul(Integer(2), Pow(Symbol('h'), Integer(-1)), S
 nonconservative_matrix[9,1,0] = Add(Mul(Pow(Symbol('h'), Integer(-1)), Symbol('q_x_0')), Mul(Pow(Symbol('h'), Integer(-1)), Symbol('q_x_1')))
 nonconservative_matrix[9,1,1] = Add(Mul(Pow(Symbol('h'), Integer(-1)), Symbol('q_y_0')), Mul(Pow(Symbol('h'), Integer(-1)), Symbol('q_y_1')))
 source: shape=(10, 1)
-source[2,0] = Add(Mul(Integer(-1), Pow(Symbol('h'), Integer(-1)), Symbol('lambda_s'), Symbol('q_x_0'), Pow(Symbol('rho'), Integer(-1))), Mul(Pow(Symbol('h'), Integer(-1)), Symbol('lambda_s'), Symbol('q_x_1'), Pow(Symbol('rho'), Integer(-1))))
+source[2,0] = Add(Mul(Symbol('e_x'), Symbol('g'), Symbol('h')), Mul(Integer(-1), Pow(Symbol('h'), Integer(-1)), Symbol('lambda_s'), Symbol('q_x_0'), Pow(Symbol('rho'), Integer(-1))), Mul(Pow(Symbol('h'), Integer(-1)), Symbol('lambda_s'), Symbol('q_x_1'), Pow(Symbol('rho'), Integer(-1))))
 source[3,0] = Add(Mul(Integer(3), Pow(Symbol('h'), Integer(-1)), Symbol('lambda_s'), Symbol('q_x_0'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(-1), Integer(3), Pow(Symbol('h'), Integer(-1)), Symbol('lambda_s'), Symbol('q_x_1'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(-1), Integer(12), Pow(Symbol('h'), Integer(-2)), Symbol('nu'), Symbol('q_x_1')))
 source[4,0] = Add(Mul(Integer(-1), Pow(Symbol('h'), Integer(-1)), Symbol('lambda_s'), Symbol('q_y_0'), Pow(Symbol('rho'), Integer(-1))), Mul(Pow(Symbol('h'), Integer(-1)), Symbol('lambda_s'), Symbol('q_y_1'), Pow(Symbol('rho'), Integer(-1))))
 source[5,0] = Add(Mul(Integer(3), Pow(Symbol('h'), Integer(-1)), Symbol('lambda_s'), Symbol('q_y_0'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(-1), Integer(3), Pow(Symbol('h'), Integer(-1)), Symbol('lambda_s'), Symbol('q_y_1'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(-1), Integer(12), Pow(Symbol('h'), Integer(-2)), Symbol('nu'), Symbol('q_y_1')))

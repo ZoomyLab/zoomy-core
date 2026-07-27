@@ -255,7 +255,10 @@ def vam_reference(vam1):
         "P_1": hf * Dx(u0) + u1 * Dx(hf) + 2 * (u1 * Dx(bf) - w1),
     }
     sign = {"h": 1, "q_0": 1, "r_0": 1, "q_1": -1, "r_1": -1}
-    inviscid = {sm.parameters.lambda_s: 0, sm.parameters.nu: 0}
+    # Escalante eq (4) is the FLAT inviscid column; VAM now carries the general
+    # downslope body force −g·e_x (cid 171), so specialise to e_x=0 to compare.
+    inviscid = {sm.parameters.lambda_s: 0, sm.parameters.nu: 0,
+                sm.parameters.e_x: 0}
     return {"R": R, "C": C, "sign": sign, "inviscid": inviscid, "Fn": Fn}
 
 

@@ -49,7 +49,14 @@ def derivation_cache_enabled() -> bool:
 
 # Bump when the derivation pipeline changes in a way that invalidates every
 # cached entry (new op semantics, changed extraction, etc.).
-CACHE_VERSION = "v7"   # v7: REQ-188 — the SystemModel cache key now hashes the
+CACHE_VERSION = "v8"   # v8: cid 170/171 — the shared momentum blueprints changed
+#                              (equations.py: gravity carried as a VECTOR via
+#                              gravity_components; ml_sme/ml_vam interface transfer
+#                              now routed through the basis mass matrix).  These
+#                              live in equations.py, a derive_model DEPENDENCY that
+#                              the per-model spec/MRO hash does NOT cover, so bump
+#                              to invalidate every stale v7 entry (incl. _prebuilt).
+#                        v7: REQ-188 — the SystemModel cache key now hashes the
 #                              FULL source of every class in the model's MRO
 #                              (sm_cache.cache_key) instead of only derive_model,
 #                              so a case-local operator override (e.g. RainSWE.source)

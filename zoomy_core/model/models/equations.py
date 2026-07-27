@@ -68,6 +68,34 @@ class Mass(Equation):
         return model._equations["mass"]
 
 
+def gravity_components(model, coords):
+    """Gravity BODY-FORCE VECTOR ``g``, per spatial direction — the single
+    gravity path every momentum blueprint reads.
+
+    The mass/momentum balance carries gravity as a vector: its in-plane
+    (horizontal) components are the downslope body force ``g·e_d`` and its normal
+    (vertical) component is ``−g`` (straight down, magnitude ``g``).  The flat
+    plane is the special CASE ``e_d = 0`` → ``g = (0, …, −g)`` read through the
+    SAME formula — no separate flat path.  Hydrostatic (:class:`Momentum`) and
+    non-hydrostatic (:class:`MomentumNonHydrostatic`) momentum both take their
+    in-plane body force and their vertical component from here, so the two share
+    ONE gravity path; the only difference is how each treats the vertical
+    (Momentum eliminates it hydrostatically, MomentumNonHydrostatic folds it into
+    the surface-gradient term ``−g_z·∂_d η``).
+
+    Returns ``(g_h, g_z)``: ``g_h`` maps each horizontal coord → its in-plane
+    body-force component, ``g_z`` is the vertical (normal) component.  The
+    streamwise incline uses the existing ``e_x`` parameter; other horizontals
+    carry a flat literal ``0`` (so the shallow gauge, and every existing golden,
+    is unchanged)."""
+    horiz = coords[1:-1]
+    g = model.parameters.g
+    incline = {C.x: g * model.parameter("e_x", 0.0)}    # downslope body force
+    g_h = {xd: incline.get(xd, sp.S.Zero) for xd in horiz}
+    g_z = -g                                             # normal component
+    return g_h, g_z
+
+
 class Momentum(Equation):
     """GENERAL 3-D momentum balance — the FULL stress tensor, no shallow
     simplification baked in:
@@ -86,8 +114,8 @@ class Momentum(Equation):
         coords = model.coords
         t, zc = coords[0], coords[-1]
         horiz = coords[1:-1]
-        g, rho = model.parameters.g, model.parameters.rho
-        e_x = model.parameter("e_x", 0.0)
+        rho = model.parameters.rho
+        g_h, g_z = gravity_components(model, coords)     # shared gravity vector
         uvel = [sp.Function(_HNAME[xd], real=True)(*coords) for xd in horiz]
         w = sp.Function("w", real=True)(*coords)
         p = sp.Function("p", real=True)(*coords)
@@ -108,11 +136,11 @@ class Momentum(Equation):
             # FULL stress divergence Σ_j ∂_j τ_ij, j over horizontals + z
             sdiv = (sum(dop(xj)(stress(xi, xj)) for xj in horiz)
                     + d.z(stress(xi, zc)))
-            incline = g * e_x if xi == C.x else sp.S.Zero
-            comps.append(d.t(uvel[i]) + adv + dop(xi)(p) / rho - sdiv / rho - incline)
-        # vertical momentum (eliminated hydrostatically)
+            comps.append(d.t(uvel[i]) + adv + dop(xi)(p) / rho - sdiv / rho
+                         - g_h[xi])
+        # vertical momentum (eliminated hydrostatically); − g_z = +g (flat)
         comps.append(d.t(w) + sum(dop(xj)(uvel[j] * w) for j, xj in enumerate(horiz))
-                     + d.z(w * w) + d.z(p) / rho + g)
+                     + d.z(w * w) + d.z(p) / rho - g_z)
         model.declare_state(p)
         model.declare_closure(*tau.values())
         model.add_equation("momentum", (len(comps),), comps)
@@ -326,7 +354,8 @@ class MomentumNonHydrostatic(Equation):
         t = coords[0]
         horiz = coords[1:-1]
         s = self.suffix
-        g, rho = model.parameters.g, model.parameters.rho
+        rho = model.parameters.rho
+        g_h, g_z = gravity_components(model, coords)     # shared gravity vector
         uvel = [sp.Function(_HNAME[xd] + s, real=True)(*coords) for xd in horiz]
         w = sp.Function("w" + s, real=True)(*coords)
         p = sp.Function("p" + s, real=True)(*coords)
@@ -347,10 +376,14 @@ class MomentumNonHydrostatic(Equation):
         model.declare_closure(*tau.values())
         for i, xd in enumerate(horiz):
             adv = sum(_DERIV[xe](uvel[i] * uvel[j]) for j, xe in enumerate(horiz))
+            # −g_z·∂_d η is the pre-absorbed hydrostatic gradient (flat: +g·∂_d η);
+            # −g_h[xd] is the in-plane (downslope) body force — the SAME vector
+            # component Momentum carries, so an inclined-plane VAM falls out with
+            # no hand-built model (flat e_x=0 → no change).
             model.add_equation(
                 f"momentum_{_CNAME[xd]}",
-                d.t(uvel[i]) + adv + d.z(uvel[i] * w) + g * _DERIV[xd](eta)
-                + _DERIV[xd](p) / rho - d.z(tau[xd]) / rho)
+                d.t(uvel[i]) + adv + d.z(uvel[i] * w) - g_z * _DERIV[xd](eta)
+                + _DERIV[xd](p) / rho - d.z(tau[xd]) / rho - g_h[xd])
         model.add_equation(
             "momentum_z",
             d.t(w) + sum(_DERIV[xd](uvel[i] * w) for i, xd in enumerate(horiz))
@@ -395,4 +428,4 @@ class Transport(Equation):
 
 __all__ = ["Equation", "Mass", "Momentum", "MomentumNonHydrostatic", "Transport",
            "moment_scaling", "small_slope_scaling", "frame_slope",
-           "add_inplane_viscous", "package_viscous"]
+           "add_inplane_viscous", "package_viscous", "gravity_components"]
