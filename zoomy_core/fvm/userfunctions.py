@@ -11,21 +11,15 @@ is built from these tables via :func:`numpy_module`.
 Kept a leaf module (imports only numpy) so ``to_numpy`` can import it without a
 ``fvm`` ↔ ``transformation`` cycle.
 
-The 1-slot caches share ONE decomposition/solve across the many component calls
-lambdify emits for a single evaluation: the printer turns the ``n + 2n²``
-component reads of one face into ``n + 2n²`` separate ``eigensystem(i, …)``
-calls with the SAME argument objects (hence same ``id``), and likewise ``n``
-``solve(i, …)`` calls.  R, |Λ| and L MUST come from the same eigenbasis or
-``|A| = R|Λ|L`` is silently inconsistent — the cache is a CORRECTNESS
-requirement, not just an optimization.  Valid only WITHIN one lambdified
-evaluation (same argument objects); a fresh evaluation gets fresh arrays.
+Each kernel returns the WHOLE packed result of ONE decomposition / solve
+(``eigensystem`` → ``[λ, R, L]``, ``eigenvalues`` → ``λ``, ``solve`` → ``A⁻¹b``);
+component access is ``pick(K(*a), idx)``.  The producers emit every component
+read against the SAME ``K(*a)`` node, so lambdify's cse hoists it to a single
+call per face — R, |Λ| and L therefore come from ONE eigenbasis by construction
+(``|A| = R|Λ|L`` consistent), with no per-call cache to keep them in sync.
 """
 
 import numpy as np
-
-_EIGENSYSTEM_CACHE = {"key": None, "out": None}
-_EIGENVALUES_CACHE = {"key": None, "out": None}
-_SOLVE_CACHE = {"key": None, "out": None}
 
 
 def _stack_square(a_flat, n):
@@ -45,26 +39,19 @@ def _scalarize(x):
     return float(x) if np.ndim(x) == 0 else x
 
 
-# ── compute-once pack helpers (REQ-179) ──────────────────────────────────────
-# The per-component ``eigensystem(idx, *A_flat)`` calling convention forces the
-# printer to inline the full ``A_flat`` argument list into EACH of the ``n+2n²``
-# component calls — 93% of the lowered eigensystem tree and the ~20-min
-# single-core lambdify at ML-FullVAM scale (fully-inlined source is 10-15×
-# larger and compiles 13× slower — REQ-179 measurements).  The numpy printer
-# (:meth:`to_numpy.NumpyRuntimeModel._lower_opaque_kernels`) instead rewrites
-# each ``K(idx, *A_flat)`` into ``pick(K_pack(*A_flat), idx)``.  Every component
-# of one face shares the SAME ``A_flat`` objects, so all ``K_pack(*A_flat)`` are
-# ONE sympy node — cse hoists it to a single temp, emitting ``A_flat`` ONCE.
-# The ``*_pack`` bodies are the exact (inf-guarded) numerics the cached kernels
-# below use, so ``pick(K_pack(a), i)`` is bit-identical to ``K(i, *a)``.
+def eigensystem(*a_flat):
+    """Opaque ``eigensystem`` kernel: the FULL packed stack
+    ``[λ(n), R(n·n), L=R⁻¹(n·n)]`` (row-major, length ``n+2n²``) of the row-major
+    ``n×n`` matrix ``a_flat`` (``n = round(√len)``), batched over the grid.
+    Component access is ``pick(eigensystem(*a), idx)`` — the canonical form the
+    Roe scheme emits; the producers share ONE ``eigensystem(*a)`` node, so
+    lambdify's cse hoists it to a single ``eig`` per face (R, |Λ|, L from ONE
+    eigenbasis by construction).
 
-def _eigensystem_pack(a_flat):
-    """Full ``[λ(n), R(n·n), L=R⁻¹(n·n)]`` stack of the row-major ``n×n`` matrix
-    ``a_flat`` (``n = round(√len)``), batched over the grid.  REQ-168 inf-guard:
-    LAPACK raises on non-finite input, so non-finite batch members get λ = +inf
-    with an identity eigenbasis (R = L = I) — the +inf wave speed flags the
-    garbage state; the identity basis keeps ``|A| = R|Λ|L`` well-defined without
-    inventing an inverse of a garbage matrix."""
+    REQ-168 inf-guard: LAPACK raises on non-finite input, so non-finite batch
+    members get λ = +inf with an identity eigenbasis (R = L = I) — the +inf wave
+    speed flags the garbage state; the identity basis keeps ``|A| = R|Λ|L``
+    well-defined without inventing an inverse of a garbage matrix."""
     n = int(round(len(a_flat) ** 0.5))
     A = _stack_square(a_flat, n)
     flat = A.reshape(-1, n, n)
@@ -86,12 +73,17 @@ def _eigensystem_pack(a_flat):
         axis=-1).reshape(A.shape[:-2] + (n + 2 * n * n,))
 
 
-def _eigenvalues_pack(a_flat):
-    """λ-only spectrum (n,) of the row-major ``n×n`` matrix ``a_flat``, batched
-    over the grid.  REQ-168 inf-guard: eig the finite batch members, +inf for
-    the rest (order-2 MOOD / transient BC-ghost feed non-finite candidate face
-    states BY DESIGN — an infinite wave speed is exactly what a garbage face
-    should report; dt clamps, MOOD flags the candidate)."""
+def eigenvalues(*a_flat):
+    """Opaque ``eigenvalues`` kernel (λ-only): the spectrum vector ``(n,)`` of
+    the row-major ``n×n`` matrix ``a_flat`` (``n = round(√len)``), batched over
+    the grid.  The light companion of :func:`eigensystem` (no eigenvectors) for
+    the wave-speed / CFL bound; component access is ``pick(eigenvalues(*a),
+    idx)`` (cse-hoisted to ONE ``eigvals`` per face).
+
+    REQ-168 inf-guard: eig the finite batch members, +inf for the rest (order-2
+    MOOD / transient BC-ghost feed non-finite candidate face states BY DESIGN —
+    an infinite wave speed is exactly what a garbage face should report; dt
+    clamps, MOOD flags the candidate)."""
     n = int(round(len(a_flat) ** 0.5))
     A = _stack_square(a_flat, n)
     flat = A.reshape(-1, n, n)
@@ -102,9 +94,12 @@ def _eigenvalues_pack(a_flat):
     return out.reshape(A.shape[:-2] + (n,))
 
 
-def _solve_pack(args):
-    """Per-cell linear solve ``A⁻¹ b`` (ncells, n).  ``args`` = row-major ``A``
-    (n·n) followed by ``b`` (n); ``n`` inferred from the count ``n·n + n``."""
+def solve(*args):
+    """Opaque ``solve`` kernel: the per-cell linear solve ``A⁻¹ b`` ``(ncells,
+    n)``.  ``args`` = row-major ``A`` (n·n) followed by ``b`` (n); ``n``
+    inferred from the count ``n·n + n``.  Batched over the grid — the NSM
+    point-implicit ``source`` lowers to ONE batched ``np.linalg.solve``;
+    component access is ``pick(solve(*a), idx)``."""
     m = len(args)
     n = int(round((-1.0 + (1.0 + 4.0 * m) ** 0.5) / 2.0))
     arrs = [np.asarray(a, dtype=float) for a in args]
@@ -123,75 +118,13 @@ def _solve_pack(args):
     return np.linalg.solve(A, b)[..., 0]   # (ncells, n)
 
 
-def eigensystem_pack(*a_flat):
-    """Compute-once companion of :func:`eigensystem` (no ``idx``): the full
-    packed stack, consumed by :func:`pick`.  See the pack-helper note above."""
-    return _eigensystem_pack(a_flat)
-
-
-def eigenvalues_pack(*a_flat):
-    """Compute-once companion of :func:`eigenvalues` (no ``idx``)."""
-    return _eigenvalues_pack(a_flat)
-
-
-def solve_pack(*args):
-    """Compute-once companion of :func:`solve` (no ``idx``)."""
-    return _solve_pack(args)
-
-
 def pick(packed, idx):
-    """idx-th component of a packed opaque-kernel result (``*_pack``).  Cheap
-    trailing-axis index read — the numpy printer emits ``n+2n²`` of these
-    against ONE cse-hoisted ``K_pack(*A_flat)`` temp (REQ-179).  ``_scalarize``
-    keeps the scalar-input path returning a float, matching the cached
-    kernels."""
+    """idx-th component of a packed opaque-kernel result (:func:`eigensystem` /
+    :func:`eigenvalues` / :func:`solve`).  Cheap trailing-axis index read — the
+    producers emit ``pick(K(*a), idx)`` against ONE cse-hoisted ``K(*a)`` node
+    so each face runs ONE decomposition / solve.  ``_scalarize`` keeps the
+    scalar-input path returning a float, matching a scalar ``K`` evaluation."""
     return _scalarize(packed[..., int(idx)])
-
-
-def eigensystem(idx, *a_flat):
-    """Opaque ``eigensystem`` kernel: idx-th component of the flat stack
-    ``[eigenvalues(n), R(n·n), L=R⁻¹(n·n)]`` of the row-major ``n×n`` matrix
-    ``a_flat`` (``n = round(√len)``).  Batched over the grid; one ``eig`` is
-    shared across the ``n + 2n²`` component calls via the 1-slot cache.  (The
-    numpy printer normally rewrites these into ``pick(eigensystem_pack(*a), i)``
-    per REQ-179; this cached form remains the cross-backend contract kernel and
-    the direct-call path.)"""
-    key = tuple(map(id, a_flat))
-    c = _EIGENSYSTEM_CACHE
-    if c["key"] != key:
-        c["args"] = a_flat   # REQ-168 ADD.3: pin refs — ids of gc'd arrays get recycled
-        c["key"] = key
-        c["out"] = _eigensystem_pack(a_flat)
-    return _scalarize(c["out"][..., int(idx)])
-
-
-def eigenvalues(idx, *a_flat):
-    """Opaque ``eigenvalues`` kernel (λ-only): idx-th eigenvalue (real part) of
-    the row-major ``n×n`` matrix ``a_flat`` (``n = round(√len)``).  The light
-    companion of :func:`eigensystem` — no eigenvectors — for the wave-speed /
-    CFL bound.  Batched over the grid; one ``eigvals`` shared via the cache."""
-    key = tuple(map(id, a_flat))
-    c = _EIGENVALUES_CACHE
-    if c["key"] != key:
-        c["args"] = a_flat   # REQ-168 ADD.3: pin refs — ids of gc'd arrays get recycled
-        c["key"] = key
-        c["out"] = _eigenvalues_pack(a_flat)
-    return _scalarize(c["out"][..., int(idx)])
-
-
-def solve(idx, *args):
-    """Opaque ``solve`` kernel: idx-th component of the per-cell linear solve
-    ``A⁻¹ b``.  ``args`` = row-major ``A`` (n·n) followed by ``b`` (n); ``n``
-    inferred from the count ``n·n + n``.  Batched over the grid — the NSM
-    point-implicit ``source`` lowers to one batched ``np.linalg.solve`` per
-    step, shared across the ``n`` component calls via the 1-slot cache."""
-    key = tuple(id(a) for a in args)
-    c = _SOLVE_CACHE
-    if c["key"] != key:
-        c["args"] = args     # REQ-168 ADD.3: pin refs — ids of gc'd arrays get recycled
-        c["key"] = key
-        c["out"] = _solve_pack(args)
-    return c["out"][:, int(idx)]
 
 
 def newton_solve(residual, x0, n_iter=60, tol=1e-14):
@@ -275,6 +208,10 @@ KERNELS = {
     "eigensystem": eigensystem,
     "eigenvalues": eigenvalues,
     "solve": solve,
+    # Component read of a packed kernel result (numpy-internal, not a
+    # cross-backend REQUIRED_KERNEL — the per-component C/UFL backends restore
+    # ``K(idx, *a)`` from ``pick(K(*a), idx)`` instead of resolving ``pick``).
+    "pick": pick,
     # Higher-order root-find (numpy-internal — the reconstruction supplies the
     # residual callable, so it is NOT a lambdify-lowered REQUIRED_KERNEL).
     "newton_solve": newton_solve,
@@ -282,12 +219,6 @@ KERNELS = {
     # the reconstruction supplies the slope closure, so — like newton_solve —
     # it is NOT a lambdify-lowered REQUIRED_KERNEL.
     "solve_steady_ode": solve_steady_ode,
-    # REQ-179 compute-once lowering targets (numpy-internal, not part of the
-    # cross-backend REQUIRED_KERNELS contract — like the ARITHMETIC helpers).
-    "eigensystem_pack": eigensystem_pack,
-    "eigenvalues_pack": eigenvalues_pack,
-    "solve_pack": solve_pack,
-    "pick": pick,
 }
 
 # Arithmetic / printer-lowered helpers the numpy printer emits — NOT part of the

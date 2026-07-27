@@ -1183,7 +1183,8 @@ class SystemModel:
         ``Model.eigensystem`` so a SystemModel-driven solver reaches the
         same operator the root model defines.
         """
-        from zoomy_core.model.kernel_functions import eigensystem as _es
+        from zoomy_core.model.kernel_functions import (
+            eigensystem as _es, pick as _pick)
         n = self.n_equations
         qm = self.quasilinear_matrix
         normal = list(self.normal.values())
@@ -1191,7 +1192,8 @@ class SystemModel:
             sum(qm[i, j, d] * normal[d] for d in range(self.n_dim))
             for i in range(n) for j in range(n)
         ]
-        return ZArray([_es(sp.Integer(idx), *A_flat)
+        stack = _es(*A_flat)
+        return ZArray([_pick(stack, sp.Integer(idx))
                        for idx in range(n + 2 * n * n)])
 
     @property
@@ -1209,7 +1211,8 @@ class SystemModel:
         scaled as ``g·h`` rather than ``sqrt(g·h)`` — ~6-9× too large (REQ-167).
         A *derived* operator (cheap symbolic wrapping of ``quasilinear_matrix``),
         so exposed as a property — always consistent with the current matrix."""
-        from zoomy_core.model.kernel_functions import eigenvalues as _ev
+        from zoomy_core.model.kernel_functions import (
+            eigenvalues as _ev, pick as _pick)
         n = self.n_equations
         qm = self.quasilinear_matrix
         normal = list(self.normal.values())
@@ -1217,7 +1220,8 @@ class SystemModel:
             sum(qm[i, j, d] * normal[d] for d in range(self.n_dim))
             for i in range(n) for j in range(n)
         ]
-        return ZArray([_ev(sp.Integer(idx), *A_flat) for idx in range(n)])
+        stack = _ev(*A_flat)
+        return ZArray([_pick(stack, sp.Integer(idx)) for idx in range(n)])
 
     def refresh_derived_operators(self, *, eigenvalues: bool = False):
         """Recompute ``quasilinear_matrix`` and the source jacobians from

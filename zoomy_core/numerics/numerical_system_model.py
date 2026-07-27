@@ -544,7 +544,7 @@ def _linearize_source(sm):
     (the jacobian is baked into ``S_lin`` and consumed explicitly)."""
     import sympy as sp
     from zoomy_core.misc.misc import ZArray
-    from zoomy_core.model.kernel_functions import solve as _solve
+    from zoomy_core.model.kernel_functions import solve as _solve, pick as _pick
     from zoomy_core.transformation.to_numpy import DT_SYMBOL
 
     n = sm.n_equations
@@ -580,7 +580,8 @@ def _linearize_source(sm):
     A = sp.eye(n) - DT_SYMBOL * J
     A_flat = [A[i, j] for i in range(n) for j in range(n)]
     b_flat = [sp.sympify(sm.source[i, 0]) for i in range(n)]
-    rows = [[_solve(sp.Integer(i), *A_flat, *b_flat)] for i in range(n)]
+    sol = _solve(*A_flat, *b_flat)
+    rows = [[_pick(sol, sp.Integer(i))] for i in range(n)]
     sm.source = ZArray(rows)
 
 

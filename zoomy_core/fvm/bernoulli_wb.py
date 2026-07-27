@@ -223,8 +223,8 @@ def make_steady_ode_slope(quasilinear_fn, source_fn, b_idx, solve_op, xp,
     ``source_fn(U) → Sfr`` ``(n_eq, nf)`` are the EMITTED operators the caller
     binds to its runtime (``A = J_F + B`` incl. the bed column, ``Sfr`` the
     friction source ``-R``); ``solve_op`` is the EXISTING ``solve`` opaque linear
-    kernel (``solve_op(idx, *A_flat, *b) → (A⁻¹b)[idx]``); ``xp`` is
-    ``numpy``/``jax.numpy``.
+    kernel (``solve_op(*A_flat, *b) → A⁻¹b``, the whole solution vector); ``xp``
+    is ``numpy``/``jax.numpy``.
 
     The topography row ``b_idx`` is dropped from the invert (``b`` is passive,
     ``b_t=0``) and its column carried to the RHS as the paper's ``S(U)·H_x``:
@@ -244,7 +244,8 @@ def make_steady_ode_slope(quasilinear_fn, source_fn, b_idx, solve_op, xp,
         # non-b block A_VV, bed column A_Vb, friction source S_V
         A_flat = [A0[V[i], V[j]] for i in range(nV) for j in range(nV)]
         rhs = [Sfr[V[i]] - A0[V[i], b_idx] * hx for i in range(nV)]
-        gV = [solve_op(k, *A_flat, *rhs) for k in range(nV)]   # reuse solve op
+        gV_all = solve_op(*A_flat, *rhs)          # reuse solve op (whole vector)
+        gV = [gV_all[..., k] for k in range(nV)]
         rows = []
         vi = 0
         for i in range(n_state):

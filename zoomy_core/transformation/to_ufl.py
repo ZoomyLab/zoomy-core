@@ -265,11 +265,14 @@ class UFLRuntimeModel(NumpyRuntimeModel):
         )
 
     def _lower_opaque_kernels(self, expr):
-        """UFL keeps the opaque kernels in the ``eigensystem(idx, …)``
-        convention — the REQ-179 compute-once rewrite (``pick`` /
-        ``eigensystem_pack``) is numpy-module-internal and has no UFL/Firedrake
-        binding, so it must NOT run on this lowering path."""
-        return expr
+        """UFL keeps the opaque kernels in the per-component
+        ``eigensystem(idx, …)`` convention: the Firedrake module hooks
+        (``eigensystem_hook(idx, *a)`` / ``eigenvalues_hook(idx, *a)``) are
+        per-component, with no binding for the packed-stack ``K(*a)`` /
+        ``pick``.  The producers emit the canonical ``pick(K(*a), idx)``, so
+        restore the ``K(idx, *a)`` form here before lambdify."""
+        from zoomy_core.model.kernel_functions import lower_pick_to_component
+        return lower_pick_to_component(expr)
 
     @staticmethod
     def _substitute_derivative_atoms(function_obj):

@@ -16,6 +16,7 @@ from zoomy_core.numerics.numerical_system_model import (
     to_numerical_system_model,
 )
 from zoomy_core.solver.arg_slots import SOLVER_ARG_MAPPING, SOLVER_DECL_KINDS
+from zoomy_core.model.kernel_functions import lower_pick_to_component
 
 # =========================================================================
 #  1. HELPER FUNCTIONS
@@ -612,6 +613,13 @@ class GenericCppBase(CXX11CodePrinter):
 
     def convert_expression_body(self, expr, shape, target="res"):
         """Convert expression body."""
+        # Restore the per-component ``K(idx, *a)`` form the C-family
+        # UserFunctions runtime supplies (``numerics::eigensystem`` etc.) from
+        # the canonical ``pick(K(*a), idx)`` the producers emit — BEFORE cse, so
+        # cse cannot hoist the shared stack-returning ``K(*a)`` node into a temp
+        # this per-component runtime has no signature for.  Byte-identical to the
+        # pre-``pick`` emission (distinct ``idx`` ⇒ nothing to hoist).
+        expr = lower_pick_to_component(expr)
         if self.resolve_opaque:
             # Inline registered-function calls BEFORE the cse pass below, so
             # CSE sees through the call boundary (idempotent — resolved
@@ -1047,6 +1055,9 @@ class OutParamCodePrinter(GenericCppBase):
         """Convert an expression into a body that writes ``target`` — the
         function's out-parameter array.  No local declaration, no
         ``return``."""
+        # Restore per-component ``K(idx, *a)`` from ``pick(K(*a), idx)`` before
+        # cse (see the base ``convert_expression_body``).
+        expr = lower_pick_to_component(expr)
         if self.resolve_opaque:
             expr = self._resolve_opaque_calls(expr)
         if isinstance(expr, sp.Piecewise):

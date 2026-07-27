@@ -16,11 +16,17 @@ from zoomy_core.misc.misc import ZArray
 
 
 class eigensystem(sp.Function):
-    """eigensystem(idx, *A_flat) — idx-th component of the eigendecomposition of
-    the row-major n*n matrix A_flat, laid out as
-      [ eigenvalues(n), right_eigenvectors R (n*n, row-major), left L=R^{-1} (n*n) ].
-    Opaque to SymPy; numerical in the backends (np.linalg.eig / Eigen).  The Roe
-    scheme builds |A| = R|Lambda|L from this."""
+    """``eigensystem(*A_flat)`` — the FULL packed eigendecomposition stack of the
+    row-major ``n*n`` matrix ``A_flat`` (``n = round(√len)``), laid out as
+      [ eigenvalues λ (n), right_eigenvectors R (n*n, row-major), left L=R^{-1} (n*n) ]
+    (length ``n + 2n²``).  Component ``idx`` is read as ``pick(eigensystem(*a),
+    idx)`` — the CANONICAL form the Roe scheme emits, so lambdify's cse hoists
+    the shared ``eigensystem(*a)`` node to ONE ``eig`` per face.  Opaque to
+    SymPy; numerical in the backends (np.linalg.eig / Eigen).  The Roe scheme
+    builds |A| = R|Lambda|L from this.  The per-component C/UFL runtimes
+    (``numerics::eigensystem(idx, *a)`` / ``eigensystem_hook(idx, *a)``) are fed
+    the ``eigensystem(idx, *a)`` form their printers restore from ``pick`` via
+    :func:`lower_pick_to_component`."""
 
     is_commutative = True
     is_real = True
@@ -31,8 +37,10 @@ class eigensystem(sp.Function):
 
 
 class eigenvalues(sp.Function):
-    """eigenvalues(idx, *A_flat) — idx-th eigenvalue (real part) of the
-    row-major n*n matrix A_flat, with n inferred from ``len(A_flat) = n*n``.
+    """``eigenvalues(*A_flat)`` — the λ-only spectrum vector ``(n)`` of the
+    row-major ``n*n`` matrix ``A_flat`` (``n = round(√len)``).  Component ``idx``
+    is read as ``pick(eigenvalues(*a), idx)`` (canonical form; cse-hoisted to
+    ONE ``eigvals`` per face).
 
     The λ-only companion of :class:`eigensystem` (no right/left eigenvectors),
     used for the wave-speed / CFL bound ``max|λ_i(A_n)|`` when the model has no
@@ -52,16 +60,17 @@ class eigenvalues(sp.Function):
 
 
 class solve(sp.Function):
-    """``solve(idx, *A_flat, *b_flat)`` — idx-th component of the per-cell
-    linear solve ``A⁻¹ b``.  ``A`` is the row-major ``n*n`` matrix (the first
-    ``n*n`` args after ``idx``) and ``b`` the length-``n`` RHS (the last ``n``
-    args); ``n`` is inferred from the arg count (``n*n + n``).
+    """``solve(*A_flat, *b_flat)`` — the per-cell linear solve ``A⁻¹ b``, a
+    length-``n`` vector.  ``A`` is the row-major ``n*n`` matrix (the first
+    ``n*n`` args) and ``b`` the length-``n`` RHS (the last ``n`` args); ``n`` is
+    inferred from the arg count (``n*n + n``).  Component ``idx`` is read as
+    ``pick(solve(*a), idx)`` (canonical form; cse-hoisted to ONE solve per cell).
 
     Opaque to SymPy; numerical in each backend (``np``/``jnp.linalg.solve`` /
     Eigen ``A.colPivHouseholderQr().solve(b)``).  The single backend-specific
     atom of the NSM point-implicit source treatment: the linearized source
-    ``S_lin = (I − dt·J)⁻¹ S`` emits one ``solve(i, A_flat, b_flat)`` per row,
-    with ``A = I − dt·J`` and ``b = S`` — every backend then consumes the
+    ``S_lin = (I − dt·J)⁻¹ S`` emits one ``pick(solve(A_flat, b_flat), i)`` per
+    row, with ``A = I − dt·J`` and ``b = S`` — every backend then consumes the
     transformed ``source`` as an ordinary source, the only new op being this
     per-cell solve (mirrors the ``eigensystem`` opaque-op pattern)."""
 
@@ -71,6 +80,70 @@ class solve(sp.Function):
     @classmethod
     def eval(cls, *args):
         return None  # always keep unevaluated (opaque)
+
+
+class pick(sp.Function):
+    """``pick(packed, idx)`` — the ``idx``-th component of a packed opaque-kernel
+    result (:class:`eigensystem` / :class:`eigenvalues` / :class:`solve`).
+
+    The producers emit every component read of those kernels as
+    ``pick(K(*a), idx)`` so the ONE ``K(*a)`` node they share is cse-hoisted to a
+    single decomposition / solve per face (numpy / jax, where ``K`` returns the
+    whole stack and ``pick`` is a trailing-axis index read).  The per-component
+    backends (the C/C++ family's ``numerics::K(idx, *a)``, the Firedrake
+    ``K_hook(idx, *a)`` UFL bindings) instead restore the ``K(idx, *a)`` form via
+    :func:`lower_pick_to_component` before their own cse.  Opaque to SymPy."""
+
+    is_commutative = True
+    is_real = True
+
+    @classmethod
+    def eval(cls, *args):
+        return None  # always keep unevaluated (opaque)
+
+
+# Names of the opaque kernels whose components are addressed positionally — the
+# ones ``pick`` wraps and the per-component backends (C / UFL) unwrap.
+_PER_COMPONENT_KERNELS = frozenset({"eigensystem", "eigenvalues", "solve"})
+
+
+def lower_pick_to_component(expr):
+    """Rewrite the canonical ``pick(K(*a), idx)`` (``K`` in
+    :data:`_PER_COMPONENT_KERNELS`) back to the per-component ``K(idx, *a)``
+    form, structure-preserving.
+
+    numpy / jax keep the ``pick(K(*a), idx)`` form — ``K`` returns the packed
+    stack and cse hoists the shared node.  The per-component backends supply
+    ``K`` one component at a time (the C/C++ family's ``numerics::K(idx, *a)``
+    Eigen runtime; the Firedrake ``K_hook(idx, *a)`` UFL bindings), so those
+    printers call this BEFORE their own cse — otherwise cse would hoist the
+    stack node their runtime cannot produce.  A pure structural swap under
+    ``evaluate(False)`` (no ``Max``/ordering re-evaluation)."""
+    def _rw(e):
+        if isinstance(e, (list, tuple)):
+            return type(e)(_rw(x) for x in e)
+        if isinstance(e, sp.NDimArray):
+            flat = [_rw(x) for x in sp.flatten(e)]
+            rebuilt = sp.ImmutableDenseNDimArray(flat, e.shape)
+            return ZArray(rebuilt) if isinstance(e, ZArray) else rebuilt
+        if isinstance(e, sp.MatrixBase):
+            return e.applyfunc(_rw)
+        if not isinstance(e, sp.Basic):
+            return e
+        reps = {}
+        for call in e.atoms(sp.Function):
+            if call.func.__name__ != "pick":
+                continue
+            inner, idx = call.args
+            if (isinstance(inner, sp.Function)
+                    and inner.func.__name__ in _PER_COMPONENT_KERNELS):
+                with sp.evaluate(False):
+                    reps[call] = inner.func(idx, *inner.args)
+        if not reps:
+            return e
+        with sp.evaluate(False):
+            return e.xreplace(reps)
+    return _rw(expr)
 
 
 class compute_derivative(sp.Function):

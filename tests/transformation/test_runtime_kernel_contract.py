@@ -56,25 +56,31 @@ def _swe_jacobian(u, c):
 
 
 def test_opaque_kernel_numerics():
-    """eigenvalues scalar + batched; eigensystem cache reconstructs
-    A = R |Lambda| L with L R = I; solve == linalg.solve; inf-TOLERANT
-    (poisoned members report +inf eigenvalues / identity eigenbasis, finite
-    members untouched — REQ-168 addenda); the 1-slot caches hold STRONG refs
-    (a recycled id can never produce a stale hit)."""
+    """The opaque kernels return the WHOLE packed result (``eigensystem`` →
+    ``[λ, R, L]``, ``eigenvalues`` → ``λ``, ``solve`` → ``A⁻¹b``); component
+    access is ``pick(K(*a), idx)``.  eigenvalues scalar + batched; eigensystem
+    reconstructs A = R |Lambda| L with L R = I; solve == linalg.solve;
+    inf-TOLERANT (poisoned members report +inf eigenvalues / identity
+    eigenbasis, finite members untouched — REQ-168 addenda); ``pick`` reads
+    a component of the packed stack."""
     n = 2
-    # scalar values
+    # scalar values — eigenvalues returns the whole spectrum vector
     a = _keep([np.array(x) for x in [0.0, 1.0, 19.62, 0.0]])
-    ev = sorted(abs(uf.eigenvalues(i, *a)) for i in range(2))
+    ev = sorted(np.abs(uf.eigenvalues(*a)))
     assert np.allclose(ev, [np.sqrt(19.62), np.sqrt(19.62)])
-    # batched: per-cell spectral radius
+    # batched: per-cell spectral radius (component axis is trailing)
     g_h = np.array([19.62, 9.81, 4.905])
     a = _keep([np.zeros(3), np.ones(3), g_h, np.zeros(3)])
-    got = np.maximum(np.abs(uf.eigenvalues(0, *a)), np.abs(uf.eigenvalues(1, *a)))
+    evb = np.abs(uf.eigenvalues(*a))
+    got = np.maximum(evb[..., 0], evb[..., 1])
     assert np.allclose(got, np.sqrt(g_h))
+    # pick reads a component of the packed spectrum (== trailing-axis index)
+    assert np.allclose(uf.pick(uf.eigenvalues(*a), 1),
+                       np.asarray(uf.eigenvalues(*a))[..., 1])
     # eigensystem reconstructs the matrix from ONE shared eigenbasis
     a = _keep([np.array(x) for x in _swe_jacobian(2.0, 3.0)])
-    stack = np.array([uf.eigensystem(i, *a) for i in range(n + 2 * n * n)],
-                     dtype=float)
+    stack = np.asarray(uf.eigensystem(*a), dtype=float)
+    assert stack.shape == (n + 2 * n * n,)
     lam = stack[:n]
     R = stack[n:n + n * n].reshape(n, n)
     L = stack[n + n * n:].reshape(n, n)
@@ -82,35 +88,26 @@ def test_opaque_kernel_numerics():
     assert np.allclose(sorted(lam), [-1.0, 5.0])
     assert np.allclose(R @ np.diag(lam) @ L, A, atol=1e-10)
     assert np.allclose(L @ R, np.eye(n), atol=1e-12)
-    # solve kernel == linalg.solve
+    # solve kernel == linalg.solve (whole vector; pick reads one component)
     args = [2.0, 1.0, 1.0, 3.0, 1.0, 2.0]
-    x = np.array([uf.solve(0, *args), uf.solve(1, *args)]).ravel()
-    assert np.allclose(x, np.linalg.solve([[2, 1], [1, 3]], [1, 2]))
+    sol = np.asarray(uf.solve(*args)).ravel()
+    assert np.allclose(sol, np.linalg.solve([[2, 1], [1, 3]], [1, 2]))
+    assert np.allclose(np.ravel(uf.pick(uf.solve(*args), 0)), sol[0])
     # inf-tolerance: fully poisoned -> +inf, never a LinAlgError
     a = _keep([np.array(x) for x in [np.inf, 1.0, 5.0, 4.0]])
-    lams = [float(uf.eigenvalues(i, *a)) for i in range(2)]
+    lams = np.asarray(uf.eigenvalues(*a)).ravel()
     assert all(np.isposinf(lams))
     # mixed batch masks PER MEMBER
     a = _keep([np.array([x, np.nan]) for x in _swe_jacobian(2.0, 3.0)])
-    lam0 = np.array([float(np.asarray(uf.eigenvalues(i, *a))[0])
-                     for i in range(2)])
-    a2 = _keep([np.array([x, np.nan]) for x in _swe_jacobian(2.0, 3.0)])
-    lam1 = np.array([float(np.asarray(uf.eigenvalues(i, *a2))[1])
-                     for i in range(2)])
-    assert np.allclose(sorted(lam0), [-1.0, 5.0])
-    assert np.isposinf(lam1).all()
+    ev = np.asarray(uf.eigenvalues(*a))          # (batch=2, n=2)
+    assert np.allclose(sorted(ev[0]), [-1.0, 5.0])   # finite member
+    assert np.isposinf(ev[1]).all()                  # poisoned member
     # poisoned eigensystem returns the identity eigenbasis
     a = _keep([np.array(x) for x in [np.inf, 0.0, 0.0, np.inf]])
-    out = np.array([float(uf.eigensystem(i, *a)) for i in range(n + 2 * n * n)])
+    out = np.asarray(uf.eigensystem(*a), dtype=float)
     lam, R, L = out[:n], out[n:n + n * n].reshape(n, n), out[n + n * n:].reshape(n, n)
     assert np.isposinf(lam).all()
     assert np.array_equal(R, np.eye(n)) and np.array_equal(L, np.eye(n))
-    # REQ-168 addendum 3: 1-slot caches pin strong refs to the argument pack
-    a = [np.array(x) for x in _swe_jacobian(1.0, 2.0)]
-    uf.eigenvalues(0, *a)
-    assert all(x is y for x, y in zip(uf._EIGENVALUES_CACHE["args"], a))
-    uf.eigensystem(0, *a)
-    assert all(x is y for x, y in zip(uf._EIGENSYSTEM_CACHE["args"], a))
 
 
 # ── 3. HLL / HLLC flux VALUES + REQ-157 riemann honoured ────────────────────

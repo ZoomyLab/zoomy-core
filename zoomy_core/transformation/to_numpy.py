@@ -26,66 +26,6 @@ _eigenvalues_numpy = _uf.eigenvalues
 _solve_numpy = _uf.solve
 
 
-# ── REQ-179 compute-once lowering symbols ────────────────────────────────────
-# Opaque sympy Functions the numpy printer rewrites the per-component kernel
-# calls into (``K(idx, *A_flat)`` → ``pick(K_pack(*A_flat), idx)``).  Their
-# ``__name__`` MUST match the numpy-module keys (``eigensystem_pack`` etc.) so
-# ``lambdify`` prints them to those impls.  Numpy-internal — never emitted to
-# other backends (their printers keep the ``eigensystem(idx, …)`` convention).
-class eigensystem_pack(sp.Function):
-    is_commutative = True
-    is_real = True
-
-    @classmethod
-    def eval(cls, *args):
-        return None
-
-
-class eigenvalues_pack(sp.Function):
-    is_commutative = True
-    is_real = True
-
-    @classmethod
-    def eval(cls, *args):
-        return None
-
-
-class solve_pack(sp.Function):
-    is_commutative = True
-    is_real = True
-
-    @classmethod
-    def eval(cls, *args):
-        return None
-
-
-class pick(sp.Function):
-    is_commutative = True
-    is_real = True
-
-    @classmethod
-    def eval(cls, *args):
-        return None
-
-
-_COMPUTE_ONCE_PACK = None   # lazily built {opaque-kernel class: pack class}
-
-
-def _compute_once_pack_map():
-    """``{eigensystem: eigensystem_pack, …}`` — built lazily to avoid importing
-    ``kernel_functions`` (→ ``misc`` → …) at module import time."""
-    global _COMPUTE_ONCE_PACK
-    if _COMPUTE_ONCE_PACK is None:
-        from zoomy_core.model.kernel_functions import (
-            eigensystem as _es, eigenvalues as _ev, solve as _sv)
-        _COMPUTE_ONCE_PACK = {
-            _es: eigensystem_pack,
-            _ev: eigenvalues_pack,
-            _sv: solve_pack,
-        }
-    return _COMPUTE_ONCE_PACK
-
-
 class NumpyRuntimeModel:
     """Runtime model generated from a symbolic Model.
 
@@ -122,47 +62,19 @@ class NumpyRuntimeModel:
         return flat_args
 
     def _lower_opaque_kernels(self, expr):
-        """REQ-179 compute-once lowering: rewrite each per-component opaque
-        kernel call ``K(idx, *A_flat)`` into ``pick(K_pack(*A_flat), idx)``.
+        """Backend seam for the opaque-kernel calling convention (no-op for
+        numpy / jax).
 
-        Every component of one face (the ``n+2n²`` ``eigensystem`` reads, the
-        ``n`` ``eigenvalues`` / ``solve`` reads) shares the SAME ``A_flat``
-        objects, so all ``K_pack(*A_flat)`` collapse to ONE sympy node — cse
-        then hoists it to a single temp, emitting the (large) ``A_flat``
-        argument list ONCE instead of duplicating it into every component call.
-        That inlining was 93% of the lowered eigensystem tree and the ~20-min
-        single-core lambdify at ML-FullVAM scale; the rewrite is bit-identical
-        (``pick(K_pack(a), i)`` shares the ``*_pack`` numerics with ``K(i,*a)``)
-        and numpy-internal (other backends keep the ``eigensystem(idx,…)``
-        convention — see :meth:`to_ufl.UFLRuntimeModel._lower_opaque_kernels`)."""
-        if not isinstance(expr, sp.Basic):
-            return expr
-        # Lower array containers ELEMENT-WISE and rebuild the container in the
-        # normal (evaluating) context: the ``evaluate=False`` guard below must
-        # not catch an ``NDimArray``'s internal shape / loop-size arithmetic
-        # (``prod(shape)``), or ``.tolist()`` later trips over an unevaluated
-        # ``Mul`` size.  ``list(arr)`` iterates the flat scalar entries.
-        if isinstance(expr, sp.NDimArray):
-            lowered = [self._lower_opaque_kernels(e) for e in list(expr)]
-            return type(expr)(lowered, expr.shape)
-        reps = {}
-        for src_cls, pack_cls in _compute_once_pack_map().items():
-            for call in expr.atoms(src_cls):
-                idx, *rest = call.args
-                reps[call] = pick(pack_cls(*rest), idx)
-        if not reps:
-            return expr
-        # ``xreplace`` rebuilds every ancestor of a replaced kernel atom via
-        # ``node.func(*new_args)`` with the GLOBAL evaluate flag.  For a
-        # spectral-radius ``Max(|λ_i|)`` sitting above the ``eigenvalues``
-        # kernels (Rusanov dissipation), that rebuild re-runs ``Max``'s O(n²)
-        # ``factor_terms`` ordering on the still-inlined Jacobian tree — the
-        # SETUP explosion (REQ-189).  The rewrite is a pure STRUCTURAL kernel
-        # swap, so it must not re-evaluate: pin ``evaluate=False`` for the
-        # rebuild.  cse in the following ``lambdify`` still hoists the shared
-        # ``*_pack`` node, so the reduction lowers unchanged / bit-identically.
-        with sp.evaluate(False):
-            return expr.xreplace(reps)
+        The producers emit every component read of the opaque kernels in the
+        CANONICAL ``pick(K(*a), idx)`` form (K ∈ {eigensystem, eigenvalues,
+        solve}).  numpy and jax register ``K`` (returns the whole packed stack)
+        and ``pick`` (trailing-axis index read) in their module dict, so the
+        form lowers directly and lambdify's cse hoists the shared ``K(*a)`` node
+        to ONE call per face — no rewrite needed here.  The per-component
+        backends override this seam: :meth:`to_ufl.UFLRuntimeModel.
+        _lower_opaque_kernels` restores the ``K(idx, *a)`` form their UFL
+        bindings expect."""
+        return expr
 
     def _lambdify_function(self, function_obj, modules):
         """Internal helper `_lambdify_function`."""

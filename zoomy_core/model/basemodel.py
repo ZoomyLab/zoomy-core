@@ -1261,14 +1261,17 @@ class Model(param.Parameterized, SymbolicRegistrar):
         stacked as ``[Lambda(n), R(n*n), L(n*n)]`` (row-major), each entry an
         opaque ``eigensystem`` kernel call — numerical in the backends.  The Roe
         scheme builds ``|A| = R|Lambda|L`` from this."""
-        from zoomy_core.model.kernel_functions import eigensystem as _es
+        from zoomy_core.model.kernel_functions import (
+            eigensystem as _es, pick as _pick)
         n = self.n_variables
         qm = self.quasilinear_matrix()
         A_flat = [
             sum(qm[i, j, d] * self.normal[d] for d in range(self.dimension))
             for i in range(n) for j in range(n)
         ]
-        return ZArray([_es(sp.Integer(idx), *A_flat) for idx in range(n + 2 * n * n)])
+        stack = _es(*A_flat)
+        return ZArray([_pick(stack, sp.Integer(idx))
+                       for idx in range(n + 2 * n * n)])
 
     def print_model_functions(self, function_names=None):
         """Print model functions."""
