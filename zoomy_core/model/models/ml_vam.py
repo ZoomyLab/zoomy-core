@@ -421,7 +421,13 @@ class MLVAM(BaseModel):
         def _ustar(a, xd):
             below, above = _trace(a, 1, xd), _trace(a + 1, 0, xd)
             if iface is not None:
-                return iface.expression(below, above, sp.S.Zero)
+                # pass the REAL internal-interface mass flux G_α (not 0): an
+                # UpwindInterface donor decision (Hörnschemeyer Eq. 9) is by the
+                # sign of G — feeding 0 silently degenerated it to always-below.
+                # MeanInterface ignores G, so the default path is unchanged.
+                # Matches MLSME._ustar so the ML-VAM→ML-SME (P=0) reduction
+                # commutes under either interface scheme.
+                return iface.expression(below, above, G_sol[Gf[a]])
             return (below + above) / 2
 
         # vertical-z placeholder so Model.horizontal = (x[, y]) (see ml_sme)

@@ -100,7 +100,10 @@ class MLSME(BaseModel):
                     else rf"\hat{{{HNAME[xd]}}}_{ell}")
         def sname(xd, ell):
             return f"tau_{ell}" if dim == 2 else f"tau_{CN[xd]}z_{ell}"
-        values = {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0}
+        # e_x (downslope gravity component) is minted on the per-layer sub-model
+        # by gravity_components (mirrors SME/VAM); declare it on the assembled
+        # model too so it binds with a value at codegen.
+        values = {"g": 9.81, "rho": 1.0, "nu": 0.0, "lambda_s": 0.0, "e_x": 0.0}
         for j in range(1, N):
             values[f"l_{j}"] = 1.0 / N
         user_vals = getattr(self, "parameter_values", None)
@@ -120,7 +123,8 @@ class MLSME(BaseModel):
         rho_s = sp.Symbol("rho", positive=True)
 
         from zoomy_core.model.models.equations import (
-            Mass, small_slope_scaling, add_inplane_viscous, package_viscous)
+            Mass, small_slope_scaling, add_inplane_viscous, package_viscous,
+            gravity_components)
         from zoomy_core.model.models.material import ClosureState
         from zoomy_core.model.models.closures import apply_layer_stress_closures
 
@@ -146,12 +150,17 @@ class MLSME(BaseModel):
             tau = {xd: sp.Function(sname(xd, ell), real=True)(*coords)
                    for xd in horiz}
             MOM = [f"momentum_{CN[xd]}" for xd in horiz]
+            # shared gravity vector: g·∂_d(b+H) is the hydrostatic surface
+            # gradient (= −g_z·∂_d η); −g_h[xd] is the downslope incline body
+            # force g·e_x on the streamwise row (0 on cross/vertical), the SAME
+            # single gravity path SME/VAM read (mints e_x on ml).
+            g_h, _ = gravity_components(ml, coords)
             for i, xd in enumerate(horiz):
                 adv = sum(DERIV[xe](uvel[i] * uvel[j]) for j, xe in enumerate(horiz))
                 ml.add_equation(
                     f"momentum_{CN[xd]}",
                     d.t(uvel[i]) + adv + d.z(uvel[i] * w)
-                    + gl * DERIV[xd](b + H) - d.z(tau[xd]) / rl)
+                    + gl * DERIV[xd](b + H) - d.z(tau[xd]) / rl - g_h[xd])
             if retain_inplane:                       # add in-plane divergence pre-σ-map
                 add_inplane_viscous(ml, [getattr(ml, mn) for mn in MOM],
                                     uvel, list(horiz), nu_s)
