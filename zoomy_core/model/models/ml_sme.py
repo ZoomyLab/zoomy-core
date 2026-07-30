@@ -49,7 +49,7 @@ class MLSME(BaseModel):
 
     _finalize_lazy = True
     _cacheable_derivation = True        # derive_model returns m; byproducts on m
-    n_layers = param.Integer(default=2, bounds=(2, None))
+    n_layers = param.Integer(default=2, bounds=(1, None))
     level = param.Parameter(default=1, doc=(
         "Moment truncation order per layer.  An int applies the SAME order to "
         "every layer (the canonical MLSME).  A list ``[N_1, …, N_{n_layers}]`` "
@@ -271,7 +271,7 @@ class MLSME(BaseModel):
         # ── Hörnschemeyer interface closure (∇·-based, dimension-agnostic) ──
         ht = sp.Function("h", positive=True)(t, *horiz)
         l_par = [sp.Symbol(f"l_{j}", positive=True) for j in range(1, N)]
-        l_all = [*l_par, 1 - sum(l_par)]
+        l_all = [*l_par, sp.S.One - sum(l_par)]
         frac = {hl[j]: l_all[j] * ht for j in range(N)}
         q_mod = {ell: {xd: [sp.Function(qname(xd, ell), real=True)(k, t, *horiz)
                             for k in range(levels[ell - 1] + 1)] for xd in horiz}
