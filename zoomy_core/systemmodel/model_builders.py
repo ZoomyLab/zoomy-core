@@ -93,6 +93,11 @@ def build_mlswe(model) -> SystemModel:
 
 # ── MLSME ────────────────────────────────────────────────────────────────────
 def build_mlsme(model) -> SystemModel:
+    # Per-layer hydrostatic ``g·h_ℓ²/2`` is marked HydrostaticPressure at its
+    # fold site in ``MLSME.derive_model`` (each h_ℓ is a DISTINCT function there,
+    # so the mark is unambiguous — a builder-side ``.subs`` cannot separate the
+    # bottom layer's g·l₁²h²/2 from the same monomial inside the top layer's
+    # expanded g·(1−l₁)²h²/2).  Nothing to tag here.
     m = model.derivation
     sm = SystemModel.from_model(
         m, Q=[m.bed, m.ht, *m.q_flat], canonical_source=model)
@@ -103,6 +108,8 @@ def build_mlsme(model) -> SystemModel:
 
 # ── MLVAM ────────────────────────────────────────────────────────────────────
 def build_mlvam(model) -> SystemModel:
+    # Per-layer hydrostatic marked at its fold site in ``MLVAM.derive_model``
+    # (see ``build_mlsme`` — distinct h_ℓ makes the mark unambiguous).
     m = model.derivation
     sm = SystemModel.from_model(
         m, Q=[m.bed, m.ht, *m.q_flat, *m.r_flat, *m.P_flat],

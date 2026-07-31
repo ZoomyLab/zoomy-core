@@ -30,6 +30,32 @@ _HNAME = {C.x: "u", C.y: "v"}
 _CNAME = {C.x: "x", C.y: "y"}
 
 
+def evaluate_time_derivatives(expr, t):
+    """``.doit()`` a residual while keeping every purely-spatial conservative
+    flux divergence ``∂_x(F)`` FOLDED.
+
+    The multilayer assembly (``ml_vam``/``ml_sme``) must evaluate the fraction's
+    time derivative — ``∂_t h_ℓ → l_ℓ ∂_t h`` for the global-mass substitution —
+    and resolve the modal-closure ``Subs`` byproducts, but a blanket ``.doit()``
+    also distributes the folded momentum flux ``∂_x(q²/h) → 2q/h ∂_x q −
+    q²/h² ∂_x h`` and the hydrostatic ``∂_x(g h²/2) → g h ∂_x h``, re-routing them
+    from the FLUX / hydrostatic-pressure slots into the nonconservative matrix
+    (the fully-non-conservative ML blow-up).  Evaluate only the ``Subs`` atoms
+    and the derivatives that carry ``t`` — a targeted ``xreplace`` that never
+    rebuilds (and thus never re-sorts) the surrounding ``Add``, leaving the
+    spatial ``∂_x(F)`` atoms folded — the same "no blanket doit on momentum"
+    discipline the single-layer VAM/SME follow."""
+    expr = sp.sympify(expr)
+    # resolve the modal-closure Subs first (``.doit()`` substitutes ζ=0/1 etc.);
+    # a Subs never carries a bare state ∂_x flux, so this cannot distribute one.
+    expr = expr.xreplace({s: s.doit() for s in expr.atoms(sp.Subs)})
+    # then evaluate ONLY the time derivatives (surface ∂_t h_ℓ); spatial ∂_x(F)
+    # atoms are left untouched → still folded.
+    return expr.xreplace({dv: dv.doit()
+                          for dv in expr.atoms(sp.Derivative)
+                          if t in dv.variables})
+
+
 class Equation:
     """Base balance blueprint.  ``add_to(model)`` declares variables and adds
     the residual; ``model.add_equation(BlueprintInstance)`` dispatches here."""

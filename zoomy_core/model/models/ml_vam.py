@@ -52,8 +52,10 @@ from zoomy_core.model.derivation import (
 from zoomy_core.model.derivation.projection import Integrate
 from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
 from zoomy_core.model.derivation.closure import GaussQuadrature
+from zoomy_core.model.derivation.system_extract import HydrostaticPressure
 from zoomy_core.model.operations import Multiply, ProductRule, KinematicBC
 from zoomy_core.model.models.walls import register_free_slip_wall
+from zoomy_core.model.models.equations import evaluate_time_derivatives
 from zoomy_core.systemmodel import SystemModel
 
 t, x, y, z = C.t, C.x, C.y, C.z
@@ -287,7 +289,11 @@ class MLVAM(BaseModel):
             for nm in MOM + ["momentum_z"]:
                 for k in range(Nu + 1):
                     eqk = getattr(ml, nm)[k]
-                    eqk.expr = sp.expand(sp.sympify(eqk.expr).doit())
+                    # surface ∂_t h_ℓ (for the h-eq substitution) + resolve the
+                    # modal-closure Subs WITHOUT distributing the folded spatial
+                    # flux ∂_x(q²/h_ℓ) / ∂_x(g h_ℓ²/2) — a blanket .doit() here
+                    # sent mode 0's whole momentum flux into the NCP slot.
+                    eqk.expr = sp.expand(evaluate_time_derivatives(eqk.expr, t))
             h_eq = ml.mass[0].solve_for(d.t(h_l))
             for nm in MOM + ["momentum_z"]:
                 for k in range(Nu + 1):
@@ -343,12 +349,15 @@ class MLVAM(BaseModel):
             # DERIVED conservative flux per (row, direction) for the §6c
             # regroup (no hardcoding): F = (2k+1) h_l ∫ φ_k · flux dζ on this
             # layer's modal ansatz.  Horizontal: u_d·u_e + p/ρ (diagonal).
-            # Vertical: the BULK advection w_bulk·u_e — the σ-velocity top mode
-            # (∂_t/G-laden, i.e. the kinematic interface part, not a material
-            # spatial flux) stays nonconservative.
+            # Vertical: the FULL advection w·u_e with w = ``wt_m`` (incl. the
+            # bottom-KBC/interface top mode), exactly as VAM's momentum_z flux
+            # uses ``wt_m``.  The top mode's ∂_t (interface motion) and G
+            # (interface mass flux) pieces are rendered spatial by the §6c
+            # ∂_t h → dth_glob / G_sol substitutions, so ∂_e(F) is a clean
+            # conservative flux — keeping only w_bulk left that part in the NCP
+            # slot and broke the MLVAM(1)==VAM reduction on r_k rows.
             p_zeta = (sum(P_heads[ell - 1](kp, t, *horiz) * phis[kp]
                           for kp in range(Nu + 1)) + p_top_mode * phis[top])
-            w_bulk = sum(rfm[j] / h_l * phis[j] for j in range(Nu + 1))
             flux_F = {}
             for k2 in range(1, Nu + 1):
                 for di, xd in enumerate(horiz):
@@ -362,13 +371,25 @@ class MLVAM(BaseModel):
                 for e, xe in enumerate(horiz):
                     flux_F[("momentum_z", k2, xe)] = (
                         h_l / inner_basis.gram(k2, k2)
-                        * _zint01(phis[k2] * (w_bulk * uvel_m[e])))
+                        * _zint01(phis[k2] * (wt_m * uvel_m[e])))
 
             cont = sp.expand(ml.mass[0].expr)
             constraints = [sp.expand(ml.mass[k].expr) for k in range(1, Nu + 2)]
             momd = {xd: [sp.expand(getattr(ml, f"momentum_{CN[xd]}")[k].expr)
                          for k in range(Nu + 1)] for xd in horiz}
             momz = [sp.expand(ml.momentum_z[k].expr) for k in range(Nu + 1)]
+            # Mark this layer's hydrostatic self-pressure g·h_ℓ²/2 (folded on the
+            # mode-0 momentum flux) as HydrostaticPressure at its FOLD SITE — here
+            # h_l is a DISTINCT function per layer, so the mark is unambiguous; a
+            # builder-side .subs on the assembled column (h_ℓ=l_ℓ·h) cannot
+            # separate the bottom layer's g·l₁²h²/2 from the same monomial inside
+            # the top layer's expanded g·(1−l₁)²h²/2.  Routes the self-weight to
+            # the well-balanced P slot (VAM parity at n=1; lake-at-rest over a
+            # bump for n≥2); the inter-layer g·h_ℓ·∂_x h_{ℓ'} and bed g·h_ℓ·∂_x b
+            # stay in the NCP.
+            hyd = ml.parameters.g * h_l ** 2 / 2
+            momd = {xd: [row.subs({hyd: HydrostaticPressure(hyd)}) for row in rows]
+                    for xd, rows in momd.items()}
             # per-layer vertical reconstruction profiles (LOCAL ζ), in the
             # conserved layer state (qfm=q_ℓ, rfm=r_ℓ, P_ℓ) + h_l + G_bot — the
             # SAME modal columns the §6c flux uses: ``uvel_m`` horizontal
@@ -446,7 +467,10 @@ class MLVAM(BaseModel):
                                        layer_eqs[ell][3])
             for xd in horiz:
                 for k in range(Nu + 1):
-                    row = momd[xd][k].subs(frac).doit()
+                    # frac (h_ℓ→l_ℓ·h) then evaluate ONLY the fraction's ∂_t
+                    # (so ∂_t(l_ℓ·h)→l_ℓ·∂_t h feeds the global-mass sub) —
+                    # keep ∂_x(F) folded so the momentum flux stays conservative.
+                    row = evaluate_time_derivatives(momd[xd][k].subs(frac), t)
                     row = sp.expand(row).subs(sp.Derivative(ht, t), dth_glob)
                     for a, side, sgn in ((ell, 1, +1), (ell - 1, 0, -1)):
                         if 1 <= a <= N - 1:
@@ -465,17 +489,24 @@ class MLVAM(BaseModel):
                     row = sp.expand(row).subs(G_sol)
                     # CN[x]="x" → momentum_x_ℓ_k in 1-D (byte-identical names)
                     m.add_equation(f"momentum_{CN[xd]}_{ell}_{k}",
-                                   sp.expand(row.subs(par).doit()))
+                                   sp.expand(evaluate_time_derivatives(
+                                       row.subs(par), t)))
             for k in range(Nu + 1):                       # vertical (no swap)
-                row = momz[k].subs(frac).doit()
+                row = evaluate_time_derivatives(momz[k].subs(frac), t)
                 row = sp.expand(row).subs(sp.Derivative(ht, t), dth_glob).subs(G_sol)
                 m.add_equation(f"momentum_z_{ell}_{k}",
-                               sp.expand(row.subs(par).doit()))
+                               sp.expand(evaluate_time_derivatives(
+                                   row.subs(par), t)))
             for j, cst in enumerate(constraints):
-                cst = sp.expand(cst.subs(frac).doit())
+                # divergence constraint: keep the folded σ-mass-flux compound
+                # (1/h)·∂_x(h·q_k) folded (→ nonconservative routing, as VAM's
+                # mass modes) — a blanket doit distributes it into a bare flux
+                # + a B[h] term and breaks the MLVAM(1)==VAM P-row reduction.
+                cst = sp.expand(evaluate_time_derivatives(cst.subs(frac), t))
                 cst = sp.expand(cst.subs(sp.Derivative(ht, t), dth_glob)).subs(G_sol)
                 m.add_equation(f"constraint_{ell}_{j}",
-                               sp.expand(cst.subs(par).doit()))
+                               sp.expand(evaluate_time_derivatives(
+                                   cst.subs(par), t)))
 
         m.apply(InvertMassMatrix())
 
@@ -514,12 +545,17 @@ class MLVAM(BaseModel):
                   for ell in range(1, N + 1) for xd in horiz]
                  + [f"momentum_z_{ell}" for ell in range(1, N + 1)])
         for base in bases:
-            for k in range(Nu + 1):
+            # skip mode 0 (mirror VAM §6d): it is never doited by part-1, so it
+            # carries no bare ∂²-term to absorb and its folded conservative flux
+            # must survive.  NO blanket .doit() here — part-1 already surfaced the
+            # bare ∂²b on modes k≥1; a doit would re-distribute the just-folded
+            # ∂_x(F) back into the NCP slot.
+            for k in range(1, Nu + 1):
                 name = f"{base}_{k}"
                 if name not in m._equations:
                     continue
                 eq = getattr(m, name)
-                e = sp.expand(sp.sympify(eq.expr).doit())
+                e = sp.expand(sp.sympify(eq.expr))
                 for e_dir in space:
                     F_d = sp.S.Zero
                     for a in list(e.atoms(sp.Derivative)):

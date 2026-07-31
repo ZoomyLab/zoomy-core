@@ -35,8 +35,10 @@ from zoomy_core.model.derivation import (
 from zoomy_core.model.derivation.closure import GaussQuadrature
 from zoomy_core.model.derivation.projection import Integrate
 from zoomy_core.model.derivation.basisfunctions import Legendre_shifted
+from zoomy_core.model.derivation.system_extract import HydrostaticPressure
 from zoomy_core.model.operations import Multiply, ProductRule, KinematicBC
 from zoomy_core.model.models.walls import register_free_slip_wall
+from zoomy_core.model.models.equations import evaluate_time_derivatives
 from zoomy_core.systemmodel import SystemModel
 
 t, x, y, z = C.t, C.x, C.y, C.z
@@ -273,6 +275,14 @@ class MLSME(BaseModel):
             cont = sp.expand(h_eq_q.lhs - h_eq_q.rhs)
             mom = {xd: [sp.expand(getattr(ml, f"momentum_{CN[xd]}")[kmode].expr)
                         for kmode in range(Nu + 1)] for xd in horiz}
+            # Mark this layer's hydrostatic self-pressure g·h_ℓ²/2 (folded on the
+            # mode-0 momentum flux) as HydrostaticPressure at its FOLD SITE, where
+            # h_l is a DISTINCT function per layer (see MLVAM.derive_layer): routes
+            # the self-weight to the well-balanced P slot (SME parity at n=1;
+            # lake-at-rest for n≥2), leaving inter-layer / bed slope in the NCP.
+            hyd = ml.parameters.g * h_l ** 2 / 2
+            mom = {xd: [row.subs({hyd: HydrostaticPressure(hyd)}) for row in rows]
+                   for xd, rows in mom.items()}
             return cont, mom
 
         layer_eqs = {ell: derive_layer(ell) for ell in range(1, N + 1)}
@@ -337,7 +347,13 @@ class MLSME(BaseModel):
         for ell in range(1, N + 1):
             for xd in horiz:
                 for k in range(levels[ell - 1] + 1):
-                    mom = layer_eqs[ell][1][xd][k].subs(frac).doit()
+                    # frac (h_ℓ→l_ℓ·h) then evaluate ONLY the fraction's ∂_t
+                    # (∂_t(l_ℓ·h)→l_ℓ·∂_t h for the global-mass sub) — keep the
+                    # spatial ∂_x(F) folded so the momentum flux ∂_x(q²/h_ℓ) and
+                    # the hydrostatic ∂_x(g h_ℓ²/2) stay conservative (a blanket
+                    # .doit() distributed them into the NCP → non-conservative).
+                    mom = evaluate_time_derivatives(
+                        layer_eqs[ell][1][xd][k].subs(frac), t)
                     # u* swap in the per-direction TRANSFER trace only
                     for a, side, sgn in ((ell, 1, +1), (ell - 1, 0, -1)):
                         if 1 <= a <= N - 1:
@@ -355,7 +371,8 @@ class MLSME(BaseModel):
                     mom = sp.expand(mom).subs(G_sol)
                     enm = (f"momentum_{ell}_{k}" if dim == 2
                            else f"momentum_{CN[xd]}_{ell}_{k}")
-                    m.add_equation(enm, sp.expand(mom.subs(par).doit()))
+                    m.add_equation(enm, sp.expand(
+                        evaluate_time_derivatives(mom.subs(par), t)))
 
         # KEEP-ALL: route the retained per-layer in-plane deviatoric-stress
         # divergence into conservative diffusion (mirrors ml_fullsme.py); b is a
