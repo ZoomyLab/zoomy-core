@@ -705,6 +705,15 @@ class SystemModel:
     # The vertical coordinate Symbol (``model.coords[-1]`` / the σ ``ζ`` after the
     # σ-map), or ``None`` for a depth-collapsed model with no vertical direction.
     vertical: Optional[Any] = None
+    # Terms the structural extractor matched NO classification branch for — a
+    # per-row ``(row_index, remainder)`` list produced by the term-conservation
+    # guard in ``system_extract._classification_remainder``.  EMPTY for a
+    # correctly-routed model (every additive term reached a slot); a nonzero
+    # entry is a SILENTLY-DROPPED term (the class of bug that hid the VAM
+    # bed-slope diffusion).  Surfaced by ``describe(full=True)`` and enforced by
+    # :meth:`assert_all_classified`.  Only the declarative extraction path sets
+    # it; hand-built production models leave it empty.
+    unclassified_terms: List = field(default_factory=list)
     history: List[Dict[str, str]] = field(default_factory=list)
 
     def __post_init__(self):
@@ -1364,11 +1373,25 @@ class SystemModel:
             aux_initial_conditions=getattr(
                 canonical_source if canonical_source is not None else model,
                 "aux_initial_conditions", None),
+            unclassified_terms=ops.get("unclassified", []),
         )
         sm.history.append({
             "name": "from_model",
             "description": f"structural extraction from {type(model).__name__}",
         })
+        # Classification-completeness guard: an additive term the extractor
+        # routed to NO slot is a silent drop.  Warn by default (opt into a hard
+        # failure with ``sm.assert_all_classified()``).
+        if sm.unclassified_terms:
+            import warnings
+            rows = ", ".join(str(i) for i, _ in sm.unclassified_terms)
+            warnings.warn(
+                f"SystemModel.from_model({type(model).__name__}): "
+                f"{len(sm.unclassified_terms)} equation row(s) [{rows}] carry "
+                "term(s) the operator extractor classified into NO slot — they "
+                "are silently dropped from the balance law.  Inspect "
+                "describe(full=True) and call assert_all_classified() to fail "
+                "hard.", stacklevel=2)
         # Auto-scan: route every non-state Function atom (e.g. the open
         # viscous-stress boundary trace ``tau_xz(t, x, 0)``) and every
         # Derivative atom into ``aux_state`` — the SAME aux-exposure the
@@ -2803,6 +2826,30 @@ class SystemModel:
         """Convenience wrapper around :class:`RemoveNonDiagonalH`."""
         return RemoveNonDiagonalH()(self, **kwargs)
 
+    # ── classification guard ──────────────────────────────────────────
+
+    def assert_all_classified(self):
+        """Raise if any equation row carries an operator term the structural
+        extractor could not classify into a slot (a silent drop).
+
+        The opt-in STRICT counterpart to the default build-time warning: a
+        model that quietly loses a term from the balance law — e.g. a
+        ``∂_x(A·∂_x b)`` bed-slope routed to an off-diagonal diffusion entry
+        the runtime discards — fails here instead of running wrong.  A
+        correctly-routed model (``unclassified_terms`` empty) returns ``self``
+        so it can be chained."""
+        if self.unclassified_terms:
+            lines = "\n".join(
+                f"  row {i}: {sp.sstr(r)}" for i, r in self.unclassified_terms)
+            raise ValueError(
+                "SystemModel has unclassified operator term(s) — these matched "
+                "no classification branch and are silently dropped from the "
+                "balance law:\n" + lines + "\n\nFix the derivation so every "
+                "additive term reads as a flux / pressure / NCP / diffusion / "
+                "source contribution (or tag it explicitly); do NOT special-"
+                "case the classifier.")
+        return self
+
     # ── describe ──────────────────────────────────────────────────────
 
     def describe(self, full: bool = False) -> "SystemModelDescription":
@@ -2987,6 +3034,26 @@ class SystemModelDescription:
             parts.append("_(none set)_")
         return "\n\n".join(parts)
 
+    def _unclassified_block(self) -> str:
+        """The classification-completeness report — only with ``full=True``.
+
+        Lists every additive operator term the structural extractor matched no
+        slot for (a silent drop from the balance law).  Clearly labelled and
+        EMPTY-when-clean so its absence is never mistaken for "not checked"."""
+        sm = self._sm
+        unc = list(getattr(sm, "unclassified_terms", []) or [])
+        parts = ["**Unclassified terms (silent drops):**"]
+        if not unc:
+            parts.append("_none — every term reached a slot ✓_")
+            return "\n\n".join(parts)
+        parts.append(
+            "⚠ the following terms were classified into NO operator slot and "
+            "are dropped from the balance law:")
+        for i, r in unc:
+            parts.append(f"- row {i} (updates ${sp.latex(sm.state[i])}$): "
+                         f"$${sp.latex(r)}$$")
+        return "\n\n".join(parts)
+
     def _repr_markdown_(self) -> str:
         sm = self._sm
         parts = [
@@ -3006,6 +3073,7 @@ class SystemModelDescription:
         parts.append(self._operator_block())     # CORE operators — always
         if self._full:
             parts.append(self._extra_block())     # rare slots — full=True only
+            parts.append(self._unclassified_block())  # completeness report
         if sm.history:
             parts.append(
                 "**Operations:** "

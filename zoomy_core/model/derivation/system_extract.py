@@ -297,8 +297,10 @@ def extract_system_operators(model, Q, Qaux=None, dae=False):
 
     rows = _assign_rows(model, Q, field_to_fn, state, state_fn, t)
 
+    residuals = []
     for i in range(n_eq):
         residual = sp.expand(rows[i].xreplace(field_to_fn))
+        residuals.append(residual)
         _classify_row(
             residual, i, state, state_funcs, t, space, gravity_param,
             F, P, B, S, M, A,
@@ -309,8 +311,22 @@ def extract_system_operators(model, Q, Qaux=None, dae=False):
                     if A[i, j, d, e] != 0:
                         A_nonzero = True
 
+    # ── classification completeness guard ────────────────────────────────
+    # Term-conservation check: reassemble each row from the slots it was
+    # routed to (``M∂_t Q + ∇·(F+P) + B∂_x Q + ∇·(A∇Q) − S``) and subtract
+    # the ORIGINAL residual.  A nonzero remainder is a term the classifier
+    # matched NO branch for — a SILENT DROP (the class of bug that hid the
+    # VAM bed-slope ``A[v,b]`` diffusion for weeks).  For a correctly-routed
+    # model every remainder is identically zero; the healthy families
+    # therefore report an EMPTY list.  Computed in state-Function form (before
+    # the Symbol back-substitution) so ``∂_x`` acts on coordinate-dependent
+    # atoms.
+    unclassified = _classification_remainder(
+        residuals, state_funcs, t, space, F, P, B, S, M, A)
+
     # Back-substitute Symbol-functions → bare Symbols for storage.
     rev = {v: k for k, v in {**state_fn, **aux_fn}.items()}
+    unclassified = [(i, r.xreplace(rev)) for i, r in unclassified]
 
     def _to_sym(m):
         return m.xreplace(rev) if hasattr(m, "xreplace") else m
@@ -376,7 +392,67 @@ def extract_system_operators(model, Q, Qaux=None, dae=False):
         nonconservative_matrix=B, source=S, mass_matrix=M,
         diffusion_matrix=A_out,
         state_function_map=state_function_map,
+        unclassified=unclassified,
     )
+
+
+def _classification_remainder(residuals, state_funcs, t, space,
+                              F, P, B, S, M, A):
+    """Term-conservation check for the extracted operators.
+
+    For each row ``i`` reassemble the canonical balance law from the slots
+    the classifier routed to —
+
+    ``M·∂_t Q + ∇·(F + P) + Σ_d B_d·∂_{x_d} Q + ∇·(A ∇Q) − S`` —
+
+    and subtract the ORIGINAL residual (marker-unwrapped, ``.doit()``-expanded
+    so folded ``∂_x(q²/h)`` and unfolded ``q/h·∂_x q`` normalise to the same
+    bare-derivative atoms).  A remainder that does not collapse to zero is a
+    term the classifier matched NO branch for — routed nowhere, i.e. SILENTLY
+    DROPPED.  Returns a list of ``(row, remainder)`` for the nonzero rows
+    (empty ⇒ every term is accounted for), remainders in state-Function form.
+
+    This is the durable, GENERIC guard against the class of bug that hid the
+    VAM bed-slope diffusion drop: it depends only on the balance-law algebra,
+    never on per-system knowledge of which terms a given family emits."""
+    n_eq = len(residuals)
+    n_state = len(state_funcs)
+    n_dim = len(space)
+
+    def _unwrap(expr):
+        expr = expr.replace(
+            lambda e: isinstance(e, HydrostaticPressure), lambda e: e.args[0])
+        expr = expr.replace(
+            lambda e: isinstance(e, ViscousDiffusion), lambda e: e.args[0])
+        return expr
+
+    out = []
+    for i in range(n_eq):
+        recon = sp.S.Zero
+        for j in range(n_state):
+            if M[i, j] != 0:
+                recon += M[i, j] * sp.Derivative(state_funcs[j], t)
+        for d in range(n_dim):
+            if F[i, d] != 0:
+                recon += sp.Derivative(F[i, d], space[d])
+            if P[i, d] != 0:
+                recon += sp.Derivative(P[i, d], space[d])
+            for j in range(n_state):
+                if B[i, j, d] != 0:
+                    recon += B[i, j, d] * sp.Derivative(state_funcs[j], space[d])
+                for e in range(n_dim):
+                    if A[i, j, d, e] != 0:
+                        recon += sp.Derivative(
+                            A[i, j, d, e] * sp.Derivative(state_funcs[j],
+                                                          space[e]),
+                            space[d])
+        recon -= S[i, 0]
+        remainder = sp.expand((_unwrap(residuals[i]) - recon).doit())
+        if remainder != 0:
+            remainder = sp.simplify(remainder)
+        if remainder != 0:
+            out.append((i, remainder))
+    return out
 
 
 def _classify_row(residual, i, state, state_funcs, t, space, gravity_param,
