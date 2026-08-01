@@ -778,6 +778,27 @@ def _inherit_parent_aux(sm, sm_parent):
     sm.refresh_derived_operators(eigenvalues=False)
 
 
+def _inherit_equilibrium_reconstruction(sm_pred, sm_parent):
+    """Carry the parent's ``equilibrium_reconstruction`` onto the PREDICTOR.
+
+    ``ChorinSplitVAMSolver`` inherits :class:`HyperbolicSolver` precisely so the
+    predictor substep reuses the same well-balanced reconstruction machinery as
+    every other hyperbolic solver.  That hook reads the flag off the sub-system
+    it is handed (``getattr(self.sm, "equilibrium_reconstruction", "none")``) —
+    but the sub-systems are built FRESH here and default the field to
+    ``"none"``, so a model declaring ``equilibrium_reconstruction='audusse'``
+    silently lost it at the split and the inherited hook never fired.  The
+    inheritance was real; the flag just never arrived.
+
+    Only the predictor gets it: it is the hyperbolic flux step, and it is the
+    only substep the reconstruction is defined for.  The pressure and corrector
+    substeps are not flux steps and must stay ``"none"``.
+    """
+    eqr = getattr(sm_parent, "equilibrium_reconstruction", "none")
+    if eqr and eqr != "none":
+        sm_pred.equilibrium_reconstruction = eqr
+
+
 def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
                      equation_to_state_index, history_entry,
                      source_only=False):
@@ -1245,6 +1266,7 @@ def split_for_pressure(sm, pressure_vars, dt, *, bottom=None):
     # symbol survived into ``np.asarray`` (``TypeError: Cannot convert
     # expression to float``).  Inherit exactly like the other two stages.
     _inherit_parent_aux(SM_corr, sm)
+    _inherit_equilibrium_reconstruction(SM_pred, sm)
     SM_corr._bc_source = getattr(sm, "_bc_source", None)
     SM_corr._aux_bc_source = getattr(sm, "_aux_bc_source", None)
     SM_corr.history.append({
@@ -1461,6 +1483,7 @@ def split_for_pressure_structural(sm, pressure_vars, dt):
     # symbol survived into ``np.asarray`` (``TypeError: Cannot convert
     # expression to float``).  Inherit exactly like the other two stages.
     _inherit_parent_aux(SM_corr, sm)
+    _inherit_equilibrium_reconstruction(SM_pred, sm)
     SM_corr._bc_source = getattr(sm, "_bc_source", None)
     SM_corr._aux_bc_source = getattr(sm, "_aux_bc_source", None)
     SM_corr.history.append({
@@ -1779,6 +1802,7 @@ def split_simple(sm, pressure_vars, dt, *, bottom=None):
     # symbol survived into ``np.asarray`` (``TypeError: Cannot convert
     # expression to float``).  Inherit exactly like the other two stages.
     _inherit_parent_aux(SM_corr, sm)
+    _inherit_equilibrium_reconstruction(SM_pred, sm)
     SM_corr._bc_source = getattr(sm, "_bc_source", None)
     SM_corr._aux_bc_source = getattr(sm, "_aux_bc_source", None)
     SM_corr.history.append({
