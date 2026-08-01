@@ -676,7 +676,7 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
     # Setup
     # ------------------------------------------------------------------
 
-    def setup_simulation(self, mesh, write_output=False):
+    def setup_simulation(self, mesh, write_output=True):
         """Set up the Chorin solver:
 
         1. Pad ``SM_pred`` to square so :class:`HyperbolicSolver` can
