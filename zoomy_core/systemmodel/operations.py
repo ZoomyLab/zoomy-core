@@ -49,6 +49,7 @@ __all__ = [
     "kp_hinv",
     "desingularize_hinv",
     "desingularize_positivity",
+    "equilibrate_constraint_rows",
     "guard_eigenvalue_powers",
     "gate_eigenvalues_dry",
 ]
@@ -742,6 +743,106 @@ def _depth_state(sm, what):
             f"{what}: no depth state 'h' found "
             f"(state = {[str(s) for s in sm.state]}).")
     return h
+
+
+def _min_h_power(expr, h):
+    """Lowest power of ``h`` in ``expr`` as a rational function of ``h``.
+
+    Returns ``mindeg(numerator) - mindeg(denominator)``; negative means the
+    entry carries a ``1/h**n``.  ``None`` when it cannot be decided (the caller
+    then leaves the row alone rather than guessing)."""
+    e = sp.sympify(expr)
+    if e == 0 or h not in e.free_symbols:
+        return 0
+    try:
+        num, den = sp.fraction(sp.cancel(sp.together(e)))
+
+        def _mindeg(p):
+            p = sp.expand(p)
+            if p == 0:
+                return 0
+            return min(m[0] for m in sp.Poly(p, h).monoms())
+
+        return _mindeg(num) - _mindeg(den)
+    except (sp.PolynomialError, TypeError, ValueError):
+        return None
+
+
+def equilibrate_constraint_rows(mode=True):
+    """Operation: ROW-EQUILIBRATE the DAE constraint rows in ``h``.
+
+    Multiplies each ALGEBRAIC row (zero ``mass_matrix`` row — the Lagrange-
+    multiplier constraints of a DAE, e.g. the divergence constraints whose
+    multipliers are the non-hydrostatic pressure modes) by the **minimal**
+    power of ``h`` that clears every negative power of ``h`` from that row.
+
+    Why this is safe: scaling a CONSTRAINT row by a positive factor leaves the
+    constraint manifold — and hence the solution — unchanged wherever ``h > 0``.
+    It changes only the CONDITIONING of the elliptic block.  The layer-averaged
+    non-hydrostatic literature does the same thing with a blanket ``h**2``
+    (Escalante–Fernández-Nieto–Morales de Luna–Castro 2019, their Eq. 19: the
+    incompressibility constraints are "multiplied by ``h**2`` … in terms of
+    discharges", so no ``1/h`` remains and the pressure matrix stays invertible
+    as ``h -> 0``).  Taking the MINIMAL per-row power instead avoids the
+    over-scaling a blanket factor introduces on rows that only needed ``h**1``.
+
+    Applied at the SystemModel level ON PURPOSE: by this stage ``d_x(q/h)`` has
+    already been resolved into aux symbols plus an EXPLICIT ``h**-n`` factor, so
+    a row multiply genuinely reaches it.  At derivation time the ``1/h`` is
+    still buried inside an unevaluated ``Derivative`` and an external multiply
+    is a no-op (measured).
+
+    ``h`` is found generically as the state named ``"h"``; rows are identified
+    structurally by a zero mass-matrix row — no per-model knowledge.
+    """
+    def _op(sm):
+        if not mode:
+            return
+        h = _depth_state(sm, "equilibrate_constraint_rows")
+        M = sm.mass_matrix
+        if M is None:
+            return
+        n_eq = M.shape[0]
+        scaled = []
+        for i in range(n_eq):
+            if any(sp.sympify(M[i, j]) != 0 for j in range(M.shape[1])):
+                continue                      # differential row — not a constraint
+            entries = []
+            for slot in ("flux", "hydrostatic_pressure", "source",
+                         "source_explicit"):
+                op = getattr(sm, slot, None)
+                if op is None:
+                    continue
+                arr = sp.Array(op)
+                if arr.rank() == 1:
+                    entries.append((slot, (i,), arr[i]))
+                else:
+                    for d in range(arr.shape[1]):
+                        entries.append((slot, (i, d), arr[i, d]))
+            ncp = getattr(sm, "nonconservative_matrix", None)
+            if ncp is not None:
+                arr = sp.Array(ncp)
+                for a in range(arr.shape[1]):
+                    for d in range(arr.shape[2]):
+                        entries.append(("nonconservative_matrix", (i, a, d),
+                                        arr[i, a, d]))
+            powers = [_min_h_power(e, h) for _, _, e in entries]
+            if any(p is None for p in powers):
+                continue                      # undecidable — leave the row alone
+            n = -min(powers)
+            if n <= 0:
+                continue                      # already free of 1/h
+            for slot, idx, e in entries:
+                op = getattr(sm, slot)
+                op[idx] = sp.expand(sp.cancel(sp.sympify(e) * h ** n))
+            scaled.append((i, n))
+        if scaled:
+            sm.refresh_derived_operators(eigenvalues=False)
+        _op.scaled_rows = scaled
+
+    _op.name = "equilibrate_constraint_rows"
+    _op.description = "minimal-power h row-equilibration of DAE constraint rows"
+    return _op
 
 
 def desingularize_hinv(mode="kp"):
