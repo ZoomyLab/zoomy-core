@@ -722,6 +722,62 @@ def _assert_subsystem_symbols_declared(sm):
             f"own operators reference.")
 
 
+def _inherit_parent_aux(sm, sm_parent):
+    """REQ-151: keep the PARENT's aux layout a PREFIX of every sub-system's.
+
+    ``expose_aux_atoms`` only routes Function / Derivative atoms, so a
+    plain-Symbol aux the parent owns — e.g. the KP-desingularized ``hinv``
+    that every velocity ``u = q·hinv`` depends on — is SILENTLY dropped from
+    the sub-system.  Then two things break: (A) the sub-system's own flux /
+    eigenvalues reference an aux row that is absent (``NameError: hinv`` on
+    jax, an out-of-range aux index on numpy, or a sympy expression that
+    survives into ``np.asarray`` → ``TypeError: Cannot convert expression to
+    float``); (B) the parent's BC kernel, forwarded verbatim, indexes aux by
+    the PARENT's row numbers against the sub-system's DIFFERENT layout (an
+    out-of-range crash, or worse a silent wrong-row read).  In 1-D the parent
+    rows happen to be a prefix, so this never fired.  Restore that invariant
+    by construction: prepend the parent rows (in parent order), then reindex
+    the registries to the new layout.
+
+    Applies to EVERY sub-system, including the hand-built corrector — that one
+    bypassed ``_build_subsystem`` and so missed this, which is exactly why
+    ``desingularize_hinv`` before ``chorin_split`` used to kill the corrector
+    with failure mode (A).
+    """
+    parent_aux = list(sm_parent.aux_state)
+    if not parent_aux:
+        return
+    pnames = {str(a) for a in parent_aux}
+    extra = [a for a in sm.aux_state if str(a) not in pnames]
+    sm.aux_state = parent_aux + extra
+    names = [str(a) for a in sm.aux_state]
+    for reg in ("aux_registry", "aux_input_registry"):
+        for e in (getattr(sm, reg, None) or []):
+            if e.get("name") in names:
+                e["row"] = names.index(e["name"])
+    # Carry the parent's LOCAL aux formula (``hinv = kp_hinv(h)``) so the
+    # desingularized rows are actually COMPUTED on the sub-system pool
+    # (defect D — the aux would otherwise sit at 0, zeroing every velocity).
+    # The parent rows are now a prefix, so the parent's per-row column aligns
+    # 1:1; extra rows are identity passthrough.
+    parent_upd = getattr(sm_parent, "update_aux_variables", None)
+    if parent_upd is not None and getattr(parent_upd, "shape", (0,))[0]:
+        n_parent = parent_upd.shape[0]
+        rows = [parent_upd[i, 0] if i < n_parent else a
+                for i, a in enumerate(sm.aux_state)]
+        sm.update_aux_variables = ZArray([[r] for r in rows])
+    # REQ-169: ``aux_state`` just GREW (parent rows prepended) AFTER
+    # ``expose_aux_atoms`` already sized ``source_jacobian_wrt_aux_variables``
+    # to the smaller sub-system aux vector.  Rebuild the derived jacobians so
+    # their columns match the FINAL aux_state layout — otherwise a printer
+    # that iterates ``c in range(len(aux_state))`` (e.g. the amrex Chorin
+    # header generator's ``_expr_source_jac_aux``) runs off the end of the
+    # stale ``(n_eq, n_aux_before)`` jacobian → ``Index (0, k) out of border``.
+    # Mirrors what ``expose_aux_atoms`` / ``expose_*_as_aux`` do after every
+    # ``aux_state`` mutation.
+    sm.refresh_derived_operators(eigenvalues=False)
+
+
 def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
                      equation_to_state_index, history_entry,
                      source_only=False):
@@ -988,49 +1044,7 @@ def _build_subsystem(*, eq_names, eq_residuals, sm_parent, state,
     # ``h_x``, the pressure stage carries the pressure derivatives
     # ``P_l_x`` / ``P_l_x_x``, etc.
     sm.expose_aux_atoms()
-    # ── REQ-151: keep the PARENT's aux layout a PREFIX of every sub-system's.
-    # ``expose_aux_atoms`` only routes Function / Derivative atoms, so a
-    # plain-Symbol aux the parent owns — e.g. the KP-desingularized ``hinv``
-    # that every velocity ``u = q·hinv`` depends on — is SILENTLY dropped from
-    # the sub-system.  Then two things break: (A) the sub-system's own flux /
-    # eigenvalues reference an aux row that is absent (``NameError: hinv`` on
-    # jax, an out-of-range aux index on numpy); (B) the parent's BC kernel,
-    # forwarded verbatim, indexes aux by the PARENT's row numbers against the
-    # sub-system's DIFFERENT layout (an out-of-range crash, or worse a silent
-    # wrong-row read).  In 1-D the parent rows happen to be a prefix, so this
-    # never fired.  Restore that invariant by construction: prepend the parent
-    # rows (in parent order), then reindex the registries to the new layout.
-    parent_aux = list(sm_parent.aux_state)
-    if parent_aux:
-        pnames = {str(a) for a in parent_aux}
-        extra = [a for a in sm.aux_state if str(a) not in pnames]
-        sm.aux_state = parent_aux + extra
-        names = [str(a) for a in sm.aux_state]
-        for reg in ("aux_registry", "aux_input_registry"):
-            for e in (getattr(sm, reg, None) or []):
-                if e.get("name") in names:
-                    e["row"] = names.index(e["name"])
-        # Carry the parent's LOCAL aux formula (``hinv = kp_hinv(h)``) so the
-        # desingularized rows are actually COMPUTED on the sub-system pool
-        # (defect D — the aux would otherwise sit at 0, zeroing every
-        # velocity).  The parent rows are now a prefix, so the parent's per-row
-        # column aligns 1:1; extra rows are identity passthrough.
-        parent_upd = getattr(sm_parent, "update_aux_variables", None)
-        if parent_upd is not None and getattr(parent_upd, "shape", (0,))[0]:
-            n_parent = parent_upd.shape[0]
-            rows = [parent_upd[i, 0] if i < n_parent else a
-                    for i, a in enumerate(sm.aux_state)]
-            sm.update_aux_variables = ZArray([[r] for r in rows])
-        # REQ-169: ``aux_state`` just GREW (parent rows prepended) AFTER
-        # ``expose_aux_atoms`` already sized ``source_jacobian_wrt_aux_variables``
-        # to the smaller sub-system aux vector.  Rebuild the derived jacobians so
-        # their columns match the FINAL aux_state layout — otherwise a printer
-        # that iterates ``c in range(len(aux_state))`` (e.g. the amrex Chorin
-        # header generator's ``_expr_source_jac_aux``) runs off the end of the
-        # stale ``(n_eq, n_aux_before)`` jacobian → ``Index (0, k) out of border``.
-        # Mirrors what ``expose_aux_atoms`` / ``expose_*_as_aux`` do after every
-        # ``aux_state`` mutation.
-        sm.refresh_derived_operators(eigenvalues=False)
+    _inherit_parent_aux(sm, sm_parent)
     # Guard that would have caught all of the above: every free symbol of the
     # sub-system's hyperbolic operators must be a state, an aux, a parameter,
     # a coordinate, time, or ``dt`` — anything else means a kernel references
@@ -1224,6 +1238,13 @@ def split_for_pressure(sm, pressure_vars, dt, *, bottom=None):
     )
     SM_corr.equation_names = list(update_names)
     SM_corr.expose_aux_atoms()
+    # SM_corr is the ONE sub-system built directly instead of through
+    # ``_build_subsystem``, so it used to miss the parent-aux prefix — and with
+    # it any plain-Symbol aux the parent owns (``hinv``).  The corrector's
+    # ``update_variables`` then referenced ``hinv`` without declaring it and the
+    # symbol survived into ``np.asarray`` (``TypeError: Cannot convert
+    # expression to float``).  Inherit exactly like the other two stages.
+    _inherit_parent_aux(SM_corr, sm)
     SM_corr._bc_source = getattr(sm, "_bc_source", None)
     SM_corr._aux_bc_source = getattr(sm, "_aux_bc_source", None)
     SM_corr.history.append({
@@ -1433,6 +1454,13 @@ def split_for_pressure_structural(sm, pressure_vars, dt):
     )
     SM_corr.equation_names = list(update_names)
     SM_corr.expose_aux_atoms()
+    # SM_corr is the ONE sub-system built directly instead of through
+    # ``_build_subsystem``, so it used to miss the parent-aux prefix — and with
+    # it any plain-Symbol aux the parent owns (``hinv``).  The corrector's
+    # ``update_variables`` then referenced ``hinv`` without declaring it and the
+    # symbol survived into ``np.asarray`` (``TypeError: Cannot convert
+    # expression to float``).  Inherit exactly like the other two stages.
+    _inherit_parent_aux(SM_corr, sm)
     SM_corr._bc_source = getattr(sm, "_bc_source", None)
     SM_corr._aux_bc_source = getattr(sm, "_aux_bc_source", None)
     SM_corr.history.append({
@@ -1744,6 +1772,13 @@ def split_simple(sm, pressure_vars, dt, *, bottom=None):
     )
     SM_corr.equation_names = list(update_names)
     SM_corr.expose_aux_atoms()
+    # SM_corr is the ONE sub-system built directly instead of through
+    # ``_build_subsystem``, so it used to miss the parent-aux prefix — and with
+    # it any plain-Symbol aux the parent owns (``hinv``).  The corrector's
+    # ``update_variables`` then referenced ``hinv`` without declaring it and the
+    # symbol survived into ``np.asarray`` (``TypeError: Cannot convert
+    # expression to float``).  Inherit exactly like the other two stages.
+    _inherit_parent_aux(SM_corr, sm)
     SM_corr._bc_source = getattr(sm, "_bc_source", None)
     SM_corr._aux_bc_source = getattr(sm, "_aux_bc_source", None)
     SM_corr.history.append({

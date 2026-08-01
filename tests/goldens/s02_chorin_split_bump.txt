@@ -152,7 +152,7 @@ aux_registry:
 == stage corrector ==
 class: SystemModel
 state: [Symbol('b'), Symbol('h'), Symbol('q_0'), Symbol('q_1'), Symbol('r_0'), Symbol('r_1'), Symbol('P_0'), Symbol('P_1')]
-aux_state: [Symbol('P_0_x'), Symbol('b_x'), Symbol('h_x'), Symbol('P_1_x')]
+aux_state: [Symbol('b_x'), Symbol('q_1_x'), Symbol('dbdx'), Symbol('hinv'), Symbol('P_0_x'), Symbol('h_x'), Symbol('P_1_x')]
 parameters: [g, rho, nu, lambda_s, e_x]
 symbol_assumptions:
   b : {complex, extended_real, finite, hermitian, real}
@@ -163,8 +163,11 @@ symbol_assumptions:
   r_1 : {complex, extended_real, finite, hermitian, real}
   P_0 : {complex, extended_real, finite, hermitian, real}
   P_1 : {complex, extended_real, finite, hermitian, real}
-  P_0_x : {complex, extended_real, finite, hermitian, real}
   b_x : {complex, extended_real, finite, hermitian, real}
+  q_1_x : {complex, extended_real, finite, hermitian, real}
+  dbdx : {complex, extended_real, finite, hermitian, real}
+  hinv : {complex, extended_real, finite, hermitian, real}
+  P_0_x : {complex, extended_real, finite, hermitian, real}
   h_x : {complex, extended_real, finite, hermitian, real}
   P_1_x : {complex, extended_real, finite, hermitian, real}
   g : {complex, extended_nonnegative, extended_nonzero, extended_positive, extended_real, finite, hermitian, nonnegative, nonzero, positive, real}
@@ -190,7 +193,14 @@ update_variables[0,0] = Add(Mul(Integer(-1), Symbol('P_0'), Symbol('dt'), Symbol
 update_variables[1,0] = Add(Mul(Integer(-1), Integer(6), Symbol('P_0'), Symbol('b_x'), Symbol('dt'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(-1), Integer(3), Symbol('P_0'), Symbol('dt'), Symbol('h_x'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(-1), Integer(6), Symbol('P_1'), Symbol('b_x'), Symbol('dt'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(-1), Integer(2), Symbol('P_1'), Symbol('dt'), Symbol('h_x'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(-1), Symbol('P_1_x'), Symbol('dt'), Symbol('h'), Pow(Symbol('rho'), Integer(-1))), Symbol('q_1'))
 update_variables[2,0] = Add(Mul(Integer(-1), Integer(2), Symbol('P_1'), Symbol('dt'), Pow(Symbol('rho'), Integer(-1))), Symbol('r_0'))
 update_variables[3,0] = Add(Mul(Integer(6), Symbol('P_0'), Symbol('dt'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(6), Symbol('P_1'), Symbol('dt'), Pow(Symbol('rho'), Integer(-1))), Symbol('r_1'))
-update_aux_variables: None
+update_aux_variables: shape=(7, 1)
+update_aux_variables[0,0] = Symbol('b_x')
+update_aux_variables[1,0] = Symbol('q_1_x')
+update_aux_variables[2,0] = Symbol('dbdx')
+update_aux_variables[3,0] = Mul(Pow(Integer(2), Rational(1, 2)), Symbol('h'), Pow(Add(Pow(Symbol('h'), Integer(4)), Pow(Max(Float('1.0e-8', precision=53), Symbol('h')), Integer(4))), Rational(-1, 2)))
+update_aux_variables[4,0] = Symbol('P_0_x')
+update_aux_variables[5,0] = Symbol('h_x')
+update_aux_variables[6,0] = Symbol('P_1_x')
 reconstruction_variables: None
 state_from_reconstruction: None
 interpolate_to_3d: None
@@ -199,8 +209,8 @@ boundary_specs: {}
 bc_tags: []
 bc_kernel: ImmutableDenseNDimArray(Tuple(Symbol('b'), Symbol('h'), Symbol('q_0'), Symbol('q_1'), Symbol('r_0'), Symbol('r_1'), Symbol('P_0'), Symbol('P_1')), Tuple(Integer(8)))
 aux_registry:
-  {atom=Derivative(Symbol('P_0'), Tuple(Symbol('x'), Integer(1))), aux_symbol=Symbol('P_0_x'), kind='derivative', multi_index=(1,), name='P_0_x', row=0, state_index=6, target_kind='state', target_name='P_0'}
-  {atom=Derivative(Symbol('b'), Tuple(Symbol('x'), Integer(1))), aux_symbol=Symbol('b_x'), kind='derivative', multi_index=(1,), name='b_x', row=1, state_index=0, target_kind='state', target_name='b'}
-  {atom=Derivative(Symbol('h'), Tuple(Symbol('x'), Integer(1))), aux_symbol=Symbol('h_x'), kind='derivative', multi_index=(1,), name='h_x', row=2, state_index=1, target_kind='state', target_name='h'}
-  {atom=Derivative(Symbol('P_1'), Tuple(Symbol('x'), Integer(1))), aux_symbol=Symbol('P_1_x'), kind='derivative', multi_index=(1,), name='P_1_x', row=3, state_index=7, target_kind='state', target_name='P_1'}
+  {atom=Derivative(Symbol('P_0'), Tuple(Symbol('x'), Integer(1))), aux_symbol=Symbol('P_0_x'), kind='derivative', multi_index=(1,), name='P_0_x', row=4, state_index=6, target_kind='state', target_name='P_0'}
+  {atom=Derivative(Symbol('b'), Tuple(Symbol('x'), Integer(1))), aux_symbol=Symbol('b_x'), kind='derivative', multi_index=(1,), name='b_x', row=0, state_index=0, target_kind='state', target_name='b'}
+  {atom=Derivative(Symbol('h'), Tuple(Symbol('x'), Integer(1))), aux_symbol=Symbol('h_x'), kind='derivative', multi_index=(1,), name='h_x', row=5, state_index=1, target_kind='state', target_name='h'}
+  {atom=Derivative(Symbol('P_1'), Tuple(Symbol('x'), Integer(1))), aux_symbol=Symbol('P_1_x'), kind='derivative', multi_index=(1,), name='P_1_x', row=6, state_index=7, target_kind='state', target_name='P_1'}
 
