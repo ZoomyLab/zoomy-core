@@ -299,6 +299,16 @@ def _pad_to_square(sm: SystemModel) -> SystemModel:
     sm_square.aux_registry = list(getattr(sm, "aux_registry", []) or [])
     sm_square.aux_input_registry = list(
         getattr(sm, "aux_input_registry", []) or [])
+    # The WB mode is a NUMERICS choice that must survive padding.  This object
+    # — not the caller's ``SM_pred`` — is what reaches HyperbolicSolver's
+    # well-balanced hook, which reads ``getattr(sm, "equilibrium_reconstruction")``.
+    # ``SystemModel(...)`` above defaults it to "none", so a model declaring
+    # 'audusse' / 'bernoulli' had it silently dropped HERE even after the
+    # splitter propagates it onto SM_pred: padding rebuilds the object.  Only
+    # the square path was affected — ``n_eq == n_state`` returns ``sm`` itself
+    # and so never lost it, which is why 1-D SWE/SME suites never caught this.
+    sm_square.equilibrium_reconstruction = getattr(
+        sm, "equilibrium_reconstruction", "none")
     # Frozen flux Jacobian (see the cid=50 note above): pad the stage's
     # materialized quasilinear cache row-wise so the padded copy NEVER
     # re-materializes it from the swept flux.
