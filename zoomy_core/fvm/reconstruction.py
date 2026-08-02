@@ -948,13 +948,19 @@ class FreeSurfaceLSQMUSCL(LSQMUSCLReconstruction):
         self._h_idx = h_index
         self._eps_wet = eps_wet
 
-    def __call__(self, Q, bf_face_values):
+    def __call__(self, Q, bf_face_values, phi=None, force_o1=None):
         n_vars = Q.shape[0]
         grads, phi = self._compute_limited_gradients(Q, n_vars, bf_face_values)
         # Wet-dry: zero limiter in dry cells — even on unlimited rows
         # (so bathymetry's slope stops contributing once h is dry).
         dry = Q[self._h_idx, :] < self._eps_wet
         phi[:, dry] = 0.0
+        # This class inherits ``supports_force_o1 = True`` from the base but
+        # used to override ``__call__`` WITHOUT the kwarg, so the solver's
+        # a-posteriori MOOD pass raised ``unexpected keyword argument
+        # 'force_o1'`` on every order-2 free-surface run.  The demotion is the
+        # same operation as the dry fallback above: zero the limiter there.
+        phi = self._apply_force_o1(phi, force_o1)
         Q_L, Q_R = self._reconstruct(Q, grads, phi, bf_face_values)
         # Clamp h >= 0
         np.maximum(Q_L[self._h_idx, :], 0.0, out=Q_L[self._h_idx, :])
