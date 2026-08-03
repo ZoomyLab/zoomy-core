@@ -662,6 +662,23 @@ class MLVAM(BaseModel):
                     for xd in horiz for k in range(Nu + 1)]
         m.r_flat = [r for layer in r_mod for r in layer]
         m.P_flat = [p for layer in P_mod for p in layer]
+
+        # WB reconstruction rows (mirrors ``VAM`` §6g / ``SME`` §12): limit the
+        # FREE SURFACE η = b+h and the PRIMITIVE velocity moments q/h, r/h.
+        # Both q and r are thickness-scaled by construction (the per-layer
+        # change of variables carries ``qi/h_l``), so their primitives stay
+        # bounded as h → 0 — which removes the wet/dry threshold from the
+        # reconstruction rather than retuning it.  Scaled by the TOTAL depth
+        # ``ht``: the per-layer ``h_ell`` are intermediate functions eliminated
+        # during derivation and are NOT state symbols here, so they cannot
+        # appear in an emitted row; ``ht`` is a state, gives the same
+        # boundedness, and inverts exactly (it differs from the layer velocity
+        # by the constant fraction l_ell).
+        # Pressure modes P PASS THROUGH — they are not thickness-scaled, and
+        # unregistered slots default to the identity at extraction.
+        m.reconstruction_rows = {ht: b + ht}
+        m.reconstruction_rows.update({q: q / ht for q in m.q_flat})
+        m.reconstruction_rows.update({r: r / ht for r in m.r_flat})
         m.layer_eqs_debug = _layer_eqs_debug
         return m
 

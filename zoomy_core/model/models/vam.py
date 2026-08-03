@@ -364,6 +364,27 @@ class VAM(BaseModel):
         register_free_slip_wall(
             m, ([qh(i, t, *horiz) for qh in vam_q_heads] for i in range(Nu + 1)))
 
+        # 6g — WB reconstruction rows (mirrors ``SME`` §12): limit the FREE
+        # SURFACE η = b+h and the PRIMITIVE velocity moments q_d/h and r/h.
+        # Both q and r are h-SCALED by construction (§6a: the change of
+        # variables ``\hat{w} → r`` carries ``ri/h``), so their primitives stay
+        # bounded as h → 0 — that is what removes the wet/dry threshold from
+        # the reconstruction instead of retuning it.  The pressure modes P_i
+        # are NOT h-scaled (``\hat{p} → P`` is the identity there) and PASS
+        # THROUGH: unregistered slots default to the identity at extraction, so
+        # they are deliberately absent here rather than listed as identity.
+        # Without these rows ``reconstruction_variables`` stayed ``None``, and
+        # every order-2 VAM run fell back to the index-driven legacy path that
+        # needs ``free_surface_h_index``.
+        m.reconstruction_rows = {h: b + h}
+        for qn in QNAME:
+            _qh = getattr(m.functions, qn).head
+            m.reconstruction_rows.update(
+                {_qh(i, t, *horiz): _qh(i, t, *horiz) / h for i in range(Nu + 1)})
+        _rh = m.functions.r.head
+        m.reconstruction_rows.update(
+            {_rh(i, t, *horiz): _rh(i, t, *horiz) / h for i in range(Nu + 1)})
+
         # 7 — vertical reconstruction → interpolate (field order [b,h,u,v,w,p];
         # v at index 3 only in dim=3).  The modal profiles assembled in §6b/§6c
         # ARE the reconstruction: ``uvel_m[di]`` = Σ_{i≤Nu}(q_{di,i}/h)·φ_i is the

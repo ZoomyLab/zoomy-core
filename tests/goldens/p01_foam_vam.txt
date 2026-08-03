@@ -366,6 +366,43 @@ inline Foam::List<Foam::scalar> update_variables(
 }
 
 
+inline Foam::List<Foam::scalar> reconstruction_variables(
+    const Foam::List<Foam::scalar>& Q,
+    const Foam::List<Foam::scalar>& Qaux,
+    const Foam::List<Foam::scalar>& p)
+{
+    auto res = Foam::List<Foam::scalar>(8, 0.0);
+    res[0] = Q[0];
+    res[1] = Q[0] + Q[1];
+    res[2] = Qaux[3]*Q[2];
+    res[3] = Qaux[3]*Q[3];
+    res[4] = Qaux[3]*Q[4];
+    res[5] = Qaux[3]*Q[5];
+    res[6] = Q[6];
+    res[7] = Q[7];
+    return res;
+}
+
+
+inline Foam::List<Foam::scalar> state_from_reconstruction(
+    const Foam::List<Foam::scalar>& W,
+    const Foam::List<Foam::scalar>& Qaux,
+    const Foam::List<Foam::scalar>& p)
+{
+    Foam::scalar t0 = -W[0] + W[1];
+    auto res = Foam::List<Foam::scalar>(8, 0.0);
+    res[0] = W[0];
+    res[1] = t0;
+    res[2] = W[2]*t0;
+    res[3] = W[3]*t0;
+    res[4] = W[4]*t0;
+    res[5] = W[5]*t0;
+    res[6] = W[6];
+    res[7] = W[7];
+    return res;
+}
+
+
 inline Foam::List<Foam::scalar> interpolate_to_3d_at(
     const Foam::List<Foam::scalar>& Q,
     const Foam::List<Foam::scalar>& Qaux,

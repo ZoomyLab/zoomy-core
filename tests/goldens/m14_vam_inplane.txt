@@ -77,8 +77,24 @@ source_explicit: None
 eigenvalues: None
 update_variables: None
 update_aux_variables: None
-reconstruction_variables: None
-state_from_reconstruction: None
+reconstruction_variables: shape=(8,)
+reconstruction_variables[0] = Symbol('b')
+reconstruction_variables[1] = Add(Symbol('b'), Symbol('h'))
+reconstruction_variables[2] = Mul(Pow(Symbol('h'), Integer(-1)), Symbol('q_0'))
+reconstruction_variables[3] = Mul(Pow(Symbol('h'), Integer(-1)), Symbol('q_1'))
+reconstruction_variables[4] = Mul(Pow(Symbol('h'), Integer(-1)), Symbol('r_0'))
+reconstruction_variables[5] = Mul(Pow(Symbol('h'), Integer(-1)), Symbol('r_1'))
+reconstruction_variables[6] = Symbol('P_0')
+reconstruction_variables[7] = Symbol('P_1')
+state_from_reconstruction: shape=(8,)
+state_from_reconstruction[0] = Symbol('WB_b')
+state_from_reconstruction[1] = Add(Mul(Integer(-1), Symbol('WB_b')), Symbol('WB_h'))
+state_from_reconstruction[2] = Mul(Symbol('WB_q_0'), Add(Mul(Integer(-1), Symbol('WB_b')), Symbol('WB_h')))
+state_from_reconstruction[3] = Mul(Symbol('WB_q_1'), Add(Mul(Integer(-1), Symbol('WB_b')), Symbol('WB_h')))
+state_from_reconstruction[4] = Mul(Symbol('WB_r_0'), Add(Mul(Integer(-1), Symbol('WB_b')), Symbol('WB_h')))
+state_from_reconstruction[5] = Mul(Symbol('WB_r_1'), Add(Mul(Integer(-1), Symbol('WB_b')), Symbol('WB_h')))
+state_from_reconstruction[6] = Symbol('WB_P_0')
+state_from_reconstruction[7] = Symbol('WB_P_1')
 interpolate_to_3d: shape=(6, 1)
 interpolate_to_3d[0,0] = Symbol('b')
 interpolate_to_3d[1,0] = Symbol('h')
