@@ -29,6 +29,8 @@ from zoomy_core.model.models.sme import SME
 from zoomy_core.model.models.swe import SWE
 from zoomy_core.model.models.vam import VAM
 from zoomy_core.systemmodel.system_model import SystemModel
+from zoomy_core.model.models.closures import (
+    Newtonian, NavierSlip, StressFree)
 
 pytestmark = [pytest.mark.model]
 
@@ -189,9 +191,11 @@ def test_rederive_cached_equals_fresh_srepr():
     fresh NO-CACHE derivation — the designed answer to 'goldens detect change,
     not wrongness' for the cache tiers."""
     import goldenlib
-    cached = SystemModel.from_model(VAM(level=1, dimension=2))
+    _c = lambda: [Newtonian(), NavierSlip(), StressFree()]
+    cached = SystemModel.from_model(VAM(level=1, dimension=2, closures=_c()))
     with goldenlib.no_cache():
-        fresh = SystemModel.from_model(VAM(level=1, dimension=2))
+        fresh = SystemModel.from_model(
+            VAM(level=1, dimension=2, closures=_c()))
     for op in ("flux", "source", "nonconservative_matrix", "eigenvalues"):
         c, f = getattr(cached, op, None), getattr(fresh, op, None)
         if c is None or f is None:
@@ -268,14 +272,19 @@ def test_rederive_mro_source_rebust(tmp_path):
 def test_rederive_cross_process_disk_hit_and_prebuilt(cache_dir):
     """REQ-163: a SECOND python process with the same spec loads from disk,
     and the shipped ``_prebuilt`` tier is non-empty and unpicklable-sane."""
-    SystemModel.from_model(SME(level=0, dimension=2))
+    SystemModel.from_model(SME(level=0, dimension=2,
+                               closures=[Newtonian(), NavierSlip(),
+                                         StressFree()]))
     code = (
         "import os, time\n"
         f"os.environ['ZOOMY_CACHE_DIR'] = {str(cache_dir)!r}\n"
         "from zoomy_core.model.models.sme import SME\n"
         "from zoomy_core.systemmodel.system_model import SystemModel\n"
         "t0 = time.time()\n"
-        "sm = SystemModel.from_model(SME(level=0, dimension=2, parameters={'g': 777.0}))\n"
+        "from zoomy_core.model.models.closures import (\n"
+        "    Newtonian, NavierSlip, StressFree)\n"
+        "sm = SystemModel.from_model(SME(level=0, dimension=2, parameters={'g': 777.0},\n"
+        "    closures=[Newtonian(), NavierSlip(), StressFree()]))\n"
         "dt = time.time() - t0\n"
         "assert sm.n_equations > 0\n"
         "assert dt < 2.0, f'expected disk hit, took {dt:.2f}s'\n"

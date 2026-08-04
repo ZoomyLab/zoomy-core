@@ -14,6 +14,8 @@ import zoomy_core.fvm.timestepping as timestepping
 from zoomy_core.fvm.solver_imex_numpy import IMEXSolver
 from zoomy_core.mesh import BaseMesh
 from zoomy_core.model.models.sme import SME
+from zoomy_core.model.models.closures import (
+    Newtonian, NavierSlip, StressFree)
 from zoomy_core.numerics.numerical_system_model import NumericalSystemModel
 
 pytestmark = [pytest.mark.solver, pytest.mark.small, pytest.mark.gate]
@@ -28,7 +30,8 @@ def test_imex_smoke_default_and_global_source():
     path (REQ-144): both finite."""
     mesh = BaseMesh.create_2d(domain=(0.0, 10.0, 0.0, 1.0), nx=8, ny=4)
     nsm = NumericalSystemModel.from_model(
-        SME(level=1, dimension=2, parameters={"g": 9.81, "n_m": 0.02}))
+        SME(level=1, dimension=2, parameters={"g": 9.81, "n_m": 0.02},
+            closures=[Newtonian(), NavierSlip(), StressFree()]))
     for cls in (IMEXSolver, _IMEXGlobal):
         solver = cls(time_end=0.02, compute_dt=timestepping.adaptive(CFL=0.3))
         solver.setup_simulation(mesh, nsm, write_output=False)

@@ -60,8 +60,14 @@ _HEALTHY = {
                                 closures=[Newtonian(), StressFree()]),
     "MLVAM(2,1)": lambda: MLVAM(n_layers=2, level=1, dimension=2,
                                 closures=[Newtonian(), StressFree()]),
-    "MLSWE(2)": lambda: MLSWE(n_layers=2, dimension=2),
-    "MLSME(2,1)": lambda: MLSME(n_layers=2, level=1, dimension=2),
+    # Closures on EVERY entry: "healthy" has to mean closed.  These two were
+    # the only families built bare, and they carry the same four unbound
+    # interface stresses ML-VAM does — silently frictionless internal
+    # interfaces, which is not a healthy family.
+    "MLSWE(2)": lambda: MLSWE(n_layers=2, dimension=2,
+                              closures=[Newtonian(), StressFree()]),
+    "MLSME(2,1)": lambda: MLSME(n_layers=2, level=1, dimension=2,
+                                closures=[Newtonian(), StressFree()]),
 }
 
 

@@ -476,10 +476,24 @@ def build_m02_swe_2d():
     return body
 
 
-def _simple_model_golden(factory, title):
-    from zoomy_core.systemmodel.system_model import SystemModel
+def _simple_model_golden(factory, title, unclosed=False):
+    """Render one model's SystemModel snapshot.
+
+    ``unclosed=True`` pins a model built WITHOUT a stress closure — the honest
+    open system (m11, m16).  That is exactly what ``UnclosedClosureError``
+    refuses to hand back by default, so the build is wrapped in the explicit
+    ``allow_unclosed()`` opt-in; the golden keeps pinning the open operator
+    shape, and the guard keeps firing everywhere it is not asked for.
+    """
+    from zoomy_core.systemmodel.system_model import SystemModel, allow_unclosed
+    import contextlib
+    import warnings
     with no_cache():
-        sm = SystemModel.from_model(factory())
+        with (allow_unclosed() if unclosed else contextlib.nullcontext()):
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore", message=".*unclosed term", category=UserWarning)
+                sm = SystemModel.from_model(factory())
     return render_system_model(sm, title=title)
 
 
@@ -551,7 +565,8 @@ def build_m11_vam_1d():
     from zoomy_core.model.models import VAM
     return _simple_model_golden(
         lambda: VAM(level=1, dimension=2),
-        "VAM(level=1, dimension=2) — 8x8 square DAE (unclosed tau)")
+        "VAM(level=1, dimension=2) — 8x8 square DAE (unclosed tau)",
+        unclosed=True)
 
 
 def vam_escalante_model():
@@ -597,7 +612,8 @@ def build_m16_sigma3d():
     from zoomy_core.model.models.sigma3d import Sigma3D
     return _simple_model_golden(
         lambda: Sigma3D(),
-        "Sigma3D() — zeta as flux direction, zeta-zeta diffusion")
+        "Sigma3D() — zeta as flux direction, zeta-zeta diffusion",
+        unclosed=True)
 
 
 # ── systemmodel goldens (warm cache allowed — they pin the SM layer) ───────
@@ -913,6 +929,7 @@ def build_x01_numpy_wb_solver():
         return np.array([b, eta0 - b, 0.0, 0.0])
 
     model = SME(level=1, equilibrium_reconstruction="audusse",
+                closures=_std_closures(),
                 boundary_conditions=BoundaryConditions(
                     [Periodic(tag="left", periodic_to_physical_tag="right"),
                      Periodic(tag="right", periodic_to_physical_tag="left")]))
@@ -949,8 +966,10 @@ def build_x01_numpy_wb_solver():
     # preserves the discharge q = h*alpha_0 EXACTLY on a shifted bed.
     from zoomy_core.fvm.bernoulli_wb import build_bernoulli_config, reconstruct
     from zoomy_core.model.boundary_conditions import Extrapolation
-    sm2 = SystemModel.from_model(SME(level=2, boundary_conditions=BoundaryConditions(
-        [Extrapolation(tag="left"), Extrapolation(tag="right")])))
+    sm2 = SystemModel.from_model(SME(
+        level=2, closures=_std_closures(),
+        boundary_conditions=BoundaryConditions(
+            [Extrapolation(tag="left"), Extrapolation(tag="right")])))
     cfg = build_bernoulli_config(sm2, mode="bernoulli")
     h, b, a0, a1 = 1.5, 0.3, 0.6, 0.2
     Qb = np.array([[b], [h], [h * a0], [h * a1], [0.0]])

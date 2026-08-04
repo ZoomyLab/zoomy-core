@@ -13,6 +13,8 @@ identity and shallow recovery (test_sigma3d.py).
 
 Shape, count and smoke checks are NEVER sufficient — pin every term.
 """
+import warnings
+
 import pytest
 import sympy as sp
 
@@ -436,7 +438,16 @@ def test_sigma3d_shallow_recovery():
     mom_full = sp.sympify(full.derivation.momentum.expr)
     txx = [a for a in mom_full.atoms(sp.Function) if "tau_xx" in str(a.func)]
     assert txx, "full-stress Sigma3D must retain the in-plane stress tau~_xx"
-    assert any("tau_xx" in str(s) for s in SystemModel.from_model(full).aux_state)
+    # The full-stress Sigma3D is deliberately OPEN — tau~_xx is the honest
+    # unclosed in-plane stress, which is the thing under test — so the build
+    # takes the explicit opt-in rather than the guard's refusal.
+    from zoomy_core.systemmodel.system_model import allow_unclosed
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with allow_unclosed():
+            sm_full = SystemModel.from_model(full)
+    assert any("tau_xx" in str(s) for s in sm_full.aux_state)
+    assert sm_full._unclosed_closures == ["\\tilde{tau_xx}"]
 
     clear_derivation_model_cache()
     shallow = Sigma3D(closures=[Newtonian(), NavierSlip(), StressFree(),

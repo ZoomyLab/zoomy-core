@@ -215,6 +215,8 @@ def test_periodic_idempotent_and_wrap(one_hyperbolic_step):
         Periodic(tag="right", periodic_to_physical_tag="left"),
     ])
     sm = SystemModel.from_model(SME(level=0,
+                                    closures=[Newtonian(), NavierSlip(),
+                                              StressFree()],
                                     parameters={"nu": 1e-6, "lambda_s": 0.0},
                                     boundary_conditions=bcs))
     n_state = len(sm.state)
@@ -312,12 +314,15 @@ def test_wall_is_normal_aware_2d():
     # KeyError on every VAM.  Their vertical (r) and pressure (P) moments are
     # scalars under a HORIZONTAL wall normal and must pass through untouched —
     # only the horizontal momentum vector of each moment reflects.
+    # SWE carries no stress moments; every moment family needs its σ rows
+    # closed, or ``from_model`` refuses the open system.
+    _c = dict(closures=[Newtonian(), NavierSlip(), StressFree()])
     for build in (lambda **k: SWE(dimension=2, **k),
-                  lambda **k: SME(level=0, dimension=3, **k),
-                  lambda **k: SME(level=1, dimension=3, **k),
-                  lambda **k: MLSME(n_layers=2, level=0, dimension=3, **k),
-                  lambda **k: VAM(level=1, dimension=3, **k),
-                  lambda **k: MLVAM(n_layers=2, level=1, dimension=3, **k)):
+                  lambda **k: SME(level=0, dimension=3, **_c, **k),
+                  lambda **k: SME(level=1, dimension=3, **_c, **k),
+                  lambda **k: MLSME(n_layers=2, level=0, dimension=3, **_c, **k),
+                  lambda **k: VAM(level=1, dimension=3, **_c, **k),
+                  lambda **k: MLVAM(n_layers=2, level=1, dimension=3, **_c, **k)):
         sm = SystemModel.from_model(build())
         bc = FromModel(tag="left", definition="wall").resolve(sm)
         names = [str(s) for s in sm.state]

@@ -25,6 +25,8 @@ import sympy as sp
 from zoomy_core.misc.misc import ZArray
 from zoomy_core.model.basefunction import Function
 from zoomy_core.model.models.sme import SME
+from zoomy_core.model.models.closures import (
+    Newtonian, NavierSlip, StressFree)
 from zoomy_core.numerics.numerical_system_model import NumericalSystemModel
 from zoomy_core.fvm.riemann_solvers import (
     NonconservativeRusanov,
@@ -47,7 +49,9 @@ def _cse_ops(rows):
 @pytest.fixture(scope="module")
 def sme_numerics():
     nsm = NumericalSystemModel.from_model(
-        SME(level=1, dimension=2), riemann=PositiveNonconservativeHLL
+        SME(level=1, dimension=2,
+            closures=[Newtonian(), NavierSlip(), StressFree()]),
+        riemann=PositiveNonconservativeHLL
     ).derive()
     return nsm, nsm.build_numerics()
 
@@ -159,7 +163,8 @@ def test_resolve_opaque_leaves_external_kernels_as_calls():
     from zoomy_core.model.models.vam import VAM
 
     nsm = NumericalSystemModel.from_model(
-        VAM(level=1), riemann=NonconservativeRusanov).derive()
+        VAM(level=1, closures=[Newtonian(), NavierSlip(), StressFree()]),
+        riemann=NonconservativeRusanov).derive()
     num = nsm.build_numerics()
     pr_on = AmrexNumerics(num, resolve_opaque=True)
     body = pr_on._process_kernel_from_function(_consumer(num))[0]

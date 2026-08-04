@@ -22,6 +22,13 @@ import sympy as sp
 
 from zoomy_core.model.models.vam import VAM
 from zoomy_core.model.models.ml_vam import MLVAM
+from zoomy_core.model.models.closures import (
+    Newtonian, NavierSlip, StressFree)
+
+#: A moment model with no stress closure is OPEN — its sigma rows read zero
+#: and ``SystemModel.from_model`` refuses it.  The Chorin pressure operator
+#: is closure-independent, so close them the production way.
+_CLOS = lambda: [Newtonian(), NavierSlip(), StressFree()]
 
 # R4 (approved spec §1c): wholesale rederive — operator-vs-matrix-free
 # self-consistency, run on re-baseline / by tag, zero default-gate cost.
@@ -136,7 +143,7 @@ def _verify(model, seed=0):
 
 
 def test_pressure_operator_vam_1_2():
-    op = _verify(VAM(level=1, dimension=2))
+    op = _verify(VAM(level=1, dimension=2, closures=_CLOS()))
     assert len(op.P_modes) == 2
     assert op.Axx is not None          # one horizontal coord → x only
     assert op.Ax is not None
@@ -144,7 +151,8 @@ def test_pressure_operator_vam_1_2():
 
 
 def test_pressure_operator_lazy_cached_and_nonbreaking():
-    smp = VAM(level=1, dimension=2).chorin_split().SM_press
+    smp = VAM(level=1, dimension=2,
+              closures=_CLOS()).chorin_split().SM_press
     # source is intact / probe path still valid (no re-derivation side effect)
     src_before = sp.sympify(smp.source[0, 0])
     op1 = smp.pressure_operator()
@@ -155,7 +163,7 @@ def test_pressure_operator_lazy_cached_and_nonbreaking():
 
 @pytest.mark.rederive
 def test_pressure_operator_vam_1_3():
-    op = _verify(VAM(level=1, dimension=3))
+    op = _verify(VAM(level=1, dimension=3, closures=_CLOS()))
     assert len(op.P_modes) == 2
     assert op.Ax is not None and op.Ay is not None       # x,y horizontal
     assert op.Axx is not None and op.Ayy is not None
@@ -163,5 +171,5 @@ def test_pressure_operator_vam_1_3():
 
 @pytest.mark.rederive
 def test_pressure_operator_ml_vam():
-    op = _verify(MLVAM(n_layers=2, level=1, dimension=2))
+    op = _verify(MLVAM(n_layers=2, level=1, dimension=2, closures=_CLOS()))
     assert len(op.P_modes) >= 2

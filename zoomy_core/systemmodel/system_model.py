@@ -25,6 +25,7 @@ Solvers and analysis routines accept either a ``Model`` or a
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -1401,6 +1402,8 @@ class SystemModel:
         # open-SME source vanishes (the stress is an auxiliary field, computed
         # separately) exactly as production reports.
         sm.expose_aux_atoms()
+        _assert_declared_closures_closed(sm, model,
+                                         canonical_source=canonical_source)
         # Parse any registered function groups (vertical reconstruction →
         # interpolate_to_3d, its inverse → project_from_3d, …) into their
         # SystemModel slots; runtime gradient aux (∂_x h, ∂_x q_i) land in Qaux.
@@ -1707,6 +1710,8 @@ class SystemModel:
         # structured registry entry.  Solvers walk ``sm.aux_registry``
         # to compute aux values per step.
         sm.expose_aux_atoms()
+        _assert_declared_closures_closed(sm, model,
+                                         canonical_source=canonical_source)
 
         # ── raw-Model promotion: function groups + coupling/boundary conditions
         # (REQ-87).  Production models (SWE and subclasses) declare their WB
@@ -2852,6 +2857,42 @@ class SystemModel:
 
     # ── describe ──────────────────────────────────────────────────────
 
+    def describe_unclosed(self) -> str:
+        """List the aux rows nothing computes — the model's OPEN terms.
+
+        Every aux slot is one of three things, and this says which:
+
+        * **computed** — an ``aux_registry`` row (a derivative from the LSQ
+          walk, or a closure evaluated pointwise);
+        * **external** — declared by the model with a definition it cannot
+          evaluate pointwise (the stay-3D column integrals ``U``, ``ω``);
+          a backend fills it;
+        * **UNCLOSED** — neither.  Nothing writes the row, so it reads ZERO:
+          silently absent physics, which is what
+          :class:`UnclosedClosureError` refuses to hand back.
+
+        Written for the reader who just hit that error and wants to know which
+        closures the model is still missing.
+        """
+        unclosed = list(getattr(self, "_unclosed_closures", None) or ())
+        external = dict(getattr(self, "external_aux", None) or {})
+        computed = [str(a) for a in (self.aux_state or ())
+                    if str(a) not in unclosed and str(a) not in external]
+
+        out = [f"UNCLOSED TERMS: {len(unclosed)}"]
+        for nm in unclosed:
+            out.append(f"  ✗ {nm}   — nothing computes this; it reads ZERO")
+        if external:
+            out.append(f"external (declared, backend-supplied): {len(external)}")
+            for nm, defn in external.items():
+                out.append(f"  · {nm}" + (f"   {defn}" if defn is not None else ""))
+        if computed:
+            out.append(f"computed (aux_registry): {len(computed)}")
+            out.append("  " + ", ".join(computed))
+        if not unclosed:
+            out.append("The system is CLOSED.")
+        return "\n".join(out)
+
     def describe(self, full: bool = False) -> "SystemModelDescription":
         """Return a Description rendering the operator form.
 
@@ -3522,4 +3563,167 @@ __all__ = [
     "InvertMassMatrix",
     "RemoveNonDiagonalH",
     "HydrostaticReconstruction",
+    "UnclosedClosureError",
+    "allow_unclosed",
 ]
+
+
+#: Set inside the :func:`allow_unclosed` context manager — the ONE way to get a
+#: SystemModel back with unclosed terms still in it.
+_ALLOW_UNCLOSED = False
+
+
+@contextmanager
+def allow_unclosed():
+    """Permit a build to RETURN a SystemModel that still has unclosed terms.
+
+    The open system is a legitimate object to want — it is the honest
+    full-stress model, and printing it is how you find out *which* closures a
+    model still needs.  What is not legitimate is getting it by accident, so
+    the opt-in is explicit and greppable::
+
+        with allow_unclosed():
+            sm = SystemModel.from_model(VAM(level=1, dimension=2))
+        print(sm.describe_unclosed())
+
+    Inside the block the open terms are reported as a ``UserWarning`` and
+    listed on :attr:`SystemModel._unclosed_closures`; outside it they raise
+    :class:`UnclosedClosureError`.
+    """
+    global _ALLOW_UNCLOSED
+    prev = _ALLOW_UNCLOSED
+    _ALLOW_UNCLOSED = True
+    try:
+        yield
+    finally:
+        _ALLOW_UNCLOSED = prev
+
+
+def _declared_aux_definitions(model) -> dict:
+    """``{name: definition}`` for aux the MODEL declared itself.
+
+    ``add_equation(name, Eq(sym, expr), group="aux")`` is how a model says "this
+    is a genuine auxiliary field with a definition, filled by the backend" — the
+    stay-3D column integrals ``U = ∫₀¹ u dζ`` and ``ω`` are the standing
+    example: a running quadrature is not an algebraic ``update_aux_variables``
+    row, so it has no registry entry and never will.
+
+    Those names live in ``_aux_names`` on the DERIVATION model, which is reached
+    as ``model.derivation`` — the outer user-facing Model does not carry them
+    (the same seam that hides ``_closure_vars``), so checking only ``model``
+    silently returns nothing and every declared aux looks unclosed.
+    """
+    for owner in (model, getattr(model, "derivation", None)):
+        names = getattr(owner, "_aux_names", None)
+        if not names:
+            continue
+        eqs = getattr(owner, "_equations", None) or {}
+        return {str(nm): getattr(eqs.get(nm), "expr", None) for nm in names}
+    return {}
+
+
+def _assert_declared_closures_closed(sm, model, canonical_source=None):
+    """Refuse to hand back a SystemModel with a DECLARED closure left unbound.
+
+    ``Model.declare_closure`` marks a field as needing a closure; if no closure
+    substitutes it during the derivation it is swept into ``aux_state`` by
+    ``expose_aux_atoms`` — with NO ``update_aux_variables`` row.  Nothing then
+    ever writes that slot, so the term reads ZERO: not an error, not garbage,
+    silently absent physics.  That is how the ML-VAM interface tractions
+    ``tau(0)`` / ``tau(1)`` vanish — they ARE derived (the by-parts step emits
+    them), but ``apply_layer_stress_closures`` binds them only on the top / bed
+    layer, so every internal interface is frictionless and nothing says so.
+
+    An aux that is MEANT to be external is declared explicitly (``register_aux``
+    gives it a formula, so it is computed).  This check fires only on the
+    difference: declared a closure, landed in aux, and has no row.
+    """
+    # ``_closure_vars`` lives on the INNER per-layer DModel built inside
+    # ``derive_model`` and does NOT survive to the model handed here, so
+    # trusting it makes this a silent no-op.  Use the emitted object: an aux
+    # slot with NO aux_registry row is one that nothing ever computes.
+    computed = set()
+    for entry in (getattr(sm, "aux_registry", None) or ()):
+        nm = entry.get("name") if isinstance(entry, dict) else getattr(entry, "name", None)
+        if nm is not None:
+            computed.add(str(nm))
+
+    # …and the OTHER way an aux gets a value: a real ``update_aux_variables``
+    # row.  A model that declares ``aux_variables=["r_o"]`` and returns the
+    # rain rate from ``update_aux_variables()`` has no registry entry — the
+    # registry only holds what ``expose_aux_atoms`` minted — so reading the
+    # registry alone calls that computed field unclosed.  A row equal to its
+    # own aux symbol is the identity passthrough ``register_aux`` writes for
+    # rows it does not own, and computes nothing.
+    uav = getattr(sm, "update_aux_variables", None)
+    if uav is not None:
+        for row, sym in enumerate(sm.aux_state or ()):
+            try:
+                expr = uav[row, 0] if getattr(uav, "shape", None) else uav[row]
+            except (IndexError, TypeError):
+                continue
+            if sp.sympify(expr) != sp.sympify(sym):
+                computed.add(str(sym))
+
+    # …UNLESS the model declared it as a genuine auxiliary with a definition.
+    # Those have no registry row by construction (a column quadrature is not an
+    # algebraic aux update) and are filled by the backend — declared, not
+    # forgotten.  Record them on the SystemModel so the distinction is
+    # inspectable rather than living only inside this check.
+    declared = _declared_aux_definitions(model)
+    # Name the model the USER wrote.  On the declarative path ``model`` is the
+    # inner derivation object, whose class is the generic ``Model`` — reporting
+    # that tells the reader nothing about which of their models is open.
+    name = type(canonical_source if canonical_source is not None
+                else model).__name__
+    aux_names = [str(a) for a in (sm.aux_state or ())]
+    sm.external_aux = {nm: defn for nm, defn in declared.items()
+                       if nm in aux_names}
+
+    unclosed = sorted(nm for nm in aux_names
+                      if nm not in computed and nm not in sm.external_aux)
+    sm._unclosed_closures = unclosed
+    if not unclosed:
+        return
+    if _ALLOW_UNCLOSED:
+        import warnings
+        warnings.warn(
+            f"{name}: {len(unclosed)} unclosed term(s) "
+            f"({', '.join(unclosed)}) — returned under allow_unclosed(). "
+            "The system is OPEN: those rows read ZERO until closed. "
+            "See sm.describe_unclosed().", stacklevel=2)
+        return
+    raise UnclosedClosureError(unclosed, name, system_model=sm)
+
+
+class UnclosedClosureError(RuntimeError):
+    """A declared closure reached the SystemModel with nothing closing it.
+
+    Carries the built :attr:`system_model` so the open terms can be inspected
+    from the exception itself — ``err.describe()`` is the same listing
+    :meth:`SystemModel.describe_unclosed` produces.
+    """
+
+    def __init__(self, unclosed, model_name="", system_model=None):
+        self.unclosed = list(unclosed)
+        self.model_name = model_name
+        self.system_model = system_model
+        super().__init__(
+            f"{model_name}: {len(self.unclosed)} DECLARED closure(s) reached the "
+            f"SystemModel unbound: {', '.join(self.unclosed)}.\n"
+            "These were swept into aux_state with no update_aux_variables row, "
+            "so they would read ZERO — silently absent physics (e.g. an "
+            "internal interface traction, leaving the layers frictionless).\n"
+            "Fix by EITHER passing a closure that binds them, OR — if the field "
+            "really is supplied from outside — declaring it with a definition "
+            "via add_equation(name, Eq(sym, expr), group='aux') / "
+            "register_aux(name, formula).\n"
+            "To inspect the open system instead, rebuild inside "
+            "`with allow_unclosed():` and call sm.describe_unclosed().")
+
+    def describe(self) -> str:
+        """The open-term listing (see :meth:`SystemModel.describe_unclosed`)."""
+        if self.system_model is not None:
+            return self.system_model.describe_unclosed()
+        return "\n".join([f"UNCLOSED TERMS — {self.model_name}"]
+                         + [f"  {nm}" for nm in self.unclosed])

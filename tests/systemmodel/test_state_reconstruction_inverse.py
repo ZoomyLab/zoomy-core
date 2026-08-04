@@ -27,7 +27,16 @@ pytestmark = [pytest.mark.systemmodel, pytest.mark.small, pytest.mark.gate]
 
 def _build(spec):
     kind, kw = spec
-    return SystemModel.from_model({"SWE": SWE, "SME": SME, "VAM": VAM}[kind](**kw))
+    cls = {"SWE": SWE, "SME": SME, "VAM": VAM}[kind]
+    if kind != "SWE":
+        # A moment model with no stress closure is OPEN — its σ rows read zero
+        # and ``SystemModel.from_model`` refuses it.  The reconstruction map is
+        # closure-independent, so close them the production way rather than
+        # reconstructing a model nobody would run.
+        from zoomy_core.model.models.closures import (
+            Newtonian, NavierSlip, StressFree)
+        kw = dict(kw, closures=[Newtonian(), NavierSlip(), StressFree()])
+    return SystemModel.from_model(cls(**kw))
 
 
 CASES = {

@@ -29,6 +29,8 @@ from zoomy_core.model.models.sme import SME
 from zoomy_core.model.models.ml_sme import MLSME
 from zoomy_core.model.models.vam import VAM
 from zoomy_core.model.models.ml_vam import MLVAM
+from zoomy_core.model.models.closures import (
+    Newtonian, NavierSlip, StressFree)
 from zoomy_core.systemmodel.system_model import SystemModel
 
 pytestmark = [pytest.mark.model, pytest.mark.small, pytest.mark.gate]
@@ -90,14 +92,21 @@ def _roundtrip_worst(model, hval=1.7, bval=0.3, layer_split=0.43):
     return worst
 
 
+#: A moment model with no stress closure is OPEN — its σ rows read zero and
+#: ``SystemModel.from_model`` refuses it.  The interpolate / project maps are
+#: closure-independent, so close them the production way rather than
+#: round-tripping a model nobody would run.
+_CLOS = [Newtonian(), NavierSlip(), StressFree()]
+
+
 @pytest.mark.parametrize("model,label", [
-    (SME(level=0, dimension=2), "SME(0)"),
-    (SME(level=1, dimension=2), "SME(1)"),
-    (SME(level=2, dimension=2), "SME(2)"),
-    (SME(level=1, dimension=3), "SME(1) 3-D"),
-    (MLSME(n_layers=2, level=2, dimension=2), "MLSME(2,2)"),
-    (VAM(level=1, dimension=2), "VAM(1)"),
-    (MLVAM(n_layers=2, level=1, dimension=2), "MLVAM(2,1)"),
+    (SME(level=0, dimension=2, closures=_CLOS), "SME(0)"),
+    (SME(level=1, dimension=2, closures=_CLOS), "SME(1)"),
+    (SME(level=2, dimension=2, closures=_CLOS), "SME(2)"),
+    (SME(level=1, dimension=3, closures=_CLOS), "SME(1) 3-D"),
+    (MLSME(n_layers=2, level=2, dimension=2, closures=_CLOS), "MLSME(2,2)"),
+    (VAM(level=1, dimension=2, closures=_CLOS), "VAM(1)"),
+    (MLVAM(n_layers=2, level=1, dimension=2, closures=_CLOS), "MLVAM(2,1)"),
 ])
 def test_roundtrip_identity(model, label):
     """``project_from_3d ∘ interpolate_to_3d`` recovers every conserved moment
@@ -120,7 +129,7 @@ def test_physics_pins():
       ``(j+1/2)/N_z`` (never the endpoint convention that broke coupling).
     """
     # -- q0 = h*U ----------------------------------------------------------
-    sm = SystemModel.from_model(SME(level=0, dimension=2))
+    sm = SystemModel.from_model(SME(level=0, dimension=2, closures=_CLOS))
     P = [sp.sympify(e) for e in sp.flatten(sm.project_from_3d)]
     P3h = sp.Symbol("P3_h", real=True)
     U, hval = 1.3, 2.5
@@ -145,7 +154,7 @@ def test_physics_pins():
     assert sp.simplify(w0 - u0 * sp.Derivative(b, C.x)) == 0
 
     # -- REQ-108 cell-centre nodes ------------------------------------------
-    model = SME(level=1, dimension=2)
+    model = SME(level=1, dimension=2, closures=_CLOS)
     N_z = int(model.project_nz)
     P = [sp.sympify(e) for e in sp.flatten(SystemModel.from_model(model).project_from_3d)]
     nodes = sorted({float(a.args[0])

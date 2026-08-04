@@ -51,7 +51,13 @@ def _swe():
 
 
 def _sme():
-    return SME(dimension=2, level=1, parameters={"g": 9.81})
+    # Closed: a level-1 SME with no stress closure is OPEN (its σ rows read
+    # zero) and ``SystemModel.from_model`` refuses it.  Fluctuation structure
+    # is closure-independent, so close it the production way.
+    from zoomy_core.model.models.closures import (
+        Newtonian, NavierSlip, StressFree)
+    return SME(dimension=2, level=1, parameters={"g": 9.81},
+               closures=[Newtonian(), NavierSlip(), StressFree()])
 
 
 def test_swe_model_ncp_is_nonzero():
