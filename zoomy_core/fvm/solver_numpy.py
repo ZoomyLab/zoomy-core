@@ -1217,6 +1217,77 @@ class HyperbolicSolver(Solver):
         else:
             self._sim_save_fields = lambda time, time_stamp, i_snapshot, Q, Qaux: i_snapshot
 
+    def _mood_cascade(self, rk2, Qnew, h_idx, mesh, dt):
+        """A-posteriori MOOD cascade: demote the troubled STENCIL, and iterate.
+
+        Clain, Diot & Loubère (*JCP* 230(10):4028–4050, 2011) §4.2 separate the
+        CellPD ``d_i`` — the degree of the reconstruction on cell ``K_i`` — from
+        the EdgePD ``d_ij``, the degree actually used to build the face state.
+        Their Table 1 gives three ways to derive the second from the first, and
+        only two of them may be used:
+
+        * ``EPD_0``: ``d_ij = d_i``, ``d_ji = d_j`` — each side keeps its own
+          cell degree;
+        * ``EPD_1``: ``d_ij = d_ji = min(d_i, d_j)``;
+        * ``EPD_2``: the smallest CellPD over all direct neighbours.
+
+        Definition 9 calls a strategy *upper-limiting* when ``d_i = d`` forces
+        ``d_ij <= d`` and ``d_ji <= d`` on every edge of ``K_i``, and Theorem 10
+        proves an upper-limiting strategy reaches an admissible solution in
+        finitely many iterations — at ``d = 0`` the face states are the cell
+        averages, so the scheme IS the monotone first-order one.  Remark 11 is
+        the part that matters here: EPD_1 and EPD_2 are upper-limiting, while
+        **EPD_0 is not, and "cannot be used since MOOD iterative procedure may
+        loop endlessly"**.
+
+        This solver demoted only the troubled cell — EPD_0 — so the troubled
+        cell's un-demoted neighbour still extrapolated its order-2 slope into
+        their shared face, and the demoted cell was drained below zero anyway.
+        Measured on a 16x16 radial dry dam break: 16 cells flagged, 8 still had
+        ``h < 0`` after the re-step (``h_min = -1.58e-08``); demoting the
+        stencil instead left none (``h_min = 0``), at 52 of 256 cells rather
+        than the 256 a blanket first-order fallback would cost.
+
+        With ``force_o1`` a boolean the degree map is two-level, so demoting a
+        cell takes it straight to the parachute and EPD_2 is expressed exactly:
+        a cell reconstructs at order 1 on ALL its faces as soon as it, or any
+        direct neighbour, is troubled.  ``demoted`` grows strictly on every
+        pass, which is the termination argument; a candidate that is still
+        inadmissible once every troubled cell sits at order 1 has exhausted the
+        parachute and RAISES rather than committing — no depth is clamped, and
+        an unusable state must not be marched on (a NaN depth does not stop the
+        run, it propagates through the LSQ stencil and keeps marching).
+        """
+        n = Qnew.shape[1]
+        nb = np.asarray(mesh.cell_neighbors)
+        demoted = np.zeros(n, dtype=bool)
+        for _ in range(n + 1):                 # Thm 10 bound; strict growth below
+            troubled = ((Qnew[h_idx, :] < 0.0)
+                        | ~np.isfinite(Qnew).all(axis=0))
+            if not troubled.any():
+                return Qnew
+            # EPD_2: troubled cells and their direct face neighbours.
+            grown = troubled.copy()
+            idx = np.flatnonzero(troubled)
+            for k in range(nb.shape[1]):
+                nbk = nb[idx, k]
+                grown[nbk[(nbk >= 0) & (nbk < n)]] = True
+            if not (grown & ~demoted).any():
+                break                           # parachute reached, still bad
+            demoted |= grown
+            Qnew = rk2(demoted)
+        bad = np.flatnonzero(troubled)
+        raise FloatingPointError(
+            f"MOOD cascade exhausted at dt={dt:g}: {bad.size} cell(s) remain "
+            f"inadmissible with every troubled stencil already at order 1 "
+            f"(cells {bad[:8].tolist()}{'…' if bad.size > 8 else ''}, "
+            f"min h = {np.nanmin(Qnew[h_idx, bad]):.6e}).\n"
+            "The first-order scheme is positivity-preserving under its CFL "
+            "bound, so this is a real defect, not a tolerance: check the CFL, "
+            "the boundary conditions, and any operation that gates the wave "
+            "speed used for the flux dissipation.  Nothing is clamped here on "
+            "purpose — the inadmissible state is the evidence.")
+
     def step(self, dt):
         """One explicit timestep (ghost-cell-free).
 
@@ -1256,22 +1327,16 @@ class HyperbolicSolver(Solver):
                 return 0.5 * (Q0 + Q2)
 
             Qnew = _rk2(None)
-            # A-posteriori MOOD (REQ-152, mirrors solver_jax
-            # ``_explicit_hyperbolic_step``): detect troubled cells on the
-            # order-2 candidate — PAD (h < 0) + CAD (non-finite) — and, ONLY if
-            # any is troubled, re-run forcing those cells to 1st order.  The
-            # re-step is conservative (shared face flux) and the demoted cells
-            # are positivity-preserving by the order-1 Xing–Zhang lemma.  NO
-            # depth is ever clamped/floored: if the re-step still yields h < 0
-            # that surfaces as a real result, not a truncated one.
+            # A-posteriori MOOD (REQ-152): detect troubled cells on the order-2
+            # candidate — PAD (h < 0) + CAD (non-finite) — and re-run with the
+            # troubled STENCIL demoted to order 1, iterating until the candidate
+            # is admissible.  See :meth:`_mood_cascade` for why the stencil and
+            # not the cell.  NO depth is ever clamped/floored.
             h_idx = getattr(self, "_free_surface_h_index", None)
             if (getattr(self, "_mood", False)
                     and getattr(self, "_support_o1", False)
                     and h_idx is not None):
-                troubled = ((Qnew[h_idx, :] < 0.0)
-                            | ~np.isfinite(Qnew).all(axis=0))
-                if troubled.any():
-                    Qnew = _rk2(troubled)
+                Qnew = self._mood_cascade(_rk2, Qnew, h_idx, mesh, dt)
         else:
             # RK1
             Qnew = Q + dt * rhs(time_now, Q)

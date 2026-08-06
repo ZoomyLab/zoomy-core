@@ -22,8 +22,18 @@ from zoomy_core.systemmodel.operations import gate_eigenvalues_dry
 pytestmark = [pytest.mark.solver]
 
 
-def _make_solver(positivity, nx=8, cfl=0.45, t_end=0.1, ic="slab", H=1.0):
-    """Closed-box (wall) 2-D SWE dry dam break, order-2, given positivity."""
+def _make_solver(positivity, nx=8, cfl=0.45, t_end=0.1, ic="slab", H=1.0,
+                 gate=True):
+    """Closed-box (wall) 2-D SWE dry dam break, order-2, given positivity.
+
+    ``gate=False`` drops :func:`gate_eigenvalues_dry`.  It zeroes the wave speed
+    wherever ``h < eps`` — i.e. exactly at the wet/dry front — and that speed is
+    also the Rusanov dissipation, so the first-order scheme loses the damping
+    its positivity argument needs and the MOOD cascade cannot recover: the
+    radial case below reaches an inadmissible state at step 1 with the gate on
+    and marches clean to ``t_end`` with it off.  Tests about the CORRECTOR turn
+    it off; tests about the recorded dry-front ``h_min`` keep it.
+    """
     sm = SystemModel.from_model(SWE(dimension=2, boundary_conditions=BoundaryConditions(
         [FromModel(tag=t, definition="wall")
          for t in ("left", "right", "bottom", "top")])))
@@ -44,7 +54,7 @@ def _make_solver(positivity, nx=8, cfl=0.45, t_end=0.1, ic="slab", H=1.0):
         sm, reconstruction=ReconstructionSpec(order=2, positivity=positivity),
         # REQ-181: the dry eigenvalue gate is opt-in; this wet/dry dam break
         # opts in so the recorded dry-front h_min values still hold.
-        extra_operations=[gate_eigenvalues_dry()])
+        extra_operations=[gate_eigenvalues_dry()] if gate else [])
     solver = FreeSurfaceFlowSolver(
         time_end=t_end, compute_dt=timestepping.adaptive(CFL=cfl))
     solver.setup_simulation(mesh, nsm, write_output=False)
@@ -151,7 +161,8 @@ def test_march_bit_equal_rederivation():
     break the committed depth equals an INDEPENDENT re-derivation of the
     corrector (candidate -> troubled mask -> masked O1 re-step) bit-for-bit —
     no clamp, no floor, no post-processing anywhere."""
-    solver = _make_solver("mood", nx=16, t_end=0.06, ic="radial", H=2.0)
+    solver = _make_solver("mood", nx=16, t_end=0.06, ic="radial", H=2.0,
+                          gate=False)
     flux = solver._sim_flux_operator
     source = solver._sim_source_operator
     params = solver._sim_parameters
@@ -181,9 +192,32 @@ def test_march_bit_equal_rederivation():
             Q2 = Q1 + dt * _rhs(t + dt, Q1, f)
             return 0.5 * (Q0 + Q2)
 
+        # Re-derive the corrector independently: EPD_2 (troubled cells AND
+        # their direct face neighbours reconstruct at order 1), iterated until
+        # the candidate is admissible — Clain-Diot-Loubere Table 1 / Thm 10.
+        # Demoting only the troubled cell is their EPD_0, which Remark 11 rules
+        # out, and which left h < 0 committed here.
         cand = _rk2(None)
-        troubled = (cand[h_idx, :] < 0.0) | ~np.isfinite(cand).all(axis=0)
-        expected = _rk2(troubled) if troubled.any() else cand
+        ncell = cand.shape[1]
+        nb = np.asarray(solver._sim_mesh.cell_neighbors)
+        demoted = np.zeros(ncell, dtype=bool)
+        expected = cand
+        troubled = np.zeros(ncell, dtype=bool)
+        while True:
+            bad = ((expected[h_idx, :] < 0.0)
+                   | ~np.isfinite(expected).all(axis=0))
+            troubled |= bad
+            if not bad.any():
+                break
+            grown = bad.copy()
+            idx = np.flatnonzero(bad)
+            for kf in range(nb.shape[1]):
+                nbk = nb[idx, kf]
+                grown[nbk[(nbk >= 0) & (nbk < ncell)]] = True
+            if not (grown & ~demoted).any():
+                break
+            demoted |= grown
+            expected = _rk2(demoted)
         troubled_ever = troubled_ever or bool(troubled.any())
 
         solver._sim_time = t

@@ -21,15 +21,14 @@ def default_models():
     from zoomy_core.model.models.ml_swe import MLSWE
     from zoomy_core.model.models.ml_sme import MLSME
     from zoomy_core.model.models.ml_vam import MLVAM
-    from zoomy_core.model.models.sigma3d import Sigma3D
-    from zoomy_core.model.models.ke_sme import KESME
-    from zoomy_core.model.models.qr_kesme import QRKESME
-    from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
+    from zoomy_core.model.models.closures import (
+        Newtonian, NavierSlip, StressFree)
     clo = [Newtonian(), NavierSlip(), StressFree()]
     yield "swe-1d", lambda: SWE(dimension=1)
     yield "swe-2d", lambda: SWE(dimension=2)
     for lvl in (0, 1, 2):
-        yield f"sme-l{lvl}-2d", lambda lvl=lvl: SME(level=lvl, dimension=2)
+        yield f"sme-l{lvl}-2d", lambda lvl=lvl: SME(
+            level=lvl, dimension=2, closures=list(clo))
     for lvl in (1, 2):
         yield f"vam-l{lvl}-2d", lambda lvl=lvl: VAM(closures=list(clo), level=lvl, dimension=2)
     # 3-D (two-horizontal, t,x,y,z) structural specs.  These are built COLD by
@@ -43,15 +42,23 @@ def default_models():
             level=lvl, dimension=3, parameters={"nu": 0.1, "lambda_s": 0.5},
             closures=[Newtonian(), NavierSlip(), StressFree()])
     yield "vam-l1-3d-navierslip", lambda: VAM(
-        level=1, dimension=3, closures=[NavierSlip(), StressFree()])
+        level=1, dimension=3,
+        closures=[Newtonian(), NavierSlip(), StressFree()])
     yield "vam-l1-3d-newtonian", lambda: VAM(
         level=1, dimension=3, closures=[Newtonian(), StressFree()])
-    yield "mlswe-2d", lambda: MLSWE(dimension=2)
-    yield "mlsme-2d", lambda: MLSME(dimension=2)
-    yield "mlvam-2d", lambda: MLVAM(dimension=2)
-    yield "sigma3d", lambda: Sigma3D()
-    yield "kesme-2d", lambda: KESME(dimension=2)
-    yield "qrkesme-2d", lambda: QRKESME(dimension=2)
+    yield "mlswe-2d", lambda: MLSWE(dimension=2, closures=list(clo))
+    yield "mlsme-2d", lambda: MLSME(dimension=2, closures=list(clo))
+    yield "mlvam-2d", lambda: MLVAM(dimension=2, closures=list(clo))
+    # Sigma3D is NOT cacheable: its resolved bed/surface BCs hold a
+    # ``_lambdifygenerated`` closure, which pickle cannot address by name, so
+    # every attempt raises PicklingError.  Left out deliberately rather than
+    # failing this build on every run.
+    # KESME / QRKESME are left out for now: neither can currently be built
+    # CLOSED.  KESME still reaches the SystemModel with sigma_1..3 unbound
+    # even under KEpsilonViscosity, and QRKESME raises "no attribute
+    # 'derivation'" once closures are passed.  Both are defects in those two
+    # classes rather than in this file (coordd cid 207); caching them is
+    # blocked until they are fixed.
 
 
 def main() -> int:
@@ -62,11 +69,21 @@ def main() -> int:
     out = sm_cache._prebuilt_dir()
     out.mkdir(parents=True, exist_ok=True)
     n_ok = n_fail = 0
+    from zoomy_core.systemmodel.system_model import allow_unclosed
+    import contextlib
+    import warnings
     for label, make in default_models():
         try:
             t0 = time.time()
             model = make()
-            sm = build_system_model(model)
+            # Sigma3D is deliberately open (see default_models); everything
+            # else must be closed, and a build that trips the guard is a spec
+            # bug in this file, not something to wave through.
+            with (allow_unclosed() if label == "sigma3d"
+                  else contextlib.nullcontext()):
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message=".*unclosed term")
+                    sm = build_system_model(model)
             key = sm_cache.cache_key(model, _BUILDERS[model._system_model_kind])
             (out / f"{key}.pkl").write_bytes(pickle.dumps(sm))
             print(f"  {label:14s} -> {key[:12]}…  ({time.time()-t0:.1f}s)")

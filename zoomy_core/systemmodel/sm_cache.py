@@ -168,8 +168,23 @@ def fetch(key: str | None):
         return None
     try:
         return pickle.loads(blob)
-    except Exception:
-        _MEMORY.pop(key, None)   # corrupt / stale-format entry: rebuild
+    except Exception as exc:
+        # Corrupt / stale-format entry: falling through to a fresh build is
+        # always CORRECT — but say so.  Swallowing this silently is how all 16
+        # shipped ``_prebuilt`` entries became unreadable under param 2.3.3
+        # (``'List' object has no attribute 'class_'`` — that slot is
+        # ``item_type`` now) with nothing reporting it: every build that should
+        # have hit the cache paid a full symbolic derivation instead, and only
+        # a test that unpickled the tier by hand ever noticed.
+        import warnings
+        warnings.warn(
+            f"sm_cache: cached SystemModel {key[:12]}… could not be unpickled "
+            f"({type(exc).__name__}: {exc}); deriving fresh.  If this fires for "
+            "every model, the shipped cache is stale for this environment — "
+            "regenerate with "
+            "`python -m zoomy_core.systemmodel.build_prebuilt_cache`.",
+            RuntimeWarning, stacklevel=2)
+        _MEMORY.pop(key, None)
         return None
 
 
