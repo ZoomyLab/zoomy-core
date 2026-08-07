@@ -127,6 +127,7 @@ OPERATOR_SLOTS = (
     # derived operators (lazily materialized; see ``map_operator_slots``)
     "quasilinear_matrix",
     "eigenvalues",
+    "eigenvalues_cfl",
     "source_jacobian_wrt_variables",
     "source_jacobian_wrt_aux_variables",
     # per-cell maps
@@ -620,6 +621,7 @@ def register_aux(name: str, formula, **assumptions):
 _DERIVED_OPERATORS = (
     "quasilinear_matrix",
     "eigenvalues",
+    "eigenvalues_cfl",
     "source_jacobian_wrt_variables",
     "source_jacobian_wrt_aux_variables",
 )
@@ -710,7 +712,8 @@ def regularize_pow(field: Union[str, sp.Symbol], aux_name: str):
                    + _RECONSTRUCTION_OPERATORS):
             M = getattr(sm, nm, None)
             if M is not None:
-                inv = inv_floor if nm == "eigenvalues" else aux
+                inv = (inv_floor if nm in ("eigenvalues", "eigenvalues_cfl")
+                       else aux)
                 flat = [_rw(sp.sympify(e), inv) for e in sp.flatten(M)]
                 setattr(sm, nm, type(M)(flat).reshape(*M.shape))
 
@@ -984,7 +987,8 @@ def _eigenvalue_exclusion(eigenvalues: str) -> tuple:
         raise ValueError(
             f"eigenvalues={eigenvalues!r} is not a legal treatment; expected "
             f"one of {list(_EIGENVALUE_TREATMENTS)}.")
-    return ("eigenvalues",) if eigenvalues == "exclude" else ()
+    return (("eigenvalues", "eigenvalues_cfl")
+            if eigenvalues == "exclude" else ())
 
 
 def _assert_no_forward_aux_reference(sm, aux, aux_row: int, name: str) -> None:
@@ -1287,23 +1291,53 @@ def guard_eigenvalue_powers():
 
 
 def gate_eigenvalues_dry(eps=None):
-    """Operation: gate the symbolic eigenvalues to 0 in dry cells (``h < eps``).
+    """Operation: publish a TIMESTEP-ONLY spectrum gated to 0 in dry cells
+    (``h < eps``) into ``sm.eigenvalues_cfl``, leaving ``sm.eigenvalues``
+    physical.
 
     Wraps every entry ``e`` of ``sm.eigenvalues`` in ``conditional(h > eps, e,
-    0)`` so the wave speeds (and the Rusanov dissipation built from them) vanish
-    at dry cells — the reusable core form of the Malpasset SME ``ev_gate``.
-    ``h`` is the state named ``"h"``; ``eps`` defaults to the model's
-    ``wet_dry_eps`` parameter when present, else :data:`_DEFAULT_WET_DRY_EPS`
-    (pass ``eps=`` to override).
+    0)`` so the dt/CFL reduction sees no spurious dry-cell wave speed — the
+    reusable core form of the Malpasset SME ``ev_gate``.  ``h`` is the state
+    named ``"h"``; ``eps`` defaults to the model's ``wet_dry_eps`` parameter
+    when present, else :data:`_DEFAULT_WET_DRY_EPS` (pass ``eps=`` to
+    override).
+
+    **It writes a SEPARATE slot, and that split is the whole point** (cid=209).
+    Until 2026-08-07 the gate overwrote ``sm.eigenvalues`` in place, and the
+    spectrum has TWO consumers that want opposite things at a dry cell:
+
+    * the dt/CFL estimate (``solver_numpy.get_compute_max_abs_eigenvalue``) —
+      wants dry cells suppressed, which is the single job this op was added for;
+    * the Rusanov face dissipation
+      (``numerics.riemann_solvers.local_max_abs_eigenvalue``) — needs the TRUE
+      ``sqrt(g h)``, because ``s_max = max(|λ(qL)|, |λ(qR)|)`` IS the artificial
+      viscosity coefficient of the first-order positivity argument.
+
+    Zeroing the shared array ran every face whose two cells sit below
+    ``wet_dry_eps`` as a pure CENTRAL scheme.  MEASURED on a 16×16 radial dry
+    dam break (H=2, CFL 0.45, order 2, positivity=mood, only this op differing):
+    gated-in-place, the MOOD cascade EXHAUSTED at step 1 with four cells still
+    at ``h = -2.1e-07`` and every troubled stencil already demoted to order 1;
+    ungated, the same run marched 21 steps to ``t_end`` with worst
+    ``h = 0.0`` exactly.  Sweeping CFL 0.45/0.30/0.25/0.167/0.10 did not move
+    it, so it was never a timestep problem.  Order 1 was clean either way (no
+    slopes to demote, both face states cell averages).
+
+    So ``eigenvalues`` stays the physical spectrum every dissipation, Roe and
+    hyperbolicity consumer reads, and ``eigenvalues_cfl`` carries the gated
+    copy for the timestep alone.  A consumer that finds ``eigenvalues_cfl is
+    None`` falls back to ``eigenvalues`` — i.e. no gate opted in.
 
     The dry gate MUST carry the power guard (:func:`guard_eigenvalue_powers`):
     a backend ``conditional`` lowered branchless (``mask*a + (1-mask)*b``)
     computes BOTH arms, and ``NaN*0 = NaN`` would leak a ``sqrt(negative)`` past
     the ``h > eps`` gate (REQ-74).  So this op applies the guard to each wet
-    branch before the ``conditional`` — reproducing the pre-split combined op
-    byte-for-byte as a single op.  The guard is idempotent, so the explicit
-    composition ``[guard_eigenvalue_powers(), gate_eigenvalues_dry()]``
-    reproduces it too.
+    branch before the ``conditional``.  The guard is idempotent, so the explicit
+    composition ``[guard_eigenvalue_powers(), gate_eigenvalues_dry()]`` produces
+    the same gated expression — with the difference that the explicit ``power``
+    half acts on ``sm.eigenvalues`` (where it belongs: guarding a fractional
+    power of ``h`` is always safe and changes nothing for ``h >= 0``) while the
+    ``gate`` half only ever writes ``sm.eigenvalues_cfl``.
 
     This is B of the (A, B) split (REQ-181); A is
     :func:`guard_eigenvalue_powers`.  Neither is an NSM default — opt in via
@@ -1316,10 +1350,19 @@ def gate_eigenvalues_dry(eps=None):
         h = _depth_state(sm, "gate_eigenvalues_dry")
         e_eps = _wet_dry_eps(sm, eps)
         cond = sp.Function("conditional")
-        gated = [cond(h > e_eps, _guard_eigenvalue_expr(e, h), sp.S.Zero)
-                 for e in flat]
-        sm.eigenvalues = ZArray(gated).reshape(*ev.shape)
+        guarded = [_guard_eigenvalue_expr(e, h) for e in flat]
+        gated = [cond(h > e_eps, e, sp.S.Zero) for e in guarded]
+        # cid=209: only the GATED copy goes to the dt-only slot.  The ZEROING is
+        # what must not reach ``sm.eigenvalues`` (it is the Rusanov dissipation).
+        # The power guard is a different thing and DOES belong there: it is
+        # ``Max(., 0)`` under a fractional power of h, a no-op for the physical
+        # h >= 0 and the only reason a transient h < 0 does not turn the
+        # dissipation into NaN (REQ-74).  Dropping it here would have handed the
+        # dissipation an unguarded sqrt(h) that the old in-place gate protected.
+        sm.eigenvalues = ZArray(guarded).reshape(*ev.shape)
+        sm.eigenvalues_cfl = ZArray(gated).reshape(*ev.shape)
 
     _op.name = "gate_eigenvalues_dry"
-    _op.description = "gate eigenvalues to 0 for dry cells (h < eps); guard sqrt(h) args"
+    _op.description = ("publish dt-only eigenvalues_cfl gated to 0 for dry "
+                       "cells (h < eps); guard sqrt(h) args")
     return _op

@@ -547,6 +547,12 @@ class NumpyRuntimeModel:
         _register("update_aux_variables",
                   _column_to_rank1(getattr(sm, "update_aux_variables", None)))
         _register("eigenvalues", _column_to_rank1(sm.eigenvalues))
+        # ``eigenvalues_cfl`` — the dt-only spectrum published by
+        # ``gate_eigenvalues_dry`` (cid=209).  ``None`` when no gate was opted
+        # into; the CFL consumer then falls back to ``eigenvalues``.  The
+        # Rusanov dissipation always reads ``eigenvalues``.
+        _register("eigenvalues_cfl",
+                  _column_to_rank1(getattr(sm, "eigenvalues_cfl", None)))
 
         # NDimArray operators (NCP, quasilinear) — per-axis slab as a
         # Matrix, each routed through ``_lambdify_function`` (so each

@@ -47,6 +47,7 @@ source: shape=(4, 1)
 source[2,0] = Mul(Integer(-1), Pow(Symbol('h'), Integer(-1)), Pow(Symbol('l_1'), Integer(-1)), Symbol('lambda_s'), Symbol('q_1_0'), Pow(Symbol('rho'), Integer(-1)))
 source_explicit: None
 eigenvalues: None
+eigenvalues_cfl: None
 update_variables: None
 update_aux_variables: None
 reconstruction_variables: None

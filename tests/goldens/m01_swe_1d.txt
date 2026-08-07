@@ -42,6 +42,7 @@ source_explicit: None
 eigenvalues: shape=(3, 1)
 eigenvalues[1,0] = Add(Mul(Integer(-1), Pow(Symbol('g'), Rational(1, 2)), Pow(Symbol('h'), Rational(1, 2)), Symbol('n0')), Mul(Pow(Symbol('h'), Integer(-1)), Symbol('n0'), Symbol('q_0')))
 eigenvalues[2,0] = Add(Mul(Pow(Symbol('g'), Rational(1, 2)), Pow(Symbol('h'), Rational(1, 2)), Symbol('n0')), Mul(Pow(Symbol('h'), Integer(-1)), Symbol('n0'), Symbol('q_0')))
+eigenvalues_cfl: None
 update_variables: None
 update_aux_variables: None
 reconstruction_variables: shape=(3,)

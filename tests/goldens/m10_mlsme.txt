@@ -65,6 +65,7 @@ source[4,0] = Add(Mul(Integer(-1), Symbol('e_x'), Symbol('g'), Symbol('h'), Symb
 source[5,0] = Mul(Integer(-1), Integer(6), Symbol('nu'), Symbol('q_2_1'), Pow(Add(Mul(Pow(Symbol('h'), Integer(2)), Pow(Symbol('l_1'), Integer(2))), Mul(Integer(-1), Integer(2), Pow(Symbol('h'), Integer(2)), Symbol('l_1')), Pow(Symbol('h'), Integer(2))), Integer(-1)))
 source_explicit: None
 eigenvalues: None
+eigenvalues_cfl: None
 update_variables: None
 update_aux_variables: None
 reconstruction_variables: None

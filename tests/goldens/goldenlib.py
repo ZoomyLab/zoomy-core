@@ -221,6 +221,7 @@ def render_system_model(sm, *, title: str = "SystemModel") -> str:
     render_array("source", sm.source, out)
     render_array("source_explicit", getattr(sm, "source_explicit", None), out)
     render_array("eigenvalues", getattr(sm, "eigenvalues", None), out)
+    render_array("eigenvalues_cfl", getattr(sm, "eigenvalues_cfl", None), out)
     render_array("update_variables", getattr(sm, "update_variables", None), out)
     render_array("update_aux_variables",
                  getattr(sm, "update_aux_variables", None), out)

@@ -59,6 +59,7 @@ source[3,0] = Add(Mul(Integer(-1), Integer(12), Pow(Symbol('hinv'), Integer(2)),
 source[5,0] = Add(Mul(Integer(-1), Rational(1, 5), Symbol('b_x'), Symbol('hinv'), Symbol('q_0'), Symbol('q_1_x')), Mul(Rational(1, 5), Symbol('b_x'), Symbol('hinv'), Symbol('q_1'), Symbol('q_1_x')))
 source_explicit: None
 eigenvalues: None
+eigenvalues_cfl: None
 update_variables: None
 update_aux_variables: shape=(4, 1)
 update_aux_variables[0,0] = Symbol('b_x')
@@ -138,6 +139,7 @@ source[0,0] = Add(Mul(Integer(4), Symbol('P_0'), Symbol('b_x'), Symbol('dt'), Sy
 source[1,0] = Add(Mul(Integer(12), Symbol('P_0'), Pow(Symbol('b_x'), Integer(2)), Symbol('dt'), Symbol('hinv'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(12), Symbol('P_0'), Symbol('b_x'), Symbol('dt'), Symbol('h_x'), Symbol('hinv'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(4), Symbol('P_0'), Symbol('dt'), Pow(Symbol('h_x'), Integer(2)), Symbol('hinv'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(-1), Symbol('P_0'), Symbol('dt'), Symbol('h_x_x'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(12), Symbol('P_0'), Symbol('dt'), Symbol('hinv'), Pow(Symbol('rho'), Integer(-1))), Mul(Symbol('P_0_x'), Symbol('dt'), Symbol('h'), Symbol('h_x'), Symbol('hinv'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(-1), Integer(2), Symbol('P_0_x'), Symbol('dt'), Symbol('h_x'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(-1), Symbol('P_0_x_x'), Symbol('dt'), Symbol('h'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(12), Symbol('P_1'), Pow(Symbol('b_x'), Integer(2)), Symbol('dt'), Symbol('hinv'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(8), Symbol('P_1'), Symbol('b_x'), Symbol('dt'), Symbol('h_x'), Symbol('hinv'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(2), Symbol('P_1'), Symbol('b_x_x'), Symbol('dt'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(2), Symbol('P_1'), Symbol('dt'), Pow(Symbol('h_x'), Integer(2)), Symbol('hinv'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(12), Symbol('P_1'), Symbol('dt'), Symbol('hinv'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(2), Symbol('P_1_x'), Symbol('b_x'), Symbol('dt'), Symbol('h'), Symbol('hinv'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(2), Symbol('P_1_x'), Symbol('b_x'), Symbol('dt'), Pow(Symbol('rho'), Integer(-1))), Mul(Symbol('P_1_x'), Symbol('dt'), Symbol('h'), Symbol('h_x'), Symbol('hinv'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(-1), Integer(2), Symbol('b_x'), Symbol('hinv'), Symbol('q_1')), Mul(Integer(-1), Symbol('h_x'), Symbol('hinv'), Symbol('q_0')), Mul(Integer(-1), Symbol('h_x'), Symbol('hinv'), Symbol('q_1')), Mul(Integer(2), Symbol('hinv'), Symbol('r_1')), Symbol('q_0_x'))
 source_explicit: None
 eigenvalues: None
+eigenvalues_cfl: None
 update_variables: None
 update_aux_variables: shape=(12, 1)
 update_aux_variables[0,0] = Symbol('b_x')
@@ -220,6 +222,7 @@ nonconservative_matrix: shape=(4, 8, 1)
 source: shape=(4, 1)
 source_explicit: None
 eigenvalues: None
+eigenvalues_cfl: None
 update_variables: shape=(4, 1)
 update_variables[0,0] = Add(Mul(Integer(-1), Symbol('P_0'), Symbol('dt'), Symbol('h_x'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(-1), Symbol('P_0_x'), Symbol('dt'), Symbol('h'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(2), Symbol('P_1'), Symbol('b_x'), Symbol('dt'), Pow(Symbol('rho'), Integer(-1))), Symbol('q_0'))
 update_variables[1,0] = Add(Mul(Integer(-1), Integer(6), Symbol('P_0'), Symbol('b_x'), Symbol('dt'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(-1), Integer(3), Symbol('P_0'), Symbol('dt'), Symbol('h_x'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(-1), Integer(6), Symbol('P_1'), Symbol('b_x'), Symbol('dt'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(-1), Integer(2), Symbol('P_1'), Symbol('dt'), Symbol('h_x'), Pow(Symbol('rho'), Integer(-1))), Mul(Integer(-1), Symbol('P_1_x'), Symbol('dt'), Symbol('h'), Pow(Symbol('rho'), Integer(-1))), Symbol('q_1'))

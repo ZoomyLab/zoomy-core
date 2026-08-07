@@ -26,13 +26,13 @@ def _make_solver(positivity, nx=8, cfl=0.45, t_end=0.1, ic="slab", H=1.0,
                  gate=True):
     """Closed-box (wall) 2-D SWE dry dam break, order-2, given positivity.
 
-    ``gate=False`` drops :func:`gate_eigenvalues_dry`.  It zeroes the wave speed
-    wherever ``h < eps`` — i.e. exactly at the wet/dry front — and that speed is
-    also the Rusanov dissipation, so the first-order scheme loses the damping
-    its positivity argument needs and the MOOD cascade cannot recover: the
-    radial case below reaches an inadmissible state at step 1 with the gate on
-    and marches clean to ``t_end`` with it off.  Tests about the CORRECTOR turn
-    it off; tests about the recorded dry-front ``h_min`` keep it.
+    ``gate=False`` drops :func:`gate_eigenvalues_dry`.  Every test here now runs
+    with the gate ON (cid=209): the gate publishes its dry-zeroed spectrum to
+    the dt-only ``eigenvalues_cfl`` slot and leaves ``eigenvalues`` — the
+    Rusanov dissipation — physical.  While it overwrote the shared slot the
+    radial case below reached an inadmissible state at step 1, because zeroing
+    ``s_max`` at the wet/dry front removed the very damping the first-order
+    positivity argument rests on and the MOOD cascade could not recover.
     """
     sm = SystemModel.from_model(SWE(dimension=2, boundary_conditions=BoundaryConditions(
         [FromModel(tag=t, definition="wall")
@@ -161,8 +161,7 @@ def test_march_bit_equal_rederivation():
     break the committed depth equals an INDEPENDENT re-derivation of the
     corrector (candidate -> troubled mask -> masked O1 re-step) bit-for-bit —
     no clamp, no floor, no post-processing anywhere."""
-    solver = _make_solver("mood", nx=16, t_end=0.06, ic="radial", H=2.0,
-                          gate=False)
+    solver = _make_solver("mood", nx=16, t_end=0.06, ic="radial", H=2.0)
     flux = solver._sim_flux_operator
     source = solver._sim_source_operator
     params = solver._sim_parameters

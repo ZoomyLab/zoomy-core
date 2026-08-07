@@ -40,7 +40,7 @@ from zoomy_core.systemmodel.system_model import SystemModel
 # guarded (read) but never assigned back to.
 _OPERATOR_ATTRS = (
     "flux", "hydrostatic_pressure", "nonconservative_matrix", "source",
-    "source_explicit", "mass_matrix", "eigenvalues",
+    "source_explicit", "mass_matrix", "eigenvalues", "eigenvalues_cfl",
     "source_jacobian_wrt_variables", "source_jacobian_wrt_aux_variables",
     "diffusion_matrix", "update_variables", "update_aux_variables",
     "state_update",

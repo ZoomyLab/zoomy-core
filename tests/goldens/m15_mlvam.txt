@@ -127,6 +127,7 @@ source[12,0] = Mul(Integer(2), Symbol('r_2_0'), Pow(Add(Mul(Integer(-1), Symbol(
 source[13,0] = Mul(Integer(2), Symbol('r_2_1'), Pow(Add(Mul(Integer(-1), Symbol('h'), Symbol('l_1')), Symbol('h')), Integer(-1)))
 source_explicit: None
 eigenvalues: None
+eigenvalues_cfl: None
 update_variables: None
 update_aux_variables: None
 reconstruction_variables: shape=(14,)

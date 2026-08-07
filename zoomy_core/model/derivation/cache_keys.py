@@ -49,7 +49,16 @@ def derivation_cache_enabled() -> bool:
 
 # Bump when the derivation pipeline changes in a way that invalidates every
 # cached entry (new op semantics, changed extraction, etc.).
-CACHE_VERSION = "v8"   # v8: cid 170/171 — the shared momentum blueprints changed
+CACHE_VERSION = "v9"   # v9: cid 209 — SystemModel gained the ``eigenvalues_cfl``
+#                              field (the dt-only spectrum; gate_eigenvalues_dry
+#                              writes it instead of overwriting ``eigenvalues``).
+#                              The SM cache PICKLES SystemModel instances and its
+#                              key hashes the MODEL's MRO + the builder — NOT
+#                              system_model.py — so a v8 blob unpickles into an
+#                              object missing the new field and every consumer
+#                              that reads it raises AttributeError.  Bump to bust
+#                              every stale v8 entry (incl. the shipped _prebuilt).
+#                        v8: cid 170/171 — the shared momentum blueprints changed
 #                              (equations.py: gravity carried as a VECTOR via
 #                              gravity_components; ml_sme/ml_vam interface transfer
 #                              now routed through the basis mass matrix).  These

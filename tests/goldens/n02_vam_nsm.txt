@@ -67,6 +67,7 @@ source[6,0] = Mul(Integer(2), Symbol('hinv'), Symbol('r_0'))
 source[7,0] = Mul(Integer(2), Symbol('hinv'), Symbol('r_1'))
 source_explicit: None
 eigenvalues: None
+eigenvalues_cfl: None
 update_variables: None
 update_aux_variables: shape=(4, 1)
 update_aux_variables[0,0] = Symbol('b_x')

@@ -87,6 +87,7 @@ OPERATOR_ARG_SLOTS = {
     "source_jacobian_wrt_variables": (_V, _A, _P),
     "source_jacobian_wrt_aux_variables": (_V, _A, _P),
     "eigenvalues": (_V, _A, _P, _N),
+    "eigenvalues_cfl": (_V, _A, _P, _N),
     "source": (_V, _A, _P, _T, _DT, _X),
     "update_variables": (_V, _A, _P, _DT),
     "update_aux_variables": (_V, _A, _P, _T, _X),
@@ -579,6 +580,18 @@ class SystemModel:
     # are real FIELDS (channeled from the Model — see below).
     # ``eigenvalues`` stays ``None`` when skipped.
     eigenvalues: Optional[ZArray] = None           # (n_eq,)
+    # ``eigenvalues_cfl`` — the TIMESTEP-ONLY spectrum.  ``None`` (the normal
+    # case) means "no separate estimate; the dt path reads ``eigenvalues``".
+    # It exists because the two consumers of the spectrum want OPPOSITE things
+    # at a dry cell (cid=209): the dt/CFL reduction wants spurious dry-cell
+    # speeds suppressed so they do not drive dt to zero, while the Rusanov
+    # face dissipation needs the TRUE ``sqrt(g h)`` — zeroing it there removes
+    # the artificial viscosity the first-order positivity argument rests on,
+    # and the MOOD cascade then exhausts at the wet/dry front.  So
+    # :func:`~zoomy_core.systemmodel.operations.gate_eigenvalues_dry` publishes
+    # its gated copy HERE and leaves ``eigenvalues`` physical.  Same shape and
+    # same lowering signature as ``eigenvalues``.
+    eigenvalues_cfl: Optional[ZArray] = None      # (n_eq,)
     # ∂S/∂Q and ∂S/∂Qaux — CHANNELED from the source Model in
     # :meth:`from_model` (the Model already derived & cached them — printers
     # READ them off the SystemModel and never re-derive with ``sp.diff``).  A
@@ -730,6 +743,7 @@ class SystemModel:
         self.source                 = _to_zarray(self.source)
         self.mass_matrix            = _to_zarray(self.mass_matrix)
         self.eigenvalues            = _to_zarray(self.eigenvalues)
+        self.eigenvalues_cfl        = _to_zarray(self.eigenvalues_cfl)
         self.update_variables           = _to_zarray(self.update_variables)
         self.diffusion_matrix           = _to_zarray(self.diffusion_matrix)
         self.diffusion_matrix_explicit  = _to_zarray(self.diffusion_matrix_explicit)
@@ -2132,6 +2146,8 @@ class SystemModel:
         self.refresh_derived_operators(eigenvalues=False)
         if self.eigenvalues is not None:
             self.eigenvalues = self.eigenvalues.xreplace(sub_dict)
+        if self.eigenvalues_cfl is not None:
+            self.eigenvalues_cfl = self.eigenvalues_cfl.xreplace(sub_dict)
 
         self.history.append({
             "name": "expose_aux_atoms",
@@ -2250,6 +2266,8 @@ class SystemModel:
         self.refresh_derived_operators(eigenvalues=False)
         if self.eigenvalues is not None:
             self.eigenvalues = self.eigenvalues.xreplace(sub_dict)
+        if self.eigenvalues_cfl is not None:
+            self.eigenvalues_cfl = self.eigenvalues_cfl.xreplace(sub_dict)
         self.history.append({
             "name": "expose_functions_as_aux",
             "description": (
@@ -2345,6 +2363,8 @@ class SystemModel:
         self.refresh_derived_operators(eigenvalues=False)
         if self.eigenvalues is not None:
             self.eigenvalues = self.eigenvalues.xreplace(derivative_subs)
+        if self.eigenvalues_cfl is not None:
+            self.eigenvalues_cfl = self.eigenvalues_cfl.xreplace(derivative_subs)
 
         self.history.append({
             "name": "expose_derivatives_as_aux",
@@ -2590,6 +2610,8 @@ class SystemModel:
         self.refresh_derived_operators(eigenvalues=False)
         if self.eigenvalues is not None:
             self.eigenvalues = self.eigenvalues.xreplace(full_transform)
+        if self.eigenvalues_cfl is not None:
+            self.eigenvalues_cfl = self.eigenvalues_cfl.xreplace(full_transform)
         self.history.append({
             "name": "change_state_variables",
             "description": (

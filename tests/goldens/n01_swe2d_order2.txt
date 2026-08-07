@@ -56,6 +56,7 @@ eigenvalues: shape=(4, 1)
 eigenvalues[1,0] = Mul(Add(Mul(Symbol('n0'), Symbol('q_x_0')), Mul(Symbol('n1'), Symbol('q_y_0'))), Pow(Max(Float('1.0e-14', precision=53), Symbol('h')), Integer(-1)))
 eigenvalues[2,0] = Add(Mul(Integer(-1), Pow(Symbol('g'), Rational(1, 2)), Pow(Symbol('h'), Rational(1, 2))), Mul(Symbol('n0'), Symbol('q_x_0'), Pow(Max(Float('1.0e-14', precision=53), Symbol('h')), Integer(-1))), Mul(Symbol('n1'), Symbol('q_y_0'), Pow(Max(Float('1.0e-14', precision=53), Symbol('h')), Integer(-1))))
 eigenvalues[3,0] = Add(Mul(Pow(Symbol('g'), Rational(1, 2)), Pow(Symbol('h'), Rational(1, 2))), Mul(Symbol('n0'), Symbol('q_x_0'), Pow(Max(Float('1.0e-14', precision=53), Symbol('h')), Integer(-1))), Mul(Symbol('n1'), Symbol('q_y_0'), Pow(Max(Float('1.0e-14', precision=53), Symbol('h')), Integer(-1))))
+eigenvalues_cfl: None
 update_variables: None
 update_aux_variables: shape=(7, 1)
 update_aux_variables[0,0] = Symbol('dq_x0dx')

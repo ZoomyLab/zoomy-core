@@ -458,7 +458,16 @@ class HyperbolicSolver(Solver):
     def _get_dry_threshold(self, symbolic_model):
         return _param_value(symbolic_model, "eps_wet", default=1e-3)
 
-    # -- Max abs eigenvalue (for CFL + Rusanov dissipation) ------------
+    # -- Max abs eigenvalue (for the CFL/dt estimate ONLY) -------------
+    #
+    # cid=209: this is the dt consumer, and it is the ONLY one that reads a
+    # gated spectrum.  When ``gate_eigenvalues_dry`` was opted in it published
+    # ``eigenvalues_cfl`` (dry cells zeroed) — read THAT here so a dry cell
+    # cannot drive dt.  The Rusanov face dissipation lives in
+    # ``numerics.riemann_solvers.local_max_abs_eigenvalue`` and deliberately
+    # keeps reading the ungated ``eigenvalues``: ``s_max`` IS the artificial
+    # viscosity of the positivity argument, and zeroing it at the wet/dry front
+    # ran those faces centrally and exhausted the MOOD cascade.
 
     def get_compute_max_abs_eigenvalue(self, mesh, model):
         symbolic_model = self._get_symbolic_model(model)
@@ -491,7 +500,8 @@ class HyperbolicSolver(Solver):
             # eigenvalues) per face side — no per-face Python loop and no
             # LAPACK at all.
             rt = NumpyRuntimeModel.from_system_model(symbolic_model)
-            eig_fn = rt.eigenvalues
+            # Gated slot when a dry gate was opted in, else the raw spectrum.
+            eig_fn = getattr(rt, "eigenvalues_cfl", None) or rt.eigenvalues
             n_int = normals[:, interior_faces]
             n_bnd = normals[:, boundary_faces]
             n_vars_s = symbolic_model.n_variables

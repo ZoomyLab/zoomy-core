@@ -57,6 +57,7 @@ eigenvalues[1,0] = Mul(Rational(1, 5), Pow(Symbol('h'), Integer(-1)), Add(Mul(In
 eigenvalues[2,0] = Mul(Rational(1, 5), Pow(Symbol('h'), Integer(-1)), Add(Mul(Integer(5), Symbol('n0'), Symbol('q_0')), Mul(Pow(Integer(5), Rational(1, 2)), Symbol('n0'), Symbol('q_1'))))
 eigenvalues[3,0] = Mul(Pow(Symbol('h'), Integer(-1)), Add(Mul(Symbol('n0'), Symbol('q_0')), Mul(Integer(-1), Symbol('n0'), Pow(Add(Mul(Symbol('g'), Pow(Symbol('h'), Integer(3))), Pow(Symbol('q_1'), Integer(2))), Rational(1, 2)))))
 eigenvalues[4,0] = Mul(Pow(Symbol('h'), Integer(-1)), Add(Mul(Symbol('n0'), Symbol('q_0')), Mul(Symbol('n0'), Pow(Add(Mul(Symbol('g'), Pow(Symbol('h'), Integer(3))), Pow(Symbol('q_1'), Integer(2))), Rational(1, 2)))))
+eigenvalues_cfl: None
 update_variables: None
 update_aux_variables: None
 reconstruction_variables: shape=(5,)

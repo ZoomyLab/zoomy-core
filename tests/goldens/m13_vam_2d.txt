@@ -99,6 +99,7 @@ source[8,0] = Mul(Integer(2), Pow(Symbol('h'), Integer(-1)), Symbol('r_0'))
 source[9,0] = Mul(Integer(2), Pow(Symbol('h'), Integer(-1)), Symbol('r_1'))
 source_explicit: None
 eigenvalues: None
+eigenvalues_cfl: None
 update_variables: None
 update_aux_variables: None
 reconstruction_variables: shape=(10,)
