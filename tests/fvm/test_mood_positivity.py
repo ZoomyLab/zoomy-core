@@ -191,32 +191,21 @@ def test_march_bit_equal_rederivation():
             Q2 = Q1 + dt * _rhs(t + dt, Q1, f)
             return 0.5 * (Q0 + Q2)
 
-        # Re-derive the corrector independently: EPD_2 (troubled cells AND
-        # their direct face neighbours reconstruct at order 1), iterated until
-        # the candidate is admissible — Clain-Diot-Loubere Table 1 / Thm 10.
-        # Demoting only the troubled cell is their EPD_0, which Remark 11 rules
-        # out, and which left h < 0 committed here.
+        # Re-derive the corrector INDEPENDENTLY (cid 214): demote the troubled
+        # cells, then the whole step if that is not enough.  Two levels, no
+        # iteration — the same design the jax backend carries.  The EPD_2
+        # stencil cascade this replaces was measured harmful at a wet/dry front
+        # (see _mood_cascade's docstring).
+        def _bad(Qc):
+            return (Qc[h_idx, :] < 0.0) | ~np.isfinite(Qc).all(axis=0)
+
         cand = _rk2(None)
-        ncell = cand.shape[1]
-        nb = np.asarray(solver._sim_mesh.cell_neighbors)
-        demoted = np.zeros(ncell, dtype=bool)
+        troubled = _bad(cand)
         expected = cand
-        troubled = np.zeros(ncell, dtype=bool)
-        while True:
-            bad = ((expected[h_idx, :] < 0.0)
-                   | ~np.isfinite(expected).all(axis=0))
-            troubled |= bad
-            if not bad.any():
-                break
-            grown = bad.copy()
-            idx = np.flatnonzero(bad)
-            for kf in range(nb.shape[1]):
-                nbk = nb[idx, kf]
-                grown[nbk[(nbk >= 0) & (nbk < ncell)]] = True
-            if not (grown & ~demoted).any():
-                break
-            demoted |= grown
-            expected = _rk2(demoted)
+        if troubled.any():
+            expected = _rk2(troubled)
+            if _bad(expected).any():
+                expected = _rk2(np.ones(cand.shape[1], dtype=bool))
         troubled_ever = troubled_ever or bool(troubled.any())
 
         solver._sim_time = t

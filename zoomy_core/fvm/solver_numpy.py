@@ -1213,75 +1213,72 @@ class HyperbolicSolver(Solver):
             self._sim_save_fields = lambda time, time_stamp, i_snapshot, Q, Qaux: i_snapshot
 
     def _mood_cascade(self, rk2, Qnew, h_idx, mesh, dt):
-        """A-posteriori MOOD cascade: demote the troubled STENCIL, and iterate.
+        """A-posteriori MOOD repair: demote the troubled CELLS, then, if that is
+        not enough, the whole step — ONE design shared with the jax backend.
 
-        Clain, Diot & Loubère (*JCP* 230(10):4028–4050, 2011) §4.2 separate the
-        CellPD ``d_i`` — the degree of the reconstruction on cell ``K_i`` — from
-        the EdgePD ``d_ij``, the degree actually used to build the face state.
-        Their Table 1 gives three ways to derive the second from the first, and
-        only two of them may be used:
+        Two levels, and no iteration:
 
-        * ``EPD_0``: ``d_ij = d_i``, ``d_ji = d_j`` — each side keeps its own
-          cell degree;
-        * ``EPD_1``: ``d_ij = d_ji = min(d_i, d_j)``;
-        * ``EPD_2``: the smallest CellPD over all direct neighbours.
+        1. flag the inadmissible cells (``h < 0`` or non-finite) and re-step
+           with those reconstructing at order 1;
+        2. if any remain, re-step with the WHOLE domain at order 1.  That is the
+           ``d = 0`` end of the Clain-Diot-Loubère cascade — the monotone
+           first-order scheme, positivity-preserving under its CFL bound — so it
+           terminates the repair by construction rather than by a growth
+           argument.
 
-        Definition 9 calls a strategy *upper-limiting* when ``d_i = d`` forces
-        ``d_ij <= d`` and ``d_ji <= d`` on every edge of ``K_i``, and Theorem 10
-        proves an upper-limiting strategy reaches an admissible solution in
-        finitely many iterations — at ``d = 0`` the face states are the cell
-        averages, so the scheme IS the monotone first-order one.  Remark 11 is
-        the part that matters here: EPD_1 and EPD_2 are upper-limiting, while
-        **EPD_0 is not, and "cannot be used since MOOD iterative procedure may
-        loop endlessly"**.
+        This REPLACES the EPD_2 stencil cascade (cid 210/214), which demoted a
+        troubled cell together with its face neighbours and iterated.  EPD_2 is
+        the right reading of Clain, Diot & Loubère (*JCP* 230(10):4028-4050,
+        2011) Remark 11 for a smooth/shock problem, where the neighbour carries
+        a polynomial whose degree must be coupled across the shared face.  At a
+        WET/DRY front it is actively harmful, because the neighbour it demotes
+        is dry: measured on jax, EPD_2 cost 5.8x the compute (230 steps vs 40)
+        at 46x smaller dt and left only 216 of 9216 cells exactly dry against
+        3408, by pushing a numerical film of h ~ 1e-11 carrying momentum
+        ~2000x disproportionate to its depth.  Mass and positivity stayed
+        perfect throughout, which is why nothing caught it.
 
-        This solver demoted only the troubled cell — EPD_0 — so the troubled
-        cell's un-demoted neighbour still extrapolated its order-2 slope into
-        their shared face, and the demoted cell was drained below zero anyway.
-        Measured on a 16x16 radial dry dam break: 16 cells flagged, 8 still had
-        ``h < 0`` after the re-step (``h_min = -1.58e-08``); demoting the
-        stencil instead left none (``h_min = 0``), at 52 of 256 cells rather
-        than the 256 a blanket first-order fallback would cost.
-
-        With ``force_o1`` a boolean the degree map is two-level, so demoting a
-        cell takes it straight to the parachute and EPD_2 is expressed exactly:
-        a cell reconstructs at order 1 on ALL its faces as soon as it, or any
-        direct neighbour, is troubled.  ``demoted`` grows strictly on every
-        pass, which is the termination argument; a candidate that is still
-        inadmissible once every troubled cell sits at order 1 has exhausted the
-        parachute and RAISES rather than committing — no depth is clamped, and
-        an unusable state must not be marched on (a NaN depth does not stop the
-        run, it propagates through the LSQ stencil and keeps marching).
+        Both backends now carry this design, so a numpy/jax comparison measures
+        the MODEL rather than two different repair strategies.  numpy RAISES
+        where jax commits the first-order state — jax cannot raise from inside
+        ``jit``, and the order-1 march is provably admissible, so committing it
+        is honest there; here the inadmissible state is kept as evidence and no
+        depth is ever clamped.
         """
         n = Qnew.shape[1]
-        nb = np.asarray(mesh.cell_neighbors)
-        demoted = np.zeros(n, dtype=bool)
-        for _ in range(n + 1):                 # Thm 10 bound; strict growth below
-            troubled = ((Qnew[h_idx, :] < 0.0)
-                        | ~np.isfinite(Qnew).all(axis=0))
-            if not troubled.any():
-                return Qnew
-            # EPD_2: troubled cells and their direct face neighbours.
-            grown = troubled.copy()
-            idx = np.flatnonzero(troubled)
-            for k in range(nb.shape[1]):
-                nbk = nb[idx, k]
-                grown[nbk[(nbk >= 0) & (nbk < n)]] = True
-            if not (grown & ~demoted).any():
-                break                           # parachute reached, still bad
-            demoted |= grown
-            Qnew = rk2(demoted)
-        bad = np.flatnonzero(troubled)
+
+        def _troubled(Qc):
+            return (Qc[h_idx, :] < 0.0) | ~np.isfinite(Qc).all(axis=0)
+
+        troubled = _troubled(Qnew)
+        if not troubled.any():
+            return Qnew
+
+        # 1. demote the troubled cells and re-step.
+        Q_wc = rk2(troubled)
+        if not _troubled(Q_wc).any():
+            return Q_wc
+
+        # 2. parachute: whole-STEP order 1.  This is the d = 0 end of the
+        #    Clain-Diot-Loubere cascade -- the monotone first-order scheme,
+        #    positivity-preserving under its CFL bound -- so it terminates the
+        #    repair by construction.
+        Q_all = rk2(np.ones(n, dtype=bool))
+        if not _troubled(Q_all).any():
+            return Q_all
+
+        bad = np.flatnonzero(_troubled(Q_all))
         raise FloatingPointError(
-            f"MOOD cascade exhausted at dt={dt:g}: {bad.size} cell(s) remain "
-            f"inadmissible with every troubled stencil already at order 1 "
+            f"MOOD repair exhausted at dt={dt:g}: {bad.size} cell(s) remain "
+            f"inadmissible after a WHOLE-STEP order-1 re-step "
             f"(cells {bad[:8].tolist()}{'…' if bad.size > 8 else ''}, "
-            f"min h = {np.nanmin(Qnew[h_idx, bad]):.6e}).\n"
+            f"min h = {np.nanmin(Q_all[h_idx, bad]):.6e}).\n"
             "The first-order scheme is positivity-preserving under its CFL "
             "bound, so this is a real defect, not a tolerance: check the CFL, "
             "the boundary conditions, and any operation that gates the wave "
             "speed used for the flux dissipation.  Nothing is clamped here on "
             "purpose — the inadmissible state is the evidence.")
+
 
     def step(self, dt):
         """One explicit timestep (ghost-cell-free).
