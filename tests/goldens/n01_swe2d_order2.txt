@@ -54,9 +54,13 @@ source[3,0] = Mul(Integer(-1), Symbol('g'), Pow(Symbol('hinv'), Rational(4, 3)),
 source_explicit: None
 eigenvalues: shape=(4, 1)
 eigenvalues[1,0] = Mul(Add(Mul(Symbol('n0'), Symbol('q_x_0')), Mul(Symbol('n1'), Symbol('q_y_0'))), Pow(Max(Float('1.0e-14', precision=53), Symbol('h')), Integer(-1)))
-eigenvalues[2,0] = Add(Mul(Integer(-1), Pow(Symbol('g'), Rational(1, 2)), Pow(Symbol('h'), Rational(1, 2))), Mul(Symbol('n0'), Symbol('q_x_0'), Pow(Max(Float('1.0e-14', precision=53), Symbol('h')), Integer(-1))), Mul(Symbol('n1'), Symbol('q_y_0'), Pow(Max(Float('1.0e-14', precision=53), Symbol('h')), Integer(-1))))
-eigenvalues[3,0] = Add(Mul(Pow(Symbol('g'), Rational(1, 2)), Pow(Symbol('h'), Rational(1, 2))), Mul(Symbol('n0'), Symbol('q_x_0'), Pow(Max(Float('1.0e-14', precision=53), Symbol('h')), Integer(-1))), Mul(Symbol('n1'), Symbol('q_y_0'), Pow(Max(Float('1.0e-14', precision=53), Symbol('h')), Integer(-1))))
-eigenvalues_cfl: None
+eigenvalues[2,0] = Add(Mul(Integer(-1), Pow(Symbol('g'), Rational(1, 2)), Pow(Max(Integer(0), Symbol('h')), Rational(1, 2))), Mul(Symbol('n0'), Symbol('q_x_0'), Pow(Max(Float('1.0e-14', precision=53), Symbol('h')), Integer(-1))), Mul(Symbol('n1'), Symbol('q_y_0'), Pow(Max(Float('1.0e-14', precision=53), Symbol('h')), Integer(-1))))
+eigenvalues[3,0] = Add(Mul(Pow(Symbol('g'), Rational(1, 2)), Pow(Max(Integer(0), Symbol('h')), Rational(1, 2))), Mul(Symbol('n0'), Symbol('q_x_0'), Pow(Max(Float('1.0e-14', precision=53), Symbol('h')), Integer(-1))), Mul(Symbol('n1'), Symbol('q_y_0'), Pow(Max(Float('1.0e-14', precision=53), Symbol('h')), Integer(-1))))
+eigenvalues_cfl: shape=(4, 1)
+eigenvalues_cfl[0,0] = Function('conditional')(StrictGreaterThan(Symbol('h'), Float('1.0e-8', precision=53)), Integer(0), Integer(0))
+eigenvalues_cfl[1,0] = Function('conditional')(StrictGreaterThan(Symbol('h'), Float('1.0e-8', precision=53)), Mul(Add(Mul(Symbol('n0'), Symbol('q_x_0')), Mul(Symbol('n1'), Symbol('q_y_0'))), Pow(Max(Float('1.0e-14', precision=53), Symbol('h')), Integer(-1))), Integer(0))
+eigenvalues_cfl[2,0] = Function('conditional')(StrictGreaterThan(Symbol('h'), Float('1.0e-8', precision=53)), Add(Mul(Integer(-1), Pow(Symbol('g'), Rational(1, 2)), Pow(Max(Integer(0), Symbol('h')), Rational(1, 2))), Mul(Symbol('n0'), Symbol('q_x_0'), Pow(Max(Float('1.0e-14', precision=53), Symbol('h')), Integer(-1))), Mul(Symbol('n1'), Symbol('q_y_0'), Pow(Max(Float('1.0e-14', precision=53), Symbol('h')), Integer(-1)))), Integer(0))
+eigenvalues_cfl[3,0] = Function('conditional')(StrictGreaterThan(Symbol('h'), Float('1.0e-8', precision=53)), Add(Mul(Pow(Symbol('g'), Rational(1, 2)), Pow(Max(Integer(0), Symbol('h')), Rational(1, 2))), Mul(Symbol('n0'), Symbol('q_x_0'), Pow(Max(Float('1.0e-14', precision=53), Symbol('h')), Integer(-1))), Mul(Symbol('n1'), Symbol('q_y_0'), Pow(Max(Float('1.0e-14', precision=53), Symbol('h')), Integer(-1)))), Integer(0))
 update_variables: None
 update_aux_variables: shape=(7, 1)
 update_aux_variables[0,0] = Symbol('dq_x0dx')
@@ -111,8 +115,8 @@ dt_max: 5.0
 depth_regularization: None
 regularization_eps: 0.01
 eigenvalue_treatment: 'regularize'
-eigenvalue_guard: None
+eigenvalue_guard: 'gate'
 normalize_normal: True
 source_treatment: 'explicit'
-default_operations: ['_op', '_op']
+default_operations: ['_op', '_op', '_op']
 extra_operations: []

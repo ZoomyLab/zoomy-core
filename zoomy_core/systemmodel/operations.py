@@ -1345,9 +1345,31 @@ def gate_eigenvalues_dry(eps=None):
     emits numerical wave speeds, gated by the solver instead)."""
     def _op(sm):
         ev, flat = _flat_eigenvalues(sm, "gate_eigenvalues_dry")
-        if ev is None:
-            return
         h = _depth_state(sm, "gate_eigenvalues_dry")
+        if ev is None:
+            # NO CLOSED FORM (SME / VAM): the model computes its wave speeds by
+            # a runtime eigensolve.  EMBED that computation inside the gate
+            # rather than skipping — wrap the opaque
+            # ``numerical_eigenvalues`` kernel (itself derived from the CURRENT
+            # ``quasilinear_matrix``) in the same dry conditional.  The slot
+            # then carries "if wet, solve for the spectrum; if dry, 0", so a
+            # backend still just evaluates one operator and never needs a
+            # wet/dry rule of its own.
+            #
+            # Before this, the op returned early for these models, which is why
+            # the numerical-spectrum path was the one place a backend still had
+            # to carry its own dry threshold.
+            e_eps = _wet_dry_eps(sm, eps)
+            cond = sp.Function("conditional")
+            num = sm.numerical_eigenvalues
+            gated = [cond(h > e_eps, e, sp.S.Zero) for e in sp.flatten(num)]
+            # ``numerical_eigenvalues`` is RANK-1 (length n), but the
+            # eigenvalue slot contract is ``(n_eq, 1)`` — the same column shape
+            # the closed-form branch writes.  Reshaping to the rank-1 source
+            # shape instead made every downstream 2-D index raise
+            # "Dimension of index greater than rank of array".
+            sm.eigenvalues_cfl = ZArray(gated).reshape(len(gated), 1)
+            return
         e_eps = _wet_dry_eps(sm, eps)
         cond = sp.Function("conditional")
         guarded = [_guard_eigenvalue_expr(e, h) for e in flat]

@@ -720,7 +720,26 @@ class NumericalSystemModel(SystemModel):
     #               power guard internally per REQ-74/REQ-181);
     #   "both"    — the explicit composition of the two, which REQ-181 pins as
     #               byte-identical to "gate" alone (the guard is idempotent).
-    eigenvalue_guard: Optional[str] = None
+    #
+    # DEFAULT IS NOW "gate" for depth-carrying transport systems (cid 210).
+    # REQ-181 removed the gate from the defaults for ONE reason: it overwrote
+    # ``sm.eigenvalues``, so gating for the timestep also gutted the Rusanov
+    # dissipation.  cid 209 removed that reason — the gate now publishes to the
+    # separate ``eigenvalues_cfl`` slot and leaves ``eigenvalues`` physical — so
+    # the objection that made it opt-in no longer exists.
+    #
+    # It has to be a DEFAULT, not an opt-in, because a dt guard is a SCHEME
+    # decision and scheme decisions live here, never in a backend.  While it was
+    # opt-in (and almost nobody opted in) each backend grew its own substitute:
+    # numpy hand-rolled a face-level dry-cell skip keyed on a DIFFERENT
+    # parameter (``eps_wet``) with a hard-coded 1e-3 default in backend source,
+    # while jax grew nothing at all and let a dry cell's u = q/h drive dt.  Two
+    # thresholds five orders of magnitude apart plus a backend with none is
+    # exactly the drift the "no numerical constant in a backend" rule exists to
+    # prevent.  Emitting ``eigenvalues_cfl`` from here makes every backend agree
+    # by construction, because they all just evaluate the operator they are
+    # given.
+    eigenvalue_guard: Optional[str] = "gate"
     # Impose |n| = 1 on the face normal before anything else runs.
     #
     # REQ-208 item (2) flipped this ON by default.  It is a FACT, not a
@@ -1097,7 +1116,12 @@ class NumericalSystemModel(SystemModel):
         depth_regularization: Optional[str] = None,
         regularization_eps: float = 1e-2,
         eigenvalue_treatment: str = "regularize",
-        eigenvalue_guard: Optional[str] = None,
+        # cid 210: "gate" by default — the dt spectrum is emitted from HERE, so
+        # no backend has to (or may) invent a dry-cell CFL rule of its own.
+        # Safe as a default only since cid 209 made the gate write the separate
+        # ``eigenvalues_cfl`` slot instead of clobbering ``eigenvalues``.
+        # Pass ``eigenvalue_guard=None`` to opt out explicitly.
+        eigenvalue_guard: Optional[str] = "gate",
         normalize_normal: bool = True,
     ) -> "NumericalSystemModel":
         """Build an NSM from a :class:`SystemModel` (or a :class:`Model`,

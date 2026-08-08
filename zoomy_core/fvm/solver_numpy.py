@@ -455,9 +455,6 @@ class HyperbolicSolver(Solver):
     def _get_symbolic_model(self, model):
         return model.model if hasattr(model, "model") else model
 
-    def _get_dry_threshold(self, symbolic_model):
-        return _param_value(symbolic_model, "eps_wet", default=1e-3)
-
     # -- Max abs eigenvalue (for the CFL/dt estimate ONLY) -------------
     #
     # cid=209: this is the dt consumer, and it is the ONLY one that reads a
@@ -473,7 +470,6 @@ class HyperbolicSolver(Solver):
         symbolic_model = self._get_symbolic_model(model)
         keys = list(symbolic_model.variables.keys())
         fi_h = keys.index("h") if "h" in keys else None
-        dry_thr = self._get_dry_threshold(symbolic_model) if fi_h is not None else 0.0
         dim = symbolic_model.dimension
         normals = mesh.face_normals[:dim, :]
         has_aux = symbolic_model.n_aux_variables > 0
@@ -520,12 +516,6 @@ class HyperbolicSolver(Solver):
                 max_ev[interior_faces] = np.maximum(m_A, m_B)
                 max_ev[boundary_faces] = _side_max(
                     Q, Qaux, parameters, iInner_bnd, n_bnd)
-                if fi_h is not None:                          # dry-cell skip
-                    both_dry = ((Q[fi_h, iA_int] < dry_thr)
-                                & (Q[fi_h, iB_int] < dry_thr))
-                    max_ev[interior_faces[both_dry]] = 0.0
-                    max_ev[boundary_faces[
-                        Q[fi_h, iInner_bnd] < dry_thr]] = 0.0
                 return max_ev
             return compute_max_eigenvalue
 
@@ -573,11 +563,6 @@ class HyperbolicSolver(Solver):
             max_ev = np.zeros(mesh.n_faces)
             max_ev[interior_faces] = np.maximum(m[:n_if], m[n_if:2 * n_if])
             max_ev[boundary_faces] = m[2 * n_if:]
-            if fi_h is not None:                          # dry-cell skip
-                both_dry = ((Q[fi_h, iA_int] < dry_thr)
-                            & (Q[fi_h, iB_int] < dry_thr))
-                max_ev[interior_faces[both_dry]] = 0.0
-                max_ev[boundary_faces[Q[fi_h, iInner_bnd] < dry_thr]] = 0.0
             return max_ev
         return compute_max_eigenvalue
 
@@ -1487,7 +1472,12 @@ class FreeSurfaceFlowSolver(HyperbolicSolver):
                     base, h_index=h_idx, b_index=b_idx, b_in_state=True)
                 return _SurfaceReconAdapter(surf)
             from zoomy_core.fvm.reconstruction import FreeSurfaceLSQMUSCL
-            eps_wet = self._get_dry_threshold(symbolic_model)
+            # The RECONSTRUCTION's wet/dry epsilon — a different consumer from
+            # the (now NSM-emitted) CFL spectrum, but the same rule: the value
+            # is the model's own ``wet_dry_eps``, never a backend literal.
+            from zoomy_core.systemmodel.operations import _DEFAULT_WET_DRY_EPS
+            eps_wet = _param_value(symbolic_model, "wet_dry_eps",
+                                   default=_DEFAULT_WET_DRY_EPS)
             return FreeSurfaceLSQMUSCL(
                 mesh, dim, h_index=h_idx, eps_wet=eps_wet,
                 limiter=self.nsm.reconstruction.limiter)
