@@ -294,9 +294,12 @@ def moving_equilibrium_cells(Q, hx, dx, b_idx, slope, solve_steady_ode, xp,
     return Ustar_L, Ustar_R, sigma
 
 
-def reconstruct(Qf, bstar, cfg):
+def reconstruct(Qf, bstar, cfg, xp=np):
     """Reconstruct face states Qf (n_vars, nf) to the common bed bstar (nf,).
     Dispatches on cfg['mode'] ('audusse' | 'bernoulli' | 'projected_bernoulli').
+
+    ``xp`` is the array module (numpy | jax.numpy), so a backend consumes THIS
+    kernel rather than reimplementing the reconstruction locally (cid 214).
 
     At level 0 the moving-equilibrium modes ('bernoulli' / 'projected_bernoulli')
     both collapse to the SWE specific-energy root, so they route through the
@@ -304,7 +307,7 @@ def reconstruct(Qf, bstar, cfg):
     ``newton_solve`` opaque kernel) — the SAME core kernel the jax solver
     consumes.  Level ≥ 1 keeps the σ-quadrature streamline kernels below."""
     if cfg["mode"] == "audusse":
-        return _reconstruct_audusse(Qf, bstar, cfg)
+        return _reconstruct_audusse(Qf, bstar, cfg, xp)
     if cfg["level"] == 0 and cfg["mode"] in ("bernoulli", "projected_bernoulli"):
         from zoomy_core.fvm.userfunctions import newton_solve
         return reconstruct_bernoulli_level0(
@@ -314,19 +317,27 @@ def reconstruct(Qf, bstar, cfg):
     return _reconstruct_bernoulli(Qf, bstar, cfg)
 
 
-def _reconstruct_audusse(Qf, bstar, cfg):
+def _reconstruct_audusse(Qf, bstar, cfg, xp=np):
     """Lake-at-rest hydrostatic reconstruction: h*=max(0,h+b−b*), velocity
-    preserved (q_k rescaled by h*/h), b→b*."""
+    preserved (q_k rescaled by h*/h), b→b*.
+
+    BACKEND-AGNOSTIC (cid 214), like :func:`reconstruct_bernoulli_level0` beside
+    it: ``xp`` is numpy or jax.numpy and the result is ASSEMBLED rather than
+    mutated, because jax arrays reject the ``out[i] = ...`` item assignment the
+    original used.  Written this way so jax consumes this kernel instead of
+    carrying its own copy of the reconstruction — the backend supplies the loop,
+    core supplies the scheme."""
     h_idx, b_idx, q_idx = cfg["h"], cfg["b"], cfg["q"]
-    out = Qf.copy()
     h = Qf[h_idx]
-    hstar = np.maximum(0.0, h + Qf[b_idx] - bstar)
-    ratio = hstar / np.maximum(h, 1e-14)
-    out[h_idx] = hstar
-    out[b_idx] = bstar
-    for qi in q_idx:
-        out[qi] = Qf[qi] * ratio
-    return out
+    hstar = xp.maximum(0.0, h + Qf[b_idx] - bstar)
+    ratio = hstar / xp.maximum(h, 1e-14)
+    q_set = set(q_idx)
+    rows = [hstar if i == h_idx
+            else bstar if i == b_idx
+            else Qf[i] * ratio if i in q_set
+            else Qf[i]
+            for i in range(Qf.shape[0])]
+    return xp.stack(rows)
 
 
 def _reconstruct_bernoulli(Qf, bstar, cfg):
