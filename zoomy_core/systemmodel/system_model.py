@@ -71,9 +71,9 @@ def face_normal_symbols(n_dim):
     return [sp.Symbol(f"n{d}", real=True) for d in range(int(n_dim))]
 
 
-_V, _A, _P, _N, _T, _DT, _X = (
+_V, _A, _P, _N, _T, _DT, _X, _R = (
     "variables", "aux_variables", "parameters",
-    "normal", "time", "dt", "position")
+    "normal", "time", "dt", "position", "reconstruction")
 
 OPERATOR_ARG_SLOTS = {
     "flux": (_V, _A, _P),
@@ -88,6 +88,16 @@ OPERATOR_ARG_SLOTS = {
     "source_jacobian_wrt_aux_variables": (_V, _A, _P),
     "eigenvalues": (_V, _A, _P, _N),
     "eigenvalues_cfl": (_V, _A, _P, _N),
+    # The well-balanced reconstruction pair.  ``reconstruction_variables`` maps
+    # the state to the variables the limiter works in (SWE: b, eta, u);
+    # ``state_from_reconstruction`` is its inverse and is therefore expressed in
+    # the ``WB_<state>`` symbols, NOT in the state — hence the ``reconstruction``
+    # group.  Declared here so a backend READS the signature like any other
+    # operator instead of hand-assembling it (cid 214: numpy could not register
+    # them at all because operator_signature had no entry, and jax built its
+    # own tuple locally).
+    "reconstruction_variables": (_V, _A, _P),
+    "state_from_reconstruction": (_R, _A, _P),
     "source": (_V, _A, _P, _T, _DT, _X),
     "update_variables": (_V, _A, _P, _DT),
     "update_aux_variables": (_V, _A, _P, _T, _X),
@@ -884,8 +894,19 @@ class SystemModel:
             "time": self.time,
             "dt": _DT_SYMBOL,
             "position": self._position_struct(),
+            "reconstruction": self._reconstruction_struct(),
         }
         return Zstruct(**{s: group[s] for s in OPERATOR_ARG_SLOTS[name]})
+
+    def _reconstruction_struct(self) -> Zstruct:
+        """The ``WB_<state>`` symbols the reconstruction INVERSE is written in.
+
+        ``state_from_reconstruction`` takes the limiter's reconstructed FACE
+        values, not the cell state, so its first argument group is these fresh
+        symbols rather than ``variables``."""
+        from zoomy_core.model.reconstruction_inverse import reconstruction_symbols
+        syms = reconstruction_symbols(list(self.state))
+        return Zstruct(**{s.name: s for s in syms})
 
     def operator(self, name: str) -> "Any":
         """The operator kernel CARRIED as a ``basefunction.Function``: ``args``

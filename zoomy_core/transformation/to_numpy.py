@@ -547,6 +547,16 @@ class NumpyRuntimeModel:
         _register("update_aux_variables",
                   _column_to_rank1(getattr(sm, "update_aux_variables", None)))
         _register("eigenvalues", _column_to_rank1(sm.eigenvalues))
+        # The WB reconstruction pair — NSM operators, so the runtime lowers them
+        # like any other (cid 214).  numpy previously lowered NEITHER, which is
+        # why its solver hand-rolled FreeSurface*/Surface*/Primitive
+        # reconstructions instead of using the map the model emitted.
+        # Already rank-1 ``(n_state,)`` — NOT the ``(n, 1)`` column shape
+        # ``eigenvalues`` carries — so they register as-is.
+        _register("reconstruction_variables",
+                  getattr(sm, "reconstruction_variables", None))
+        _register("state_from_reconstruction",
+                  getattr(sm, "state_from_reconstruction", None))
         # ``eigenvalues_cfl`` — the dt-only spectrum published by
         # ``gate_eigenvalues_dry`` (cid=209).  ``None`` when no gate was opted
         # into; the CFL consumer then falls back to ``eigenvalues``.  The
