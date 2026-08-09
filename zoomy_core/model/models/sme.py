@@ -498,6 +498,7 @@ class SME(BaseModel):
         ``eigenvalues = None`` → the runtime's opaque numeric eigensystem."""
         n_eq = sm.n_equations
         twin = SystemModel.from_model(SME(level=5, dimension=int(self.dimension),
+                   closures=self.closures,
                    parameters=dict(self.parameter_values.items())))
         if twin.eigenvalues is None:
             sm.eigenvalues = None
