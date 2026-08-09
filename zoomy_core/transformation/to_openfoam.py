@@ -821,15 +821,42 @@ class FoamNumericsPrinter(GenericCppBase):
     def __init__(self, numerics, **opts):
         super().__init__()
         self.numerics = numerics
-        # Normalise the contained model to an NSM (numerics.model is a
-        # SystemModel; promote it so the printer always operates on an NSM).
-        sm = _promote_with_dry_gate(numerics.model)
-        self.sm = sm
-        # State / aux / parameter / normal symbol maps.
-        self.register_map("Q", list(sm.state))
-        self.register_map("Qaux", list(sm.aux_state))
-        self.register_map("n", list(sm.normal.values()))
-        self.register_map("p", list(sm.parameters.values()))
+        self.sm = numerics.model
+        # State / aux / parameter / normal symbol maps — sourced from
+        # ``numerics.variables`` / ``.aux_variables`` / ``.parameters`` /
+        # ``.normal``, NOT from a freshly re-derived NSM.
+        #
+        # ``numerics.functions`` (``numerical_flux``, ``local_max_abs_eigenvalue``,
+        # …) are ``Function`` objects whose bodies were snapshotted at
+        # ``Numerics.__init__`` time from EXACTLY these symbol objects
+        # (``self.variables = ZArray(list(self.model.state))`` there — see
+        # ``riemann_solvers.Numerics.__init__``). Re-deriving a NEW NSM here
+        # (formerly via ``_promote_with_dry_gate(numerics.model)``) builds a
+        # SEPARATE ``state`` list: ``construct_numerical`` (the Model ->
+        # SystemModel -> NSM boundary, ``numerical_system_model.py``) replaces
+        # every state/aux symbol that carries a sign assumption (e.g. depth
+        # ``h = Symbol("h", positive=True)`` — every depth-based model declares
+        # it thus) with a bare, assumption-free twin. That twin is a DIFFERENT
+        # sympy object with the SAME name: it prints identically but compares
+        # unequal (exactly the trap ``construct_numerical``'s own docstring
+        # warns about, cid=87). A symbol map keyed by the twin then silently
+        # misses the original in ``numerics.functions`` bodies whenever the two
+        # diverge — e.g. ``numerics`` was built from a SystemModel that was
+        # never itself promoted/derived through the NSM boundary (as
+        # ``thesis/notebooks/coupling/cases/confluence/model_sme.py`` used to)
+        # — and ``generic_c.GenericCppBase._print_Symbol`` falls through to
+        # printing the BARE symbol name instead of an accessor (``h`` instead
+        # of ``Q[1]``), which does not compile.
+        #
+        # Sourcing the map from ``numerics.*`` instead is unconditionally
+        # correct: those are (by construction, in ``Numerics.__init__``) the
+        # very objects every registered function is expressed in terms of, so
+        # the map can never miss regardless of what ``numerics.model`` is or
+        # how/whether it was promoted before ``Numerics`` was built.
+        self.register_map("Q", list(numerics.variables))
+        self.register_map("Qaux", list(numerics.aux_variables))
+        self.register_map("n", list(numerics.normal))
+        self.register_map("p", list(numerics.parameters))
         # Face-state symbols carried by the symbolic Numerics — wired
         # into the printer so they print as ``Q_minus[i]`` etc.
         self.register_map("Q_minus", list(numerics.variables_minus))
