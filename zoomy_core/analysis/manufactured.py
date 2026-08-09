@@ -181,7 +181,17 @@ def manufactured_source(sm, exact):
     ``exact`` maps each state variable (Symbol or name) to a smooth sympy
     expression in ``sm.space``.  See the module docstring for the formula:
 
-        S_mms = A(W*)·∂_x W*  −  ∂_x( D(W*)·∂_x W* )  −  S(W*)
+        S_mms = ∂_t W*  +  A(W*)·∂_x W*  −  ∂_x( D(W*)·∂_x W* )  −  S(W*)
+
+    The ``∂_t W*`` term vanishes identically for a steady ``W*(x)``, so a
+    steady case is unaffected.  Supply a ``W*(x, t)`` — using ``sm.time`` —
+    and the manufactured solution becomes genuinely UNSTEADY, which is what
+    makes the measured order a statement about the time integrator, the
+    flux and the source coupling rather than about how well the scheme
+    holds an equilibrium.  That distinction is not academic: with a good
+    well-balancing the steady test SATURATES — wb_comparison case B reads
+    EOC 3.01/2.81/2.42 at order 1 and 3.01/2.81/2.41 at order 2, i.e. it
+    cannot see the order at all (cid 211).
 
     The middle term is the DIFFUSIVE flux divergence (``diffusion_matrix`` D,
     the contract's ``+∂_x(D ∂_x Q)`` on the RHS): SME/VAM carry an intrinsic
@@ -223,7 +233,12 @@ def manufactured_source(sm, exact):
                 diff += sp.diff(flux_d, coords[d])
         Si = (_scalar(S, (i, 0)) if getattr(S, "shape", None) and len(S.shape) > 1
               else _scalar(S, i)).xreplace(subs)
-        out.append(sp.simplify(adv - diff - Si))
+        # TRANSIENT term.  Zero whenever W* has no time dependence, so every
+        # steady case is bit-unchanged; non-zero the moment the caller writes a
+        # W*(x, t), which is what turns this into a test of the SCHEME rather
+        # than of the equilibrium (see the module note).
+        dWdt = sp.diff(W[i], sm.time) if i < len(W) else sp.Integer(0)
+        out.append(sp.simplify(dWdt + adv - diff - Si))
     return ZArray(out).reshape(n_eq, 1)
 
 
