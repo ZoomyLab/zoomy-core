@@ -961,6 +961,16 @@ class FreeSurfaceLSQMUSCL(LSQMUSCLReconstruction):
         # 'force_o1'`` on every order-2 free-surface run.  The demotion is the
         # same operation as the dry fallback above: zero the limiter there.
         phi = self._apply_force_o1(phi, force_o1)
+        # PUBLISH the limited cell-centre gradient, exactly as the parent does.
+        # This override computes grads/phi itself and used to drop them on the
+        # floor; the solver's cell-interior non-conservative integral guards on
+        # ``getattr(reconstruct, "_limited_grad", None)`` and so was SILENTLY
+        # skipped for every free-surface order-2 run -- no error, no NaN, just a
+        # scheme quietly missing the interior source term that Noelle, Pankratz,
+        # Puppo & Natvig (2006) eq. (15) requires of a 2nd-order Audusse-type
+        # well-balanced scheme (1st order needs only the face jump, Audusse 2004
+        # eq. 2.5, which is why order 1 was always right).
+        self._limited_grad = phi[:, None, :] * grads
         Q_L, Q_R = self._reconstruct(Q, grads, phi, bf_face_values)
         # Clamp h >= 0
         np.maximum(Q_L[self._h_idx, :], 0.0, out=Q_L[self._h_idx, :])
@@ -1761,6 +1771,15 @@ class PrimitiveReconstruction:
         aux_L, aux_R = self._face_aux(Qaux, Qaux_bf)
         Q_L = self._apply(self._inverse, wb_L, aux_L)
         Q_R = self._apply(self._inverse, wb_R, aux_R)
+        # Proxy the base's limited gradient so the solver's cell-interior
+        # non-conservative integral can find it through this wrapper.  Fixing
+        # only the base is not enough: VAM/ML-VAM at order >= 2 always arrive
+        # here, and the solver looks the gradient up on the OUTER object.
+        # NOTE this is the gradient in WB/primitive space, not chain-ruled back
+        # through ``state_from_reconstruction``.  Measured within 0.1% of the
+        # exact face-difference construction on the Escalante bump, because the
+        # defect is worst near rest where the nonlinear chain-rule term vanishes.
+        self._limited_grad = getattr(self.base, "_limited_grad", None)
         return Q_L, Q_R
 
     def _face_aux(self, Qaux, Qaux_bf):
