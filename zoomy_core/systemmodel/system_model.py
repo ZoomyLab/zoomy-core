@@ -86,6 +86,7 @@ OPERATOR_ARG_SLOTS = {
     "source_explicit": (_V, _A, _P),
     "source_jacobian_wrt_variables": (_V, _A, _P),
     "source_jacobian_wrt_aux_variables": (_V, _A, _P),
+    "flux_jacobian_wrt_aux_variables": (_V, _A, _P),
     "eigenvalues": (_V, _A, _P, _N),
     "eigenvalues_cfl": (_V, _A, _P, _N),
     # The well-balanced reconstruction pair.  ``reconstruction_variables`` maps
@@ -505,6 +506,9 @@ def _attach_function_groups(sm, model, canonical_source=None) -> None:
     if new_aux:
         sm.source_jacobian_wrt_aux_variables = _to_zarray(
             sm._compute_source_jacobian_wrt_aux_variables())
+        if getattr(sm, "derive_jacobians", False) and len(sm.aux_state or []):
+            sm.flux_jacobian_wrt_aux_variables = _to_zarray(
+                sm._compute_flux_jacobian_wrt_aux_variables())
     if sm.position is None:
         sm.position = Zstruct(X0=x, X1=y_pos, X2=z_pos)
 
@@ -614,6 +618,23 @@ class SystemModel:
     # transpose, reoriented at the channel).
     source_jacobian_wrt_variables: Optional[ZArray] = None      # (n_eq, n_state)
     source_jacobian_wrt_aux_variables: Optional[ZArray] = None  # (n_eq, n_aux)
+    # dF/dQaux — (n_eq, n_aux, n_dim).  The FLUX twin of the source jacobian:
+    # needed wherever a total x-derivative of the flux is taken and the flux
+    # depends on aux, since d/dx F(Q,Qaux) = dF/dQ·dQ/dx + dF/dQaux·dQaux/dx.
+    # Without it that second term is silently dropped.
+    flux_jacobian_wrt_aux_variables: Optional[ZArray] = None    # (n_eq,n_aux,n_dim)
+    #: Derive ``flux_jacobian_wrt_aux_variables`` (and any future aux-side
+    #: jacobian) when a Model did not channel it?  OFF by default: it is
+    #: ``n_eq x n_aux x n_dim`` sympy.diff calls, a real cost on a high-level
+    #: moment model, and wasted whenever nothing downstream asks for it.
+    #:
+    #: Scope is deliberately narrow.  The LONG-STANDING source jacobians
+    #: (``source_jacobian_wrt_variables`` / ``_wrt_aux_variables``) are NOT
+    #: gated — IMEX and friends have always relied on them being derived, and
+    #: making them optional would break consumers that predate this flag.
+    #: Consumers wanting the new aux-side jacobian call
+    #: :meth:`ensure_jacobians` before the runtime is lowered.
+    derive_jacobians: bool = False
     normal: Optional[Zstruct] = None
     parameter_values: Optional[Zstruct] = None   # name -> numeric default
     equation_to_state_index: Optional[List[int]] = None
@@ -767,6 +788,8 @@ class SystemModel:
             self.source_jacobian_wrt_variables)
         self.source_jacobian_wrt_aux_variables = _to_zarray(
             self.source_jacobian_wrt_aux_variables)
+        self.flux_jacobian_wrt_aux_variables = _to_zarray(
+            self.flux_jacobian_wrt_aux_variables)
 
         # FALLBACK only: a SystemModel built without a Model channel (standalone
         # analysis, or the structural derivation path) arrives here with the
@@ -779,6 +802,11 @@ class SystemModel:
         if self.source is not None and self.source_jacobian_wrt_aux_variables is None:
             self.source_jacobian_wrt_aux_variables = _to_zarray(
                 self._compute_source_jacobian_wrt_aux_variables())
+        if (self.derive_jacobians and self.flux is not None
+                and self.flux_jacobian_wrt_aux_variables is None
+                and len(self.aux_state or [])):
+            self.flux_jacobian_wrt_aux_variables = _to_zarray(
+                self._compute_flux_jacobian_wrt_aux_variables())
 
         if self.equation_to_state_index is None:
             self.equation_to_state_index = list(range(self.n_equations))
@@ -1189,6 +1217,64 @@ class SystemModel:
         for i in range(n_eq):
             for k in range(n_aux):
                 out[i, k] = sp.diff(self.source[i, 0], self.aux_state[k])
+        return out
+
+    def ensure_jacobians(self):
+        """Derive the source/flux jacobians NOW, if they are not already there.
+
+        The fallback derivation is off by default (:attr:`derive_jacobians`)
+        because it is ``n_eq x n_state`` sympy.diff calls and is wasted whenever
+        nothing downstream asks for them.  A consumer that DOES need them — IMEX
+        assembling an implicit source Jacobian, a quasilinear/steady-ODE
+        assembly — calls this BEFORE the runtime is lowered, since the printers
+        emit whatever is present at that moment.
+
+        Idempotent, and never overwrites a matrix a Model channeled.
+        """
+        self.derive_jacobians = True
+        if self.source is not None and self.source_jacobian_wrt_variables is None:
+            self.source_jacobian_wrt_variables = _to_zarray(
+                self._compute_source_jacobian_wrt_variables())
+        if (self.source is not None
+                and self.source_jacobian_wrt_aux_variables is None
+                and len(self.aux_state or [])):
+            self.source_jacobian_wrt_aux_variables = _to_zarray(
+                self._compute_source_jacobian_wrt_aux_variables())
+        if (self.flux is not None
+                and self.flux_jacobian_wrt_aux_variables is None
+                and len(self.aux_state or [])):
+            self.flux_jacobian_wrt_aux_variables = _to_zarray(
+                self._compute_flux_jacobian_wrt_aux_variables())
+        return self
+
+    def _compute_flux_jacobian_wrt_aux_variables(self):
+        """``∂F/∂Qaux`` — shape ``(n_eq, n_aux, n_dim)``.
+
+        The flux twin of :meth:`_compute_source_jacobian_wrt_aux_variables`, and
+        needed for the same reason its source counterpart is: a TOTAL derivative
+        of the flux along x is
+
+            d/dx F(Q, Qaux) = ∂F/∂Q · dQ/dx + ∂F/∂Qaux · dQaux/dx
+
+        and ``quasilinear_matrix`` carries only the first term (it differentiates
+        w.r.t. the state with aux held independent).  Anything that forms a
+        steady balance or a quasilinear system from the flux — the
+        moving-equilibrium steady-ODE reconstruction is the current consumer —
+        needs the second term too, or it silently solves a different equation.
+
+        Note ``P`` (hydrostatic pressure) is deliberately NOT folded in here:
+        this is the flux jacobian, and callers that want the full transport
+        matrix add ``∂P/∂Qaux`` themselves, exactly as ``quasilinear_matrix``
+        assembles ``∂F/∂Q + ∂P/∂Q + B`` from separate pieces.
+        """
+        n_eq = self.n_equations
+        n_aux = len(self.aux_state)
+        d = self.n_dim
+        out = sp.MutableDenseNDimArray.zeros(n_eq, n_aux, d)
+        for i in range(n_eq):
+            for k in range(n_aux):
+                for j in range(d):
+                    out[i, k, j] = sp.diff(self.flux[i, j], self.aux_state[k])
         return out
 
     def _compute_eigenvalues(self):

@@ -531,6 +531,12 @@ class NumpyRuntimeModel:
                   sm.source_jacobian_wrt_variables)
         _register("source_jacobian_wrt_aux_variables",
                   sm.source_jacobian_wrt_aux_variables if sm.aux_state else None)
+        # Flux twin of the above.  Emitted on the SAME terms so a consumer that
+        # needs a total d/dx of the flux gets both halves -- without it,
+        # dF/dQaux * dQaux/dx is silently dropped from any quasilinear or steady
+        # balance assembled from the flux.
+        _register("flux_jacobian_wrt_aux_variables",
+                  sm.flux_jacobian_wrt_aux_variables if sm.aux_state else None)
         # ``update_variables(Q, Qaux, p, dt)`` — per-cell state remap.  For a
         # full model it returns the whole state; for a Chorin corrector
         # sub-system it returns one value per ``equation_to_state_index`` row
