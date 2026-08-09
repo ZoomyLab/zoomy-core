@@ -27,6 +27,33 @@ from __future__ import annotations
 __all__ = ["show", "in_notebook"]
 
 
+class _Latex:
+    """A LaTeX payload that renders without IPython being installed.
+
+    ``IPython.display.Math`` is only a thin wrapper around ``_repr_latex_``, and
+    depending on it made rendering fail in exactly the environment that matters:
+    a lean kernel (Pyodide, a bare venv) has a working ``display`` but no
+    IPython, so importing ``Math`` failed and equations fell back to ASCII
+    pretty-print -- the very bug this module exists to fix.  Rich-repr hooks are
+    a protocol, not a library, so implement them directly.
+    """
+
+    __slots__ = ("tex",)
+
+    def __init__(self, tex: str):
+        self.tex = tex
+
+    def _repr_latex_(self) -> str:
+        return f"${self.tex}$"
+
+    # Hosts that prefer markdown/html still get MathJax-able output.
+    def _repr_markdown_(self) -> str:
+        return f"${self.tex}$"
+
+    def __repr__(self) -> str:                           # plain-text fallback
+        return self.tex
+
+
 def _host_display():
     """A ``display`` provided by the HOST, if there is one.
 
@@ -103,14 +130,10 @@ def show(obj=None, *, eq=None, precision: int = 6):
             pass
         tex = f"{sp.latex(lhs)} = {sp.latex(rhs)}"
         _d = _host_display()
-        try:
-            from IPython.display import Math
-        except Exception:                                # noqa: BLE001
-            Math = None
         if _d is None and in_notebook():
             from IPython.display import display as _d    # noqa: F811
-        if _d is not None and Math is not None:
-            _d(Math(tex))
+        if _d is not None:
+            _d(_Latex(tex))
         else:
             print(sp.pretty(sp.Eq(lhs, rhs, evaluate=False)))
         return
