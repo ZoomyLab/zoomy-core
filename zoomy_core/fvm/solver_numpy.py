@@ -1104,7 +1104,19 @@ class HyperbolicSolver(Solver):
         # captured once here.  ``source_explicit`` is NOT in this cut's scope and
         # keeps its ``(Q, Qaux, p)`` signature (padded coordinate args).
         source_needs_dt = getattr(model, "source_needs_dt", False)
-        cell_centers = getattr(mesh, "cell_centers", None)
+        # INNER cells only.  ``mesh.cell_centers`` is GHOST-PADDED while the
+        # ``Q``/``Qaux`` handed to the source are not (measured on a 200-cell
+        # 1-D mesh: Q (4, 200), Qaux (5, 200), cell_centers (3, 202)), so a
+        # position-dependent source mixed 202-length position terms with
+        # 200-length state terms and died with
+        #     operands could not be broadcast together with shapes (200,) (202,)
+        # That is every MMS case on this backend -- the manufactured source is
+        # position-dependent by construction.
+        _cc = getattr(mesh, "cell_centers", None)
+        _ni = getattr(mesh, "n_inner_cells", None)
+        cell_centers = (_cc[:, :_ni] if _cc is not None and _ni is not None
+                        and getattr(_cc, "ndim", 0) == 2 and _cc.shape[1] != _ni
+                        else _cc)
 
         def compute_source(dt, time, Q, Qaux, parameters, dQ):
             if source_needs_dt:
