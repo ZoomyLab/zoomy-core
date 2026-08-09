@@ -1683,9 +1683,9 @@ class PrimitiveReconstruction:
     """Wraps a base ghost-cell-free reconstruction with pre/post
     transforms to the model's primitive well-balanced variables.
 
-    Pre  (per cell):  ``state_cell → wb_cell``  via ``forward_fn``.
-    Limit (per cell): base reconstruction on the WB cell values.
-    Post (per face):  ``wb_face → state_face`` via ``inverse_fn``.
+    Pre  (per cell / boundary face):  ``state → wb``   via ``forward_fn``.
+    Limit (per cell):                 base reconstruction on the WB values.
+    Post (per face, L and R side):    ``wb → state``    via ``inverse_fn``.
 
     The point of the WB transform is to limit the *physically*
     bounded quantities (``η = h+b``, ``u = q/h``, …) instead of the
@@ -1697,37 +1697,95 @@ class PrimitiveReconstruction:
     (physically bounded), and the recovered ``q_face = h_face · u_face``
     is positivity-consistent by construction.
 
-    ``forward_fn`` and ``inverse_fn`` are lambdified callables
-    ``f(Q) → wb`` and ``g(WB) → Q`` (vectorised across cells / faces
-    by the caller; this class iterates explicitly to keep the
-    interface model-agnostic).
+    ``forward_fn`` / ``inverse_fn`` are the model's OWN
+    ``reconstruction_variables`` / ``state_from_reconstruction`` operators,
+    lowered through :class:`~zoomy_core.transformation.to_numpy.
+    NumpyRuntimeModel` exactly like ``flux`` / ``source`` / every other
+    operator — so they carry the FULL declared signature
+    (``OPERATOR_ARG_SLOTS["reconstruction_variables"] == (variables,
+    aux_variables, parameters)``, ``["state_from_reconstruction"] ==
+    (reconstruction, aux_variables, parameters)``, see
+    ``systemmodel.system_model``) instead of a hand-rolled state-only
+    lambdify.  A model whose forward/inverse map references an algebraic
+    aux (e.g. the KP-desingularised ``hinv = 1/h`` that ``u = q·hinv``
+    depends on) needs that ``Qaux`` argument to even evaluate — dropping it
+    raised a bare ``NameError`` the first time an order-2 VAM case exercised
+    this path.  A model that inlines its own regularization instead (no
+    aux row at all) simply has an empty ``aux_variables`` group here and the
+    lowered kernel ignores it — nothing in this class ever assumes a
+    particular aux row exists, by name or position.
+
+    Aux is genuinely PER-CELL / PER-FACE data (unlike ``parameters``, which
+    are compile-time constants the caller binds once), so it cannot be
+    baked in at construction — ``Qaux`` (cells) / ``Qaux_bf`` (boundary
+    faces) are supplied fresh on every call, mirroring the ``Q`` /
+    ``bf_face_values`` pair.  A model with zero aux rows still works: the
+    caller passes ``(0, n)`` arrays and the lowered kernel's (empty)
+    aux argument group contributes nothing.
     """
 
-    def __init__(self, base, forward_fn, inverse_fn):
-        self.base = base
-        self._forward = forward_fn
-        self._inverse = inverse_fn
+    #: Opt-in flag read by ``solver_numpy.get_flux_operator``'s flux
+    #: operator (mirrors ``supports_force_o1``): only when set does the
+    #: caller bother building/passing ``Qaux`` / ``Qaux_bf``.
+    needs_aux = True
 
-    def __call__(self, Q, bf_face_values):
-        # ``Q``: (n_state, n_inner_cells).
-        # ``bf_face_values``: (n_state, n_boundary_faces).
-        wb_Q  = self._apply(self._forward, Q)
-        wb_bf = self._apply(self._forward, bf_face_values)
+    def __init__(self, base, forward_fn, inverse_fn, n_aux, parameters):
+        self.base = base
+        self._forward = forward_fn      # rt.reconstruction_variables:  (Q, Qaux, p)  -> WB
+        self._inverse = inverse_fn      # rt.state_from_reconstruction: (WB, Qaux, p) -> Q
+        self._n_aux = n_aux
+        self._parameters = parameters   # constant (n_params,) array — OPERATOR_ARG_SLOTS 'parameters' group
+
+    def __call__(self, Q, bf_face_values, Qaux=None, Qaux_bf=None):
+        # ``Q``: (n_state, n_inner_cells).  ``bf_face_values``: (n_state, n_boundary_faces).
+        # ``Qaux`` / ``Qaux_bf``: (n_aux, n_inner_cells) / (n_aux, n_boundary_faces);
+        # default to the (possibly empty) zero-aux case so a bare model — or a
+        # caller that hasn't opted into ``needs_aux`` wiring — still works.
+        if Qaux is None:
+            Qaux = np.zeros((self._n_aux, Q.shape[1]))
+        if Qaux_bf is None:
+            Qaux_bf = np.zeros((self._n_aux, bf_face_values.shape[1]))
+
+        wb_Q  = self._apply(self._forward, Q, Qaux)
+        wb_bf = self._apply(self._forward, bf_face_values, Qaux_bf)
         wb_L, wb_R = self.base(wb_Q, wb_bf)
-        Q_L = self._apply(self._inverse, wb_L)
-        Q_R = self._apply(self._inverse, wb_R)
+
+        # The inverse map is evaluated on the FULL face axis (interior +
+        # boundary — ``self.base``'s own face count, ``Q_L``/``Q_R`` shape).
+        # Aux is PIECEWISE-CONSTANT per cell everywhere else in this solver —
+        # the Riemann dissipation reads the OWNING cell's aux, never a
+        # reconstructed one (``get_flux_operator``'s ``qauxA``/``qauxB`` /
+        # ``_ghost_aux``) — so the L/R aux fed to the inverse map at a face is
+        # likewise the owning cell's (or the boundary ghost's), matching that
+        # same convention instead of inventing a face-limited aux profile.
+        aux_L, aux_R = self._face_aux(Qaux, Qaux_bf)
+        Q_L = self._apply(self._inverse, wb_L, aux_L)
+        Q_R = self._apply(self._inverse, wb_R, aux_R)
         return Q_L, Q_R
 
-    @staticmethod
-    def _apply(fn, arr):
-        """Apply a vector-valued symbolic-derived callable column-wise.
+    def _face_aux(self, Qaux, Qaux_bf):
+        """Scatter cell / boundary aux onto ``self.base``'s full face axis,
+        aligned with its own ``Q_L``/``Q_R`` convention
+        (``LSQMUSCLReconstruction._reconstruct``): L = the face's owning
+        inner cell, R = the neighbour cell (interior faces) or the boundary
+        ghost ``Qaux_bf`` (boundary faces)."""
+        base = self.base
+        n_faces = base._n_faces
+        aux_L = np.zeros((self._n_aux, n_faces))
+        aux_R = np.zeros((self._n_aux, n_faces))
+        aux_L[:, base._interior_faces] = Qaux[:, base._iA_int]
+        aux_R[:, base._interior_faces] = Qaux[:, base._iB_int]
+        aux_L[:, base._boundary_faces] = Qaux[:, base._iInner_bnd]
+        aux_R[:, base._boundary_faces] = Qaux_bf
+        return aux_L, aux_R
 
-        ``fn(*x_col) → x_col_transformed``; we iterate columns to keep
-        the wrapper agnostic to how the user lambdified the maps."""
-        out = np.empty_like(arr)
-        for c in range(arr.shape[1]):
-            out[:, c] = np.asarray(fn(*arr[:, c]), dtype=float).ravel()
-        return out
+    def _apply(self, fn, arr, aux):
+        """Apply the model's declared ``(state_like, Qaux, parameters)``
+        operator to a WHOLE array of columns (cells or faces) at once — the
+        same broadcasting convention every other lowered operator uses
+        (``sm.flux(Q, Qaux, p)`` etc.), so this works identically whether the
+        model declares 0, 1, or many aux rows."""
+        return np.asarray(fn(arr, aux, self._parameters), dtype=float)
 
 
 __all__ = (__all__ if "__all__" in dir() else []) + [

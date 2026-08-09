@@ -671,22 +671,33 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
                 eps_wet=eps_wet, limiter=self.nsm.reconstruction.limiter,
                 unlimited_indices=unlimited or None,
             )
-            # Lambdify the Model-declared WB forward / inverse maps.
-            # ``state_from_reconstruction`` is in ``WB_<state_name>``
-            # symbols — build that signature too.
-            fwd = symbolic_model.reconstruction_variables
-            inv = symbolic_model.state_from_reconstruction
-            if fwd is None or inv is None:
+            if (symbolic_model.reconstruction_variables is None
+                    or symbolic_model.state_from_reconstruction is None):
                 # Fall back to bare base limiter — no primitive transform.
                 return base
-            state_syms = list(symbolic_model.state)
-            wb_syms = [sp.Symbol(f"WB_{s.name}", real=True)
-                       for s in state_syms]
-            forward_fn = sp.lambdify(
-                state_syms, list(fwd), modules=["numpy"])
-            inverse_fn = sp.lambdify(
-                wb_syms, list(inv), modules=["numpy"])
-            return PrimitiveReconstruction(base, forward_fn, inverse_fn)
+            # Lower the Model-declared WB forward / inverse maps through
+            # ``NumpyRuntimeModel`` — exactly like ``flux`` / ``source`` / every
+            # other operator (``to_numpy.NumpyRuntimeModel.from_system_model``
+            # already reads ``sm.operator_signature`` for both
+            # ``reconstruction_variables`` and ``state_from_reconstruction``,
+            # cid 214).  A hand-rolled ``sp.lambdify(state_syms, ...)`` here
+            # used to bind STATE ONLY, silently dropping the declared
+            # ``(…, aux_variables, parameters)`` groups — any model whose
+            # forward/inverse map reads an algebraic aux (e.g. the KP
+            # desingularised ``hinv`` behind ``u = q·hinv``) then raised a bare
+            # ``NameError`` at lambdify-call time.  Signature is driven
+            # entirely by ``OPERATOR_ARG_SLOTS`` (via ``operator_signature``),
+            # never hardcoded here, so a model with different aux — or none —
+            # still works.
+            recon_rt = NumpyRuntimeModel.from_system_model(symbolic_model)
+            parameters = np.array(
+                list(symbolic_model.parameter_values.values()), dtype=float)
+            return PrimitiveReconstruction(
+                base, recon_rt.reconstruction_variables,
+                recon_rt.state_from_reconstruction,
+                n_aux=len(symbolic_model.aux_state),
+                parameters=parameters,
+            )
         return super()._build_reconstruction(mesh, symbolic_model)
 
     # ------------------------------------------------------------------

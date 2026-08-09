@@ -872,12 +872,19 @@ class HyperbolicSolver(Solver):
         self._n_bf = n_bf
 
         support_o1 = bool(getattr(reconstruct, "supports_force_o1", False))
+        # Opt-in (mirrors ``support_o1`` above): only a reconstruction that
+        # wraps the model's OWN WB forward/inverse maps (``PrimitiveReconstruction``)
+        # declares ``needs_aux`` — every other reconstruction class is
+        # untouched by the block below.
+        support_aux = bool(getattr(reconstruct, "needs_aux", False))
 
         def flux_operator(dt, time, Q, Qaux, parameters, dQ, force_o1=None):
             dQ = np.zeros((n_vars, nc))
 
             # 1. Compute boundary face values via the indexed BC kernel.
             bf_values = np.zeros((n_vars, n_bf))
+            aux_bf = (np.zeros((Qaux.shape[0], n_bf), dtype=float)
+                      if support_aux else None)
             for i_bf in range(n_bf):
                 q_inner = Q[:, bf_cells[i_bf]]
                 qaux_inner = Qaux[:, bf_cells[i_bf]] if has_aux else _EMPTY_AUX
@@ -888,13 +895,30 @@ class HyperbolicSolver(Solver):
                     bc_indices[i_bf], time, position, d_face[i_bf],
                     q_inner, qaux_inner, parameters, normal,
                 )
+                if support_aux:
+                    # ``bf_values[:, i_bf]`` is a BC-TRANSFORMED state, not
+                    # the inner cell's own (a Dirichlet/characteristic BC can
+                    # prescribe a different h) — an algebraic aux (e.g. the
+                    # KP-desingularised ``hinv = 1/h``) must be recomputed
+                    # FROM IT, exactly like the ghost-state aux ``_ghost_aux``
+                    # already recomputes for the post-reconstruction BC
+                    # override below.  Reusing ``qaux_inner`` unchanged would
+                    # silently divide by the WRONG h at this boundary face.
+                    aux_bf[:, i_bf] = _ghost_aux(
+                        bf_values[:, i_bf], qaux_inner, parameters, time,
+                        position)
 
             # 2. Reconstruct (uses bf_values for limiter bounds + Q_R placeholder).
             # ``force_o1`` (a-posteriori MOOD re-step, when the reconstruction
             # supports it) zeroes the slopes of flagged cells → constant
             # reconstruction; ``None`` on every normal / order-1 path.
             o1kw = {"force_o1": force_o1} if support_o1 else {}
-            Q_L, Q_R = reconstruct(Q, bf_values, **o1kw)
+            # ``Qaux`` / ``aux_bf`` — only a reconstruction that declared
+            # ``needs_aux`` (PrimitiveReconstruction) receives them; the model's
+            # own declared ``aux_state`` drives their row layout end to end, so
+            # a model with zero aux rows degrades to ``(0, n)`` arrays here.
+            auxkw = {"Qaux": Qaux, "Qaux_bf": aux_bf} if support_aux else {}
+            Q_L, Q_R = reconstruct(Q, bf_values, **o1kw, **auxkw)
 
             # 3. Override Q_R at boundary faces with BC(Q_L) — except
             # periodic faces, whose face value is the opposite-side cell
