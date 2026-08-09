@@ -1450,6 +1450,61 @@ class SystemModel:
             canonical_source, "equilibrium_reconstruction", "none")
         return sm
 
+    def has_active_source(self) -> bool:
+        """``True`` if any source row is non-zero AT THE CONFIGURED PARAMETERS.
+
+        The symbolic source carries free parameters (``e_x``, ``n``, …) that are
+        non-zero as symbols but vanish at their configured values (``n=0``
+        frictionless, ``e_x=0`` no tilt), so the raw symbolic form is not the
+        question — substitute first.  Matching is by symbol NAME because the
+        assumptions on a source symbol need not equal a freshly minted
+        ``Symbol``, which makes ``subs``-by-object silently miss.
+        """
+        import sympy as _sp
+        pv = dict(self.parameter_values or {})
+
+        def _numify(e):
+            e = _sp.sympify(e)
+            return e.subs({s: pv[s.name] for s in e.free_symbols
+                           if s.name in pv})
+        try:
+            return any(_sp.simplify(_numify(e)) != 0
+                       for e in _sp.flatten(self.source))
+        except Exception:                                # noqa: BLE001
+            return True          # unknown ⇒ assume active, the safe branch
+
+    def has_higher_moments(self) -> bool:
+        """``True`` if the system carries moment rows beyond the depth-averaged
+        one — i.e. anything a level-0 shallow-water closed form does not cover."""
+        names = [str(s) for s in self.state]
+        return len([n for n in names if n not in ("h", "b")]) - 1 >= 1
+
+    def resolve_equilibrium_kernel(self, *, force_steady_ode: bool = False) -> str:
+        """Which CONCRETE well-balanced kernel a backend must run.
+
+        This is model knowledge and it is decided HERE, once, so a backend never
+        re-derives it.  Backends previously reconstructed the moment level by
+        counting non-``h``/``b`` state fields and sniffed the source with
+        ``sympy.simplify`` at solver-setup time — the model layer telling the
+        model's own story through the numerics layer's mouth.  A backend now
+        reads the answer and branches on a plain Python string at trace time, so
+        nothing about "level" survives into generated code.
+
+        ``none`` / ``audusse`` pass through unchanged.  The Bernoulli family
+        splits: the closed-form specific-energy reconstruction is only valid for
+        a level-0, source-free system, so anything with friction or higher
+        moments resolves to the fully well-balanced steady-ODE moving-equilibrium
+        reconstruction (Pimentel-García).  ``force_steady_ode`` routes a
+        frictionless level-0 system there too, which is what makes the WB
+        head-to-head comparison possible (cid 157).
+        """
+        eqr = getattr(self, "equilibrium_reconstruction", "none") or "none"
+        if eqr in ("none", "audusse"):
+            return eqr
+        if force_steady_ode or self.has_higher_moments() or self.has_active_source():
+            return "steady_ode"
+        return "bernoulli_closed_form"
+
     def is_vertical_dependent(self, symbol) -> bool:
         """``True`` if the state ``symbol`` is a vertical-dependent (3-D) field
         — e.g. ``ũ(t,x,ζ)`` — and ``False`` for a depth-collapsed field
