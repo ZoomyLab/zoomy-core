@@ -27,11 +27,56 @@ from __future__ import annotations
 __all__ = ["show", "in_notebook"]
 
 
-def in_notebook() -> bool:
-    """True when a live IPython/Jupyter kernel is driving this process.
+def _host_display():
+    """A ``display`` provided by the HOST, if there is one.
 
-    Importable IPython is NOT enough — a headless worker can import it without
-    a kernel — so this asks ``get_ipython()`` for an actual instance."""
+    Checked BEFORE IPython because the Theia/Pyodide GUI runs its own kernel:
+    it injects ``display`` into the cell namespace but provides no
+    ``get_ipython()``, so an IPython-only probe reported "not a notebook" and
+    equations came out as ASCII pretty-print in the GUI.
+
+    Looked for in the caller's frames (where the GUI injects it) and in
+    builtins.  ``ZOOMY_DISPLAY=rich|plain`` overrides everything, for a host
+    that wants to state the answer rather than be sniffed."""
+    import builtins
+    import os
+    import sys
+
+    forced = os.environ.get("ZOOMY_DISPLAY", "").strip().lower()
+    if forced == "plain":
+        return None
+
+    d = getattr(builtins, "display", None)
+    if callable(d):
+        return d
+    # walk out of this module into the caller's globals
+    try:
+        f = sys._getframe(1)
+        while f is not None:
+            if f.f_globals.get("__name__") != __name__:
+                d = f.f_globals.get("display")
+                if callable(d) and getattr(d, "__module__", "") != __name__:
+                    return d
+            f = f.f_back
+    except Exception:                                    # noqa: BLE001
+        pass
+    if forced == "rich":
+        try:
+            from IPython.display import display as _d
+            return _d
+        except Exception:                                # noqa: BLE001
+            return None
+    return None
+
+
+def in_notebook() -> bool:
+    """True when SOMETHING can render rich output.
+
+    A host-injected ``display`` counts (the GUI kernel), as does a live
+    IPython instance.  Importable IPython alone does not — a headless worker
+    can import it without a kernel."""
+    if _host_display() is not None:
+        return True
     try:
         from IPython import get_ipython
     except Exception:                                    # noqa: BLE001
@@ -56,14 +101,23 @@ def show(obj=None, *, eq=None, precision: int = 6):
             rhs = sp.N(rhs, precision)
         except Exception:                                # noqa: BLE001
             pass
-        if in_notebook():
-            from IPython.display import Math, display as _d
-            _d(Math(f"{sp.latex(lhs)} = {sp.latex(rhs)}"))
+        tex = f"{sp.latex(lhs)} = {sp.latex(rhs)}"
+        _d = _host_display()
+        try:
+            from IPython.display import Math
+        except Exception:                                # noqa: BLE001
+            Math = None
+        if _d is None and in_notebook():
+            from IPython.display import display as _d    # noqa: F811
+        if _d is not None and Math is not None:
+            _d(Math(tex))
         else:
             print(sp.pretty(sp.Eq(lhs, rhs, evaluate=False)))
         return
-    if in_notebook():
-        from IPython.display import display as _d
+    _d = _host_display()
+    if _d is None and in_notebook():
+        from IPython.display import display as _d        # noqa: F811
+    if _d is not None:
         _d(obj)
     else:
         print(obj)
