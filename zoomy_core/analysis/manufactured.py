@@ -238,8 +238,32 @@ def manufactured_source(sm, exact):
         # W*(x, t), which is what turns this into a test of the SCHEME rather
         # than of the equilibrium (see the module note).
         dWdt = sp.diff(W[i], sm.time) if i < len(W) else sp.Integer(0)
-        out.append(sp.simplify(dWdt + adv - diff - Si))
+        out.append(_normalise(dWdt + adv - diff - Si))
     return ZArray(out).reshape(n_eq, 1)
+
+
+def _normalise(expr):
+    """Tidy a residual row without paying for :func:`sympy.simplify`.
+
+    ``simplify`` was the entire cost of building a manufactured source, and it
+    scales appallingly with the richness of ``W*``: a degree-6 bed bump with a
+    time-dependent depth took **over 32 minutes at full CPU without emitting a
+    single row**, where skipping it returns in 0.0 s.  With Manning friction
+    (``q|q|/h^{7/3}``) it does not finish at all.  That cost is why every
+    manufactured case in the suite uses a low-degree monotone ``W*`` over a flat
+    bed -- the interesting solutions were simply unaffordable.
+
+    Nothing depends on the simplified *form*.  The residual is consumed
+    numerically (``lambdify`` in :func:`exact_cell_field`, code generation in the
+    backends), so simplification only ever bought readability when a case prints
+    its source.  ``cancel`` keeps rational terms in a readable normal form for
+    that, at a fraction of the price, and degrades to the raw expression rather
+    than raising if it cannot.
+    """
+    try:
+        return sp.cancel(sp.expand(expr))
+    except Exception:                                    # noqa: BLE001
+        return expr
 
 
 def install_manufactured_source(sm, exact):

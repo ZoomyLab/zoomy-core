@@ -648,10 +648,17 @@ class ChorinSplitVAMSolver(HyperbolicSolver):
             from zoomy_core.fvm.reconstruction import (
                 FreeSurfaceLSQMUSCL, PrimitiveReconstruction,
             )
-            from zoomy_core.fvm.solver_numpy import _var_index
+            from zoomy_core.fvm.solver_numpy import _param_value, _var_index
+            from zoomy_core.systemmodel.operations import _DEFAULT_WET_DRY_EPS
             dim = symbolic_model.dimension
             h_idx = _var_index(symbolic_model, "h")
-            eps_wet = self._get_dry_threshold(symbolic_model)
+            # Same rule as the hyperbolic backend: the reconstruction's wet/dry
+            # epsilon is the MODEL's own ``wet_dry_eps``, never a backend
+            # literal.  43ec69d deleted the old ``_get_dry_threshold`` helper
+            # from the backends but missed THIS caller, so order-2 Chorin/VAM
+            # raised AttributeError at runtime (caught by cases/vam/bump).
+            eps_wet = _param_value(symbolic_model, "wet_dry_eps",
+                                   default=_DEFAULT_WET_DRY_EPS)
             # ``b`` (when state) is static — exempt from slope limiting
             # so the LSQ slope from cell-centre b passes through cleanly
             # (Audusse HR still acts on the face values).
