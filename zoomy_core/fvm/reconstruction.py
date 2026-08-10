@@ -1771,14 +1771,42 @@ class PrimitiveReconstruction:
         aux_L, aux_R = self._face_aux(Qaux, Qaux_bf)
         Q_L = self._apply(self._inverse, wb_L, aux_L)
         Q_R = self._apply(self._inverse, wb_R, aux_R)
-        # Proxy the base's limited gradient so the solver's cell-interior
-        # non-conservative integral can find it through this wrapper.  Fixing
-        # only the base is not enough: VAM/ML-VAM at order >= 2 always arrive
-        # here, and the solver looks the gradient up on the OUTER object.
-        # NOTE this is the gradient in WB/primitive space, not chain-ruled back
-        # through ``state_from_reconstruction``.  Measured within 0.1% of the
-        # exact face-difference construction on the Escalante bump, because the
-        # defect is worst near rest where the nonlinear chain-rule term vanishes.
+        # Publish a CONSERVATIVE-space limited gradient for the solver's
+        # cell-interior non-conservative integral (B(Q)@dQ, Noelle, Pankratz,
+        # Puppo & Natvig 2006 eq. 15) — it needs d/dx of the CONSERVATIVE
+        # state, exactly what ``self.base`` already publishes correctly when
+        # used bare (no WB wrapper).  Proxying ``self.base._limited_grad``
+        # straight off the face-reconstruction call above (the previous
+        # implementation) is NOT that gradient: that call ran on ``wb_Q``
+        # (η=b+h, u=q·hinv, …), so both its slope AND its dry-cell demotion
+        # are in WB/primitive space, not conservative space —
+        #   * d(u)/dx = hinv·[dq/dx − u·dh/dx] carries an EXTRA hinv the
+        #     model's ``nonconservative_matrix`` does not expect: B's own
+        #     hinv-scaled entries are already the normal "advective
+        #     velocity" of a quasilinear system (correct, matches every
+        #     other well-balanced model) — paired with an ALSO-hinv-scaled
+        #     WB slope they compound to hinv² as h → 0.  Verified on the
+        #     Escalante bump: B's entries scale as a clean 1/h from
+        #     h=0.14 down to h=1e-4 (eps_wet=1e-8 never becomes relevant),
+        #     so an extra hinv factor from the gradient is the difference
+        #     between the term staying physically-normal (~1/h, a velocity
+        #     gradient) and blowing up (~1/h²) as a cell dries.
+        #   * ``self.base``'s dry check compares ``Q[h_idx] < eps_wet``, and
+        #     on the WB call ``Q`` IS ``wb_Q`` whose h_idx slot holds
+        #     η = b+h (``reconstruction_rows = {h: b+h, …}``) — b is the
+        #     static bed, so η tracks the topography height regardless of
+        #     how thin h itself gets, and the demotion that is supposed to
+        #     zero this very term in a drying cell never fires.
+        # A second call on the TRUE conservative ``Q`` (this method's own,
+        # untransformed argument) reuses the SAME LSQ + limiter + dry-
+        # fallback + MOOD machinery with the RIGHT input instead of adding a
+        # Jacobian or a new threshold: ``self.base`` then sees the real
+        # depth, exactly as it does for every model that is NOT WB-wrapped.
+        # Its Q_L/Q_R (discarded here) are NOT the well-balanced face states
+        # returned below — those still come from the WB call above,
+        # unchanged, so face reconstruction keeps its momentum-overshoot
+        # protection at the wet/dry front.
+        self.base(Q, bf_face_values)
         self._limited_grad = getattr(self.base, "_limited_grad", None)
         return Q_L, Q_R
 
