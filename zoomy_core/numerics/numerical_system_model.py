@@ -1215,13 +1215,30 @@ class NumericalSystemModel(SystemModel):
         # BoundaryConditions CONTAINER — REQ-16, reached as
         # ``nsm._bc_source``), ``aux_registry`` (LSQ-degree sizing),
         # ``positive_state``, ``derivative_specs``, the lazy
-        # ``_quasilinear_matrix`` cache, …) intact with NO copy.  Crucially
-        # it preserves object identity: ``nsm is sm`` and ``nsm.sm is nsm``,
-        # so callers that built the SystemModel, then keep mutating it
-        # (e.g. ``sm.initial_conditions = …`` between successive solves)
-        # see those mutations through the NSM — the faithful
-        # ``SystemModel → NumericalSystemModel`` pipeline step, not a
-        # snapshot.
+        # ``_quasilinear_matrix`` cache, …) intact.
+        #
+        # READ THIS BEFORE RELYING ON IDENTITY.  The re-class below promotes
+        # the LOCAL ``sm``, which ``construct_numerical`` rebound to a COPY at
+        # THE BOUNDARY above.  So ``nsm is sm`` holds only for that local:
+        # **the CALLER's SystemModel is a different object and is left
+        # untouched.**  This comment used to claim the opposite — that a caller
+        # could keep mutating its SystemModel (``sm.initial_conditions = …``
+        # between successive solves) and see the change through the NSM.  That
+        # is FALSE and has silently broken real work twice:
+        #
+        #   * ``model/splitter.py`` called ``to_numerical_system_model`` on the
+        #     three chorin stages and discarded the return, so no stage was
+        #     ever promoted and the cid=50 ``Pow(h, -2)`` regularization was
+        #     dead code for as long as the copy has existed.
+        #   * ~30 case scripts under ``thesis/{cases,notebooks}`` assign
+        #     ``sm.initial_conditions`` AFTER lowering, which is a no-op.  It
+        #     froze ``bingham_inclined.py`` at 87.08 % with all 40 frames
+        #     bit-identical — a wrong ANSWER, not a crash.
+        #
+        # Post-lowering mutation of a SystemModel does not reach the NSM.
+        # Either mutate BEFORE lowering, or re-lower, or drive one continuous
+        # solve.  Callers must BIND the return value: ``nsm = to_numerical_
+        # system_model(sm)``.
         #
         sm.__class__ = cls
         sm.riemann = riemann
