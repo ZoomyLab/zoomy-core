@@ -821,6 +821,24 @@ class FoamNumericsPrinter(GenericCppBase):
     def __init__(self, numerics, **opts):
         super().__init__()
         self.numerics = numerics
+        # NOTE on promotion: unlike ``FoamSystemModelPrinter``, this printer
+        # CANNOT defend itself against an un-promoted ``numerics.model`` —
+        # ``Numerics.__init__`` (riemann_solvers.py) ALREADY snapshotted
+        # ``local_max_abs_eigenvalue`` / ``numerical_flux`` from it by the
+        # time a ``Numerics`` instance reaches here, so promoting
+        # ``numerics.model`` NOW would not change the (already-baked) kernel
+        # bodies — and re-deriving a fresh NSM here (the pre-3337fe5
+        # approach) builds a symbol twin that prints identically but compares
+        # unequal to the symbols those bodies are expressed in terms of (see
+        # the symbol-map comment below, cid=87).  A hard type check was tried
+        # here and reverted: this printer is also legitimately constructed
+        # directly from a ``Numerics(model=<bare SystemModel>)`` in tests that
+        # probe raw (un-regularised) kernel shapes, so rejecting a non-NSM
+        # ``numerics.model`` breaks that contract.  The actual fix is at the
+        # CONSTRUCTION site — whoever builds ``numerics`` must promote first
+        # (see ``_promote_with_dry_gate`` above and
+        # ``zoomy_foam._pipeline._codegen`` / ``_codegen_chorin``, both of
+        # which now do).
         self.sm = numerics.model
         # State / aux / parameter / normal symbol maps — sourced from
         # ``numerics.variables`` / ``.aux_variables`` / ``.parameters`` /

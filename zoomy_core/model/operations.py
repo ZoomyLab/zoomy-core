@@ -5931,8 +5931,25 @@ def _evaluate_linear_derivatives(expr):
     """
     if not isinstance(expr, sp.Basic):
         return expr
-    if isinstance(expr, sp.Subs) and expr.args[0] == S.Zero:
-        return S.Zero
+    if isinstance(expr, sp.Subs):
+        if expr.args[0] == S.Zero:
+            return S.Zero
+        inner_walked = _evaluate_linear_derivatives(expr.args[0])
+        # ``Subs(f, v, p) == f`` whenever ``f`` no longer depends on ANY of
+        # the point variable(s) ``v`` — true REGARDLESS of ``p``.  Collapse
+        # eagerly rather than leaving the no-op wrapper in place: once the
+        # self-derivative closing below reduces a bed/surface-trace body
+        # (e.g. a level-1 Newtonian stress trace) to a ``v``-independent
+        # constant, two such Subs at DIFFERENT points (ζ=0 vs ζ=1) become
+        # identical-except-for-point.  ``Subs._hashable_content`` carries
+        # ``(variables, point)`` as a bare (non-``Basic``) tuple, and
+        # sympy's generic ``Basic.compare`` mishandles ordering two of those
+        # during ``Add`` canonicalisation (``TypeError: BooleanAtom not
+        # allowed in this context``) — collapsing here means that pair of
+        # raw Subs nodes is never built in the first place.
+        if not any(inner_walked.has(v) for v in expr.variables):
+            return inner_walked
+        return expr.func(inner_walked, *expr.args[1:])
     if isinstance(expr, Derivative):
         inner = expr.args[0]
         if inner == S.Zero:
@@ -5982,7 +5999,23 @@ def _evaluate_linear_derivatives(expr):
             return sp.Add(*(expr.func(t, *args_rest)
                             for t in sp.Add.make_args(inner_walked)))
         inner_walked = _evaluate_linear_derivatives(inner)
-        return expr.func(inner_walked, *expr.args[1:])
+        result = expr.func(inner_walked, *expr.args[1:])
+        # ``inner_walked`` may now be a BARE polynomial purely in the diff
+        # variable(s) themselves — e.g. a basis function already concretised
+        # by ``ResolveBasis`` to ``2*zeta - 1``, whose Mul-coefficient pull
+        # above (Pass-1) peeled off the self-derivative remainder
+        # ``Derivative(zeta, zeta)`` (level 1), or a higher-level
+        # ``Derivative(zeta**2, zeta)``.  There is no unknown Function /
+        # conservative product left to guard from the product rule (the
+        # only reason this function avoids ``.doit()`` elsewhere), so
+        # closing the atom here is always safe.  Left unevaluated, these
+        # zombies ride into flux / nonconservative_matrix / source and
+        # break ``sp.lambdify`` (NumPyPrinter has no rule for a raw,
+        # un-``doit``-ed ``Derivative``).
+        if (not inner_walked.atoms(Function)
+                and inner_walked.free_symbols <= set(expr.variables)):
+            return result.doit()
+        return result
     if expr.args:
         return expr.func(*(_evaluate_linear_derivatives(a) for a in expr.args))
     return expr
