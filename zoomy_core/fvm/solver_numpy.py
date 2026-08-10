@@ -389,6 +389,33 @@ class Solver(param.Parameterized):
             return self.sm
         return getattr(model, "_chain_systemmodel", None)
 
+    # -- NSM coercion --------------------------------------------------
+
+    def _coerce_to_nsm(self, model):
+        """Normalise ``model`` to a (NumericalSystemModel, source-Model)
+        pair.  Auto-promotes Model / SystemModel by building an NSM
+        with default specs (``ReconstructionSpec(order=1)``,
+        ``eigenvalue_eps=1e-8``, etc.) — to override
+        defaults, build the NSM explicitly and pass that in.
+
+        Lives on the BASE ``Solver`` because it is the one front door that
+        makes a solver's aux/state sizing agree with the kernels
+        ``NumpyRuntimeModel.from_system_model`` compiles (which promotes to
+        an NSM internally, registering e.g. the KP ``hinv`` aux).  Every
+        solver that allocates buffers must go through it.
+
+        ``source_model`` is the *original* :class:`Model` when one was
+        passed (needed for ``resolve_periodic_bcs``, which walks
+        ``boundary_conditions_list`` — a field that lives on the Model
+        object and not on the lambdified SystemModel BC kernel).  When
+        the caller supplied a bare SystemModel or NSM, ``source_model``
+        is ``None``."""
+        if isinstance(model, NumericalSystemModel):
+            return model, None
+        nsm = NumericalSystemModel.from_system_model(model)
+        source_model = None if isinstance(model, SystemModel) else model
+        return nsm, source_model
+
 
 # -- HyperbolicSolver ----------------------------------------------------------
 
@@ -428,27 +455,6 @@ class HyperbolicSolver(Solver):
         Q = model.initial_conditions.apply(mesh.cell_centers[:, :nc], Q)
         Qaux = model.aux_initial_conditions.apply(mesh.cell_centers[:, :nc], Qaux)
         return Q, Qaux
-
-    # -- NSM coercion --------------------------------------------------
-
-    def _coerce_to_nsm(self, model):
-        """Normalise ``model`` to a (NumericalSystemModel, source-Model)
-        pair.  Auto-promotes Model / SystemModel by building an NSM
-        with default specs (``ReconstructionSpec(order=1)``,
-        ``eigenvalue_eps=1e-8``, etc.) — to override
-        defaults, build the NSM explicitly and pass that in.
-
-        ``source_model`` is the *original* :class:`Model` when one was
-        passed (needed for ``resolve_periodic_bcs``, which walks
-        ``boundary_conditions_list`` — a field that lives on the Model
-        object and not on the lambdified SystemModel BC kernel).  When
-        the caller supplied a bare SystemModel or NSM, ``source_model``
-        is ``None``."""
-        if isinstance(model, NumericalSystemModel):
-            return model, None
-        nsm = NumericalSystemModel.from_system_model(model)
-        source_model = None if isinstance(model, SystemModel) else model
-        return nsm, source_model
 
     # -- Symbolic model helpers ----------------------------------------
 

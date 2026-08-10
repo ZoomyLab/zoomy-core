@@ -1509,19 +1509,36 @@ def split_for_pressure_structural(sm, pressure_vars, dt):
     # the predictor (a real flux system) is swept; the elliptic pressure /
     # pointwise corrector stages carry no wavespeeds and stay clean by design.
     #
-    # Promotion is IN PLACE (the NSM is-a SystemModel; ``from_system_model``
-    # re-classes the instance), so the ``SM_pred is stages[0].sm`` identity
-    # holds, and each stage freeze-materializes its OWN quasilinear matrix
-    # from its raw operators before the substitution (never recomputed from
-    # the swept flux — that would drop the exact ``∂(q²/h)/∂h = −q²/h²``
-    # wavespeed term; see ``regularize_pow``).  A later
-    # ``from_system_model(...)`` on a stage (the numpy/jax solvers re-promote
-    # at setup) is idempotent: ``hinv`` is already registered and no bare
-    # negative depth power remains to rewrite.
+    # Promotion RETURNS A NEW OBJECT — bind it.  This loop used to discard the
+    # return value, which was correct only while ``from_system_model`` re-classed
+    # its argument in place.  It no longer does: it opens with
+    # ``sm = construct_numerical(sm)`` (a ``copy.deepcopy`` — THE Model → SM →
+    # NSM boundary, deliberately introduced so the numerical layer gets
+    # assumption-free symbol twins instead of relabelling the symbolic one), so
+    # it promotes a COPY and leaves the caller's object untouched.  The loop was
+    # therefore a total no-op and the cid=50 fix above was dead: measured on
+    # ``chorin_split(VAM(1) Escalante-bump)`` without a pre-applied
+    # ``desingularize_hinv``, all three stages came out plain ``SystemModel``
+    # with no ``hinv`` in ``aux_state`` and a bare ``1/h`` + ``h**(-2)`` still in
+    # ``SM_pred.quasilinear_matrix`` — exactly the ``Pow(h, -2)`` this block
+    # claims to remove.  Golden S02 hid it by applying ``desingularize_hinv``
+    # BEFORE the split.
+    #
+    # Rebinding the three fields is sufficient to keep the ``SM_pred is
+    # stages[0].sm`` identity, because ``SplitForPressureResult.stages`` is a
+    # derived property that reads these same attributes rather than a stored
+    # list.  Each stage freeze-materializes its OWN quasilinear matrix from its
+    # raw operators before the substitution (never recomputed from the swept
+    # flux — that would drop the exact ``∂(q²/h)/∂h = −q²/h²`` wavespeed term;
+    # see ``regularize_pow``).  A later ``from_system_model(...)`` on a stage
+    # (the numpy/jax solvers re-promote at setup) is idempotent in effect:
+    # ``hinv`` is already registered and no bare negative depth power remains to
+    # rewrite.
     from zoomy_core.numerics.numerical_system_model import (  # lazy: no cycle
         to_numerical_system_model)
-    for _stage_sm in (SM_pred, SM_press, SM_corr):
-        to_numerical_system_model(_stage_sm)
+    SM_pred = to_numerical_system_model(SM_pred)
+    SM_press = to_numerical_system_model(SM_press)
+    SM_corr = to_numerical_system_model(SM_corr)
 
     return SplitForPressureResult(
         SM_pred=SM_pred, SM_press=SM_press, SM_corr=SM_corr)

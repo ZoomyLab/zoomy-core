@@ -304,7 +304,7 @@ class ConstantReconstructionV2:
         self._iInner_bnd = mesh.face_cells[0, mesh.boundary_face_face_indices].copy()
         self._n_faces = mesh.n_faces
 
-    def __call__(self, Q, bf_face_values=None, phi=None):
+    def __call__(self, Q, bf_face_values=None, phi=None, force_o1=None):
         """Reconstruct face states.
 
         Parameters
@@ -315,6 +315,14 @@ class ConstantReconstructionV2:
         phi : ignored
             Accepted for interface parity with the MUSCL classes;
             piecewise-constant reconstruction has no limiter.
+        force_o1 : ignored
+            Interface parity with the MUSCL classes.  This reconstruction
+            IS the order-1 demotion target, so an a-posteriori MOOD mask is
+            exactly a no-op here — not a silently dropped instruction.
+            ``supports_force_o1`` stays absent (falsy) so the cascade knows
+            there is nothing below this to demote to.  Declaring the
+            argument matters because :class:`SurfaceReconstruction` wraps
+            *any* base and forwards the full protocol.
 
         Returns (Q_L, Q_R) each (n_vars, n_faces).
         """

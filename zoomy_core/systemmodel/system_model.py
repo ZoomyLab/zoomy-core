@@ -2177,7 +2177,16 @@ class SystemModel:
         sub_dict = {}
         n_aux_before = len(self.aux_state)
         new_syms = []
-        function_row_of_name = {}
+        # Rows a derivative entry may target.  Seeded with the aux that is
+        # ALREADY declared on the model (prescribed bathymetry / geometry
+        # supplied via ``add_equation(..., group='aux')``), then extended
+        # below by the newly auto-promoted function atoms.  Without the seed
+        # a ``Derivative(b, x)`` whose ``b`` was declared aux resolved to
+        # ``target_kind='unknown'``, and ``Solver._walk_derivative_aux``
+        # SKIPS unknown targets — the LSQ gradient was never computed and the
+        # row read whatever was in the buffer (zero), i.e. a prescribed bed
+        # slope silently vanished from the source term.
+        function_row_of_name = {str(a): i for i, a in enumerate(self.aux_state)}
 
         # ── Function entries first (so derivative entries can ─────
         # reference them by row in the registry). ──────────────────

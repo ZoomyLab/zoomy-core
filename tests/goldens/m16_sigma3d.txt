@@ -56,7 +56,7 @@ boundary_specs: {}
 bc_tags: ['bottom', 'top']
 bc_kernel: Piecewise(ExprCondPair(ImmutableDenseNDimArray(Tuple(Symbol('b'), Symbol('h'), Symbol('mom')), Tuple(Integer(3))), Or(Equality(Symbol('bc_idx'), Integer(0)), Equality(Symbol('bc_idx'), Integer(1)))))
 aux_registry:
-  {atom=Derivative(Symbol('\\tilde{tau_xx}'), Tuple(Symbol('x'), Integer(1))), aux_symbol=Symbol('\\tilde{tau_xx}_x'), kind='derivative', multi_index=(1, 0), name='\\tilde{tau_xx}_x', row=3, target_kind='unknown', target_name='\\tilde{tau_xx}'}
-  {atom=Derivative(Symbol('\\tilde{tau_xx}'), Tuple(Symbol('zeta'), Integer(1))), aux_symbol=Symbol('\\tilde{tau_xx}_zeta'), kind='derivative', multi_index=(0, 1), name='\\tilde{tau_xx}_zeta', row=4, target_kind='unknown', target_name='\\tilde{tau_xx}'}
+  {atom=Derivative(Symbol('\\tilde{tau_xx}'), Tuple(Symbol('x'), Integer(1))), aux_symbol=Symbol('\\tilde{tau_xx}_x'), function_row=1, kind='derivative', multi_index=(1, 0), name='\\tilde{tau_xx}_x', row=3, target_kind='function', target_name='\\tilde{tau_xx}'}
+  {atom=Derivative(Symbol('\\tilde{tau_xx}'), Tuple(Symbol('zeta'), Integer(1))), aux_symbol=Symbol('\\tilde{tau_xx}_zeta'), function_row=1, kind='derivative', multi_index=(0, 1), name='\\tilde{tau_xx}_zeta', row=4, target_kind='function', target_name='\\tilde{tau_xx}'}
   {atom=Derivative(Symbol('b'), Tuple(Symbol('x'), Integer(1))), aux_symbol=Symbol('b_x'), kind='derivative', multi_index=(1, 0), name='b_x', row=5, state_index=0, target_kind='state', target_name='b'}
   {atom=Derivative(Mul(Symbol('h'), Symbol('zeta')), Tuple(Symbol('x'), Integer(1))), aux_symbol=Symbol('h*zeta_x'), kind='derivative', multi_index=(1, 0), name='h*zeta_x', row=6, target_kind='unknown', target_name='h*zeta'}

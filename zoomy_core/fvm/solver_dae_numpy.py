@@ -171,14 +171,19 @@ class DAESolver(Solver):
     def setup_simulation(self, mesh, model, *, write_output=False):
         """Build operators + state once, including BC plumbing,
         output infrastructure, and the registry-driven Qaux walker."""
-        # Normalise the input to a SystemModel — accepts a Model (structural
-        # extraction), a pre-built SystemModel (used as-is, e.g. a hand-built /
-        # ``dae=True`` index-1 DAE model whose non-diagonal M(Q) is inverted
-        # numerically here), or an NSM.  Same canonical helper the base
-        # ``Solver.initialize`` uses, so the DAE path is no longer the odd one
-        # out that only accepted a Model.
-        from zoomy_core.fvm.solver_numpy import _coerce_to_system_model
-        model = _coerce_to_system_model(model)
+        # Normalise the input through the SAME front door as
+        # ``Solver.setup_simulation``: Model / SystemModel / NSM → NSM, then
+        # work on ``nsm.sm``.  This must be the NSM view and not a bare
+        # ``_coerce_to_system_model`` result, because ``derive()`` REGISTERS
+        # AUX (the KP-desingularised ``hinv``): a bare SystemModel is one aux
+        # row shorter than the kernels ``NumpyRuntimeModel.from_system_model``
+        # compiles below (it promotes to an NSM internally), so every Qaux
+        # buffer allocated from ``len(sm.aux_state)`` was mis-sized and the
+        # first ``mass_matrix`` call raised ``IndexError: index N is out of
+        # bounds``.  One promotion, one aux width, one source of truth.
+        nsm, _source_model = self._coerce_to_nsm(model)
+        self.nsm = nsm
+        model = nsm.sm
         mesh = ensure_lsq_mesh(mesh, model)
         self._sim_mesh = mesh
         self._sim_model = model
@@ -301,40 +306,32 @@ class DAESolver(Solver):
             numerics, module=numerics_module,
         )
 
-        # IC from model.
+        # IC from model.  Same contract as ``Solver.initialize``: the IC
+        # object writes the FULL (n_state, nc) / (n_aux, nc) array.  A failure
+        # here is a real defect (wrong IC width, bad user function) and is
+        # raised — swallowing it left Q/Qaux at zero, which for a prescribed
+        # bathymetry/curvature aux is a silently different problem.
         Q = np.zeros((n_state, nc))
         if (hasattr(model, "initial_conditions")
                 and model.initial_conditions is not None):
-            try:
-                Q = np.asarray(
-                    model.initial_conditions.apply(
-                        mesh.cell_centers[:, :nc], Q,
-                    ),
-                    dtype=float,
-                )
-            except Exception:
-                pass
+            Q = np.asarray(
+                model.initial_conditions.apply(
+                    mesh.cell_centers[:, :nc], Q,
+                ),
+                dtype=float,
+            )
 
-        # Permanent-aux IC (model.aux_variables-based).  Function-aux
-        # and derivative-aux rows are filled by ``update_qaux``.
+        # Aux IC.  Function-aux and derivative-aux rows are overwritten by
+        # ``update_qaux`` right after, so the IC only has to be sane there.
         Qaux = np.zeros((self.n_aux_total, nc))
-        n_aux_permanent = (
-            len(sm.aux_state) - len(getattr(sm, "aux_registry", []))
-        )
-        if (n_aux_permanent > 0
-                and hasattr(model, "aux_initial_conditions")
+        if (hasattr(model, "aux_initial_conditions")
                 and model.aux_initial_conditions is not None):
-            try:
-                Qaux[:n_aux_permanent, :] = np.asarray(
-                    model.aux_initial_conditions.apply(
-                        mesh.cell_centers[:, :nc],
-                        Qaux[:n_aux_permanent, :],
-                    ),
-                    dtype=float,
-                )
-            except Exception:
-                pass
-        self._n_aux_permanent = n_aux_permanent
+            Qaux = np.asarray(
+                model.aux_initial_conditions.apply(
+                    mesh.cell_centers[:, :nc], Qaux,
+                ),
+                dtype=float,
+            )
         self._sim_Qaux = Qaux
         self._sim_parameters = p_arr
 
@@ -344,9 +341,20 @@ class DAESolver(Solver):
         # First Qaux fill: walk the registry once before the manifold
         # projection (so function-aux + derivative-aux entries have
         # sensible values at t = 0).
+        #
+        # ``self.rt``, NOT ``model``: ``Solver._apply_local_aux_formula`` needs a
+        # LOWERED ``update_aux_variables`` and skips a non-callable one, and on a
+        # SystemModel/NSM that slot is a symbolic ZArray.  The base
+        # ``Solver.setup_simulation`` rebinds ``_sim_model`` to the runtime for
+        # exactly this reason (``solver_numpy.py`` create_runtime → _sim_model);
+        # this solver keeps the symbolic model there and the runtime in
+        # ``self.rt``, so the local-aux leg has to be handed the runtime
+        # explicitly.  Without it the KP ``hinv`` never refreshes: it stays at
+        # its initial-condition value while ``h`` evolves, and every source term
+        # carrying ``1/h`` is evaluated at the wrong depth.
         self._sim_Qaux = self.update_qaux(
             Q, self._sim_Qaux, Q, self._sim_Qaux,
-            mesh, model, p_arr, 0.0, 0.0,
+            mesh, self.rt, p_arr, 0.0, 0.0,
         )
 
         # Jacobian colouring (sparse FD) — needed by
@@ -891,9 +899,11 @@ class DAESolver(Solver):
                                   self._sim_model, self._sim_parameters, dt)
         except TypeError:
             pass
+        # ``self.rt`` (see the note in setup_simulation): the local-aux leg needs
+        # the LOWERED ``update_aux_variables``, so the KP ``hinv`` tracks ``h``.
         Qaux_new = self.update_qaux(
             Q_new, Qaux_old, Q_old, Qaux_old,
-            self._sim_mesh, self._sim_model, self._sim_parameters,
+            self._sim_mesh, self.rt, self._sim_parameters,
             self._sim_time + dt, dt,
         )
         self._sim_Q = Q_new

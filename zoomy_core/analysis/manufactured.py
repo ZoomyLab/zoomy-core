@@ -253,15 +253,30 @@ def _normalise(expr):
     manufactured case in the suite uses a low-degree monotone ``W*`` over a flat
     bed -- the interesting solutions were simply unaffordable.
 
-    Nothing depends on the simplified *form*.  The residual is consumed
-    numerically (``lambdify`` in :func:`exact_cell_field`, code generation in the
-    backends), so simplification only ever bought readability when a case prints
-    its source.  ``cancel`` keeps rational terms in a readable normal form for
-    that, at a fraction of the price, and degrades to the raw expression rather
-    than raising if it cannot.
+    The form DOES matter -- for CONDITIONING, not readability -- and getting
+    that backwards silently destroyed a verification result.  This function once
+    read ``sp.cancel(sp.expand(expr))``, justified by "the residual is consumed
+    numerically so its form is irrelevant".  ``expand`` inflated the level-2
+    ``q_0`` row of ``moment_friction_mms`` from 316 to 4246 operations, and
+    evaluating THAT form in float64 loses 1.0e-2 absolute against a 60-digit
+    reference, on a row whose own magnitude is 1.2 -- catastrophic cancellation.
+    A manufactured source is a fixed function of ``x``, so the error does NOT
+    shrink with the mesh: the case fell from a clean EOC of 2.00/2.00/2.00 to a
+    FLAT -0.07/+0.09/-0.04 with L1 pinned near 2.8e-5 at every refinement, and
+    it read as a scheme defect rather than as an algebra defect.
+
+    Rule, therefore: normalisation may TIDY an expression but must never INFLATE
+    it.  Try the cheap rational normal form, keep it only if the operation count
+    did not grow, and otherwise return the structured (nested, well-conditioned)
+    expression untouched.  ``simplify`` is still avoided: it was the entire cost
+    of building a manufactured source and scales appallingly with the richness of
+    ``W*``.
     """
     try:
-        return sp.cancel(sp.expand(expr))
+        tidied = sp.cancel(sp.expand(expr))
+        if sp.count_ops(tidied) > sp.count_ops(expr):
+            return expr
+        return tidied
     except Exception:                                    # noqa: BLE001
         return expr
 
