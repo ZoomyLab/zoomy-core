@@ -528,10 +528,20 @@ class Settings(Zstruct):
                 kwargs["output"] = Zstruct(**kwargs["output"])
 
         output = kwargs["output"]
+        # ``clean_directory`` defaults to TRUE.  A run that inherits stale
+        # timestep directories does not fail -- it reports numbers computed
+        # from someone else's leftovers.  That has already happened: a coupling
+        # run picked up 118 stale directories (t up to 30 s), its mass audit
+        # read a t=30 frame as the "final time", and it reported a FABRICATED
+        # +76.7 % mass drift; the same pairing gives -2.487e-13 once the
+        # directory is wiped.  A silent wrong answer is worse than a lost output
+        # directory.  The previous defaults were also self-inconsistent:
+        # omitting ``output`` entirely gave True, while passing an ``output``
+        # Zstruct without the key gave False.
         defaults = {
             "directory": "output",
             "filename": "simulation",
-            "clean_directory": False,
+            "clean_directory": True,
             "snapshots": 2,
         }
 
@@ -552,7 +562,7 @@ class Settings(Zstruct):
                 directory="output",
                 filename="simulation",
                 snapshots=2,
-                clean_directory=False,
+                clean_directory=True,
             )
         )
 
