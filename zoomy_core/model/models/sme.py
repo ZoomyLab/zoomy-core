@@ -512,7 +512,24 @@ class SME(BaseModel):
         and pad the extra interior slots with the central advection ``n·u_m``
         (provably inside the gravity cone).  Sharp wavespeed at any level, no
         per-face eigensolve.  If even the twin has no symbolic spectrum, leave
-        ``eigenvalues = None`` → the runtime's opaque numeric eigensystem."""
+        ``eigenvalues = None`` → the runtime's numerical wave speed.
+
+        **The gravity cone bounds the TRUNCATED matrix, not the FULL one.**
+        That distinction is easy to lose, because everything on this method
+        (and the level-5 splice above) is stated about the matrix with the
+        moment coefficients ``≥ 2`` zeroed — which is the only matrix the
+        β-HSWME spectrum describes.  The runtime quasilinear matrix is NOT
+        truncated, and it is not even hyperbolic everywhere.  MEASURED on
+        ``SME(level=4, dimension=3)`` (n = 12, the confluence closure stack),
+        ``|n·u_m| + √(g h + (n·α₁)²)`` against ``numpy.linalg.eigvals`` of the
+        FULL normal-projected matrix: BELOW the true spectral radius on 192 of
+        288 realistic wet states and 864 of 1400 across a near-dry / strong-
+        shear / bed-step sweep, down to 0.031× at worst — the moment waves ride
+        on ``α_{≥2}``, which the closed form does not see at all.  So it is not
+        a usable CFL bound for the ``eigenvalues is None`` path; that path uses
+        :attr:`~zoomy_core.systemmodel.system_model.SystemModel.
+        spectral_radius_bound`, which bounds the matrix the solver actually
+        marches."""
         n_eq = sm.n_equations
         twin = SystemModel.from_model(SME(level=5, dimension=int(self.dimension),
                    closures=self.closures,

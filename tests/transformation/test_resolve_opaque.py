@@ -157,16 +157,26 @@ def test_resolve_opaque_inlines_and_matches_fused_silo(sme_numerics):
 
 
 def test_resolve_opaque_leaves_external_kernels_as_calls():
-    """VAM has no closed-form spectrum — its wave speed is the opaque
-    ``eigenvalues(idx, *A_flat)`` UserFunctions kernel.  It has no symbolic
-    definition, so resolve_opaque must keep it a CALL."""
+    """An EXTERNAL kernel — one with no symbolic definition, supplied by each
+    backend's UserFunctions — must survive ``resolve_opaque`` as a CALL, while
+    a REGISTERED one is inlined.
+
+    The vehicle is Roe's ``eigensystem(idx, *A_flat)``: the scheme assembles
+    ``|A| = R|Λ|L`` on top of the opaque decomposition for ANY SystemModel, so
+    the call is there whether or not the model has a closed-form spectrum.
+    It USED to be the λ-only ``eigenvalues`` kernel via VAM's Rusanov wave
+    speed, but that is no longer external to anything: the wave speed is now
+    ``SystemModel.spectral_radius_bound``, a closed-form expression with no
+    eigensolve in it — which is the whole point of that change, so testing the
+    property here needs a kernel that is still genuinely external."""
     from zoomy_core.model.models.vam import VAM
+    from zoomy_core.fvm.riemann_solvers import NonconservativeRoe
 
     nsm = NumericalSystemModel.from_model(
         VAM(level=1, closures=[Newtonian(), NavierSlip(), StressFree()]),
-        riemann=NonconservativeRusanov).derive()
+        riemann=NonconservativeRoe).derive()
     num = nsm.build_numerics()
     pr_on = AmrexNumerics(num, resolve_opaque=True)
     body = pr_on._process_kernel_from_function(_consumer(num))[0]
     assert "numerical_flux(" not in body        # registered -> inlined
-    assert "eigenvalues(" in body               # external -> stays a call
+    assert "eigensystem(" in body               # external -> stays a call

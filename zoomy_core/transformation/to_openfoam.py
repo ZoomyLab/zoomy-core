@@ -12,6 +12,7 @@ import itertools
 
 import sympy as sp
 
+from zoomy_core.misc.misc import ZArray
 from zoomy_core.numerics.numerical_system_model import to_numerical_system_model
 from zoomy_core.transformation.generic_c import GenericCppBase, GenericCppModel
 
@@ -66,6 +67,35 @@ _FOAM_ARG = {
 
 _AXIS = ("x", "y", "z")
 
+
+def _qualified_numerics_call(name):
+    """Print an opaque UserFunctions leaf as ``numerics::<name>(…)``.
+
+    The leaves (``eigensystem`` — the Roe ``|A| = R|Λ|L`` decomposition;
+    ``eigenvalues`` — its λ-only companion; ``solve`` — the point-implicit
+    source's per-cell ``A⁻¹b``) are implemented in ``UserFunctions.H`` under
+    ``namespace numerics``, while the generated kernels live in ``namespace
+    Model`` / ``namespace Numerics``.  Unqualified lookup does not reach
+    ``numerics``, so the call MUST carry the namespace (REQ-187: it did not,
+    and VAM / opaque-eigenvalue models failed to compile with "'eigenvalues'
+    not declared in this scope" while analytic-eigenvalue SWE was unaffected).
+
+    Shared by BOTH foam printers.  It used to sit on the Numerics printer
+    alone, which left the SAME bug live in ``Model.H`` — and there
+    ``eigenvalues`` is worse than unresolved, because the emitted kernel is
+    itself named ``eigenvalues`` and the unqualified call binds to IT.
+    """
+    def _emit(printer, *args):
+        return (f"numerics::{name}("
+                + ", ".join(printer.doprint(a) for a in args) + ")")
+    return _emit
+
+
+_NUMERICS_QUALIFIED = {
+    name: _qualified_numerics_call(name)
+    for name in ("eigensystem", "eigenvalues", "solve")
+}
+
 # Canonical 3D-field profile exchanged across a preCICE interface (Phase 7).
 # ``interpolate_to_3d`` emits these in order; ``project_from_3d`` consumes
 # them via fresh ``P3_<field>`` symbols mapped to ``profile[i]``.
@@ -99,9 +129,13 @@ class FoamSystemModelPrinter(GenericCppBase):
     Options
     -------
     analytical_eigenvalues : bool, default False
-        If True, emit the SystemModel's symbolic eigenvalue spectrum.
-        If False, emit a zero placeholder — the solver computes
-        eigenvalues numerically from ``quasilinear_matrix``.
+        If True, emit a REAL spectrum: the SystemModel's symbolic
+        ``eigenvalues`` when it has them, else the numerical spectrum off
+        ``quasilinear_matrix``.  If False, emit a zero placeholder — the
+        solver computes eigenvalues numerically itself.  Either way this
+        slot is NOT the wave speed: that is
+        ``Numerics::local_max_abs_eigenvalue``, which takes the closed-form
+        ``spectral_radius_bound`` and never an eigensolve.
     """
 
     _output_subdir = ".foam_interface"
@@ -111,6 +145,9 @@ class FoamSystemModelPrinter(GenericCppBase):
     # ``ARG_MAPPING``; the C family (foam included) spells it ``bc_idx``.
     # Pure spelling — the group itself is declared on the BC Function.
     ARG_MAPPING = {**GenericCppBase.ARG_MAPPING, "idx": "bc_idx"}
+    # Opaque UserFunctions leaves resolve through ``numerics::`` HERE too, not
+    # just in the Numerics printer — see :func:`_qualified_numerics_call`.
+    c_functions = {**GenericCppBase.c_functions, **_NUMERICS_QUALIFIED}
     analytical_eigenvalues = False
     # Phase 7 coupling: the inverse 3D→2D map.  Read from the model-owned
     # ``sm.project_from_3d`` slot (filled by ``register_group("project", …)``)
@@ -343,11 +380,24 @@ class FoamSystemModelPrinter(GenericCppBase):
             self._operator_arg_keys("quasilinear_matrix"),
         )
 
-        eig_expr = (
-            sm.eigenvalues
-            if self.analytical_eigenvalues
-            else sp.Array([[0]] * n_eq)
-        )
+        # ``analytical_eigenvalues=True`` asks for a REAL spectrum here.  When
+        # the model carries none it used to hand ``None`` straight to
+        # ``_kernel``, which dies inside the CSE pass with a bare
+        # ``AttributeError: 'NoneType' object has no attribute 'replace'`` —
+        # so every foam emission of an SME model stopped working the moment
+        # ``symbolic_spectrum`` defaulted off, with no hint of why.  Fall back
+        # to the NUMERICAL spectrum, which is what "a real spectrum, no closed
+        # form" means everywhere else in the stack.  It is not the wave-speed
+        # path (that is ``Numerics::local_max_abs_eigenvalue``, which takes
+        # ``spectral_radius_bound`` and never an eigensolve) and no foam solver
+        # reads ``Model::eigenvalues`` today, so this puts no decomposition on
+        # any hot path — it just stops the printer lying by omission.
+        if self.analytical_eigenvalues:
+            eig_expr = (sm.eigenvalues if sm.eigenvalues is not None
+                        else ZArray(list(sm.numerical_eigenvalues)
+                                    ).reshape(n_eq, 1))
+        else:
+            eig_expr = sp.Array([[0]] * n_eq)
         blocks.append(
             self._kernel(
                 "eigenvalues", eig_expr, (n_eq, 1),
@@ -782,41 +832,7 @@ class FoamNumericsPrinter(GenericCppBase):
     _output_subdir = ".foam_interface"
     real_type = "Foam::scalar"
     math_namespace = "Foam::"
-    # ``eigensystem(idx, *A_flat)`` is the opaque eigendecomposition leaf
-    # the Roe scheme builds ``|A| = R|Lambda|L`` from.  It is
-    # implemented in UserFunctions.H (``numerics::eigensystem``,
-    # Eigen-backed); the generated kernels live in ``namespace Numerics``,
-    # so the call MUST be namespace-qualified to resolve (unqualified
-    # lookup would not reach ``namespace numerics``).
-    @staticmethod
-    def _emit_eigensystem(printer, *args):
-        return "numerics::eigensystem(" + ", ".join(
-            printer.doprint(a) for a in args
-        ) + ")"
-
-    # REQ-187: EVERY opaque UserFunctions kernel needs the same qualification —
-    # ``eigenvalues`` (the λ-only wave-speed kernel, REQ-167/168) and ``solve``
-    # (point-implicit source) were emitted unqualified, so VAM / opaque-
-    # eigenvalue models failed to compile ('eigenvalues' not declared in this
-    # scope) while analytic-eigenvalue SWE was unaffected.
-    @staticmethod
-    def _emit_eigenvalues(printer, *args):
-        return "numerics::eigenvalues(" + ", ".join(
-            printer.doprint(a) for a in args
-        ) + ")"
-
-    @staticmethod
-    def _emit_solve(printer, *args):
-        return "numerics::solve(" + ", ".join(
-            printer.doprint(a) for a in args
-        ) + ")"
-
-    c_functions = {
-        **GenericCppBase.c_functions,
-        "eigensystem": _emit_eigensystem.__func__,
-        "eigenvalues": _emit_eigenvalues.__func__,
-        "solve": _emit_solve.__func__,
-    }
+    c_functions = {**GenericCppBase.c_functions, **_NUMERICS_QUALIFIED}
 
     def __init__(self, numerics, **opts):
         super().__init__()

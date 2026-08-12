@@ -513,6 +513,53 @@ def _attach_function_groups(sm, model, canonical_source=None) -> None:
         sm.position = Zstruct(X0=x, X1=y_pos, X2=z_pos)
 
 
+# ── spectral-radius bound (no eigen-decomposition) ───────────────────────
+
+
+def _perron_radius_bound(M, iterations):
+    """``Min`` over ``k ≤ iterations`` of ``(maxᵢ (Mᵏ·1)ᵢ)^{1/k}`` — a strict
+    upper bound on ``ρ(M)`` for a NONNEGATIVE symbolic matrix ``M`` (given as
+    a list of rows), read off one ``vₖ = M vₖ₋₁`` chain from ``v₀ = 1``.
+
+    See :attr:`SystemModel.spectral_radius_bound` for the statement, the
+    safety argument and the measured tightness.  Every candidate is an upper
+    bound on its own, so the ``Min`` is one too.
+
+    Deliberately ALL products and NO quotients: the obvious companion bound
+    (Collatz–Wielandt, ``ρ(M) ≤ maxᵢ (Mv)ᵢ/vᵢ`` for any ``v > 0``) is tighter
+    per iteration but needs the iterate rescaled and floored away from zero —
+    and a ``Max`` INSIDE the chain multiplies the symbolic TREE size by
+    ``n + 1`` per step on top of the ``n`` the matvec already costs.  Sympy's
+    ``Max``/``Min`` constructor sorts its arguments through ``ordered`` →
+    ``_node_count``, which walks the TREE and does not see the shared DAG, so
+    that turned a 0.8 s foam emission of ``SME(level=1)`` into 70 s.  Products
+    only keeps the tree at ``nᵏ`` and the emission at 2 s.
+
+    ``evaluate=False`` on both reductions for the SAME reason
+    ``local_max_abs_eigenvalue`` uses it: ``Max``/``Min`` over wave-speed
+    scale expressions is a RUNTIME reduction, and letting sympy attempt the
+    pairwise ordering expands every branch and explodes setup further.
+
+    No rescaling means ``vₖ`` carries the raw ``ρᵏ``.  In IEEE double that is
+    unreachable either way for a wave speed: overflow needs ``‖A‖ > 1e77``
+    and underflow ``‖A‖ < 1e-77`` at ``k = 4``.
+    """
+    n = len(M)
+    v = [sp.Integer(1)] * n
+    candidates = []
+    for k in range(1, iterations + 1):
+        v = [sum(M[i][j] * v[j] for j in range(n)) for i in range(n)]   # Mᵏ·1
+        peak = sp.Max(*v, evaluate=False)
+        # ``evaluate=False`` on the root as well: ``sqrt(a·b)`` otherwise
+        # SPLITS into ``sqrt(a)·sqrt(b)`` (sympy can see the factors are
+        # non-negative), and the C printers emit one ``pow`` call per factor.
+        candidates.append(peak if k == 1 else
+                          sp.Pow(peak, sp.Rational(1, k), evaluate=False))
+    if len(candidates) == 1:
+        return candidates[0]
+    return sp.Min(*candidates, evaluate=False)
+
+
 @dataclass
 class SystemModel:
     """Symbolic operator-form PDE system.
@@ -1353,6 +1400,96 @@ class SystemModel:
         ]
         stack = _ev(*A_flat)
         return ZArray([_pick(stack, sp.Integer(idx)) for idx in range(n)])
+
+    # Power-norm steps in :attr:`spectral_radius_bound`.  A pure
+    # cost/tightness dial — see that property for the measured table.
+    # Deliberately NOT a dataclass field: it is a scheme constant, not
+    # per-instance state, so it neither enters the SM cache key nor breaks
+    # unpickling of older blobs.
+    spectral_bound_iterations = 2
+
+    @property
+    def spectral_radius_bound(self):
+        """CLOSED-FORM upper bound on ``ρ(A_n)`` — the wave speed, without an
+        eigen-decomposition.  A scalar expression, not a spectrum.
+
+        The CFL / Rusanov consumer needs ``max|λ|``, and a RADIUS is far
+        cheaper than a SPECTRUM: :attr:`numerical_eigenvalues` costs an
+        ``Eigen::EigenSolver`` per face per step (an ``O(n³)`` QR iteration
+        behind an opaque kernel call), which is what made every emitted C /
+        foam SME case run ~40× slow once a model stopped carrying a
+        closed-form ``eigenvalues``.
+
+        ONE classical statement, applied at several ``k``::
+
+            ρ(A)ᵏ = ρ(Aᵏ) ≤ ‖Aᵏ‖_∞ ≤ ‖|A|ᵏ‖_∞ = ‖|A|ᵏ·1‖_∞
+
+        so ``ρ(A_n) ≤ (maxᵢ (Mᵏ·1)ᵢ)^{1/k}`` with ``M = |A_n|``, for EVERY
+        ``k ≥ 1``.  ``k = 1`` is exactly the Gershgorin row-sum ``‖A_n‖_∞``;
+        each further ``k`` is one more matvec on the same chain
+        ``vₖ = M vₖ₋₁`` from ``v₀ = 1``, and the bound falls toward
+        ``ρ(|A_n|)``.  The emitted kernel is the ``Min`` over ``k ≤
+        iterations``.
+
+        The second step is what makes this usable at all, and SWE at rest
+        shows why in two lines: ``A = [[0, 1], [c², 0]]`` has ``ρ = c``, the
+        row-sum bound reads ``c²`` (a factor ``c`` = 3.13 too large at
+        ``g h = 9.81``, and dimensionally wrong — ``g·h``, not ``√(g·h)``,
+        exactly the REQ-167 objection to Gershgorin), and ``M²·1 = (c², c²)``
+        makes ``k = 2`` return ``c`` EXACTLY.  Squaring is what restores the
+        dimensional homogeneity the conservative variables destroyed.
+
+        **Safety is structural, not statistical.**  Every candidate is an
+        upper bound on its own — no eigenvalue is ever computed, nothing
+        converges, and there is no iterate at which the inequality could fail.
+        So ``iterations`` buys TIGHTNESS ONLY, the CFL cannot go unsafe, and
+        no safety factor is needed.  Measured on the confluence
+        ``SME(level=4, dimension=3)`` (n = 12) against
+        ``numpy.linalg.eigvals`` of the SAME matrix over 1688 states — wet,
+        near-dry to ``h = 1e-8``, ``|u|`` to 10 m/s, shear to ``3·u``, bed
+        steps, axis-aligned and oblique normals — as ``bound / ρ(A_n)``, and
+        the codegen cost of the foam ``NumericsKernels.H`` it emits:
+
+        ==========  ==========  ==========  ==========  ==========  =========
+        iterations  median wet  p95 wet     median all  min ratio   emit (s)
+        ==========  ==========  ==========  ==========  ==========  =========
+        1           2.79        6.00        4.86        1.457       ~40
+        2           1.40        1.80        2.17        1.224       46
+        3           1.38        1.63        1.88        1.126       424
+        ==========  ==========  ==========  ==========  ==========  =========
+
+        (5064 bound evaluations, 0 below 1.  For reference the incumbent — the
+        opaque eigensolve — is not a bound at all: it returns ``max|Re λ|``,
+        which came in BELOW ``ρ(A_n)`` on 2 of those states, both
+        non-hyperbolic.)
+
+        Two things set the default at 2.  It is where the runtime win is
+        already essentially complete (2 matvecs = ``2n²`` multiply-adds
+        against an ``O(n³)`` QR iteration plus an ``Eigen::MatrixXd`` heap
+        allocation per call), AND it is the last ``k`` whose CODEGEN is cheap:
+        the C printers walk the expression TREE, not the shared DAG, and the
+        tree grows by a factor ``n`` per step (``count_ops`` 1.9k / 23k / 239k
+        at ``k = 1 / 2 / 3``, ``n = 12``), so ``k = 3`` already costs 424 s to
+        emit at ``n = 12`` where ``k = 2`` costs 46 s — and the whole
+        ``NumericsKernels.H`` took 69 s on the opaque-eigensolve baseline, so
+        at ``k = 2`` this is a codegen SPEED-UP as well.  Raise
+        ``spectral_bound_iterations`` on a small system, where ``nᵏ`` is
+        affordable and the extra tightness is free.
+
+        The limit of the chain is ``ρ(|A_n|)``, at 1.001 (median, wet) on the
+        same sweep — what is left on the table past a few iterations is the
+        sign cancellation ``|·|`` throws away, not the iteration.
+
+        A *derived* operator (a cheap symbolic wrapping of
+        ``quasilinear_matrix``), so exposed as a property — always consistent
+        with the current matrix, exactly like :attr:`numerical_eigenvalues`.
+        """
+        n = self.n_equations
+        qm = self.quasilinear_matrix
+        normal = list(self.normal.values())
+        M = [[sp.Abs(sum(qm[i, j, d] * normal[d] for d in range(self.n_dim)))
+              for j in range(n)] for i in range(n)]
+        return _perron_radius_bound(M, self.spectral_bound_iterations)
 
     def refresh_derived_operators(self, *, eigenvalues: bool = False):
         """Recompute ``quasilinear_matrix`` and the source jacobians from

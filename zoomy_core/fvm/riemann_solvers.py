@@ -17,7 +17,8 @@ from zoomy_core.model.basefunction import SymbolicRegistrar
 from zoomy_core.model.kernel_functions import (
     conditional,
 )
-from zoomy_core.systemmodel.system_model import SystemModel
+from zoomy_core.systemmodel.system_model import (
+    SystemModel, _perron_radius_bound)
 from zoomy_core.transformation.to_numpy import (
     NumpyRuntimeModel, NumpyRuntimeSymbolic,
 )
@@ -399,10 +400,12 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         Computed DIRECTLY from the model spectrum:
         ``Max(|λ_i|)`` over the SystemModel's normal-projected
         ``eigenvalues``.  When the model carries no closed-form spectrum
-        (``model.eigenvalues is None`` — hand-built models such as VAM) it
-        falls back to the Gershgorin row-sum upper bound of ``|A_n|`` (the
-        normal-projected quasilinear / flux-Jacobian matrix), a finite
-        bound so Rusanov keeps a finite ``dt``.
+        (``model.eigenvalues is None`` — SME by default, hand-built models
+        such as VAM) it falls back to
+        :attr:`~zoomy_core.systemmodel.system_model.SystemModel.
+        spectral_radius_bound`, a strict closed-form upper bound on
+        ``ρ(A_n)`` built from the normal-projected quasilinear matrix — see
+        :meth:`local_max_abs_eigenvalue`.
         """
         return self.local_max_abs_eigenvalue(
             self.variables, self.aux_variables,
@@ -413,53 +416,68 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         """Spectral radius at the given state ``(Q, Qaux, p, n)`` — the real
         expression substituted into Rusanov dissipation / CFL.
 
-        ``Max(|λ_i|)`` from the model's closed-form normal-projected
-        ``eigenvalues`` when it has one; otherwise (SME / VAM, or SWE with
-        ``eigenvalues=None``) the DIMENSIONALLY CORRECT numerical spectrum via
-        the opaque ``eigenvalues`` kernel — the SAME wave speed the backends
-        realise for Roe (REQ-167/168).  The old Gershgorin row-sum
-        (:meth:`_gershgorin_spectral_radius`) is kept only as an explicit
-        opt-in: it row-sums a dimensionally-inhomogeneous matrix and returns
-        ``~g·h`` rather than ``sqrt(g·h)`` (~6-9× too large), which marches a
-        conservative scheme unstable — so it is no longer the default."""
+        Two paths, and the model's own spectrum always wins:
+
+        * closed-form ``eigenvalues`` (SWE, SME with ``symbolic_spectrum``)
+          → ``Max(|λ_i|)`` over EXACTLY that spectrum, unchanged;
+        * no closed form (``eigenvalues is None`` — SME by default, VAM, every
+          hand-built model) → the model's :attr:`~zoomy_core.systemmodel.
+          system_model.SystemModel.spectral_radius_bound`, a closed-form
+          UPPER bound on ``ρ(A_n)`` with no eigen-decomposition in it.
+
+        The second path used to be the opaque ``numerical_eigenvalues``
+        kernel, i.e. a full numerical eigen-decomposition of the 12×12 (SME
+        level 4, 2-D) normal-projected quasilinear matrix PER FACE PER STEP,
+        on both sides of every face — which is what put the emitted C / foam
+        SME cases at ~40× their old cost the moment a model stopped carrying a
+        symbolic spectrum.  This kernel wants a RADIUS, and a radius is far
+        cheaper than a spectrum.  MEASURED on the EMITTED foam kernel of the
+        confluence ``SME(level=4, dimension=3)``, compiled ``-O2``, LAPACK
+        ``dgeev`` standing in for ``Eigen::EigenSolver``: 23.13 µs/call before,
+        0.241 µs/call after — **96×**, and 49× on ``SME(level=1)`` at n = 4.
+        The bound is STRICT at any iteration count, so the CFL cannot go
+        unsafe (see that property for the derivation and the tightness).
+
+        NOT a replacement for a spectrum: the bound is one number, so Roe —
+        which needs ``R |Λ| L`` — still goes through ``eigensystem``.  Only
+        the wave-speed consumers (Rusanov / LF dissipation, CFL dt) read this.
+        """
         if Q is None:
             return self.local_max_eigenvalue_definition()
-        if self.model.eigenvalues is not None:
-            eig = list(sp.flatten(
-                self._model_eval("eigenvalues", Q, Qaux, p, n)))
-            src = eig
-        else:
-            src = list(sp.flatten(
-                self._model_eval("numerical_eigenvalues", Q, Qaux, p, n)))
-        # ``evaluate=False`` (both the closed-form and the opaque spectrum):
-        # ``Max`` over a wave spectrum is a runtime reduction, never a symbolic
-        # simplification target.  Letting sympy evaluate it triggers the O(n²)
-        # ``_find_localzeros`` → ``factor_terms(λ_i − λ_j)`` pairwise ordering
-        # attempt — which cannot succeed (opaque / non-orderable wave speeds)
-        # yet expands each huge Jacobian-eigenvalue tree, exploding SETUP.  The
-        # unevaluated node lowers to ``np.amax``/the backend max UNCHANGED (max
-        # is exact + associative → bit-identical numerics).
+        if self.model.eigenvalues is None:
+            return self._spectral_radius_bound(Q, Qaux, p, n)
+        src = list(sp.flatten(self._model_eval("eigenvalues", Q, Qaux, p, n)))
+        # ``evaluate=False``: ``Max`` over a wave spectrum is a runtime
+        # reduction, never a symbolic simplification target.  Letting sympy
+        # evaluate it triggers the O(n²) ``_find_localzeros`` →
+        # ``factor_terms(λ_i − λ_j)`` pairwise ordering attempt — which cannot
+        # succeed (non-orderable wave speeds) yet expands each huge
+        # Jacobian-eigenvalue tree, exploding SETUP.  The unevaluated node
+        # lowers to ``np.amax``/the backend max UNCHANGED (max is exact +
+        # associative → bit-identical numerics).
         return sp.Max(*[sp.Abs(lam) for lam in src], evaluate=False)
 
-    def _gershgorin_spectral_radius(self, Q, Qaux, p, n):
-        """Gershgorin row-sum upper bound of the spectral radius of the
-        normal-projected quasilinear matrix ``A_n = Σ_d n_d A[:, :, d]``:
-        ``max_i Σ_j |A_n[i, j]|``.  A finite over-estimate of ``max|λ|`` —
-        used when the model has no closed-form ``eigenvalues`` (e.g.
-        hand-built VAM), so Rusanov/LF still get a finite, non-zero wave
-        speed."""
+    def _spectral_radius_bound(self, Q, Qaux, p, n):
+        """The model's :attr:`~zoomy_core.systemmodel.system_model.SystemModel.
+        spectral_radius_bound` at the numerics' own state symbols.
+
+        Built HERE from the ALREADY-SUBSTITUTED quasilinear matrix rather than
+        read off the SystemModel property and ``subs``-ed: ``subs`` rebuilds
+        the tree WITH evaluation, which would collapse the two
+        ``evaluate=False`` reductions the bound is made of and hand sympy the
+        pairwise ``Max``/``Min`` ordering of a dozen wave-speed trees.  Both
+        routes call the same :func:`_perron_radius_bound`, so the emitted
+        expression is structurally identical either way.
+        """
         A = self._model_eval("quasilinear_matrix", Q, Qaux, p)
-        n_vars = self.n_variables
         nrm = list(n)
         dim = len(nrm)
-        row_sums = []
-        for i in range(n_vars):
-            s = sp.Integer(0)
-            for j in range(n_vars):
-                A_n_ij = sum(A[i, j, d] * nrm[d] for d in range(dim))
-                s += sp.Abs(A_n_ij)
-            row_sums.append(s)
-        return sp.Max(*row_sums)
+        M = [[sp.Abs(sum(A[i, j, d] * nrm[d] for d in range(dim)))
+              for j in range(self.n_variables)]
+             for i in range(self.n_variables)]
+        return _perron_radius_bound(
+            M, getattr(self.model, "spectral_bound_iterations",
+                       SystemModel.spectral_bound_iterations))
 
     def _model_eval(self, operator_name, Q, Qaux, p, n=None):
         """Evaluate a SystemModel operator at a given state.

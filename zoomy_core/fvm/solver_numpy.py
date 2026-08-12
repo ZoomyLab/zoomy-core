@@ -529,8 +529,11 @@ class HyperbolicSolver(Solver):
         # spectrum — ``eigenvalues is None``): one vectorized quasilinear
         # evaluation over all cells + one stacked np.linalg.eigvals over
         # all face-side matrices, two orders of magnitude cheaper than a
-        # per-face Python loop.  Mirrors the Gershgorin/numerical fallback
-        # the symbolic Numerics uses for the flux dissipation.
+        # per-face Python loop.  This is the dt path and it stays EXACT; the
+        # flux dissipation takes the cheap ``spectral_radius_bound`` instead
+        # (``riemann_solvers.local_max_abs_eigenvalue``), because that one is
+        # evaluated per face inside emitted C where an eigensolve is not
+        # batchable.
         rt = NumpyRuntimeModel.from_system_model(symbolic_model)
         ql_fn = rt.quasilinear_matrix
         n_vars = symbolic_model.n_variables
