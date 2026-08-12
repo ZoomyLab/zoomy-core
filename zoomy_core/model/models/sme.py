@@ -79,6 +79,23 @@ class SME(BaseModel):
         "closures=[KEpsilonViscosity(), RoughWall()].  Each closes one stress "
         "component (bulk / bottom / surface).  An empty list leaves tau_xz "
         "UNCLOSED (modal moments stay free)."))
+    symbolic_spectrum = param.Boolean(default=False, doc=(
+        "Compute the closed-form beta-HSWME spectrum at BUILD time "
+        "(:meth:`_register_hswme_spectrum`).  OFF by default: the runtime then "
+        "takes numerical eigenvalues from the quasilinear matrix, which every "
+        "consumer already supports via ``eigenvalues is None`` (the path "
+        "hand-built models such as VAM have always used).\n\n"
+        "The closed form buys a sharp analytic Rusanov/CFL wavespeed with no "
+        "per-face eigensolve, but it costs a SYMBOLIC eigen-decomposition: "
+        "``A.eigenvals()`` factors the truncated characteristic polynomial over "
+        "the integers, and sympy's heuristic polynomial GCD then runs on huge "
+        "integer coefficients.  Measured on SME(level=2, dimension=3): 67 s of "
+        "a 123 s build -- 54%, of which 61 s is ``dup_zz_heu_gcd`` from a mere "
+        "16 calls.  The cost grows ~9x per level, so at level 4 in 2-D it turns "
+        "a minutes-long derivation into an hours-long one and made ordinary "
+        "postprocessing (which never reads ``eigenvalues``) unaffordable.\n\n"
+        "Turn it ON for a production run whose CFL bound you want analytic; "
+        "leave it OFF for derivation, codegen and postprocessing."))
     project_nz = param.Integer(default=33, bounds=(2, None), doc=(
         "FIXED number of vertical samples ``N_z`` for the Integral-FREE "
         "``project_from_3d`` Galerkin reduction: the resolved (e.g. VOF) "

@@ -52,7 +52,17 @@ def build_sme(model) -> SystemModel:
     m.apply({pf: HydrostaticPressure(pf)})
     sm = SystemModel.from_model(m, Q=qs, canonical_source=model)
     m.apply({HydrostaticPressure(pf): pf})   # un-tag: leave derivation clean
-    model._register_hswme_spectrum(sm)
+    # Closed-form spectrum only on request (``symbolic_spectrum``).  It is a
+    # symbolic eigen-decomposition of the truncated quasilinear matrix, and it
+    # dominated the build: 67 s of a 123 s SME(level=2, dimension=3), 61 s of
+    # that inside sympy's heuristic integer polynomial GCD from 16 calls, and
+    # ~9x worse per level -- so level 4 in 2-D ran for hours and blocked
+    # postprocessing that never looks at ``eigenvalues`` at all.  Left off, the
+    # attribute stays None and the runtime takes NUMERICAL eigenvalues from the
+    # quasilinear matrix, which riemann_solvers / solver_numpy already treat as
+    # a first-class path (it is what hand-built models like VAM always used).
+    if getattr(model, "symbolic_spectrum", False):
+        model._register_hswme_spectrum(sm)
     resolve_and_attach(sm, model.boundary_conditions,
                        aux_bcs=model.aux_boundary_conditions)
     return sm

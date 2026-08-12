@@ -1408,6 +1408,28 @@ class GenericCppModel(GenericCppBase):
             (n_eq, n_state),
             self._operator_arg_keys("quasilinear_matrix"),
         )
+        if self.analytical_eigenvalues and sm.eigenvalues is None:
+            # A zero-filled eigenvalue kernel used to be emitted here.  That is
+            # a SILENT zero wave speed: max|lambda| = 0 makes the CFL bound
+            # vacuous and dt unbounded, and the emitted solver looks healthy
+            # while marching on nonsense.  Any model without a symbolic
+            # spectrum hit it -- per riemann_solvers, that includes hand-built
+            # ones such as VAM -- so it was reachable before SME's
+            # ``symbolic_spectrum`` ever defaulted to False.
+            #
+            # Refuse instead.  The in-process solvers take numerical
+            # eigenvalues from the quasilinear matrix when the slot is None;
+            # emitted C has no such fallback yet, so the choice has to be
+            # explicit rather than silently wrong.
+            raise ValueError(
+                "cannot emit an eigenvalue kernel: this SystemModel carries no "
+                "symbolic spectrum (`eigenvalues is None`). Emitting zeros "
+                "would give a zero wave speed and an unbounded CFL step. "
+                "Either build the model with `symbolic_spectrum=True` (SME: "
+                "closed-form beta-HSWME spectrum, expensive at high level), or "
+                "set `analytical_eigenvalues = False` on this printer if the "
+                "consumer computes the spectrum numerically from the emitted "
+                "quasilinear matrix.")
         eig_expr = (
             sm.eigenvalues
             if self.analytical_eigenvalues and sm.eigenvalues is not None
