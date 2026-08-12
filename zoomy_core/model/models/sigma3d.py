@@ -225,14 +225,30 @@ class Sigma3D(BaseModel):
         mom = sp.Function("mom", real=True)(t, x, zeta)        # conserved h·ũ
         omega = sp.Function("omega", real=True)(t, x, zeta)    # σ vertical velocity
         u = mom / h
-        # conservative-σ momentum (raw 1/h; viscous −∂_ζ(ν/h ∂_ζ u) from Newtonian).
+        # The vertical viscous term is taken FROM THE BULK CLOSURE, not assumed.
+        # A bulk closure returns τ̃_xz = ρ·ν_eff(ζ)·∂_z ũ, and under the σ-map
+        # ∂_z = (1/h)∂_ζ, so the σ-momentum carries −∂_ζ(τ̃_xz/ρ).  Writing it
+        # this way keeps a ζ-DEPENDENT eddy viscosity (Elder: ν_t = κ u_⋆ h ζ(1−ζ))
+        # exactly as the derivation produced it; hard-writing ν/h ∂_ζ u would
+        # silently assume a constant scalar viscosity and the verify below would
+        # (correctly) fail.  Newtonian reduces to the old form identically.
+        bulk_clos = [c for c in clos if getattr(c, "closes", None) == "bulk"]
+        if bulk_clos:
+            tau_bulk = sum((c.expression(_cstate(at=zeta)) for c in bulk_clos),
+                           sp.S.Zero)
+            # rewrite in the conserved variable, exactly as the verify below
+            # rewrites the derived momentum (ũ = mom/h).
+            viscous = (-d.zeta(tau_bulk / rho)).subs(ut, mom / h)
+        else:                                   # no bulk closure ⇒ inviscid
+            viscous = sp.S.Zero
+        # conservative-σ momentum (raw 1/h; viscous term from the bulk closure).
         # The IN-PLANE deviatoric stress enters as the σ-conservative divergence
         # of τ̃_xx: physical −(h/ρ)∂_x τ_xx maps (via ∂_x|_z = ∂_x|_ζ − (∂_x zc/h)∂_ζ)
         # to −(1/ρ)[h ∂_x τ̃_xx − ∂_ζ τ̃_xx · ∂_x zc].  τ̃_xx=0 (shallow closure)
         # ⇒ this term vanishes and we recover the shallow-moment momentum exactly.
         inplane = -(h * d.x(tau_xx_t) - d.zeta(tau_xx_t) * d.x(zc)) / rho
         cons_mom = (d.t(mom) + d.x(mom * u + g * h**2 / 2) + d.zeta(mom * omega)
-                    + g * h * d.x(b) - e_x * g * h - d.zeta(nu / h * d.zeta(u))
+                    + g * h * d.x(b) - e_x * g * h + viscous
                     + inplane)
         # VERIFY the clean conservative form ≡ the derived σ-momentum (ũ=mom/h,
         # w̃=h·ω+∂_t z+ũ ∂_x z) — a faithful derivation, not a hand-write.
