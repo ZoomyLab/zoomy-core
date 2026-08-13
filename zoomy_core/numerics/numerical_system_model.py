@@ -316,6 +316,84 @@ def _operator_is_live(arr) -> bool:
     return False
 
 
+# ── per-operator structural-zero booleans ─────────────────────────────────
+#
+# ``_operator_is_live`` already answers "is this slot anything but a proven
+# zero?" for the implicit-mode decision.  The same question is worth asking of
+# EVERY operator slot, because a backend that knows an operator is identically
+# zero can skip building the machinery that evaluates it — and that machinery
+# is not free: the JAX dense-diffusion operator costs 2287 s of a 2539 s
+# LowerTriangle run assembling per-face geometry for a diffusion tensor that is
+# structurally zero.  Shape alone cannot see this: SWE's ``diffusion_matrix``
+# is a well-shaped tensor of literal zeros.
+#
+# Decided LATE (a property, re-read on every access, never cached), exactly
+# like ``fluctuations_are_zero`` and ``implicit_mode``: ``apply()`` rewrites
+# operators long after construction, so a boolean frozen at construction time
+# goes stale in both directions.
+
+#: Operator slot -> the name of its structural-zero boolean.  Ordered; a
+#: printer LOOPS this instead of hardcoding names, so adding a slot here
+#: reaches every C-family header without touching a printer.
+OPERATOR_ZERO_FLAGS = {
+    "flux": "flux_is_zero",
+    "hydrostatic_pressure": "hydrostatic_pressure_is_zero",
+    "nonconservative_matrix": "nonconservative_matrix_is_zero",
+    "eigenvalues": "eigenvalues_are_zero",
+    "source": "source_is_zero",
+    "source_explicit": "source_explicit_is_zero",
+    "diffusion_matrix": "diffusion_matrix_is_zero",
+    "diffusion_matrix_explicit": "diffusion_matrix_explicit_is_zero",
+}
+
+
+def operator_is_zero(arr) -> bool:
+    """THE criterion: is operator array ``arr`` STRUCTURALLY ZERO — i.e. may a
+    backend skip everything that evaluates it?
+
+    Sole owner of the question, so the NSM properties and every printer decide
+    it the same way (the ``fluctuations_are_zero`` precedent, whose defect-2
+    was two answer-holders that diverged).
+
+    ==============================  ======  =============================
+    slot                            result  reading
+    ==============================  ======  =============================
+    ``None`` / absent               True    the model HAS no such operator
+    present but empty               True    nothing to evaluate
+    every entry proven zero         True    zero as written
+    any entry non-zero              False   live operator
+    any entry UNDECIDABLE           False   assume live
+    ==============================  ======  =============================
+
+    **UNKNOWN collapses to False**, the same asymmetry as
+    :func:`numerics_fluctuations_are_zero` and :func:`_operator_is_live`: these
+    booleans are used to SKIP work, and skipping a real operator is
+    silently-wrong physics, whereas a spurious evaluation only costs time.
+
+    ⚠ **The ABSENT row differs from** :func:`numerics_fluctuations_are_zero`,
+    and the difference is deliberate — do not "unify" them.  There, the slot is
+    a BUILT face kernel, so an absent one means "not built yet / cannot tell",
+    which is UNKNOWN and therefore False.  Here the slots are MODEL-LEVEL
+    declarations on the (Numerical)SystemModel: every one of them exists as a
+    named slot, so ``None`` is not ignorance but the model's own statement that
+    it carries no such operator — which is exactly "zero".  A future reader who
+    assumes the two agree on absence will invert one of them.
+    """
+    return not _operator_is_live(arr)
+
+
+def operator_zero_flags(sm) -> dict:
+    """``{flag_name: bool}`` for every slot in :data:`OPERATOR_ZERO_FLAGS`.
+
+    Read off ``sm`` with :func:`operator_is_zero`, so a printer can LOOP
+    (``for name, value in operator_zero_flags(nsm).items(): ...``) rather than
+    hardcode the slot list.  ``sm`` may be any object carrying the operator
+    attributes — a SystemModel, a NumericalSystemModel, or a split sub-system.
+    """
+    return {flag: operator_is_zero(getattr(sm, attr, None))
+            for attr, flag in OPERATOR_ZERO_FLAGS.items()}
+
+
 def _nonlocal_aux_symbols(sm) -> set:
     """The aux Symbols whose value depends on NEIGHBOUR cells.
 
@@ -948,6 +1026,85 @@ class NumericalSystemModel(SystemModel):
         stiffness, and it is never a licence to run two stages.
         """
         return implicit_stage_mode(self)
+
+    # ── per-operator structural-zero booleans ─────────────────────
+
+    @property
+    def operators_are_zero(self) -> dict:
+        """``{flag_name: bool}`` — is each operator slot STRUCTURALLY ZERO?
+
+        One mapping so a printer or a backend LOOPS instead of hardcoding slot
+        names; the individual properties below are the same values by name.
+        Keys are the flag names (``"diffusion_matrix_is_zero"``, …), i.e. what
+        a C-family header calls them.
+
+        Semantics — including why "absent ⇒ True" here but "absent ⇒ False" in
+        :attr:`fluctuations_are_zero` — live in :func:`operator_is_zero`.
+        Re-read on every access, never cached: :meth:`apply` rewrites operators
+        long after construction.
+        """
+        return operator_zero_flags(self)
+
+    @property
+    def flux_is_zero(self) -> bool:
+        """True iff ``flux`` is structurally zero (see :func:`operator_is_zero`)."""
+        return operator_is_zero(getattr(self, "flux", None))
+
+    @property
+    def hydrostatic_pressure_is_zero(self) -> bool:
+        """True iff ``hydrostatic_pressure`` is structurally zero.
+
+        ⚠ Hand-built ``SWE`` lumps ``g·h²/2`` into ``flux`` and leaves this
+        slot zero, while DERIVED models fill it — see
+        :attr:`fluctuations_are_zero` for what that asymmetry costs.
+        """
+        return operator_is_zero(getattr(self, "hydrostatic_pressure", None))
+
+    @property
+    def nonconservative_matrix_is_zero(self) -> bool:
+        """True iff the MODEL's ``nonconservative_matrix`` is structurally zero.
+
+        ⚠ This is NOT :attr:`fluctuations_are_zero`.  That one reads the BUILT
+        face kernel and is the flag a driver gates its D± gather on; the two
+        disagree in BOTH directions (2-D SWE has a live NCP and zero emitted
+        fluctuation under ``PositiveRusanov``; ``Rusanov`` emits none from any
+        NCP).  Use this one only for questions about the model operator itself.
+        """
+        return operator_is_zero(getattr(self, "nonconservative_matrix", None))
+
+    @property
+    def eigenvalues_are_zero(self) -> bool:
+        """True iff ``eigenvalues`` is structurally zero — no wave speeds, so
+        the system carries no hyperbolic transport at all."""
+        return operator_is_zero(getattr(self, "eigenvalues", None))
+
+    @property
+    def source_is_zero(self) -> bool:
+        """True iff the (implicit-tagged) ``source`` slot is structurally zero."""
+        return operator_is_zero(getattr(self, "source", None))
+
+    @property
+    def source_explicit_is_zero(self) -> bool:
+        """True iff ``source_explicit`` is structurally zero."""
+        return operator_is_zero(getattr(self, "source_explicit", None))
+
+    @property
+    def diffusion_matrix_is_zero(self) -> bool:
+        """True iff the implicit ``diffusion_matrix`` is structurally zero.
+
+        A backend may then skip BUILDING its diffusion operator, not merely
+        skip evaluating it — the assembly is where the cost is (the JAX dense
+        TPFA operator walks every face in Python).  Shape is not a substitute:
+        SWE carries a correctly-shaped tensor of literal zeros.
+        """
+        return operator_is_zero(getattr(self, "diffusion_matrix", None))
+
+    @property
+    def diffusion_matrix_explicit_is_zero(self) -> bool:
+        """True iff the explicit ``diffusion_matrix_explicit`` twin is
+        structurally zero."""
+        return operator_is_zero(
+            getattr(self, "diffusion_matrix_explicit", None))
 
     def default_operations(self) -> list:
         """Return the system operations applied to EVERY NSM by

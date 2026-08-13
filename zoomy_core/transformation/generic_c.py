@@ -13,6 +13,7 @@ from zoomy_core.misc.misc import Zstruct, ZArray
 from zoomy_core.numerics.numerical_system_model import (
     implicit_stage_mode,
     numerics_fluctuations_are_zero,
+    operator_zero_flags,
     to_numerical_system_model,
 )
 from zoomy_core.solver.arg_slots import SOLVER_ARG_MAPPING, SOLVER_DECL_KINDS
@@ -2040,6 +2041,20 @@ class GenericCppModel(GenericCppBase):
                 f"    static constexpr bool has_free_surface = {'true' if has_free_surface else 'false'};",
             ]
         )
+        # One ``static constexpr bool`` per operator slot: TRUE iff that
+        # operator is structurally zero, so a driver may skip BUILDING the
+        # machinery that evaluates it (an assembly-time saving, not just an
+        # evaluation-time one — cf. ``diffusion_matrix_is_zero``, where shape
+        # alone says "present" for a tensor of literal zeros).  Backends may
+        # ignore these entirely.  READ from the NSM, never re-derived here, and
+        # LOOPED over ``OPERATOR_ZERO_FLAGS`` so a new slot needs no printer
+        # edit.  Semantics (absent ⇒ true, undecidable ⇒ false) are documented
+        # on ``operator_is_zero``; note the ABSENT row is the opposite of
+        # ``fluctuations_are_zero``'s, deliberately.
+        lines.extend(
+            f"    static constexpr bool {name} = {'true' if value else 'false'};"
+            for name, value in operator_zero_flags(self.sm).items()
+        )
         if has_free_surface:
             lines.extend(
                 [
@@ -2227,6 +2242,15 @@ class GenericCppNumerics(GenericCppBase):
                 f"    static constexpr bool fluctuations_are_zero = "
                 f"{'true' if numerics_fluctuations_are_zero(self.numerics) else 'false'};",
             ]
+        )
+        # The per-operator structural-zero booleans, same set and same names as
+        # ``Model.H`` (see there).  Read off the SystemModel this numerics was
+        # built from — they are properties of the model operators, so both
+        # headers necessarily agree; ``fluctuations_are_zero`` above is the one
+        # constant that does NOT, being a (model × Riemann) fact.
+        lines.extend(
+            f"    static constexpr bool {name} = {'true' if value else 'false'};"
+            for name, value in operator_zero_flags(self.model).items()
         )
         return "\n".join(lines)
 
