@@ -289,7 +289,8 @@ class Sigma3D(BaseModel):
         ``λ_s·h·mom/ν``; the slope-aware ``u_t`` comes from
         ``ClosureState.get_normal_tangential``); StressFree surface ⇒ zero viscous
         flux (``gradient=0``).  Delivered through the generalized :class:`Flux`."""
-        from zoomy_core.model.models.closures import NavierSlip, StressFree
+        from zoomy_core.model.models.closures import (
+            NavierSlip, RoughWall, StressFree)
         from zoomy_core.model.boundary_conditions import Flux
         names = [str(s) for s in sm.state]
         if "mom" not in names:
@@ -311,11 +312,31 @@ class Sigma3D(BaseModel):
                     # sign/magnitude fudge.
                     out.append(Flux(tag="bottom", on="mom",
                                     gradient=-lam * hS * momS / nu))
+                elif isinstance(c, RoughWall):
+                    # Turbulent rough bed: τ_b = ρ C_f u_b|u_b|, the same law
+                    # ``RoughWall.expression`` states, with
+                    # C_f = (κ/ln(z_p/z_0))², z_0 = k_s/30.
+                    # Matching the viscous stress ρ(ν/h)∂_ζ u to τ_b and writing
+                    # u_b = mom/h, the depth CANCELS:
+                    #     ∂_ζ mom = h·∂_ζ u = C_f·u_b|u_b|·h²/ν = C_f·mom|mom|/ν,
+                    # so the outward-normal gradient at the ζ=0 face is its
+                    # negative — the same construction as the Navier-slip arm,
+                    # quadratic instead of linear.
+                    #
+                    # ν (molecular) is the correct conversion here even under
+                    # ElderViscosity: Elder's ν_t = κ u_⋆ h ζ(1−ζ) VANISHES at
+                    # ζ = 0, so the wall diffusivity the diffusion operator
+                    # supplies is exactly ν.
+                    kappa, k_s = sm.parameters.kappa, sm.parameters.k_s
+                    z_p = sm.parameters.z_p
+                    Cf = (kappa / sp.log(z_p / (k_s / 30))) ** 2
+                    out.append(Flux(tag="bottom", on="mom",
+                                    gradient=-Cf * momS * sp.Abs(momS) / nu))
                 else:
                     raise NotImplementedError(
                         f"bed closure {type(c).__name__} → ζ-face BC not wired "
-                        "(v1 supports NavierSlip; RoughWall via its .traction is "
-                        "the documented extension).")
+                        "(NavierSlip and RoughWall are wired; extend here via "
+                        "the closure's .traction).")
             elif kind == "surface" and isinstance(c, StressFree):
                 out.append(Flux(tag="top", on="mom", gradient=0))
         return out
