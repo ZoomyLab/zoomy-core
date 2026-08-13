@@ -454,15 +454,24 @@ def _resolve_boundary_traces(nsm) -> None:
     # ``quasilinear_matrix``).  A leftover means a boundary trace was genuinely
     # unresolvable (e.g. free ζ after ``.doit()``) — no symbolic-tree printer
     # can lower it, so fail here rather than emit uncompilable code.
-    # ζ is a dummy ONLY for the projected models.  A resolved-vertical system
-    # (Sigma3D) carries ζ as a genuine mesh COORDINATE -- its SystemModel has
-    # space = [x, zeta] and dimension 2 -- and its operators depend on ζ exactly
-    # as they depend on x, which the printers lower as a coordinate.  Applying
-    # the dummy-ζ rule there rejects a correct system: an Elder eddy viscosity
-    # ν_t = κ u_⋆ h ζ(1−ζ) legitimately leaves ζ in the diffusion matrix.
+    # The stray-vertical rule below only MEANS anything if the vertical was
+    # eliminated in the first place.  A projected model (SME, VAM, ...) ends on
+    # a Galerkin step ∫₀¹(·)φ_i dζ, so ζ is integrated out and a surviving ζ can
+    # only be an unresolved integral or boundary trace.  A resolved-vertical
+    # system (Sigma3D) never projects: it keeps ζ as a genuine mesh COORDINATE,
+    # its operators depend on ζ exactly as they depend on x, and an Elder eddy
+    # viscosity ν_t = κ u_⋆ h ζ(1−ζ) legitimately leaves ζ in the diffusion
+    # matrix.  Running the check there rejects a correct system.
+    #
+    # The test is the system's OWN declared vertical against its OWN space --
+    # not the literal name "zeta" -- so a model that names its vertical
+    # differently cannot silently re-arm the check.
     _sm = getattr(nsm, "system_model", None) or getattr(nsm, "sm", None)
     _space = (getattr(nsm, "space", None) or getattr(_sm, "space", None) or [])
-    zeta_is_coordinate = any(str(s) == "zeta" for s in _space)
+    _vert = getattr(nsm, "vertical", None) or getattr(_sm, "vertical", None)
+    # vertical projected out  <=>  it is not one of the system's coordinates
+    vertical_is_projected = _vert is not None and not any(
+        str(s) == str(_vert) for s in _space)
 
     for attr in _OPERATOR_ATTRS + ("quasilinear_matrix",):
         arr = getattr(nsm, attr, None)
@@ -476,8 +485,8 @@ def _resolve_boundary_traces(nsm) -> None:
                     "printer (generic_c / amrex / ufl) cannot lower Subs; fix "
                     "the trace at its birthplace in the model derivation.")
             stray_zeta = {s for s in e.free_symbols
-                          if getattr(s, "name", None) == "zeta"}
-            if stray_zeta and not zeta_is_coordinate:
+                          if _vert is not None and str(s) == str(_vert)}
+            if stray_zeta and vertical_is_projected:
                 raise ValueError(
                     f"REQ-130: free vertical symbol {stray_zeta} survives in "
                     f"operator {attr!r}: {e} — the σ-reference coordinate ζ must "
