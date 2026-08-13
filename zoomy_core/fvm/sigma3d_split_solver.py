@@ -140,6 +140,63 @@ class Sigma3DSplitSolver:
         p = self._params(model)
         g, nu, lam, e_x = p["g"], p["nu"], p["lambda_s"], p["e_x"]
         has_bulk, has_slip, has_free = self._closure_kinds(model)
+
+        # The bed law and the bulk viscosity come FROM THE MODEL's closures, not
+        # from two hardcoded scalars.  Reading only p["nu"] and p["lambda_s"]
+        # meant a RoughWall bed (which has no lambda_s) silently became
+        # FRICTIONLESS and an ElderViscosity collapsed to a constant: the solver
+        # ran, conserved mass, and returned a profile with exactly zero shear.
+        from zoomy_core.model.models.closures import (
+            NavierSlip, RoughWall, Newtonian, ElderViscosity)
+        _clos = getattr(getattr(model, "derivation", None),
+                        "closures_resolved", None) or model.closures or []
+        bed_c = next((c for c in _clos
+                      if getattr(c, "closes", None) == "bottom"), None)
+        bulk_c = next((c for c in _clos
+                       if getattr(c, "closes", None) == "bulk"), None)
+        if not _clos:                       # default stack = Newtonian+NavierSlip
+            bed_c, bulk_c = NavierSlip(), Newtonian()
+
+        def _cf():
+            """C_f = (kappa/ln(z_p/z_0))^2, z_0 = k_s/30 — RoughWall's own law."""
+            kap = float(p.get("kappa", 0.41))
+            k_s = float(p.get("k_s", 1e-3))
+            z_p = float(p.get("z_p", 0.1))
+            return (kap / np.log(z_p / (k_s / 30.0))) ** 2
+
+        # bed traction / rho as a function of the bed velocity trace u0
+        if isinstance(bed_c, RoughWall):
+            _Cf = _cf()
+            def bed_flux(u0):                     # tau_b/rho = C_f u0|u0|
+                return _Cf * u0 * np.abs(u0)
+        elif isinstance(bed_c, NavierSlip):
+            def bed_flux(u0, _l=lam):             # tau_b/rho = lambda_s u0
+                return _l * u0
+        else:
+            def bed_flux(u0):
+                return np.zeros_like(u0)
+
+        # effective viscosity at the interior zeta-faces
+        if isinstance(bulk_c, ElderViscosity):
+            _kap = float(p.get("kappa", 0.41))
+            _Cf_e = _cf() if isinstance(bed_c, RoughWall) else None
+            def nu_of_zeta(zf, hcol, u0):
+                """nu + nu_t,  nu_t = kappa u_* h zeta(1-zeta).
+
+                u_* is the SAME sqrt(C_f)|u_b| the bed law recovers when Elder
+                was built with friction=<that bed>, so the eddy viscosity tracks
+                the computed bed shear per column instead of a frozen constant.
+                """
+                us = (np.sqrt(_Cf_e) * np.abs(u0) if _Cf_e is not None
+                      else float(p.get("u_star", 0.0)) * np.ones_like(u0))
+                return nu + _kap * us[:, None] * hcol[:, None] * zf * (1.0 - zf)
+        elif isinstance(bulk_c, Newtonian) or has_bulk:
+            def nu_of_zeta(zf, hcol, u0):
+                return np.full((hcol.size, zf.size), nu)
+        else:
+            def nu_of_zeta(zf, hcol, u0):
+                return np.zeros((hcol.size, zf.size))
+
         nu_eff = nu if has_bulk else 0.0
         lam_eff = lam if has_slip else 0.0
         xbc = self._x_bc_kind(model)
@@ -213,13 +270,16 @@ class Sigma3DSplitSolver:
             # bed-slope NCP  −g h ∂ₓb  and the gravity source  +e_x g h
             dmom += -g * h[:, None] * dbdx[:, None] + e_x * g * h[:, None]
             # vertical viscous diffusion  ∂_ζ( ν/h² ∂_ζ mom )
-            if nu_eff or lam_eff:
-                diff = nu_eff / h[:, None] ** 2                 # (NX,1) diffusivity
+            if has_bulk or has_slip:
                 Fv = np.zeros((NX, NY + 1))
-                # interior ζ-faces
-                Fv[:, 1:NY] = diff * (mom[:, 1:NY] - mom[:, :NY - 1]) / dz
-                # bed face (k=-½): Navier-slip viscous flux = λ_s · u(0) = λ_s mom/h
-                Fv[:, 0] = lam_eff * mom[:, 0] / h
+                u0 = mom[:, 0] / h                       # bed velocity trace
+                # interior ζ-faces at ζ = (k+1)·dz, k = 0 … NY-2
+                zf = (np.arange(NY - 1) + 1.0) * dz
+                nuf = nu_of_zeta(zf, h, u0)              # (NX, NY-1), ζ-DEPENDENT
+                Fv[:, 1:NY] = (nuf / h[:, None] ** 2) * (
+                    mom[:, 1:NY] - mom[:, :NY - 1]) / dz
+                # bed face (k=-½): the model's own bed law, τ_b/ρ
+                Fv[:, 0] = bed_flux(u0)
                 # surface (k=NY-½): stress-free ⇒ 0  (Fv[:,NY] stays 0)
                 dmom += (Fv[:, 1:] - Fv[:, :-1]) / dz
             return dh, dmom
