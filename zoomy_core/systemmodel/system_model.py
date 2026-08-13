@@ -1501,12 +1501,51 @@ class SystemModel:
         genuinely changes the system's characteristic structure and the
         spectrum was not skipped."""
         self.quasilinear_matrix = self._compute_quasilinear_matrix()
-        self.source_jacobian_wrt_variables = _to_zarray(
-            self._compute_source_jacobian_wrt_variables())
-        self.source_jacobian_wrt_aux_variables = _to_zarray(
-            self._compute_source_jacobian_wrt_aux_variables())
+        # POINT-IMPLICIT SOURCE: once ``source_treatment='linearized'`` has
+        # rewritten ``source`` into ``(I − dt·J)⁻¹ S``, that expression is a
+        # single OPAQUE per-cell ``solve`` kernel.  ``sp.diff`` through an
+        # opaque Function does not evaluate — it yields
+        # ``Subs(Derivative(solve(…), _xi), _xi, …)``, which no printer can
+        # compile and which ``_resolve_boundary_traces`` then reports as an
+        # "unresolved Subs boundary trace" (a misleading diagnosis: no ζ-trace
+        # is involved).  In this mode the jacobians are stale BY DESIGN —
+        # ``_linearize_source`` baked J into ``S_lin`` and consumers take the
+        # source explicitly — so keep the pre-rewrite matrices rather than
+        # re-derive nonsense from the opaque source.
+        #
+        # The one thing that must still track the mutation is the aux-jacobian
+        # WIDTH: ``register_aux`` calls us precisely because ``aux_state`` grew,
+        # and a stale matrix would be one column short for the printers.  That
+        # new column is genuinely zero here — ``register_aux`` runs BEFORE
+        # ``regularize_pow``, so the freshly added aux does not yet occur in the
+        # source — so pad instead of recomputing.
+        if getattr(self, "source_treatment", "explicit") == "linearized":
+            self.source_jacobian_wrt_aux_variables = _to_zarray(
+                self._pad_aux_jacobian_columns(
+                    self.source_jacobian_wrt_aux_variables))
+        else:
+            self.source_jacobian_wrt_variables = _to_zarray(
+                self._compute_source_jacobian_wrt_variables())
+            self.source_jacobian_wrt_aux_variables = _to_zarray(
+                self._compute_source_jacobian_wrt_aux_variables())
         if eigenvalues and self.eigenvalues is not None:
             self.eigenvalues = self._compute_eigenvalues()
+
+    def _pad_aux_jacobian_columns(self, J):
+        """Widen ``J`` to ``(n_equations, len(aux_state))`` with zero columns.
+
+        Point-implicit path only, where the aux jacobian is not re-derived (see
+        :meth:`refresh_derived_operators`) but must still match the aux width
+        the printers lower."""
+        n_aux = len(self.aux_state or [])
+        if J is None:
+            return sp.zeros(self.n_equations, n_aux)
+        have = J.shape[1] if len(J.shape) > 1 else 0
+        if have >= n_aux:
+            return J
+        return sp.Matrix(
+            self.n_equations, n_aux,
+            lambda i, j: sp.sympify(J[i, j]) if j < have else sp.S.Zero)
 
     def assert_diagonal_mass_matrix(self):
         """Consistency check: verify ``mass_matrix`` is diagonal on
