@@ -449,6 +449,10 @@ class FoamSystemModelPrinter(GenericCppBase):
         # qualifies as ``{namespace}::update_aux_variables``.
         blocks.append(self._emit_update_aux_variables())
 
+        # Mesh-free companion of the same algebraic closures, for a caller that
+        # holds one state and no field — the preCICE interface Riemann flux.
+        blocks.append(self._emit_pointwise_aux())
+
         # Companion for a split sub-model: fill the FROZEN predictor-forcing auxes
         # (aux_input_registry) that update_aux_variables does NOT re-derive — the
         # Poisson RHS driver.  Empty for a plain model (REQ-147).
@@ -488,63 +492,118 @@ class FoamSystemModelPrinter(GenericCppBase):
         # here, so the state/aux symbols lower to the dereferenced ``*Q[i]`` /
         # ``*Qaux[i]`` (OpenFOAM field algebra), mirroring the per-cell
         # algebraic leg the numpy/jax emitters write.
-        uav = getattr(sm, "update_aux_variables", None)
-        if uav is not None and len(sp.flatten(uav)) > 0:
-            rows = sp.flatten(uav)
-            deriv_rows = {e["row"] for e in sm.aux_registry
-                          if e["kind"] in ("derivative", "limited_derivative")}
-            state_syms, aux_syms = list(sm.state), list(sm.aux_state)
-            param_syms = self._parameter_symbols()
-            allowed = set(state_syms) | set(aux_syms) | set(param_syms)
-            # REQ-183 (corrected): parameters are a RUNTIME INPUT to every
-            # operator — the printer contract (``p`` is always in the interface).
-            # The field-level refresh is no exception: it now takes ``p`` and each
-            # parameter symbol lowers to its ``p[idx]`` slot, so a parameterized
-            # aux (the KP ``hinv``'s ``wet_dry_eps``, Manning ``n_m`` …) resolves
-            # at runtime and can be varied — NOT baked as literals.  Same p-index
-            # order as the per-cell operators (``register_map("p", ...)``).
-            deref = [
-                {s: f"*Q[{i}]" for i, s in enumerate(state_syms)},
-                {s: f"*Qaux[{i}]" for i, s in enumerate(aux_syms)},
-                {s: f"p[{i}]" for i, s in enumerate(param_syms)},
-            ]
-            # REQ-185: a time/space-dependent aux (rain rate ``r_o =
-            # Piecewise((rate, t<T),(0,True))``, a manufactured ``S(x)``) binds
-            # ``t`` and the position components ``x/y/z``.  The field-level
-            # refresh has the OpenFOAM ``mesh`` in scope, so ``t`` lowers to the
-            # runtime time ``mesh.time().value()`` and ``x/y/z`` to the cell-
-            # centre field components ``mesh.C().component(i)`` (field algebra) —
-            # NOT a compile error.
-            coord_map = {sm.time: "mesh.time().value()"}
-            allowed.add(sm.time)
-            pos = getattr(sm, "position", None)
-            if pos is not None:
-                for i, s in enumerate(pos.values()):
-                    coord_map[s] = f"mesh.C().component({i})"
-                    allowed.add(s)
-            deref.append(coord_map)
-            saved_maps = self.symbol_maps
-            try:
-                self.symbol_maps = deref
-                for row in range(len(aux_syms)):
-                    if row in deriv_rows or row >= len(rows):
-                        continue
-                    expr = sp.sympify(rows[row])
-                    if expr == aux_syms[row]:
-                        continue                       # identity passthrough
-                    unknown = expr.free_symbols - allowed
-                    if unknown:
-                        raise NotImplementedError(
-                            f"update_aux_variables row {row} ({aux_syms[row]}) "
-                            f"references {unknown}; the foam field-level aux "
-                            "refresh has no parameter vector to resolve them.")
-                    lines.append(
-                        f"    // Qaux[{row}] ({aux_syms[row]}) = {expr}"
-                        "  (algebraic closure)")
-                    lines.append(f"    *Qaux[{row}] = {self.doprint(expr)};")
-            finally:
-                self.symbol_maps = saved_maps
+        state_syms, aux_syms = list(sm.state), list(sm.aux_state)
+        param_syms = self._parameter_symbols()
+        # REQ-183 (corrected): parameters are a RUNTIME INPUT to every
+        # operator — the printer contract (``p`` is always in the interface).
+        # The field-level refresh is no exception: it now takes ``p`` and each
+        # parameter symbol lowers to its ``p[idx]`` slot, so a parameterized
+        # aux (the KP ``hinv``'s ``wet_dry_eps``, Manning ``n_m`` …) resolves
+        # at runtime and can be varied — NOT baked as literals.  Same p-index
+        # order as the per-cell operators (``register_map("p", ...)``).
+        deref = [
+            {s: f"*Q[{i}]" for i, s in enumerate(state_syms)},
+            {s: f"*Qaux[{i}]" for i, s in enumerate(aux_syms)},
+            {s: f"p[{i}]" for i, s in enumerate(param_syms)},
+        ]
+        # REQ-185: a time/space-dependent aux (rain rate ``r_o =
+        # Piecewise((rate, t<T),(0,True))``, a manufactured ``S(x)``) binds
+        # ``t`` and the position components ``x/y/z``.  The field-level
+        # refresh has the OpenFOAM ``mesh`` in scope, so ``t`` lowers to the
+        # runtime time ``mesh.time().value()`` and ``x/y/z`` to the cell-
+        # centre field components ``mesh.C().component(i)`` (field algebra) —
+        # NOT a compile error.
+        extra = {sm.time: "mesh.time().value()"}
+        pos = getattr(sm, "position", None)
+        if pos is not None:
+            for i, s in enumerate(pos.values()):
+                extra[s] = f"mesh.C().component({i})"
+        deref.append(extra)
+        lines += self._emit_algebraic_aux_lines(
+            deref, set(extra), "*Qaux[{row}]", "the foam field-level aux refresh")
+        lines.append("}")
+        return "\n".join(lines)
 
+    def _emit_algebraic_aux_lines(self, deref, extra_allowed, lhs, where):
+        """Assignment lines for the ALGEBRAIC (non-derivative) aux rows.
+
+        These are POINTWISE closures, not spatial derivatives, so the
+        derivative leg of :meth:`_emit_update_aux_variables` never assigns
+        them — yet every operator reads them (``Qaux[hinv]·q²`` …), so without
+        this they stay uninitialised garbage.  Emitted AFTER the derivative
+        auxes (a closure may read one) and before any operator consumes it.
+
+        ONE body, two lowerings: ``deref`` supplies the symbol → accessor maps
+        and ``lhs`` the assignment target, so the mesh-aware field refresh
+        (``*Qaux[i]`` OpenFOAM field algebra) and the mesh-free
+        :meth:`_emit_pointwise_aux` (``Qaux[i]`` scalar list) share the same
+        closure expressions instead of each carrying its own copy.
+        """
+        sm = self.sm
+        uav = getattr(sm, "update_aux_variables", None)
+        if uav is None or len(sp.flatten(uav)) == 0:
+            return []
+        rows = sp.flatten(uav)
+        deriv_rows = {e["row"] for e in sm.aux_registry
+                      if e["kind"] in ("derivative", "limited_derivative")}
+        aux_syms = list(sm.aux_state)
+        allowed = (set(sm.state) | set(aux_syms) | set(self._parameter_symbols())
+                   | set(extra_allowed))
+        out, saved_maps = [], self.symbol_maps
+        try:
+            self.symbol_maps = deref
+            for row in range(len(aux_syms)):
+                if row in deriv_rows or row >= len(rows):
+                    continue
+                expr = sp.sympify(rows[row])
+                if expr == aux_syms[row]:
+                    continue                           # identity passthrough
+                unknown = expr.free_symbols - allowed
+                if unknown:
+                    raise NotImplementedError(
+                        f"update_aux_variables row {row} ({aux_syms[row]}) "
+                        f"references {unknown}; {where} cannot resolve them.")
+                out.append(f"    // Qaux[{row}] ({aux_syms[row]}) = {expr}"
+                           "  (algebraic closure)")
+                out.append(f"    {lhs.format(row=row)} = {self.doprint(expr)};")
+        finally:
+            self.symbol_maps = saved_maps
+        return out
+
+    def _emit_pointwise_aux(self):
+        """Emit ``pointwise_aux(Q, p) -> Qaux`` — the algebraic aux closures on
+        a SINGLE scalar-list state, with no mesh.
+
+        A caller that holds one state vector and no field (the preCICE coupling
+        evaluates an interface Riemann flux on states RECONSTRUCTED from an
+        exchanged water column, which belong to no cell) still needs the
+        algebraic auxes the flux reads — ``hinv`` in every depth-based model.
+        Derivative auxes stay 0: they are spatial, and a pointwise flux has no
+        neighbourhood to take them from.
+
+        The closure expressions come from the model's own
+        ``update_aux_variables`` via :meth:`_emit_algebraic_aux_lines`, so the
+        formula lives in core and is never restated backend-side.  A model
+        whose algebraic aux binds ``t`` or a position raises rather than
+        silently emitting a mesh-free approximation of it.
+        """
+        n_aux = len(self.sm.aux_state)
+        deref = [
+            {s: f"Q[{i}]" for i, s in enumerate(self.sm.state)},
+            {s: f"Qaux[{i}]" for i, s in enumerate(self.sm.aux_state)},
+            {s: f"p[{i}]" for i, s in enumerate(self._parameter_symbols())},
+        ]
+        lines = [
+            "inline Foam::List<Foam::scalar> pointwise_aux(",
+            "    const Foam::List<Foam::scalar>& Q,",
+            "    const Foam::List<Foam::scalar>& p)",
+            "{",
+            f"    Foam::List<Foam::scalar> Qaux({n_aux}, 0.0);",
+        ]
+        lines += self._emit_algebraic_aux_lines(
+            deref, set(), "Qaux[{row}]",
+            "a pointwise (mesh-free) aux, which has no time or position")
+        lines.append("    return Qaux;")
         lines.append("}")
         return "\n".join(lines)
 
@@ -834,6 +893,17 @@ class FoamNumericsPrinter(GenericCppBase):
     math_namespace = "Foam::"
     c_functions = {**GenericCppBase.c_functions, **_NUMERICS_QUALIFIED}
 
+    #: C++ namespace the kernels are emitted into, and the model header they
+    #: are paired with.  Overridable exactly like
+    #: :attr:`FoamSystemModelPrinter.namespace_name`, so a translation unit can
+    #: carry a SECOND scheme beside its own — the preCICE interface, which
+    #: solves the shared Riemann problem with the designated high-fidelity
+    #: model's kernels while the bulk keeps its own.  The emitted body is
+    #: self-contained (no ``Model::`` references), so only the header line and
+    #: the namespace name differ.
+    namespace_name = "Numerics"
+    model_header = "Model.H"
+
     def __init__(self, numerics, **opts):
         super().__init__()
         self.numerics = numerics
@@ -954,15 +1024,15 @@ class FoamNumericsPrinter(GenericCppBase):
             '#include "List.H"',
             '#include "vector.H"',
             '#include "scalar.H"',
-            '#include "Model.H"',
+            f'#include "{self.model_header}"',
             "",
-            "namespace Numerics",
+            f"namespace {self.namespace_name}",
             "{",
             f"constexpr int n_dof_q = {sm.n_equations};",
         ]
         for _name, func_obj in self.numerics.functions.items():
             blocks.extend(self._process_kernel_from_function(func_obj))
-        blocks.append("} // namespace Numerics")
+        blocks.append(f"}} // namespace {self.namespace_name}")
         return "\n".join(blocks)
 
     @classmethod
