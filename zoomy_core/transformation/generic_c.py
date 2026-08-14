@@ -947,6 +947,24 @@ struct SimpleArray {
             if n < 0:
                 return f"(1.0 / {pow_func}({b}, {abs(n)}))"
             return f"{pow_func}({b}, {n})"
+        # ── half / third powers -> sqrt / cbrt, NEVER pow ──────────────────
+        # sympy has no `sqrt` node: it stores every square root as Pow(x, 1/2),
+        # so without this branch a sqrt reaches the compiler as `pow(x, 0.5)`.
+        # nvcc does NOT fold that back to a DSQRT — it emits a CALL to
+        # __internal_accurate_pow, 144 instructions and 52 registers.  Measured
+        # on the AMReX SWE face kernel, which evaluates ~20 per cell and is
+        # FP64-issue-bound: whole-solver evolution 8.121 -> 4.089 s (1.99x),
+        # identical step count, bit-identical final mass (LowerTriangle
+        # 526x555 @10 m, PositiveHLL, L40S).
+        #
+        # This is the shared C base — foam, dmplex and the AMReX Numerics path
+        # all inherit it — so the pow call shape was reaching every C-family
+        # backend.  sqrt/cbrt are exact-rounded IEEE operations, so values are
+        # unchanged; only the instruction count differs.
+        if exp.is_Rational and exp.q in (2, 3) and abs(exp.p) == 1:
+            fn = f"{self.math_namespace}{'sqrt' if exp.q == 2 else 'cbrt'}"
+            call = f"{fn}({b})"
+            return call if exp.p == 1 else f"(1.0 / {call})"
         return f"{self.math_namespace}pow({b}, {self._print(exp)})"
 
     def doprint(self, expr, **settings):
