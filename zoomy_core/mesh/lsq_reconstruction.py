@@ -158,6 +158,20 @@ def least_squares_reconstruction_local(
       for backward compatibility with callers that lack vertex
       topology.
 
+    Stencil selection
+    -----------------
+    * When ``cell_vertices`` is provided (recommended for ≥2D),
+      the per-cell stencil is the **full vertex-1-ring**: every
+      inner cell sharing at least one vertex with the current cell.
+      On a structured quad/triangle mesh this is geometrically
+      symmetric around the cell centre (offset sum ≈ 0), giving
+      O(h²) gradient accuracy at the cell centre on smooth fields.
+    * When ``cell_vertices`` is None, the legacy face-neighbour +
+      ``expand_neighbors`` iteration is used to fill the stencil.
+      That path is symmetric in 1D but biased in 2D/3D — only kept
+      for backward compatibility with callers that lack vertex
+      topology.
+
     Parameters
     ----------
     boundary_face_centers : ndarray, shape ``(n_boundary_faces, dim)``, optional

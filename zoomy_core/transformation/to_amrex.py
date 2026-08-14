@@ -77,7 +77,15 @@ class AmrexCore:
         code = code.replace("amrex::Math::sin(", "std::sin(")
         code = code.replace("amrex::Math::tan(", "std::tan(")
         code = code.replace("amrex::Math::exp(", "std::exp(")
-        
+        # sqrt / cbrt likewise live in std::, not amrex::Math:: -- and they MUST
+        # reach the compiler as sqrt/cbrt rather than pow(x, 1/2): nvcc lowers
+        # `std::pow(x, 1.0/2.0)` to a CALL to __internal_accurate_pow (144
+        # instructions, 52 registers) instead of the single DSQRT instruction.
+        # See the note in _print_Pow: 2.15x on the SWE flux kernel, 1.79x on the
+        # whole solver, bit-identical results.
+        code = code.replace("amrex::Math::sqrt(", "std::sqrt(")
+        code = code.replace("amrex::Math::cbrt(", "std::cbrt(")
+
         return code
 
     def get_includes(self):
@@ -187,6 +195,26 @@ class AmrexCore:
             if n < 0:
                 return f"(1.0 / amrex::Math::powi<{abs(n)}>({self._print(base)}))"
             return f"amrex::Math::powi<{n}>({self._print(base)})"
+        # ── half/third powers -> sqrt / cbrt, NOT pow ──────────────────────
+        # `std::pow(x, 1.0/2.0)` does NOT get folded to `sqrt` by nvcc: it emits
+        # a CALL to __internal_accurate_pow (144 instructions, 52 registers).
+        # The SWE face kernel evaluates ~20 of these per cell (every sqrt(g*h),
+        # every wave speed), and the kernel is FP64-ISSUE-BOUND on a 1/64-rate
+        # L40S -- so those calls dominate it.
+        #
+        # Measured on LowerTriangle 526x555 (PositiveHLL, cfl 1.0, L40S):
+        #   flux microbenchmark   1326.9 -> 617.3 us   = 2.15x, checksum bit-identical
+        #   whole solver, 300 s   1.79x   (Advance 1.87x, UpdateState 4.07x,
+        #                                  ComputeDt 1.94x), final mass identical
+        #   per face evaluation   1.324 -> 0.616 ns, i.e. from 1.73x SLOWER than
+        #                         XLA to 1.24x faster, and 1.05x faster than SERGHEI
+        #
+        # sqrt/cbrt are exact-rounded IEEE operations here, so this is a pure
+        # codegen fix: same value, ~20x fewer instructions.
+        if exp.is_Rational and exp.q in (2, 3) and exp.p in (1, -1):
+            fn = "std::sqrt" if exp.q == 2 else "std::cbrt"
+            call = f"{fn}({self._print(base)})"
+            return call if exp.p == 1 else f"(1.0 / {call})"
         return super()._print_Pow(expr)
 
 

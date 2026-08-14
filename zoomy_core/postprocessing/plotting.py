@@ -8,8 +8,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.collections import PolyCollection
 
-from . import style
-
 
 # ---------- I/O ----------
 
@@ -205,7 +203,7 @@ def plot_1d_mesh(mesh, ax, field_name=None, **_):
         y = np.zeros_like(x)
         field_name = field_name or "default"
 
-    ax.plot(x, y, markevery=style.MARKEVERY)
+    ax.plot(x, y, "-o", markersize=3)
     return float(np.min(y)), float(np.max(y))
 
 
@@ -218,11 +216,11 @@ def plot_2d_mesh(
     field_name=None,
     show_legend=True,
     legend_location="right",
-    cmap=None,
+    cmap="viridis",
     vmin=None,
     vmax=None,
     edgecolors="k",
-    linewidths=None,
+    linewidths=0.2,
     colorbar_label=None,
 ):
     """
@@ -268,11 +266,10 @@ def plot_2d_mesh(
     coll = PolyCollection(
         polygons,
         array=field_data,
-        cmap=cmap or style.CMAP_CONTINUOUS,
+        cmap=cmap,
         norm=plt.Normalize(vmin=vmin, vmax=vmax),
         edgecolors=edgecolors,
-        linewidths=(style.CONFIG.mesh_linewidth
-                    if linewidths is None else linewidths),
+        linewidths=linewidths,
     )
     ax.add_collection(coll)
     ax.autoscale()
