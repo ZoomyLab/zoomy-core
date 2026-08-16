@@ -879,6 +879,91 @@ class SystemModel:
     def n_dim(self) -> int:
         return len(self.space)
 
+    # ── Free-surface ROW MAP ───────────────────────────────────────────
+    # The ONE answer-holder for "which state row is what" in a free-surface
+    # system.  Every consumer READS these — the Audusse hydrostatic
+    # reconstruction (``fvm.riemann_solvers.PositiveRusanov``), the HLLC
+    # contact wave, and the emitted C headers (``transformation.generic_c``
+    # publishes them so a hand-written driver loop cannot guess).
+    #
+    # WHY THEY EXIST.  A consumer that infers the layout from the state ORDER
+    # is right only for the four-row SWE state ``[b, h, q_x_0, q_y_0]``, where
+    # the two momentum rows happen to sit contiguously after ``h``.  Every
+    # wider free-surface system breaks that: ``SME(level=N, dimension=3)`` lays
+    # out ``[b, h, q_x_0..q_x_N, q_y_0..q_y_N]``, so ``idx_h + 2`` is
+    # ``q_x_1``, NOT ``q_y_0``.  MEASURED consequence of the guess in the amrex
+    # driver: the Audusse rescale skipped ``q_y_0``, a face whose reconstructed
+    # depth was 0 still exported y-momentum, and the LowerTriangle catchment
+    # reached ``h = -0.170 m`` at level 2 (thesis/cases/river/serghei/run/
+    # matrix_sme/README.md, "Positivity at order 1").
+
+    @property
+    def depth_scaled_state_indices(self) -> list:
+        """Q rows carrying exactly one factor of the depth — the rows an
+        Audusse-Bristeau-Klein hydrostatic reconstruction MUST rescale by
+        ``h*/h``.
+
+        In a depth-averaged system every conserved row except the depth
+        itself and the bathymetry is an EXTENSIVE (depth-weighted) quantity:
+        ``q_{d,j} = h·alpha_{d,j}`` for a moment model, ``hu`` for SWE,
+        ``hK`` / ``hE`` for a k-epsilon closure.  Rescaling all of them is
+        what makes the reconstructed pair a STATE — the Audusse positivity
+        proof assumes ``q* = h* u``, and a partially rescaled pair
+        ``(h* = 0, q != 0)`` is not a state at all: it exports mass out of an
+        empty cell.
+
+        ``h`` and ``b`` are excluded when (and only when) they are state
+        rows; a model that carries either in ``aux_state`` has nothing to
+        exclude here.
+        """
+        return [i for i, s in enumerate(self.state)
+                if str(s) not in ("h", "b")]
+
+    @property
+    def discharge_state_indices(self) -> list:
+        """Per horizontal direction ``d``, the state row whose value IS the
+        depth-integrated mass flux in that direction — ``hu``/``hv`` for SWE,
+        ``q_x_0``/``q_y_0`` for a moment model.  ``-1`` where the system has no
+        unique such row.
+
+        Read straight off the model's OWN mass balance: the ``h`` equation is
+        ``d_t h + d_d (mass flux)_d = 0``, so the direction-``d`` discharge row
+        is the single state the mass-row flux depends on.  That is the row
+        which
+
+        * exports the mass an Audusse-reconstructed face may not export
+          (hence its place in the positivity argument), and
+        * carries the bed-slope / hydrostatic force, so it is the row that
+          receives the Audusse well-balancing source once the bed NCP has
+          been cancelled by ``b_L = b_R = b_face`` at the face.
+
+        ``-1`` is returned per direction when the mass flux is not a single
+        state row — a multilayer system, whose mass flux is the SUM of the
+        layer discharges, genuinely has no single momentum row and a
+        depth-averaged bed source is not defined for it.  Consumers must
+        check, not assume.
+        """
+        names = [str(s) for s in self.state]
+        if "h" not in names:
+            return [-1] * self.n_dim
+        i_h = names.index("h")
+        e2s = list(self.equation_to_state_index)
+        if i_h not in e2s:            # h is carried but not evolved here
+            return [-1] * self.n_dim
+        mass_row = e2s.index(i_h)
+        out = []
+        for d in range(self.n_dim):
+            expr = sp.sympify(self.flux[mass_row, d])
+            if self.hydrostatic_pressure is not None:
+                expr = expr + sp.sympify(self.hydrostatic_pressure[mass_row, d])
+            hits = []
+            for k, s in enumerate(self.state):
+                dv = sp.diff(expr, s)
+                if dv != 0 and sp.simplify(dv) != 0:
+                    hits.append(k)
+            out.append(hits[0] if len(hits) == 1 else -1)
+        return out
+
     # ── Model-compatible facade ───────────────────────────────────────
     # So a solver can consume a SystemModel exactly where it used to
     # consume a Model — same accessor surface, SystemModel internals.

@@ -209,9 +209,11 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         return v
 
     def _resolve_scaled_q_indices(self, scaled_q_indices):
-        """Internal helper `_resolve_scaled_q_indices`.  Default excludes
-        ``h`` and ``b`` from the depth-scaled Q rows when they live in
-        the state."""
+        """Internal helper `_resolve_scaled_q_indices`.  An explicit
+        ``scaled_q_indices=`` wins; otherwise READ the model's own row map
+        (:attr:`SystemModel.depth_scaled_state_indices`) — the depth-weighted
+        rows are a property of the system, not of the flux, and there is
+        exactly one answer-holder for them."""
         if scaled_q_indices is not None:
             cleaned = [int(i) for i in scaled_q_indices]
             for i in cleaned:
@@ -220,13 +222,7 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
                         f"scaled_q_indices contains out-of-bounds index {i}."
                     )
             return cleaned
-
-        excluded = set()
-        for name in ("h", "b"):
-            h = self._field_handles.get(name)
-            if h is not None and h.container == "q":
-                excluded.add(h.index)
-        return [i for i in range(self.n_variables) if i not in excluded]
+        return list(self.model.depth_scaled_state_indices)
 
     def _eps_symbol(self):
         """The canonical wet/dry threshold ``wet_dry_eps`` (REQ-48).
@@ -586,8 +582,23 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
                 self.aux_variables_minus, self.aux_variables_plus)
 
     def _momentum_indices(self):
-        """The momentum block: the first ``model.n_dim`` depth-scaled Q rows."""
-        return list(self._scaled_q_indices)[:self.model.n_dim]
+        """The momentum block: the direction-``d`` discharge row, READ from the
+        model's own row map (:attr:`SystemModel.discharge_state_indices`).
+
+        This used to be ``self._scaled_q_indices[:n_dim]`` — "the first n_dim
+        depth-scaled rows", which is the state-ORDER guess that is true only
+        for the four-row SWE state.  On ``SME(level>=1, dimension=3)`` it
+        returned ``[q_x_0, q_x_1]`` where the momentum block is
+        ``[q_x_0, q_y_0]``, so the HLLC contact wave was built on a
+        y-velocity that was really the first x-moment."""
+        idx = list(self.model.discharge_state_indices)
+        if any(k < 0 for k in idx):
+            raise ValueError(
+                f"{type(self).__name__} needs one discharge row per direction, "
+                f"but the model publishes {idx} (a -1 means its mass flux is "
+                "not a single state row — e.g. a multilayer system). Choose a "
+                "Riemann solver that does not split off a contact wave.")
+        return idx
 
     def _normal_velocity(self, q, aux, n, mom_idx):
         """Depth-averaged velocity projected on the face normal, ``u·n``,
