@@ -441,7 +441,17 @@ class Numerics(param.Parameterized, SymbolicRegistrar):
         if Q is None:
             return self.local_max_eigenvalue_definition()
         if self.model.eigenvalues is None:
-            return self._spectral_radius_bound(Q, Qaux, p, n)
+            # No closed form.  DEFAULT is the exact numerical spectrum, because
+            # this quantity sets the Rusanov / LF / HLL DISSIPATION as well as
+            # the CFL, and an upper bound is extra numerical diffusion there
+            # (see SystemModel.use_spectral_radius_bound for the measured cost
+            # on the Ritter dry dam break).  The cheap bound is opt-in.
+            if getattr(self.model, "use_spectral_radius_bound",
+                       SystemModel.use_spectral_radius_bound):
+                return self._spectral_radius_bound(Q, Qaux, p, n)
+            src = list(sp.flatten(
+                self._model_eval("numerical_eigenvalues", Q, Qaux, p, n)))
+            return sp.Max(*[sp.Abs(lam) for lam in src], evaluate=False)
         src = list(sp.flatten(self._model_eval("eigenvalues", Q, Qaux, p, n)))
         # ``evaluate=False``: ``Max`` over a wave spectrum is a runtime
         # reduction, never a symbolic simplification target.  Letting sympy
@@ -1578,7 +1588,37 @@ class PositiveNonconservativeRusanov(PositiveRusanov, NonconservativeRusanov):
     supports_batched_faces = False
 
     def get_path_integral_states(self):
-        """Get path integral states."""
+        """Endpoints of the DLM path integral.
+
+        Hydrostatic-reconstructed states, BUT ONLY when the model carries a
+        ``hydrostatic_pressure`` slot for Audusse's consistency term ``S~`` to
+        compensate.  Otherwise the RAW states.
+
+        Why the distinction is load-bearing.  Audusse reconstructs ``h*`` from
+        the bed so the pressure flux and the bed source balance at rest, and
+        ``S~ = P_raw - P*`` restores what the reconstruction removed.  ``S~`` is
+        built from ``hydrostatic_pressure``.  A path-conservative model leaves
+        that slot EMPTY and carries ``g h dh`` in the nonconservative matrix, so
+        ``S~`` is structurally absent -- and then the path integral runs between
+        reconstructed endpoints with nothing compensating them.
+
+        Continuity carries no nonconservative term, so this was previously
+        argued not to touch the depth row.  That argument is wrong: the
+        ENDPOINTS are still reconstructed, so the mass flux taken between
+        ``h*_L`` and ``h*_R`` differs from the one between ``h_L`` and ``h_R``
+        wherever ``db != 0``.  Measured on the width-averaged curved channel,
+        that lost ``W db q00`` per face -- a steady-state discharge gain of
+        1.55 percent per metre, mesh-independent, obeying ``dQ/ds = S0 Q/h``
+        (0.01429 measured against 0.01443 predicted) and scaling exactly with
+        the bed slope (2x slope -> +99.6 percent against +100.0 predicted).
+        With raw endpoints the same model conserves to -0.004 percent and
+        settles on its design operating point.
+
+        Models that DO populate ``hydrostatic_pressure`` are unaffected: they
+        keep the reconstructed endpoints and their well-balancing.
+        """
+        if getattr(self.model, "hydrostatic_pressure_is_zero", False):
+            return ZArray([self.variables_minus, self.variables_plus])
         return self.hydrostatic_reconstruction(
             self.variables_minus,
             self.variables_plus,
