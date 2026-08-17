@@ -692,6 +692,64 @@ class Legendre_shifted(Basisfunction):
             return sympy.KroneckerDelta(l, 0)
         return None
     
+class WeightedBasis(Basisfunction):
+    """A basis re-weighted by a geometric factor, e.g. a curvilinear metric.
+
+    Wraps an orthogonal family and replaces its unit test weight with an
+    explicit ``weight(var)``.  Two things follow, and both matter:
+
+    * ``analytical_weighted_integral`` integrates ``poly * weight`` rather than
+      ``poly``, so a projection against a metric-weighted basis resolves
+      concretely instead of surviving as an opaque ``Integral``;
+    * ``closed_form_bracket`` returns ``None``.  The wrapped family is
+      orthogonal under weight 1, NOT under a general weight -- for the
+      channel metric ``m = 1 - kappa W (eta - 1/2)`` the Gram matrix picks up
+      off-diagonal entries, e.g. ``<psi_0, m psi_1> = -kappa W / 6``.  Emitting
+      the unit-weight delta forms would be silently wrong, so the brackets are
+      left for concrete resolution, which is the documented fallback.
+
+    This is the slot the curvilinear metric belongs in.  Multiplying the metric
+    into the equations by hand instead bypasses bracket recognition entirely:
+    ``ExtractBrackets`` matches ``Integral(phi_i * c * phi_l)`` by weight-function
+    NAME, so an extra metric factor makes every projection integral fall through
+    to "every other shape" and survive unresolved.
+    """
+    name = "WeightedBasis"
+
+    def __init__(self, inner, weight, level=None):
+        self._inner = inner
+        self._weight = weight
+        super().__init__(level=level if level is not None else inner.level)
+
+    def basis_definition(self):
+        """The wrapped family, unchanged.  Only the test weight differs."""
+        return self._inner.basis_definition()
+
+    def bounds(self):
+        return self._inner.bounds()
+
+    @property
+    def weight(self):
+        """The geometric weight this basis projects against."""
+        return self._weight
+
+    def analytical_weighted_integral(self, poly_expr, var):
+        """``int_0^1 poly_expr(var) * weight(var) dvar`` by antiderivative.
+
+        The metric is linear in ``var`` and the integrand is a polynomial, so
+        this stays exact and cheap -- no call into sympy's general integrator.
+        """
+        w = self._weight
+        if hasattr(w, "subs"):
+            w = w.subs(Symbol("z"), var) if Symbol("z") in getattr(w, "free_symbols", set()) else w
+        anti = sympy.integrate(sympy.expand(poly_expr * w), var)
+        return sympy.expand(anti.subs(var, 1) - anti.subs(var, 0))
+
+    def closed_form_bracket(self, name, args):
+        """No delta closed form under a non-unit weight.  See the class doc."""
+        return None
+
+
 class Chebyshevu(Basisfunction):
     """Chebyshevu. (class)."""
     name = "Chebyshevu"
