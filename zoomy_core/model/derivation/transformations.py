@@ -357,3 +357,107 @@ class PDETransformation(Operation):
                 rf"\partial_{sp.latex(self._z)} u \mapsto "
                 rf"\tfrac{{1}}{{{sp.latex(self._h)}}}\partial_\zeta "
                 rf"{self._accent}{{u}}$")
+
+class ParametrizedGeometry(Operation):
+    r"""Map a Cartesian pair ``(x, y)`` onto coordinates fitted to a
+    parametrized centreline ``r(sigma)``.
+
+    The geometry is the INPUT.  Everything else -- the curvature, the metric,
+    the chain rule and the area element -- is derived from it, so a straight
+    line, a circular bend and a meander differ only in the curve handed in::
+
+        straight = sp.Matrix([s, 0])
+        bend     = sp.Matrix([R*sp.cos(s/R), R*sp.sin(s/R)])
+        meander  = sp.Matrix([s, A*sp.sin(k*s)])
+        model.apply(ParametrizedGeometry(bend, (x, y), (s, n)))
+
+    For a planar curve the channel-fitted map is ``X(s,n) = r(s) + n N(s)``
+    with unit tangent ``T`` and normal ``N``, giving an ORTHOGONAL frame with
+    scale factors ``(m, 1)`` and
+
+    .. math::
+
+        m = 1 - \kappa(s)\,n ,\qquad
+        \nabla f = \tfrac1m \partial_s f\,\mathbf T + \partial_n f\,\mathbf N .
+
+    Hence the rewrite applied to every ``Derivative`` node::
+
+        d_x f -> (T_x/m) d_s f + N_x d_n f
+        d_y f -> (T_y/m) d_s f + N_y d_n f
+
+    ``kappa = 0`` collapses ``m`` to 1 and both rules to the identity, so the
+    Cartesian model is the degenerate case of the same code path rather than a
+    separate one.  :attr:`jacobian` returns ``m`` so a later projection picks
+    up the area element ``dA = m dn ds``.
+
+    The curve may be parametrized any way; the speed ``|r'|`` is carried
+    explicitly rather than assuming arc length.
+    """
+
+    def __init__(self, centreline, coords, new_coords, *, decorate="tilde",
+                 name="parametrized_geometry", description=None):
+        self._r = sp.Matrix(centreline)
+        if self._r.shape != (2, 1):
+            raise ValueError(f"centreline must be planar 2-vector; got {self._r.shape}")
+        self._x, self._y = coords
+        self._s, self._n = new_coords
+        rp = sp.diff(self._r, self._s)
+        rpp = sp.diff(self._r, self._s, 2)
+        self._speed = sp.simplify(sp.sqrt(rp[0] ** 2 + rp[1] ** 2))
+        self._kappa = sp.simplify(
+            (rp[0] * rpp[1] - rp[1] * rpp[0]) / self._speed ** 3)
+        self._T = sp.simplify(rp / self._speed)
+        self._N = sp.Matrix([-self._T[1], self._T[0]])
+        self._m = sp.simplify(1 - self._kappa * self._n)
+        self._decorated: dict = {}
+        super().__init__(
+            name=name,
+            description=(description or
+                         f"parametrized geometry: ({self._x}, {self._y}) -> "
+                         f"({self._s}, {self._n}), kappa = {self._kappa}"),
+        )
+
+    @property
+    def kappa(self):
+        """Signed curvature of the centreline, derived from the curve."""
+        return self._kappa
+
+    @property
+    def metric(self):
+        """``m = 1 - kappa n``, the streamwise scale factor."""
+        return self._m
+
+    @property
+    def jacobian(self):
+        """Area element ``dA = m dn ds``."""
+        return self._m
+
+    def admissible(self, half_width):
+        """``m > 0`` across the section.  False geometry, not a solver failure."""
+        return sp.simplify(sp.Abs(self._kappa) * 2 * half_width < 2)
+
+    def _apply_one_derivative(self, inner, var):
+        if var == self._x:
+            return (self._T[0] / self._m) * sp.Derivative(inner, self._s) \
+                 + self._N[0] * sp.Derivative(inner, self._n)
+        if var == self._y:
+            return (self._T[1] / self._m) * sp.Derivative(inner, self._s) \
+                 + self._N[1] * sp.Derivative(inner, self._n)
+        return sp.Derivative(inner, var)
+
+    def _rewrite(self, e):
+        if isinstance(e, sp.Derivative):
+            result = self._rewrite(e.expr)
+            for var, order in e.variable_count:
+                for _ in range(int(order)):
+                    result = self._apply_one_derivative(result, var)
+            return result
+        if e.args:
+            new_args = tuple(self._rewrite(a) for a in e.args)
+            if any(n is not o for n, o in zip(new_args, e.args)):
+                return e.func(*new_args)
+        return e
+
+    def _apply_leaf(self, expr):
+        return self._rewrite(expr)
+
