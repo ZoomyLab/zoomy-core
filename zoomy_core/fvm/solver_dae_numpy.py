@@ -772,23 +772,40 @@ class DAESolver(Solver):
         """Greedy graph-colouring of the cell-dependency stencil
         (LSQ neighbours + face neighbours).  Cells of the same colour
         share no dependency cone — they can be perturbed
-        simultaneously in FD Jacobian assembly."""
+        simultaneously in FD Jacobian assembly.
+
+        The cone must span the RECONSTRUCTION stencil, not merely the face
+        stencil.  At order 2 the face value on the far side of a neighbour
+        carries that neighbour's own LSQ gradient, so the residual of cell
+        ``c`` reaches ``c +- 2``.  Colouring the one-ring cone regardless of
+        order left, measured against a dense FD assembly on this system,
+        14.4 percent of the true Jacobian OUTSIDE the assumed pattern where
+        it was never written, and let two cells two apart share a colour so
+        that the entries which were written are contaminated.  An inexact
+        Jacobian is exactly what degraded the stage Newton from quadratic to
+        linear convergence: order 2 cost 9.1x the order-1 time per step at
+        identical dt, 760 residual evaluations for a single step.
+        """
         mesh = self._sim_mesh
         nc = self.nc
-        deps = [{c} for c in range(nc)]
+        adj = [{c} for c in range(nc)]
         if (hasattr(mesh, "_lsq_neighbors")
                 and mesh._lsq_neighbors is not None):
             for c in range(nc):
                 for nbr in mesh._lsq_neighbors[c]:
                     nbr_i = int(nbr)
                     if 0 <= nbr_i < nc:
-                        deps[c].add(nbr_i)
+                        adj[c].add(nbr_i)
         for f in range(mesh.n_faces):
             cA = int(mesh.face_cells[0, f])
             cB = int(mesh.face_cells[1, f])
             if 0 <= cA < nc and 0 <= cB < nc:
-                deps[cA].add(cB)
-                deps[cB].add(cA)
+                adj[cA].add(cB)
+                adj[cB].add(cA)
+        if int(self.reconstruction_order) >= 2:
+            deps = [set().union(*(adj[d] for d in adj[c])) for c in range(nc)]
+        else:
+            deps = adj
         seen_by = [set() for _ in range(nc)]
         for c in range(nc):
             for d in deps[c]:
