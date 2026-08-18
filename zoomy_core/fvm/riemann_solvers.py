@@ -1618,7 +1618,8 @@ class PositiveNonconservativeRusanov(PositiveRusanov, NonconservativeRusanov):
         keep the reconstructed endpoints and their well-balancing.
         """
         if getattr(self.model, "hydrostatic_pressure_is_zero", False):
-            return ZArray([self.variables_minus, self.variables_plus])
+            return (self.variables_minus, self.variables_plus,
+                    self.aux_variables_minus, self.aux_variables_plus)
         return self.hydrostatic_reconstruction(
             self.variables_minus,
             self.variables_plus,
