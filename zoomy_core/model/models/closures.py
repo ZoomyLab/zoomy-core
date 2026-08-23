@@ -219,7 +219,8 @@ class QRViscosity(Closure):
     """Turbulent bulk stress for the q–r (positivity-by-construction) k–ε model.
 
     Same eddy viscosity ``ν_t = C_μ k²/ε`` as :class:`KEpsilonViscosity`, but the
-    transported state is ``sk = √k`` and ``se = √ε`` (Fe et al. 2009, k=q², ε=r²),
+    transported state is ``sk = √k`` and ``se = √ε`` (Finnie & Jeppson 1991,
+    k=q², ε=r²; later used by Fe et al. 2009),
     so ``ν_t = C_μ sk⁴/se²`` — k=sk²≥0 and ε=se²≥0 hold by construction.  Reads
     the transported ``sk``, ``se`` fields (only on a q–r k–ε model class); the
     Galerkin projection is rational in ζ → build with ``quadrature_order > 0``."""

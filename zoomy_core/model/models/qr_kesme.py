@@ -4,7 +4,7 @@ Positivity-by-construction variant of :class:`KESME`.  Instead of transporting
 ``k`` and ``ε`` (which can — and did, in the plain KESME spin-up — go negative
 and crash the run), we transport their square roots
 
-    sk = √k ,   se = √ε                            (Fe et al. 2009, q=√k, r=√ε)
+    sk = √k ,   se = √ε      (Finnie & Jeppson 1991, q=√k, r=√ε; Fe et al. 2009)
 
 so that ``k = sk² ≥ 0`` and ``ε = se² ≥ 0`` hold IDENTICALLY, for every modal
 combination.  The starting 3-D balance is the SAME k–ε system; the q–r form is
