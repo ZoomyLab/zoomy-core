@@ -17,7 +17,29 @@ from sympy import (
     together,
     Symbol,
 )
-from IPython.display import display, Latex
+
+from zoomy_core.misc.show import show
+
+
+class _LatexBlock:
+    """A display-math block that renders through whatever ``display`` the
+    host provides (Jupyter, the GUI's Pyodide kernel) and prints as LaTeX
+    source otherwise. Importing ``IPython.display`` for this made the module
+    unimportable in the Pyodide kernel, which has ``display`` but no IPython."""
+
+    __slots__ = ("tex",)
+
+    def __init__(self, tex):
+        self.tex = tex
+
+    def _repr_latex_(self):
+        return self.tex
+
+    def _repr_markdown_(self):
+        return self.tex
+
+    def __repr__(self):
+        return self.tex
 
 
 class ModelAnalyser:
@@ -44,7 +66,7 @@ class ModelAnalyser:
             return
         latex_lines = " \\\\\n".join([f"& {latex(eq)}" for eq in self.equations])
         latex_block = r"$$\begin{align*}" + "\n" + latex_lines + r"\end{align*}$$"
-        display(Latex(latex_block))
+        show(_LatexBlock(latex_block))
 
     def get_time_space(self):
         """Get time space."""
