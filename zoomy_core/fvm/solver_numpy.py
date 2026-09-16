@@ -242,23 +242,49 @@ class Solver(param.Parameterized):
 
     def update_q(self, Q, Qaux, mesh, model, parameters, dt):
         """Apply ``model.update_variables`` (h-clamp, momentum ramp) at
-        each cell.
+        each cell — evaluated for all cells in one batched call.
 
         ``update_variables`` is carried through the SystemModel and
         exposed on the runtime as ``update_variables(Q, Qaux, p, dt)`` —
         the identity for models with no per-cell transform (``dt`` then
         ignored).  It is ``None`` only for SystemModels assembled directly
         without one (e.g. split sub-systems); then this is a genuine no-op,
-        not a legacy fallback."""
+        not a legacy fallback.
+
+        Batching is exact: the lowered kernel is a lambdified numpy
+        expression evaluated element-wise (Min/Max → ``minimum``/``maximum``,
+        Piecewise → ``select``) and each cell's rows depend only on that
+        cell's own column, so ``(n_vars, n_cells)`` in gives
+        ``(n_rows, n_cells)`` out with no cross-cell accumulation.
+        ``Q[:, :] = vals[:n_vars]`` keeps the per-cell prefix/broadcast
+        semantics of ``.ravel()[:n_vars]``."""
         update = getattr(model, "update_variables", None)
         if update is None:
             return Q
-        n_vars = Q.shape[0]
-        for c in range(Q.shape[1]):
-            aux = Qaux[:, c] if Qaux.shape[0] > 0 else _EMPTY_AUX
-            Q[:, c] = np.asarray(
-                update(Q[:, c], aux, parameters, dt), dtype=float,
-            ).ravel()[:n_vars]
+        n_vars, n_cells = Q.shape
+        aux = Qaux if Qaux.shape[0] > 0 else np.empty((0, n_cells))
+        try:
+            vals = np.asarray(update(Q, aux, parameters, dt), dtype=float)
+            if vals.ndim != 2 or vals.shape[1] != n_cells:
+                # Only the element-wise block (n_rows, n_cells) is accepted.
+                # Any other shape is ambiguous or non-local — a bare scalar
+                # row comes back (n_cells,) (indistinguishable from n_cells
+                # scalar rows), a cross-cell reduction ``[q.sum()]`` comes
+                # back (1,) — so it is NOT normalised; the per-cell loop is
+                # the only exact evaluation for such a callable.
+                raise ValueError(
+                    f"batched update_variables returned {vals.shape}")
+        except (ValueError, TypeError):
+            # Fallback: a callable that does not broadcast over cells or
+            # does not return the (n_rows, n_cells) block — the per-cell
+            # loop, identical to the pre-batching behaviour.
+            for c in range(n_cells):
+                a = Qaux[:, c] if Qaux.shape[0] > 0 else _EMPTY_AUX
+                Q[:, c] = np.asarray(
+                    update(Q[:, c], a, parameters, dt), dtype=float,
+                ).ravel()[:n_vars]
+            return Q
+        Q[:, :] = vals[:n_vars]
         return Q
 
     def _apply_local_aux_formula(self, model, Qaux, Q, parameters, time,
@@ -285,21 +311,54 @@ class Solver(param.Parameterized):
         if not callable(local_fn) or Qaux.shape[0] == 0:
             return Qaux
         out = np.array(Qaux, copy=True) if copy else Qaux
-        for c in range(Q.shape[1]):
-            pos_c = (cell_centers[:, c] if cell_centers is not None
-                     else _ORIGIN3)
-            vals = np.asarray(
-                local_fn(Q[:, c], Qaux[:, c], parameters, time, pos_c),
-                dtype=float).ravel()
-            out[:vals.shape[0], c] = vals
+        n_cells = Q.shape[1]
+        # Batched evaluation over all cells.  Exact because the lowered kernel
+        # is a lambdified element-wise numpy expression whose constant /
+        # time-only rows are already ``c*ones_like(<anchor state>)``
+        # (vectorize.uniform_rank), so (n_vars, n_cells) / (n_aux, n_cells) /
+        # (3, n_cells) in gives (n_rows, n_cells) out; every cell's rows are
+        # computed from its own OLD column, exactly as the loop did.  The
+        # origin is broadcast to (3, n_cells) — NOT (3, 1) — because a
+        # position-only row (``x**2``) is not anchor-wrapped and would come
+        # back (1,) beside (n_cells,) rows (ragged → ValueError).
+        # ``cell_centers`` carries ghost columns after the inner ones.
+        pos = (cell_centers[:, :n_cells] if cell_centers is not None
+               else np.broadcast_to(_ORIGIN3[:, None], (3, n_cells)))
+        try:
+            vals = np.asarray(local_fn(Q, Qaux, parameters, time, pos),
+                              dtype=float)
+            if vals.ndim != 2 or vals.shape[1] != n_cells:
+                # Only the element-wise block (n_rows, n_cells) is accepted
+                # (what the lowered ``array([...])`` kernel returns).  Any
+                # other shape is ambiguous or non-local — a bare scalar row
+                # comes back (n_cells,) (indistinguishable from n_cells
+                # scalar rows), a cross-cell reduction ``[q.sum()]`` comes
+                # back (1,) — so it is NOT normalised; the per-cell loop is
+                # the only exact evaluation for such a callable.
+                raise ValueError(
+                    f"batched update_aux_variables returned {vals.shape}")
+        except (ValueError, TypeError):
+            # Fallback: a formula that cannot broadcast over cells or does
+            # not return the (n_rows, n_cells) block — the per-cell loop,
+            # identical to the pre-batching behaviour.
+            for c in range(n_cells):
+                pos_c = (cell_centers[:, c] if cell_centers is not None
+                         else _ORIGIN3)
+                v = np.asarray(
+                    local_fn(Q[:, c], Qaux[:, c], parameters, time, pos_c),
+                    dtype=float).ravel()
+                out[:v.shape[0], c] = v
+            return out
+        out[:vals.shape[0], :] = vals
         return out
 
     def update_qaux(self, Q, Qaux, Qold, Qauxold, mesh, model, parameters, time, dt):
         """Fill the auxiliary vector with BOTH legs the SystemModel gathered:
 
         1. the LOCAL per-cell aux formula — the lowered
-           ``update_aux_variables`` (e.g. KP ``hinv``), applied per cell like
-           :meth:`update_q`.  Absent/``None`` for models with no aux formula
+           ``update_aux_variables`` (e.g. KP ``hinv``), applied per cell (one
+           batched call) like :meth:`update_q`.  Absent/``None`` for models
+           with no aux formula
            (identity), so this leg is then skipped.
         2. the NON-LOCAL derivative-aux rows — ``kind == 'derivative'`` entries
            of ``aux_registry`` filled via ``LSQMesh.compute_derivatives`` (state

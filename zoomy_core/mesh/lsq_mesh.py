@@ -1,8 +1,8 @@
 """LSQMesh — FVMMesh with precomputed least-squares reconstruction stencils.
 
 This is the highest-fidelity mesh class: it caches the LSQ derivative
-operators so that ``compute_derivatives`` is a single matrix–vector product
-per cell instead of building the stencil on every call.
+operators so that ``compute_derivatives`` is one batched matrix–vector
+product over all cells instead of building the stencil on every call.
 """
 
 from __future__ import annotations
@@ -111,23 +111,35 @@ class LSQMesh(FVMMesh):
             derivatives_multi_index = mon_indices
         indices = find_derivative_indices(mon_indices, derivatives_multi_index)
 
-        out = np.zeros((A_glob.shape[0], len(derivatives_multi_index)), dtype=float)
-        for i in range(A_glob.shape[0]):
-            A_loc = A_glob[i]
-            nbr_idx = neighbors[i]
-            u_cells = u[nbr_idx]
-            if has_bdy:
-                bf = bdy_neighbors[i]
-                u_bdy = np.where(
-                    bf >= 0, u_boundary_face[np.maximum(bf, 0)], u[i]
-                )
-                u_full = np.concatenate([u_cells, u_bdy])
-            else:
-                u_full = u_cells
-            delta_u = u_full - u[i]
-            out[i, :] = (sf * (A_loc.T @ delta_u))[indices]
-
-        return out
+        # Batched over all cells: gather the stencil values, then one
+        # (n_mon, R) @ (R,) product per cell.  Ragged stencils are already
+        # padded by the builder (own index i in ``neighbors`` -> delta_u = 0,
+        # -1 in ``bdy_neighbors`` -> u[i] -> delta_u = 0) and the matching
+        # rows of ``A_glob`` are exactly 0.0, so padded slots contribute 0.0.
+        # The batched matmul runs the same per-cell gemv (same accumulation
+        # order) as the old ``A_loc.T @ delta_u`` loop -> bit-exact; einsum
+        # is not.
+        u = np.asarray(u)
+        n_cells = A_glob.shape[0]
+        if u.shape[0] < n_cells:
+            # The old loop read u[i] for every cell (ghosts included);
+            # keep that contract and its error class.
+            raise IndexError(
+                f"u has length {u.shape[0]} but the stencil covers "
+                f"{n_cells} cells (inner + ghost)")
+        u_self = u[:n_cells]                                   # (n_cells,)
+        u_full = u[neighbors]                                  # (n_cells, max_nbr)
+        if has_bdy:
+            u_bdy = np.where(
+                bdy_neighbors >= 0,
+                u_boundary_face[np.maximum(bdy_neighbors, 0)],
+                u_self[:, None],
+            )                                                  # (n_cells, max_bdy)
+            u_full = np.concatenate([u_full, u_bdy], axis=1)   # (n_cells, R)
+        delta_u = u_full - u_self[:, None]                     # (n_cells, R)
+        coeffs = (A_glob.transpose(0, 2, 1) @ delta_u[:, :, None])[:, :, 0]
+        # C-contiguous like the old ``np.zeros`` output buffer.
+        return np.ascontiguousarray((sf * coeffs)[:, indices], dtype=float)
 
     def derivative_operator(self, multi_index) -> csr_matrix:
         """Sparse-matrix realisation of the LSQ derivative stencil.
