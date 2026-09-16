@@ -1398,6 +1398,14 @@ class HyperbolicSolver(Solver):
         dt_snapshot = self.time_end / max(self.settings.output.snapshots - 1, 1)
         iteration = 0
 
+        # Initial snapshot, the same convention as the jax and DAE loops: the
+        # first record of the store is the initial condition at t = 0, not the
+        # state after the first step.
+        i_snapshot = self._sim_save_fields(
+            time_now, next_write_at, i_snapshot, self._sim_Q, self._sim_Qaux,
+        )
+        next_write_at += dt_snapshot
+
         while time_now < self.time_end:
             dt = self.compute_dt(
                 self._sim_Q, self._sim_Qaux, self._sim_parameters,
