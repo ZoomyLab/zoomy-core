@@ -1493,6 +1493,29 @@ class SystemModel:
     # unpickling of older blobs.
     spectral_bound_iterations = 2
 
+    # WHICH path ``Numerics.local_max_abs_eigenvalue`` takes when the model
+    # carries no closed-form ``eigenvalues``.  DEFAULT FALSE: the exact
+    # :attr:`numerical_eigenvalues` spectrum, not :attr:`spectral_radius_bound`.
+    #
+    # The bound is an UPPER bound, and ``max|lambda|`` is consumed TWICE: by the
+    # CFL, where over-estimating is merely conservative, and by the Rusanov / LF
+    # / HLL dissipation, where over-estimating is EXTRA NUMERICAL DIFFUSION.
+    # ``spectral_radius_bound`` records its own tightness as a min ratio of
+    # 1.224 over 5064 states, so the dissipation is at least ~22 % too large
+    # wherever it is used, and looser near dry states.  MEASURED on the Ritter
+    # dry dam break (thesis 1d_wetdry, order 2, n = 50…400): with the bound the
+    # depth error is 1.44–1.55x the closed-form-spectrum result at every
+    # resolution and the velocity error 2.7–3.5x, with the velocity EOC turning
+    # erratic (0.56/1.96/1.37 against 0.93/1.09/0.95).  The convergence RATE
+    # survives, which is why this hid: only the error CONSTANT moves.
+    #
+    # Set True to trade that accuracy back for speed.  The bound exists for a
+    # real reason: it took the emitted foam ``SME(level=4, dimension=3)`` kernel
+    # from 23.13 to 0.241 us/call, and a per-face eigen-decomposition is O(n^3)
+    # per side per step.  So a large-level or coupled production run may well
+    # want it; a verification or convergence study must not have it silently on.
+    use_spectral_radius_bound = False
+
     @property
     def spectral_radius_bound(self):
         """CLOSED-FORM upper bound on ``ρ(A_n)`` — the wave speed, without an
