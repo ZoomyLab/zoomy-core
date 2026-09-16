@@ -180,7 +180,8 @@ class IMEXSolver(DerivativeAwareSolverMixin, HyperbolicSolver):
             # parent HyperbolicSolver (solver_numpy.py) — ``output.directory``
             # is main-dir-relative, so ``BaseMesh.write_to_hdf5`` (raw path)
             # dies with FileNotFoundError whenever cwd != main directory.
-            io.write_mesh_to_hdf5(output_hdf5_path, self._sim_mesh)
+            io.write_mesh_to_hdf5(output_hdf5_path, self._sim_mesh,
+                                  names=[str(s) for s in self.nsm.state])
             io.save_settings(self.settings)
 
     def step(self, dt):

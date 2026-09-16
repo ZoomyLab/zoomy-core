@@ -248,12 +248,17 @@ def _save_hdf5(_filepath, i_snapshot, time, Q, Qaux, overwrite=True):
     return i_snapshot + 1.0
 
 
-def write_mesh_to_hdf5(_filepath, mesh):
+def write_mesh_to_hdf5(_filepath, mesh, names=None):
     """Initialise the solver output h5 with the mesh topology under ``/mesh/`` so
     the file is SELF-DESCRIBING for the postprocessing readers
     (``zoomy_plotting.read_hdf5`` → ``columns_from_slice`` / the column & mesh
     plots).  Written once at setup (fresh file); the per-snapshot field writer
-    then appends ``/fields/``.  No-op without h5py."""
+    then appends ``/fields/``.  No-op without h5py.
+
+    ``names`` — the state variable names, in ``Q`` row order — are stored as
+    ``/fields@names`` (the convention ``zoomy_prepost`` writes and
+    ``zoomy_plotting.read_hdf5`` resolves), so a reader can ask the store for
+    ``"h"`` instead of guessing that ``q1`` is the depth."""
     if not _HAVE_H5PY:
         return
     main_dir = misc.get_main_directory()
@@ -268,6 +273,9 @@ def write_mesh_to_hdf5(_filepath, mesh):
         g.create_dataset("n_inner_cells", data=mesh.n_inner_cells)
         g.create_dataset("vertex_coordinates", data=mesh.vertex_coordinates)
         g.create_dataset("cell_vertices", data=mesh.cell_vertices)
+        if names is not None:
+            f.create_group("fields").attrs["names"] = np.array(
+                [str(n) for n in names], dtype="S")
 
 
 def get_save_fields(_filepath, write_all=False, overwrite=True):

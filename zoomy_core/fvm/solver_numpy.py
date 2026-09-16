@@ -1252,7 +1252,8 @@ class HyperbolicSolver(Solver):
             output_hdf5_path = os.path.join(
                 self.settings.output.directory, f"{self.settings.output.filename}.h5"
             )
-            io.write_mesh_to_hdf5(output_hdf5_path, mesh)   # self-describing output
+            io.write_mesh_to_hdf5(output_hdf5_path, mesh,   # self-describing output
+                                  names=[str(s) for s in self.nsm.state])
             self._sim_save_fields = io.get_save_fields(output_hdf5_path, write_all=False)
         else:
             self._sim_save_fields = lambda time, time_stamp, i_snapshot, Q, Qaux: i_snapshot
@@ -1404,6 +1405,7 @@ class HyperbolicSolver(Solver):
         i_snapshot = self._sim_save_fields(
             time_now, next_write_at, i_snapshot, self._sim_Q, self._sim_Qaux,
         )
+        last_written = time_now
         next_write_at += dt_snapshot
 
         while time_now < self.time_end:
@@ -1425,6 +1427,7 @@ class HyperbolicSolver(Solver):
                 i_snapshot = self._sim_save_fields(
                     time_now, next_write_at, i_snapshot, self._sim_Q, self._sim_Qaux,
                 )
+                last_written = time_now
                 next_write_at += dt_snapshot
 
             if iteration % 10 == 0:
@@ -1432,6 +1435,15 @@ class HyperbolicSolver(Solver):
                     f"iteration: {iteration}, time: {time_now:.6f}, "
                     f"dt: {dt:.6f}, next write at time: {next_write_at:.6f}"
                 )
+
+        # The end state. The write schedule is accumulated by addition, so
+        # its last entry can land a roundoff above time_end and the loop
+        # ends with the final state unwritten (a 40-snapshot march to 0.5 s
+        # ended its store at 0.487 s).
+        if time_now > last_written:
+            i_snapshot = self._sim_save_fields(
+                time_now, time_now, i_snapshot, self._sim_Q, self._sim_Qaux,
+            )
 
         self._sim_time = time_now
         logger.info(f"Finished simulation with in {gettime() - t_start:.3f} seconds")
