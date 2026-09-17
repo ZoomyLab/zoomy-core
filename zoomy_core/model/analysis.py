@@ -43,12 +43,28 @@ class _LatexBlock:
 
 
 class ModelAnalyser:
-    """ModelAnalyser. (class)."""
+    """Linear analysis of a system model: linearisation about a base state,
+    plane-wave ansatz, dispersion relation.
+
+    Takes a :class:`~zoomy_core.systemmodel.system_model.SystemModel` and
+    nothing else — the analysis lives at the system level and does not
+    know whether the system was derived or written down
+    (``SystemModel.from_model(model)`` is the way in)."""
     def __init__(self, model):
         """Initialize the instance."""
+        from zoomy_core.systemmodel.system_model import SystemModel
+        if not isinstance(model, SystemModel):
+            raise TypeError(
+                "ModelAnalyser takes a SystemModel; build one with "
+                "SystemModel.from_model(model).")
         self.model = model
         self.t = model.time
-        x, y, z = model.position
+        # A bare system model resolves (x, y, z) lazily: ``position`` is set
+        # only by the derivation / boundary-condition path.
+        pos = model.position
+        if pos is None:
+            pos = model._position_struct()
+        x, y, z = pos
         self.x = x
         self.y = y
         self.z = z
@@ -70,9 +86,7 @@ class ModelAnalyser:
 
     def get_time_space(self):
         """Get time space."""
-        x, y, z = self.model.position
-        t = self.model.time
-        return t, x, y, z
+        return self.t, self.x, self.y, self.z
 
     def _get_omega_k(self):
         """Internal helper `_get_omega_k`."""
@@ -160,14 +174,15 @@ class ModelAnalyser:
         dim = model.dimension
         X = [x, y, z]
 
-        Q = Matrix(model.variables.get_list())
-        Qaux = Matrix(model.aux_variables.get_list())
+        Q = Matrix(list(model.state))
+        Qaux = Matrix(list(model.aux_state))
 
         substitutions = {Q[i]: q[i] for i in range(len(q))}
         substitutions.update({Qaux[i]: qaux[i] for i in range(len(qaux))})
 
-        # 1. Quasilinear Matrix (Flux Jacobian)
-        A_raw = model.quasilinear_matrix()
+        # 1. Quasilinear Matrix (Flux Jacobian) — the system model's lazily
+        #    computed (n_eq, n_state, n_dim) operator.
+        A_raw = model.quasilinear_matrix
         A_matrices = []
         for d in range(dim):
             mat = Matrix(A_raw[:, :, d])  # Handle immutable arrays
