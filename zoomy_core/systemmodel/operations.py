@@ -48,6 +48,7 @@ __all__ = [
     "regularize_depth_aux",
     "kp_hinv",
     "desingularize_hinv",
+    "symbolic_spectrum",
     "desingularize_positivity",
     "equilibrate_constraint_rows",
     "guard_eigenvalue_powers",
@@ -884,6 +885,24 @@ def desingularize_hinv(mode="kp"):
 
     _op.name = "desingularize_hinv"
     _op.description = f"KP 1/h desingularization (mode={mode!r})"
+    return _op
+
+
+def symbolic_spectrum():
+    """Operation: derive the closed-form spectrum of the normal-projected
+    quasilinear matrix and carry it as ``sm.eigenvalues`` (``eigenvalue_mode``
+    becomes ``"symbolic"``).
+
+    A system model built from a derivation carries no spectrum: every
+    in-process solver takes the numerical eigenvalues of the quasilinear
+    matrix in that case, but a printer that emits a wave-speed kernel needs
+    the closed form and refuses otherwise. This is where a caller pays for
+    the symbolic derivation — cheap for a shallow water system, expensive
+    for a high moment level, which is why it is opt-in."""
+    def _op(sm):
+        sm.eigenvalues = ZArray(sm._compute_eigenvalues())
+    _op.name = "symbolic_spectrum"
+    _op.description = "closed-form spectrum of the quasilinear matrix"
     return _op
 
 

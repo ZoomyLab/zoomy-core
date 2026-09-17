@@ -1032,15 +1032,19 @@ class SystemModel:
 
     # ── Operators carried as declared Functions (single signature source) ──
 
-    def _position_struct(self) -> Zstruct:
-        """The length-3 position group ``(x, y, z)``.  ``self.position`` is set
-        by the derivation / BC path; fall back to the canonical symbols exactly
-        like ``attach_boundary_conditions`` for a bare SystemModel."""
+    def position_struct(self) -> Zstruct:
+        """The length-3 position group ``(x, y, z)`` — THE accessor for a
+        consumer that needs the coordinates (printers, analysis).
+        ``self.position`` is set by the derivation / BC path; a bare
+        SystemModel resolves the canonical symbols exactly like
+        ``attach_boundary_conditions``."""
         if self.position is not None:
             return self.position
         return Zstruct(X0=self.space[0],
                        X1=sp.Symbol("y", real=True),
                        X2=sp.Symbol("z", real=True))
+
+    _position_struct = position_struct
 
     def operator_signature(self, name: str) -> Zstruct:
         """The declared ``args`` :class:`Zstruct` for operator ``name`` — the

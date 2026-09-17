@@ -59,12 +59,7 @@ class ModelAnalyser:
                 "SystemModel.from_model(model).")
         self.model = model
         self.t = model.time
-        # A bare system model resolves (x, y, z) lazily: ``position`` is set
-        # only by the derivation / boundary-condition path.
-        pos = model.position
-        if pos is None:
-            pos = model._position_struct()
-        x, y, z = pos
+        x, y, z = model.position_struct()
         self.x = x
         self.y = y
         self.z = z

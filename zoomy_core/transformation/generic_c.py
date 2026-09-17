@@ -1218,7 +1218,7 @@ class GenericCppModel(GenericCppBase):
             self.register_map("gradQ", model.gradient_variables.values())
         self.register_map("n", model.normal.values())
         if hasattr(model, "position"):
-            self.register_map("X", model.position.values())
+            self.register_map("X", model.position_struct().values())
         self.register_map("p", self.model.parameters.values())
 
     @classmethod
